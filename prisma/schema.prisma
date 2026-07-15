@@ -1,0 +1,117 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DISABLED
+}
+
+enum LicenseStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+}
+
+enum WalletLedgerType {
+  GRANT
+  RESERVE
+  RELEASE
+  CHARGE
+  REFUND
+  ADJUSTMENT
+}
+
+enum AiCapability {
+  LLM
+  IMAGE
+  VIDEO
+}
+
+enum AiRequestStatus {
+  PENDING
+  RESERVED
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+model User {
+  id         String         @id @default(cuid())
+  status     UserStatus     @default(ACTIVE)
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+  licenses   License[]
+  wallet     Wallet?
+  ledger     WalletLedger[]
+  aiRequests AiRequest[]
+
+  @@index([status])
+}
+
+model License {
+  id        String        @id @default(cuid())
+  codeHash  String        @unique
+  userId    String
+  status    LicenseStatus @default(ACTIVE)
+  expiresAt DateTime?
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  user      User          @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, status])
+  @@index([expiresAt])
+}
+
+model Wallet {
+  userId           String   @id
+  availableCredits BigInt   @default(0)
+  reservedCredits  BigInt   @default(0)
+  lifetimeGranted  BigInt   @default(0)
+  lifetimeConsumed BigInt   @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  user              User     @relation(fields: [userId], references: [id], onDelete: Restrict)
+}
+
+model WalletLedger {
+  id           String           @id @default(cuid())
+  userId       String
+  requestId    String?
+  type         WalletLedgerType
+  amount       BigInt
+  balanceAfter BigInt
+  description  String?
+  createdAt    DateTime         @default(now())
+  user         User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  request      AiRequest?       @relation(fields: [requestId], references: [id], onDelete: Restrict)
+
+  @@index([userId, createdAt])
+  @@index([requestId])
+}
+
+model AiRequest {
+  id               String          @id @default(cuid())
+  userId           String
+  clientRequestId  String
+  capability       AiCapability
+  logicalModel     String
+  status           AiRequestStatus @default(PENDING)
+  estimatedCredits BigInt          @default(0)
+  chargedCredits   BigInt          @default(0)
+  createdAt         DateTime        @default(now())
+  completedAt       DateTime?
+  user              User            @relation(fields: [userId], references: [id], onDelete: Restrict)
+  ledgerEntries     WalletLedger[]
+
+  @@unique([userId, clientRequestId])
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+}

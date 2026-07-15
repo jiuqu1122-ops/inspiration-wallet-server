@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly PROJECT_DIR="${PROJECT_DIR:-/opt/inspiration-wallet-server}"
+readonly HEALTH_URL="${HEALTH_URL:-https://api.unmind.art/health}"
+
+log() {
+  printf '[deploy] %s\n' "$*"
+}
+
+fail() {
+  printf '[deploy] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+command -v docker >/dev/null 2>&1 || fail 'Docker is not installed or not in PATH.'
+docker compose version >/dev/null 2>&1 || fail 'Docker Compose Plugin is not available.'
+command -v git >/dev/null 2>&1 || fail 'Git is not installed or not in PATH.'
+command -v curl >/dev/null 2>&1 || fail 'curl is not installed or not in PATH.'
+
+cd "$PROJECT_DIR" || fail "Cannot enter $PROJECT_DIR."
+[[ -f .env ]] || fail '.env is missing. Copy .env.example to .env and replace all placeholders.'
+[[ -f docker-compose.yml ]] || fail 'docker-compose.yml is missing.'
+if grep -Eq '^[A-Z0-9_]+=.*CHANGE_ME' .env; then
+  fail '.env still contains a CHANGE_ME placeholder.'
+fi
+
+if [[ -d .git ]] && git remote get-url origin >/dev/null 2>&1; then
+  log 'Pulling the latest code with fast-forward only...'
+  git pull --ff-only
+else
+  log 'No Git origin is configured; using the current working tree.'
+fi
+
+log 'Validating Docker Compose configuration...'
+docker compose config --quiet
+
+log 'Building the API image...'
+docker compose build api
+
+log 'Starting PostgreSQL...'
+docker compose up -d postgres
+
+log 'Waiting for PostgreSQL health check...'
+postgres_ready=false
+for _ in $(seq 1 30); do
+  if docker compose exec -T postgres sh -c 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1; then
+    postgres_ready=true
+    break
+  fi
+  sleep 2
+done
+if [[ "$postgres_ready" != true ]]; then
+  docker compose logs --tail=100 postgres >&2 || true
+  fail 'PostgreSQL did not become healthy within 60 seconds. Deployment stopped; no volume was removed.'
+fi
+
+log 'Applying pending Prisma migrations exactly once...'
+if ! docker compose run --rm --no-deps api npm run prisma:migrate:deploy; then
+  docker compose logs --tail=100 postgres >&2 || true
+  fail 'Prisma migration failed. API and Caddy were not updated; database data and volumes were preserved.'
+fi
+
+log 'Starting or updating API and Caddy...'
+docker compose up -d api caddy
+
+log 'Current service state:'
+docker compose ps
+
+log "Checking $HEALTH_URL ..."
+if ! curl --fail --silent --show-error --retry 8 --retry-delay 3 --retry-all-errors "$HEALTH_URL"; then
+  printf '\n' >&2
+  docker compose logs --tail=150 api caddy >&2 || true
+  fail 'Public health check failed. Inspect the logs above; no data or volume was deleted.'
+fi
+printf '\n'
+log 'Deployment workflow completed and the public health check passed.'

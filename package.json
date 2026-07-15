@@ -1,0 +1,41 @@
+{
+  "name": "inspiration-wallet-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Production backend for Inspiration Drawer authentication, wallets, quotas, and AI request orchestration.",
+  "type": "module",
+  "main": "dist/server.js",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src --max-warnings=0",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate:dev": "prisma migrate dev",
+    "prisma:migrate:deploy": "prisma migrate deploy"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.1.0",
+    "@fastify/helmet": "^13.0.2",
+    "@fastify/jwt": "^10.0.0",
+    "@fastify/rate-limit": "^10.3.0",
+    "@prisma/client": "6.19.3",
+    "fastify": "^5.6.0",
+    "fastify-plugin": "^5.1.0",
+    "fast-jwt": "^6.2.4",
+    "prisma": "6.19.3",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.0",
+    "@types/node": "^22.18.0",
+    "eslint": "^9.39.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.46.0"
+  }
+}

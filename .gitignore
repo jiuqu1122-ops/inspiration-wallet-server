@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+.env.production
+.env.local
+.env.*.local
+*.log
+.DS_Store
+.idea/
+.vscode/
+coverage/
+backups/*.sql
+backups/*.sql.gz
+backups/*.dump
+!backups/.gitkeep

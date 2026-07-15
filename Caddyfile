@@ -1,0 +1,41 @@
+{
+    email {$CADDY_ACME_EMAIL}
+    servers {
+        timeouts {
+            read_body 5m
+            read_header 15s
+            write 5m
+            idle 2m
+        }
+    }
+}
+
+api.unmind.art {
+    encode zstd gzip
+
+    request_body {
+        max_size 25MB
+    }
+
+    header {
+        -Server
+        Cache-Control "no-store, max-age=0"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+    }
+
+    reverse_proxy api:3000 {
+        transport http {
+            dial_timeout 10s
+            response_header_timeout 5m
+        }
+    }
+
+    log {
+        output stdout
+        format json
+    }
+}
