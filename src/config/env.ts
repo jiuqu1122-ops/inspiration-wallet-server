@@ -38,6 +38,12 @@ const envSchema = z
       .string()
       .refine(isCanonicalEd25519PublicKey, 'must be a Base64-encoded 32-byte Ed25519 public key')
       .default(defaultLicenseSigningPublicKey),
+    LICENSE_SIGNING_PRIVATE_KEY: z
+      .string()
+      .refine(isBase64Encoded32ByteKey, 'must be a Base64-encoded 32-byte Ed25519 private seed')
+      .optional()
+      .or(z.literal(''))
+      .default(''),
     ADMIN_API_KEY_HASH: z
       .string()
       .regex(/^[a-f0-9]{64}$/, 'must be a lowercase SHA-256 hex digest')

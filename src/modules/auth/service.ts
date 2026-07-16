@@ -9,10 +9,13 @@ import {
 } from '../../lib/tokens.js';
 import { getAccountSnapshot } from '../users/service.js';
 import {
+  hashCloudLicenseId,
+  hashLicenseMachineId,
   hashRefreshToken,
   verifySignedLicenseForProvision,
   type VerifiedLicenseWithCustomer,
 } from './license-verifier.js';
+import { canSignServerLicenses, signServerLicense } from './license-signer.js';
 
 export class AuthFlowError extends Error {
   constructor(
@@ -179,6 +182,118 @@ export async function exchangeLicense(
     refreshToken: tokens.refreshToken,
     accessTokenExpiresIn: env.JWT_ACCESS_EXPIRES_IN,
     refreshTokenExpiresIn: env.JWT_REFRESH_EXPIRES_IN,
+    account,
+  };
+}
+
+function trialExpiration() {
+  const expiresAt = new Date();
+  expiresAt.setUTCDate(expiresAt.getUTCDate() + 30);
+  expiresAt.setUTCHours(23, 59, 59, 999);
+  return expiresAt;
+}
+
+export async function registerTrial(
+  app: FastifyInstance,
+  input: { displayName: string; machineId: string },
+) {
+  if (!canSignServerLicenses()) {
+    throw new AuthFlowError(
+      'automatic_trial_unavailable',
+      'Automatic trial registration is not configured',
+      503,
+    );
+  }
+
+  const machineId = input.machineId.trim().toLowerCase();
+  const machineIdHash = hashLicenseMachineId(machineId);
+  const licenseId = `trial_${machineIdHash}`;
+  const codeHash = hashCloudLicenseId(licenseId);
+
+  let identity = await app.prisma.license.findUnique({
+    where: { id: licenseId },
+    include: { user: { select: { status: true } } },
+  });
+
+  if (!identity) {
+    const priorMachineLicense = await app.prisma.license.findFirst({
+      where: { machineIdHash },
+      select: { id: true },
+    });
+    if (priorMachineLicense && priorMachineLicense.id !== licenseId) {
+      throw new AuthFlowError(
+        'existing_license_requires_import',
+        'This machine already has an issued license; import or renew that license',
+        409,
+      );
+    }
+    try {
+      identity = await app.prisma.$transaction(
+        async (transaction) => {
+          const concurrent = await transaction.license.findUnique({
+            where: { id: licenseId },
+            include: { user: { select: { status: true } } },
+          });
+          if (concurrent) return concurrent;
+
+          const user = await transaction.user.create({
+            data: { wallet: { create: {} } },
+            select: { id: true },
+          });
+          return transaction.license.create({
+            data: {
+              id: licenseId,
+              codeHash,
+              customer: input.displayName.trim(),
+              machineIdHash,
+              userId: user.id,
+              status: 'ACTIVE',
+              edition: 'TRIAL',
+              features: ['*'],
+              expiresAt: trialExpiration(),
+            },
+            include: { user: { select: { status: true } } },
+          });
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+    } catch (error) {
+      if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') {
+        throw error;
+      }
+      identity = await app.prisma.license.findUnique({
+        where: { id: licenseId },
+        include: { user: { select: { status: true } } },
+      });
+      if (!identity) throw error;
+    }
+  }
+
+  assertActiveIdentity(identity);
+  if (!identity.expiresAt || !identity.edition || !identity.customer) {
+    throw new AuthFlowError('license_invalid', 'Trial license is incomplete', 500);
+  }
+
+  const license = signServerLicense({
+    licenseId: identity.id,
+    customer: identity.customer,
+    machineId,
+    edition: identity.edition.toLowerCase() as 'trial' | 'pro' | 'enterprise',
+    features: identity.features,
+    expiresAt: identity.expiresAt,
+  });
+  const account = await getAccountSnapshot(app.prisma, identity.userId, identity.id);
+  if (!account) throw new Error('Trial account could not be loaded');
+
+  return {
+    license,
+    registration: {
+      userId: identity.userId,
+      displayName: identity.customer,
+      edition: identity.edition.toLowerCase(),
+      expiresAt: identity.expiresAt.toISOString(),
+      firstRegistered: identity.createdAt.toISOString(),
+    },
     account,
   };
 }

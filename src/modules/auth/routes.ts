@@ -4,6 +4,7 @@ import { LicenseVerificationError } from './license-verifier.js';
 import {
   AuthFlowError,
   exchangeLicense,
+  registerTrial,
   revokeRefreshToken,
   rotateRefreshToken,
 } from './service.js';
@@ -19,6 +20,19 @@ const exchangeBodySchema = z
 const refreshBodySchema = z
   .object({
     refreshToken: z.string().min(1).max(16_384),
+  })
+  .strict();
+
+const trialRegistrationBodySchema = z
+  .object({
+    displayName: z
+      .string()
+      .trim()
+      .min(2)
+      .max(32)
+      .refine((value) => !/[\u0000-\u001f\u007f]/.test(value)),
+    machineId: z.string().regex(/^[a-fA-F0-9]{64}$/),
+    appVersion: z.string().trim().min(1).max(64).optional(),
   })
   .strict();
 
@@ -44,6 +58,24 @@ function sendKnownAuthError(
 }
 
 export const authRoutes: FastifyPluginAsync = async (app) => {
+  app.post(
+    '/trial/register',
+    {
+      config: { rateLimit: { max: 10, timeWindow: '1 hour' } },
+    },
+    async (request, reply) => {
+      const parsed = trialRegistrationBodySchema.safeParse(request.body);
+      if (!parsed.success) {
+        return invalidRequest(reply, 'A 2-32 character displayName and valid machineId are required');
+      }
+      try {
+        return await registerTrial(app, parsed.data);
+      } catch (error) {
+        return sendKnownAuthError(error, request, reply);
+      }
+    },
+  );
+
   app.post(
     '/license/exchange',
     {

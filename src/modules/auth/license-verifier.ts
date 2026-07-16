@@ -13,6 +13,7 @@ const licenseFileSchema = z
   .strict();
 
 const licensePayloadSchema = z.object({
+  license_id: z.string().min(16).max(128).regex(/^[a-zA-Z0-9_-]+$/).optional(),
   product: z.string().min(1).max(128),
   customer: z.string().min(1).max(512),
   machine_id: z.string().regex(/^[a-fA-F0-9]{64}$/),
@@ -83,6 +84,20 @@ function normalizeFeatures(features: string[]) {
 
 export function hashRefreshToken(token: string) {
   return createHash('sha256').update('inspiration-wallet-refresh-v1\0').update(token).digest('hex');
+}
+
+export function hashLicenseMachineId(machineId: string) {
+  return createHash('sha256')
+    .update('inspiration-drawer-machine-v1\0')
+    .update(machineId.trim().toLowerCase())
+    .digest('hex');
+}
+
+export function hashCloudLicenseId(licenseId: string) {
+  return createHash('sha256')
+    .update('inspiration-drawer-cloud-license-v1\0')
+    .update(licenseId)
+    .digest('hex');
 }
 
 function verifySignedLicenseDocument(
@@ -156,16 +171,15 @@ function verifySignedLicenseDocument(
     throw new LicenseVerificationError('expired', 'License has expired');
   }
 
-  const codeHash = createHash('sha256')
-    .update('inspiration-drawer-license-v1\0')
-    .update(payloadBytes)
-    .update('\0')
-    .update(signatureBytes)
-    .digest('hex');
-  const machineIdHash = createHash('sha256')
-    .update('inspiration-drawer-machine-v1\0')
-    .update(machineId)
-    .digest('hex');
+  const codeHash = payload.license_id
+    ? hashCloudLicenseId(payload.license_id)
+    : createHash('sha256')
+      .update('inspiration-drawer-license-v1\0')
+      .update(payloadBytes)
+      .update('\0')
+      .update(signatureBytes)
+      .digest('hex');
+  const machineIdHash = hashLicenseMachineId(machineId);
 
   return {
     codeHash,

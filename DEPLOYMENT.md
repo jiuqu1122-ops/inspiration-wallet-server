@@ -105,6 +105,7 @@ nano .env
 - `JWT_ACCESS_SECRET`、`JWT_REFRESH_SECRET`：至少 32 字符、随机生成且彼此不同。
 - `JWT_ACCESS_EXPIRES_IN=15m`、`JWT_REFRESH_EXPIRES_IN=30d`
 - `LICENSE_SIGNING_PUBLIC_KEY`：当前灵感抽屉 License 签发方的 32 字节 Ed25519 公钥（Base64）。这是公开验证材料，不是私钥；轮换签发密钥时必须先安排兼容升级。
+- `LICENSE_SIGNING_PRIVATE_KEY`：与上面公钥匹配的 32 字节 Ed25519 私钥种子（Base64），仅用于服务器自动签发 30 天试用授权。只能保存在服务器权限为 `600` 的 `.env` 和离线密码库中，禁止写入 Git、数据库、日志或客户端。
 - `ADMIN_API_KEY_HASH`：私有运营工作台管理员密钥的 SHA-256 哈希；原始管理员密钥只放密码管理器。
 - `PROVIDER_SECRETS_ENCRYPTION_KEY`：Base64 编码的 32 字节随机主密钥，用于 AES-256-GCM 加密上游渠道凭据。必须长期备份且不能随意轮换。
 - `CORS_ALLOWED_ORIGINS`：逗号分隔的精确来源。未确认 Tauri 实际 Origin 前保持为空，浏览器跨域请求将被拒绝；原生无 Origin 请求仍可访问。
@@ -297,7 +298,7 @@ docker compose ps
 curl --fail --show-error https://api.unmind.art/health
 ```
 
-不要重新生成服务器现有的 JWT Secret，否则现有会话会全部失效。也不要替换 `PROVIDER_SECRETS_ENCRYPTION_KEY`，否则已保存的上游凭据无法解密。生产 `.env` 可以保留 `.env.example` 中的当前 `LICENSE_SIGNING_PUBLIC_KEY`，但绝不能把 License 私钥放到服务器或 Git 仓库。
+不要重新生成服务器现有的 JWT Secret，否则现有会话会全部失效。也不要替换 `PROVIDER_SECRETS_ENCRYPTION_KEY`，否则已保存的上游凭据无法解密。`LICENSE_SIGNING_PRIVATE_KEY` 现在是自动试用签发所需的服务器 Secret；它必须与 `LICENSE_SIGNING_PUBLIC_KEY` 匹配，并且绝不能进入 Git 仓库、数据库、日志或客户端安装包。
 
 用户完成一次 License 交换后，可以通过 `GET /v1/account` 得到用户 ID。管理员只在服务器上执行人工加额度：
 

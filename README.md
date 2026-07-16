@@ -44,6 +44,20 @@ npm run build
 
 ## API
 
+### 首次注册与 30 天试用
+
+`POST /v1/auth/trial/register`
+
+```json
+{
+  "displayName": "张三设计",
+  "machineId": "64 位十六进制机器 ID",
+  "appVersion": "4.6.13"
+}
+```
+
+服务器按机器 ID 单向哈希生成唯一试用身份，只在首次注册时计算 30 天到期日；卸载重装或重复请求只返回原授权，不会重置试用时间。成功响应包含服务器签名的 License 和账户快照。该接口需要配置与生产公钥匹配的 `LICENSE_SIGNING_PRIVATE_KEY`。
+
 ### License 换取会话
 
 `POST /v1/auth/license/exchange`

@@ -16,6 +16,7 @@ const privateKey = createPrivateKey({
 const machineId = 'a'.repeat(64);
 
 type LicensePayload = {
+  license_id?: string;
   product: string;
   customer: string;
   machine_id: string;
@@ -108,5 +109,18 @@ describe('verifyLicense', () => {
       () => verifySignedLicense('{"payload":"not-base64"}', machineId),
       'malformed_license',
     );
+  });
+
+  it('keeps a server-issued license identity stable when the expiration changes', () => {
+    const original = {
+      ...validPayload(),
+      license_id: `trial_${'f'.repeat(64)}`,
+    };
+    const renewed = { ...original, expire_at: '2100-12-31' };
+
+    const first = verifySignedLicense(signPayload(original), machineId);
+    const second = verifySignedLicense(signPayload(renewed), machineId);
+
+    expect(first.codeHash).toBe(second.codeHash);
   });
 });
