@@ -1,12 +1,45 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
+import { redeemCredits, RedemptionError } from './redemption.js';
 
 const transactionsQuerySchema = z.object({
   cursor: z.string().min(1).max(64).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 
+const redemptionSchema = z.object({
+  code: z.string().trim().min(10).max(64),
+}).strict();
+
 export const walletRoutes: FastifyPluginAsync = async (app) => {
+  app.post(
+    '/redeem',
+    {
+      preHandler: app.authenticateAccessToken,
+      config: { rateLimit: { max: 10, timeWindow: '15 minutes' } },
+    },
+    async (request, reply) => {
+      const parsed = redemptionSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.code(400).send({
+          error: 'invalid_request',
+          message: '兑换码格式不正确',
+        });
+      }
+      try {
+        return await redeemCredits(app.prisma, {
+          userId: request.user.sub,
+          code: parsed.data.code,
+        });
+      } catch (error) {
+        if (error instanceof RedemptionError) {
+          return reply.code(error.statusCode).send({ error: error.code, message: error.message });
+        }
+        throw error;
+      }
+    },
+  );
+
   app.get(
     '/transactions',
     { preHandler: app.authenticateAccessToken },

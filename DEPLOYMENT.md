@@ -108,6 +108,7 @@ nano .env
 - `LICENSE_SIGNING_PRIVATE_KEY`：与上面公钥匹配的 32 字节 Ed25519 私钥种子（Base64），用于服务器签发邮箱账户的设备 License。只能保存在服务器权限为 `600` 的 `.env` 和离线密码库中，禁止写入 Git、数据库、日志或客户端。
 - `SMTP_HOST`、`SMTP_PORT`、`SMTP_SECURE`、`SMTP_USER`、`SMTP_PASSWORD`、`SMTP_FROM`：用于发送邮箱验证码。`465` 通常对应 `SMTP_SECURE=true`，`587` 通常对应 `false`；以邮件服务商说明为准。生产上线前必须用真实邮箱完成一次收信测试。
 - `EMAIL_CODE_TTL_MINUTES`：验证码有效分钟数，允许 5 到 30，默认 10。
+- `AGENT_REQUEST_CREDITS`：每次钱包 Agent 请求的预扣额度，必须是正整数；测试环境可从 `1` 开始，后续按实际计费策略调整。
 - `ADMIN_API_KEY_HASH`：私有运营工作台管理员密钥的 SHA-256 哈希；原始管理员密钥只放密码管理器。
 - `PROVIDER_SECRETS_ENCRYPTION_KEY`：Base64 编码的 32 字节随机主密钥，用于 AES-256-GCM 加密上游渠道凭据。必须长期备份且不能随意轮换。
 - `CORS_ALLOWED_ORIGINS`：逗号分隔的精确来源。未确认 Tauri 实际 Origin 前保持为空，浏览器跨域请求将被拒绝；原生无 Origin 请求仍可访问。
@@ -191,6 +192,8 @@ docker compose logs --since=30m api caddy
 - `/health` 返回 503：检查 PostgreSQL 健康状态和 `DATABASE_URL`，不要重置数据库。
 - API 启动失败：检查 Secret 长度、两个 Secret 是否相同、是否仍为 `CHANGE_ME`。
 - 验证码发送返回 503：检查 SMTP 主机、端口、安全模式、授权码和发件人；不要把 SMTP 密码打印到日志或截图。
+- Agent 返回 `provider_unavailable`：在运营工作台的“渠道管理”中确认至少有一个启用的 LLM 渠道，并填写默认 Agent 模型；留空时需确保上游 `/v1/models` 可访问。
+- Agent 返回 `insufficient_credits`：检查用户钱包可用额度或生成并兑换额度兑换码，不要直接修改数据库余额。
 - CORS 被拒绝：捕获客户端的真实 Origin，只把确认过的精确值加入 `CORS_ALLOWED_ORIGINS`。
 
 ## 9. 标准更新流程

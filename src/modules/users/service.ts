@@ -9,6 +9,8 @@ export async function getAccountSnapshot(
     where: { id: userId },
     select: {
       id: true,
+      email: true,
+      displayName: true,
       status: true,
       createdAt: true,
       updatedAt: true,
@@ -45,6 +47,8 @@ export async function getAccountSnapshot(
   return {
     user: {
       id: user.id,
+      email: user.email,
+      displayName: user.displayName,
       status: user.status,
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,

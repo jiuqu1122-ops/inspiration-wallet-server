@@ -22,6 +22,7 @@ const createSchema = z.object({
   name: z.string().trim().min(2).max(80),
   kind: kindSchema,
   baseUrl: z.url().max(2_000),
+  defaultModel: z.string().trim().max(200).optional(),
   apiKey: z.string().trim().min(8).max(2_000),
   headers: headersSchema.default({}),
   allowInsecureHttp: z.boolean().default(false),
@@ -32,6 +33,7 @@ const createSchema = z.object({
 const updateSchema = z.object({
   name: z.string().trim().min(2).max(80).optional(),
   baseUrl: z.url().max(2_000).optional(),
+  defaultModel: z.string().trim().max(200).optional(),
   apiKey: z.string().trim().min(8).max(2_000).optional(),
   headers: headersSchema.optional(),
   allowInsecureHttp: z.boolean().optional(),

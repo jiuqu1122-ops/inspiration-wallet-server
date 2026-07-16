@@ -31,6 +31,7 @@ type ProviderInput = {
   name: string;
   kind: AiProviderKind;
   baseUrl: string;
+  defaultModel?: string | undefined;
   apiKey: string;
   headers: Record<string, string>;
   allowInsecureHttp?: boolean | undefined;
@@ -42,6 +43,7 @@ type ProviderInput = {
 type ProviderUpdateInput = {
   name?: string | undefined;
   baseUrl?: string | undefined;
+  defaultModel?: string | undefined;
   apiKey?: string | undefined;
   headers?: Record<string, string> | undefined;
   allowInsecureHttp?: boolean | undefined;
@@ -64,6 +66,7 @@ function serializeProvider(provider: AiProviderChannel) {
     kind: provider.kind,
     enabled: provider.status === 'ACTIVE',
     baseUrl: provider.baseUrl,
+    defaultModel: provider.defaultModel,
     allowInsecureHttp: provider.allowInsecureHttp,
     apiKeyConfigured: true,
     apiKeyLast4: provider.apiKeyLast4,
@@ -164,6 +167,7 @@ export async function createProvider(prisma: PrismaClient, input: ProviderInput)
           kind: input.kind,
           status: input.enabled === false ? 'DISABLED' : 'ACTIVE',
           baseUrl,
+          defaultModel: input.defaultModel?.trim() || null,
           allowInsecureHttp,
           encryptedSecrets,
           apiKeyLast4: input.apiKey.trim().slice(-4),
@@ -232,6 +236,7 @@ export async function updateProvider(
           ...(input.name !== undefined ? { name: input.name.trim() } : {}),
           ...(input.enabled !== undefined ? { status: input.enabled ? 'ACTIVE' : 'DISABLED' } : {}),
           ...(input.capabilities !== undefined ? { capabilities: input.capabilities } : {}),
+          ...(input.defaultModel !== undefined ? { defaultModel: input.defaultModel.trim() || null } : {}),
           baseUrl,
           allowInsecureHttp,
           encryptedSecrets,

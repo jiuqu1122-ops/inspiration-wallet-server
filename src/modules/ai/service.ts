@@ -1,0 +1,248 @@
+import type { PrismaClient } from '@prisma/client';
+import { env } from '../../config/env.js';
+import { decryptProviderSecrets } from '../../lib/provider-secrets.js';
+import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
+
+const REQUEST_CREDITS = BigInt(env.AGENT_REQUEST_CREDITS);
+
+export class CloudAiError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly statusCode: number,
+  ) {
+    super(message);
+    this.name = 'CloudAiError';
+  }
+}
+
+async function selectProvider(prisma: PrismaClient) {
+  const provider = await prisma.aiProviderChannel.findFirst({
+    where: { status: 'ACTIVE', capabilities: { has: 'LLM' } },
+    orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }],
+  });
+  if (!provider) {
+    throw new CloudAiError('provider_unavailable', '当前没有可用的 Agent 渠道', 503);
+  }
+  await assertPublicProviderUrl(provider.baseUrl);
+  return provider;
+}
+
+function upstreamHeaders(apiKey: string, customHeaders: Record<string, string>) {
+  const headers = new Headers({
+    accept: 'application/json',
+    authorization: `Bearer ${apiKey}`,
+    'content-type': 'application/json',
+    'user-agent': 'Inspiration-Wallet-Server/1',
+  });
+  for (const [name, value] of Object.entries(customHeaders)) headers.set(name, value);
+  return headers;
+}
+
+async function discoverModel(
+  provider: { baseUrl: string; defaultModel: string | null },
+  apiKey: string,
+  customHeaders: Record<string, string>,
+) {
+  if (provider.defaultModel?.trim()) return provider.defaultModel.trim();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(providerEndpoint(provider.baseUrl, '/v1/models'), {
+      headers: upstreamHeaders(apiKey, customHeaders),
+      redirect: 'error',
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const value: unknown = await response.json();
+    const data: unknown = value && typeof value === 'object' && 'data' in value
+      ? (value as { data?: unknown }).data
+      : null;
+    const model: unknown = Array.isArray(data)
+      ? (data as unknown[]).find((item: unknown) => (
+          item !== null
+          && typeof item === 'object'
+          && 'id' in item
+          && typeof (item as { id?: unknown }).id === 'string'
+        ))
+      : null;
+    const modelId = model
+      && typeof model === 'object'
+      && 'id' in model
+      && typeof (model as { id?: unknown }).id === 'string'
+      ? (model as { id: string }).id
+      : '';
+    if (!modelId) {
+      throw new CloudAiError(
+        'provider_model_missing',
+        '渠道没有配置默认 Agent 模型，也未能自动读取模型',
+        503,
+      );
+    }
+    return modelId;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function reserveCredits(
+  prisma: PrismaClient,
+  input: { userId: string; clientRequestId: string },
+) {
+  return prisma.$transaction(async (transaction) => {
+    const existing = await transaction.aiRequest.findUnique({
+      where: {
+        userId_clientRequestId: {
+          userId: input.userId,
+          clientRequestId: input.clientRequestId,
+        },
+      },
+    });
+    if (existing) {
+      throw new CloudAiError('duplicate_request', '该 Agent 请求已经提交过', 409);
+    }
+    const updated = await transaction.wallet.updateMany({
+      where: { userId: input.userId, availableCredits: { gte: REQUEST_CREDITS } },
+      data: {
+        availableCredits: { decrement: REQUEST_CREDITS },
+        reservedCredits: { increment: REQUEST_CREDITS },
+      },
+    });
+    if (updated.count !== 1) {
+      throw new CloudAiError('insufficient_credits', '授权钱包余额不足', 402);
+    }
+    const wallet = await transaction.wallet.findUniqueOrThrow({ where: { userId: input.userId } });
+    const request = await transaction.aiRequest.create({
+      data: {
+        userId: input.userId,
+        clientRequestId: input.clientRequestId,
+        capability: 'LLM',
+        logicalModel: 'unmind-agent',
+        status: 'RESERVED',
+        estimatedCredits: REQUEST_CREDITS,
+      },
+    });
+    await transaction.walletLedger.create({
+      data: {
+        userId: input.userId,
+        requestId: request.id,
+        type: 'RESERVE',
+        amount: -REQUEST_CREDITS,
+        balanceAfter: wallet.availableCredits,
+        description: 'Agent 请求预扣',
+      },
+    });
+    return request.id;
+  });
+}
+
+async function settleCredits(prisma: PrismaClient, userId: string, requestId: string) {
+  await prisma.$transaction(async (transaction) => {
+    const wallet = await transaction.wallet.update({
+      where: { userId },
+      data: {
+        reservedCredits: { decrement: REQUEST_CREDITS },
+        lifetimeConsumed: { increment: REQUEST_CREDITS },
+      },
+    });
+    await transaction.aiRequest.update({
+      where: { id: requestId },
+      data: {
+        status: 'SUCCEEDED',
+        chargedCredits: REQUEST_CREDITS,
+        completedAt: new Date(),
+      },
+    });
+    await transaction.walletLedger.create({
+      data: {
+        userId,
+        requestId,
+        type: 'CHARGE',
+        amount: REQUEST_CREDITS,
+        balanceAfter: wallet.availableCredits,
+        description: 'Agent 请求结算',
+      },
+    });
+  });
+}
+
+async function releaseCredits(prisma: PrismaClient, userId: string, requestId: string) {
+  await prisma.$transaction(async (transaction) => {
+    const wallet = await transaction.wallet.update({
+      where: { userId },
+      data: {
+        availableCredits: { increment: REQUEST_CREDITS },
+        reservedCredits: { decrement: REQUEST_CREDITS },
+      },
+    });
+    await transaction.aiRequest.update({
+      where: { id: requestId },
+      data: { status: 'FAILED', completedAt: new Date() },
+    });
+    await transaction.walletLedger.create({
+      data: {
+        userId,
+        requestId,
+        type: 'RELEASE',
+        amount: REQUEST_CREDITS,
+        balanceAfter: wallet.availableCredits,
+        description: 'Agent 请求失败，释放预扣额度',
+      },
+    });
+  });
+}
+
+export async function executeWalletAgentChat(
+  prisma: PrismaClient,
+  input: {
+    userId: string;
+    clientRequestId: string;
+    messages: unknown[];
+    tools?: unknown[] | undefined;
+  },
+) {
+  const requestId = await reserveCredits(prisma, input);
+  try {
+    const provider = await selectProvider(prisma);
+    const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+    const model = await discoverModel(provider, secrets.apiKey, secrets.headers);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4 * 60_000);
+    let response: Response;
+    try {
+      response = await fetch(providerEndpoint(provider.baseUrl, '/v1/chat/completions'), {
+        method: 'POST',
+        headers: upstreamHeaders(secrets.apiKey, secrets.headers),
+        body: JSON.stringify({
+          model,
+          messages: input.messages,
+          stream: false,
+          ...(input.tools?.length ? { tools: input.tools, tool_choice: 'auto' } : {}),
+        }),
+        redirect: 'error',
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+    const text = await response.text();
+    if (!response.ok) {
+      throw new CloudAiError(
+        'provider_request_failed',
+        `Agent 渠道请求失败（HTTP ${response.status}）`,
+        502,
+      );
+    }
+    let result: unknown;
+    try {
+      result = JSON.parse(text);
+    } catch {
+      throw new CloudAiError('provider_invalid_response', 'Agent 渠道返回格式无效', 502);
+    }
+    await settleCredits(prisma, input.userId, requestId);
+    return result;
+  } catch (error) {
+    await releaseCredits(prisma, input.userId, requestId);
+    throw error;
+  }
+}

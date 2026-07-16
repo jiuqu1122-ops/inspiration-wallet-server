@@ -11,6 +11,7 @@ import {
   updateAdminAuthorization,
 } from './service.js';
 import { providerAdminRoutes } from '../providers/routes.js';
+import { createRedemptionCodes, listRedemptionCodes } from '../wallets/redemption.js';
 
 const listUsersSchema = z.object({
   query: z.string().trim().max(200).optional(),
@@ -48,6 +49,14 @@ const authorizationUpdateSchema = z
     (value) => value.displayName !== undefined || value.expiresAt !== undefined || value.status !== undefined,
   );
 
+const createRedemptionCodesSchema = z.object({
+  credits: z.string().regex(/^[1-9]\d{0,15}$/),
+  quantity: z.number().int().min(1).max(100).default(1),
+  maxRedemptions: z.number().int().min(1).max(10_000).default(1),
+  expiresAt: z.string().datetime({ offset: true }).nullable().optional(),
+  note: z.string().trim().max(200).nullable().optional(),
+}).strict();
+
 function invalid(reply: FastifyReply, message: string) {
   return reply.code(400).send({ error: 'invalid_request', message });
 }
@@ -56,6 +65,35 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.authenticateAdmin);
 
   await app.register(providerAdminRoutes, { prefix: '/providers' });
+
+  app.get('/redemption-codes', async (request, reply) => {
+    const parsed = z.object({ limit: z.coerce.number().int().min(1).max(500).default(100) })
+      .safeParse(request.query);
+    if (!parsed.success) return invalid(reply, 'Redemption code query is invalid');
+    return { items: await listRedemptionCodes(app.prisma, parsed.data.limit) };
+  });
+
+  app.post(
+    '/redemption-codes',
+    { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const parsed = createRedemptionCodesSchema.safeParse(request.body);
+      if (!parsed.success) return invalid(reply, 'Redemption code data is invalid');
+      const codes = await createRedemptionCodes(app.prisma, {
+        credits: BigInt(parsed.data.credits),
+        quantity: parsed.data.quantity,
+        maxRedemptions: parsed.data.maxRedemptions,
+        expiresAt: parsed.data.expiresAt ? new Date(parsed.data.expiresAt) : null,
+        note: parsed.data.note ?? null,
+      });
+      return reply.code(201).send({
+        credits: parsed.data.credits,
+        maxRedemptions: parsed.data.maxRedemptions,
+        codes,
+        warning: 'Plaintext codes are returned only in this response. Store them securely.',
+      });
+    },
+  );
 
   app.get(
     '/overview',

@@ -51,6 +51,7 @@ const envSchema = z
     SMTP_PASSWORD: z.string().default(''),
     SMTP_FROM: z.string().trim().default(''),
     EMAIL_CODE_TTL_MINUTES: z.coerce.number().int().min(5).max(30).default(10),
+    AGENT_REQUEST_CREDITS: z.coerce.number().int().min(1).max(1_000_000).default(1),
     ADMIN_API_KEY_HASH: z
       .string()
       .regex(/^[a-f0-9]{64}$/, 'must be a lowercase SHA-256 hex digest')

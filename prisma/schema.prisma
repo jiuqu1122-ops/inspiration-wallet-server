@@ -67,6 +67,11 @@ enum AiProviderStatus {
   DISABLED
 }
 
+enum CreditRedemptionCodeStatus {
+  ACTIVE
+  DISABLED
+}
+
 model User {
   id              String           @id @default(cuid())
   email           String?          @unique
@@ -85,6 +90,7 @@ model User {
   sessions        AuthSession[]
   adminOperations AdminOperation[]
   emailChallenges EmailVerificationChallenge[]
+  creditRedemptions CreditRedemption[]
 
   @@index([status])
 }
@@ -170,6 +176,36 @@ model WalletLedger {
   @@index([requestId])
 }
 
+model CreditRedemptionCode {
+  id              String                     @id @default(cuid())
+  codeHash        String                     @unique
+  codeHint        String
+  credits         BigInt
+  maxRedemptions  Int                        @default(1)
+  redeemedCount   Int                        @default(0)
+  status          CreditRedemptionCodeStatus @default(ACTIVE)
+  expiresAt       DateTime?
+  note            String?
+  createdAt       DateTime                   @default(now())
+  redemptions     CreditRedemption[]
+
+  @@index([status, expiresAt])
+  @@index([createdAt])
+}
+
+model CreditRedemption {
+  id        String               @id @default(cuid())
+  codeId    String
+  userId    String
+  credits   BigInt
+  createdAt DateTime             @default(now())
+  code      CreditRedemptionCode @relation(fields: [codeId], references: [id], onDelete: Restrict)
+  user      User                 @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@unique([codeId, userId])
+  @@index([userId, createdAt])
+}
+
 model AiRequest {
   id               String          @id @default(cuid())
   userId           String
@@ -210,6 +246,7 @@ model AiProviderChannel {
   kind               AiProviderKind
   status             AiProviderStatus @default(ACTIVE)
   baseUrl            String
+  defaultModel       String?
   allowInsecureHttp  Boolean          @default(false)
   encryptedSecrets   String
   apiKeyLast4        String
