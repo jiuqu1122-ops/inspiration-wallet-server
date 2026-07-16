@@ -2,6 +2,7 @@ import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import {
   createProvider,
+  getProviderBalance,
   listProviders,
   ProviderServiceError,
   recordProviderTestFailure,
@@ -80,6 +81,20 @@ export const providerAdminRoutes: FastifyPluginAsync = async (app) => {
       return providerError(reply, error);
     }
   });
+
+  app.post(
+    '/:providerId/balance',
+    { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const params = providerIdSchema.safeParse(request.params);
+      if (!params.success) return invalid(reply, 'Provider ID is invalid');
+      try {
+        return await getProviderBalance(app.prisma, params.data.providerId);
+      } catch (error) {
+        return providerError(reply, error);
+      }
+    },
+  );
 
   app.post(
     '/:providerId/test',
