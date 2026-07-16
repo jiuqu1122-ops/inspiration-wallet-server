@@ -1,5 +1,15 @@
 import { z } from 'zod';
 
+const defaultLicenseSigningPublicKey = 'AAS4rzI5dxFefYmQCNp1wYpYgKwMXp5+wG1WgF/UoRQ=';
+
+function isCanonicalEd25519PublicKey(value: string) {
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    return false;
+  }
+  const decoded = Buffer.from(value, 'base64');
+  return decoded.length === 32 && decoded.toString('base64') === value;
+}
+
 const secretSchema = z
   .string()
   .min(32, 'must contain at least 32 characters')
@@ -16,6 +26,10 @@ const envSchema = z
     JWT_REFRESH_SECRET: secretSchema,
     JWT_ACCESS_EXPIRES_IN: z.string().regex(/^\d+[smhd]$/, 'must look like 15m or 30d').default('15m'),
     JWT_REFRESH_EXPIRES_IN: z.string().regex(/^\d+[smhd]$/, 'must look like 15m or 30d').default('30d'),
+    LICENSE_SIGNING_PUBLIC_KEY: z
+      .string()
+      .refine(isCanonicalEd25519PublicKey, 'must be a Base64-encoded 32-byte Ed25519 public key')
+      .default(defaultLicenseSigningPublicKey),
     CORS_ALLOWED_ORIGINS: z.string().default(''),
   })
   .superRefine((value, context) => {

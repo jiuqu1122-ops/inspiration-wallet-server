@@ -1,36 +1,97 @@
-import type { FastifyPluginAsync } from 'fastify';
+import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
+import { LicenseVerificationError } from './license-verifier.js';
+import {
+  AuthFlowError,
+  exchangeLicense,
+  revokeRefreshToken,
+  rotateRefreshToken,
+} from './service.js';
 
-const exchangeBodySchema = z.object({
-  license: z.string().min(1).max(16_384),
-});
+const exchangeBodySchema = z
+  .object({
+    license: z.string().min(1).max(350_000),
+    machineId: z.string().regex(/^[a-fA-F0-9]{64}$/),
+    appVersion: z.string().trim().min(1).max(64).optional(),
+  })
+  .strict();
+
+const refreshBodySchema = z
+  .object({
+    refreshToken: z.string().min(1).max(16_384),
+  })
+  .strict();
+
+function invalidRequest(reply: FastifyReply, message: string) {
+  return reply.code(400).send({ error: 'invalid_request', message });
+}
+
+function sendKnownAuthError(
+  error: unknown,
+  request: FastifyRequest,
+  reply: FastifyReply,
+) {
+  if (error instanceof LicenseVerificationError) {
+    const statusCode = error.code === 'malformed_license' ? 400 : error.code === 'expired' ? 403 : 401;
+    request.log.info({ code: error.code }, 'License exchange rejected');
+    return reply.code(statusCode).send({ error: error.code, message: error.message });
+  }
+  if (error instanceof AuthFlowError) {
+    request.log.info({ code: error.code }, 'Authentication request rejected');
+    return reply.code(error.statusCode).send({ error: error.code, message: error.message });
+  }
+  throw error;
+}
 
 export const authRoutes: FastifyPluginAsync = async (app) => {
   app.post(
     '/license/exchange',
     {
-      config: {
-        rateLimit: {
-          max: 5,
-          timeWindow: '15 minutes',
-        },
-      },
+      config: { rateLimit: { max: 5, timeWindow: '15 minutes' } },
     },
     async (request, reply) => {
       const parsed = exchangeBodySchema.safeParse(request.body);
       if (!parsed.success) {
-        return reply.code(400).send({
-          error: 'invalid_request',
-          message: 'A non-empty license value is required',
-        });
+        return invalidRequest(reply, 'A signed license and matching machineId are required');
       }
+      try {
+        return await exchangeLicense(app, parsed.data);
+      } catch (error) {
+        return sendKnownAuthError(error, request, reply);
+      }
+    },
+  );
 
-      // TODO: Integrate the existing Inspiration Drawer license signature format,
-      // revocation rules, code hashing, and user provisioning before issuing tokens.
-      return reply.code(501).send({
-        error: 'not_implemented',
-        message: 'License verification is not configured yet',
-      });
+  app.post(
+    '/refresh',
+    {
+      config: { rateLimit: { max: 20, timeWindow: '15 minutes' } },
+    },
+    async (request, reply) => {
+      const parsed = refreshBodySchema.safeParse(request.body);
+      if (!parsed.success) {
+        return invalidRequest(reply, 'A refreshToken is required');
+      }
+      try {
+        return await rotateRefreshToken(app, parsed.data.refreshToken);
+      } catch (error) {
+        return sendKnownAuthError(error, request, reply);
+      }
+    },
+  );
+
+  app.post(
+    '/logout',
+    {
+      config: { rateLimit: { max: 20, timeWindow: '15 minutes' } },
+    },
+    async (request, reply) => {
+      const parsed = refreshBodySchema.safeParse(request.body);
+      if (!parsed.success) {
+        return invalidRequest(reply, 'A refreshToken is required');
+      }
+      await revokeRefreshToken(app, parsed.data.refreshToken);
+      return reply.code(204).send();
     },
   );
 };

@@ -7,6 +7,7 @@ import { loggerOptions } from './config/logger.js';
 import { authRoutes } from './modules/auth/routes.js';
 import { healthRoutes } from './modules/health/routes.js';
 import { accountRoutes } from './modules/users/routes.js';
+import { walletRoutes } from './modules/wallets/routes.js';
 import { jwtPlugin } from './plugins/jwt.js';
 import { prismaPlugin } from './plugins/prisma.js';
 
@@ -56,6 +57,7 @@ export async function buildApp() {
       }));
       await v1.register(authRoutes, { prefix: '/auth' });
       await v1.register(accountRoutes);
+      await v1.register(walletRoutes, { prefix: '/wallet' });
     },
     { prefix: '/v1' },
   );

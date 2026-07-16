@@ -19,6 +19,12 @@ enum LicenseStatus {
   EXPIRED
 }
 
+enum LicenseEdition {
+  TRIAL
+  PRO
+  ENTERPRISE
+}
+
 enum WalletLedgerType {
   GRANT
   RESERVE
@@ -52,21 +58,46 @@ model User {
   wallet     Wallet?
   ledger     WalletLedger[]
   aiRequests AiRequest[]
+  sessions   AuthSession[]
 
   @@index([status])
 }
 
 model License {
-  id        String        @id @default(cuid())
-  codeHash  String        @unique
-  userId    String
-  status    LicenseStatus @default(ACTIVE)
-  expiresAt DateTime?
-  createdAt DateTime      @default(now())
-  updatedAt DateTime      @updatedAt
-  user      User          @relation(fields: [userId], references: [id], onDelete: Restrict)
+  id              String          @id @default(cuid())
+  codeHash        String          @unique
+  machineIdHash   String?
+  userId          String
+  status          LicenseStatus   @default(ACTIVE)
+  edition         LicenseEdition?
+  features        String[]        @default([])
+  expiresAt       DateTime?
+  lastExchangedAt DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  user            User            @relation(fields: [userId], references: [id], onDelete: Restrict)
+  sessions        AuthSession[]
 
   @@index([userId, status])
+  @@index([machineIdHash, createdAt])
+  @@index([expiresAt])
+}
+
+model AuthSession {
+  id               String    @id
+  userId           String
+  licenseId        String
+  refreshTokenHash String    @unique
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  lastUsedAt       DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  user             User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  license          License   @relation(fields: [licenseId], references: [id], onDelete: Restrict)
+
+  @@index([userId, revokedAt])
+  @@index([licenseId, revokedAt])
   @@index([expiresAt])
 }
 

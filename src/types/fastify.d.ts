@@ -13,10 +13,14 @@ declare module '@fastify/jwt' {
     payload: {
       sub: string;
       tokenType: 'access' | 'refresh';
+      sessionId: string;
+      licenseId: string;
     };
     user: {
       sub: string;
       tokenType: 'access' | 'refresh';
+      sessionId: string;
+      licenseId: string;
     };
   }
 }

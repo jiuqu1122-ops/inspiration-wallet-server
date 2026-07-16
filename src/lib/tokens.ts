@@ -6,7 +6,7 @@ import { env } from '../config/env.js';
 const signRefreshToken = createSigner({
   key: env.JWT_REFRESH_SECRET,
   algorithm: 'HS256',
-  expiresIn: parseDurationToMilliseconds(env.JWT_REFRESH_EXPIRES_IN),
+  expiresIn: durationToMilliseconds(env.JWT_REFRESH_EXPIRES_IN),
   iss: env.APP_BASE_URL,
   aud: 'inspiration-drawer',
 });
@@ -21,9 +21,11 @@ const verifyRefreshJwt = createVerifier({
 const refreshPayloadSchema = z.object({
   sub: z.string().min(1),
   tokenType: z.literal('refresh'),
+  sessionId: z.string().uuid(),
+  licenseId: z.string().min(1),
 });
 
-function parseDurationToMilliseconds(value: string): number {
+export function durationToMilliseconds(value: string): number {
   const match = /^(\d+)([smhd])$/.exec(value);
   if (!match) {
     throw new Error('Invalid token duration');
@@ -33,9 +35,15 @@ function parseDurationToMilliseconds(value: string): number {
   return amount * multipliers[match[2] as keyof typeof multipliers];
 }
 
-export function createTokenPair(app: FastifyInstance, userId: string) {
-  const accessToken = app.jwt.sign({ sub: userId, tokenType: 'access' });
-  const refreshToken = signRefreshToken({ sub: userId, tokenType: 'refresh' });
+export function createTokenPair(
+  app: FastifyInstance,
+  userId: string,
+  sessionId: string,
+  licenseId: string,
+) {
+  const claims = { sub: userId, sessionId, licenseId };
+  const accessToken = app.jwt.sign({ ...claims, tokenType: 'access' });
+  const refreshToken = signRefreshToken({ ...claims, tokenType: 'refresh' });
   return { accessToken, refreshToken };
 }
 
