@@ -40,3 +40,33 @@ api.unmind.art {
         format json
     }
 }
+
+unmind.art {
+    redir https://www.unmind.art{uri} permanent
+}
+
+www.unmind.art {
+    encode zstd gzip
+
+    header {
+        -Server
+        -Via
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+    }
+
+    reverse_proxy website:80 {
+        transport http {
+            dial_timeout 10s
+            response_header_timeout 30s
+        }
+    }
+
+    log {
+        output stdout
+        format json
+    }
+}
