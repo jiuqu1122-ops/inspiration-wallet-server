@@ -77,11 +77,6 @@ function expirationEndOfDay(value: string) {
   return date;
 }
 
-function normalizeFeatures(features: string[]) {
-  const normalized = [...new Set(features.map((feature) => feature.trim().toLowerCase()).filter(Boolean))];
-  return normalized.includes('*') ? ['*'] : normalized;
-}
-
 export function hashRefreshToken(token: string) {
   return createHash('sha256').update('inspiration-wallet-refresh-v1\0').update(token).digest('hex');
 }
@@ -103,6 +98,7 @@ export function hashCloudLicenseId(licenseId: string) {
 function verifySignedLicenseDocument(
   content: string,
   submittedMachineId?: string,
+  allowExpired = false,
 ): VerifiedLicenseWithCustomer {
   const fileResult = licenseFileSchema.safeParse(parseJson(content, 'License file is not valid JSON'));
   if (!fileResult.success) {
@@ -167,7 +163,7 @@ function verifySignedLicenseDocument(
 
   const expiresAt = expirationEndOfDay(payload.expire_at.trim());
   const today = new Date().toISOString().slice(0, 10);
-  if (payload.expire_at < today) {
+  if (!allowExpired && payload.expire_at < today) {
     throw new LicenseVerificationError('expired', 'License has expired');
   }
 
@@ -185,8 +181,8 @@ function verifySignedLicenseDocument(
     codeHash,
     customer: payload.customer.trim(),
     machineIdHash,
-    edition: payload.edition.toUpperCase() as VerifiedLicense['edition'],
-    features: normalizeFeatures(payload.features),
+    edition: 'ENTERPRISE',
+    features: ['*'],
     expiresAt,
   };
 }
@@ -210,4 +206,11 @@ export function verifySignedLicenseForProvision(
   submittedMachineId?: string,
 ): VerifiedLicenseWithCustomer {
   return verifySignedLicenseDocument(content, submittedMachineId);
+}
+
+export function verifySignedLicenseForMigration(
+  content: string,
+  submittedMachineId: string,
+): VerifiedLicenseWithCustomer {
+  return verifySignedLicenseDocument(content, submittedMachineId, true);
 }

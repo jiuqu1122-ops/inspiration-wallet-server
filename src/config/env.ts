@@ -44,6 +44,13 @@ const envSchema = z
       .optional()
       .or(z.literal(''))
       .default(''),
+    SMTP_HOST: z.string().trim().default(''),
+    SMTP_PORT: z.coerce.number().int().min(1).max(65535).default(587),
+    SMTP_SECURE: z.enum(['true', 'false']).default('false'),
+    SMTP_USER: z.string().default(''),
+    SMTP_PASSWORD: z.string().default(''),
+    SMTP_FROM: z.string().trim().default(''),
+    EMAIL_CODE_TTL_MINUTES: z.coerce.number().int().min(5).max(30).default(10),
     ADMIN_API_KEY_HASH: z
       .string()
       .regex(/^[a-f0-9]{64}$/, 'must be a lowercase SHA-256 hex digest')
@@ -73,6 +80,13 @@ const envSchema = z
         message: 'must be 0.0.0.0 in production',
       });
     }
+    if (Boolean(value.SMTP_USER) !== Boolean(value.SMTP_PASSWORD)) {
+      context.addIssue({
+        code: 'custom',
+        path: ['SMTP_PASSWORD'],
+        message: 'must be configured together with SMTP_USER',
+      });
+    }
   });
 
 const parsed = envSchema.safeParse(process.env);
@@ -86,6 +100,7 @@ if (!parsed.success) {
 
 export const env = {
   ...parsed.data,
+  smtpSecure: parsed.data.SMTP_SECURE === 'true',
   corsAllowedOrigins: parsed.data.CORS_ALLOWED_ORIGINS.split(',')
     .map((origin) => origin.trim())
     .filter(Boolean),

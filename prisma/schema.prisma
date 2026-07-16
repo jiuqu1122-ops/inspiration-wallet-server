@@ -54,6 +54,7 @@ enum AdminOperationType {
   GRANT_CREDITS
   CREATE_PROVIDER
   UPDATE_PROVIDER
+  UPDATE_AUTHORIZATION
 }
 
 enum AiProviderKind {
@@ -68,6 +69,12 @@ enum AiProviderStatus {
 
 model User {
   id              String           @id @default(cuid())
+  email           String?          @unique
+  displayName     String?
+  emailVerifiedAt DateTime?
+  entitlementExpiresAt DateTime?
+  entitlementEdition LicenseEdition @default(ENTERPRISE)
+  entitlementFeatures String[]      @default([])
   status          UserStatus       @default(ACTIVE)
   createdAt       DateTime         @default(now())
   updatedAt       DateTime         @updatedAt
@@ -77,8 +84,24 @@ model User {
   aiRequests      AiRequest[]
   sessions        AuthSession[]
   adminOperations AdminOperation[]
+  emailChallenges EmailVerificationChallenge[]
 
   @@index([status])
+}
+
+model EmailVerificationChallenge {
+  id         String   @id
+  email      String
+  codeHash   String
+  attempts   Int      @default(0)
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime @default(now())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([email, createdAt])
+  @@index([expiresAt])
 }
 
 model License {

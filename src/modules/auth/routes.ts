@@ -4,10 +4,10 @@ import { LicenseVerificationError } from './license-verifier.js';
 import {
   AuthFlowError,
   exchangeLicense,
-  registerTrial,
   revokeRefreshToken,
   rotateRefreshToken,
 } from './service.js';
+import { requestEmailCode, syncEmailLicense, verifyEmailCode } from './email-auth.js';
 
 const exchangeBodySchema = z
   .object({
@@ -23,15 +23,20 @@ const refreshBodySchema = z
   })
   .strict();
 
-const trialRegistrationBodySchema = z
+const emailCodeRequestSchema = z
   .object({
-    displayName: z
-      .string()
-      .trim()
-      .min(2)
-      .max(32)
-      .refine((value) => !/[\u0000-\u001f\u007f]/.test(value)),
+    email: z.string().trim().email().max(254),
+  })
+  .strict();
+
+const emailCodeVerifySchema = z
+  .object({
+    email: z.string().trim().email().max(254),
+    challengeId: z.string().uuid(),
+    code: z.string().regex(/^\d{6}$/),
     machineId: z.string().regex(/^[a-fA-F0-9]{64}$/),
+    displayName: z.string().trim().min(2).max(32).optional(),
+    legacyLicense: z.string().min(1).max(350_000).optional(),
     appVersion: z.string().trim().min(1).max(64).optional(),
   })
   .strict();
@@ -59,17 +64,53 @@ function sendKnownAuthError(
 
 export const authRoutes: FastifyPluginAsync = async (app) => {
   app.post(
-    '/trial/register',
+    '/email/send-code',
     {
-      config: { rateLimit: { max: 10, timeWindow: '1 hour' } },
+      config: { rateLimit: { max: 5, timeWindow: '15 minutes' } },
     },
     async (request, reply) => {
-      const parsed = trialRegistrationBodySchema.safeParse(request.body);
+      const parsed = emailCodeRequestSchema.safeParse(request.body);
       if (!parsed.success) {
-        return invalidRequest(reply, 'A 2-32 character displayName and valid machineId are required');
+        return invalidRequest(reply, 'A valid email address is required');
       }
       try {
-        return await registerTrial(app, parsed.data);
+        return await requestEmailCode(app, parsed.data.email);
+      } catch (error) {
+        return sendKnownAuthError(error, request, reply);
+      }
+    },
+  );
+
+  app.post(
+    '/email/verify',
+    {
+      config: { rateLimit: { max: 10, timeWindow: '15 minutes' } },
+    },
+    async (request, reply) => {
+      const parsed = emailCodeVerifySchema.safeParse(request.body);
+      if (!parsed.success) {
+        return invalidRequest(reply, 'Email verification data is invalid');
+      }
+      try {
+        return await verifyEmailCode(app, parsed.data);
+      } catch (error) {
+        return sendKnownAuthError(error, request, reply);
+      }
+    },
+  );
+
+  app.post(
+    '/email/sync',
+    {
+      config: { rateLimit: { max: 20, timeWindow: '15 minutes' } },
+    },
+    async (request, reply) => {
+      const parsed = exchangeBodySchema.safeParse(request.body);
+      if (!parsed.success) {
+        return invalidRequest(reply, 'A signed license and matching machineId are required');
+      }
+      try {
+        return await syncEmailLicense(app, parsed.data);
       } catch (error) {
         return sendKnownAuthError(error, request, reply);
       }

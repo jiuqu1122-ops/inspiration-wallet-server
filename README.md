@@ -44,19 +44,33 @@ npm run build
 
 ## API
 
-### 首次注册与 30 天试用
+### 邮箱验证码注册 / 登录
 
-`POST /v1/auth/trial/register`
+先请求验证码：`POST /v1/auth/email/send-code`
 
 ```json
 {
-  "displayName": "张三设计",
+  "email": "designer@example.com"
+}
+```
+
+再验证并登录：`POST /v1/auth/email/verify`
+
+```json
+{
+  "email": "designer@example.com",
+  "challengeId": "验证码挑战 ID",
+  "code": "123456",
   "machineId": "64 位十六进制机器 ID",
+  "displayName": "张三设计",
+  "legacyLicense": "可选：本机旧版 License 完整文本",
   "appVersion": "4.6.13"
 }
 ```
 
-服务器按机器 ID 单向哈希生成唯一试用身份，只在首次注册时计算 30 天到期日；卸载重装或重复请求只返回原授权，不会重置试用时间。成功响应包含服务器签名的 License 和账户快照。该接口需要配置与生产公钥匹配的 `LICENSE_SIGNING_PRIVATE_KEY`。
+新邮箱首次验证会获得 30 天高级版，邮箱是账户身份；同一邮箱换设备时继承原账户到期时间，不会重新计算 30 天。机器 ID 只用于当前设备授权和识别本机旧授权。旧版试用版、专业版和高级版在新系统中统一按高级版处理。验证码只保存 HMAC 哈希且单次使用；邮件由通用 SMTP 配置发送。
+
+服务器签发的设备 License 会在客户端启动时通过 `POST /v1/auth/email/sync` 同步管理员修改后的用户名、账户状态和到期日。网络暂时不可用时客户端继续验证本地签名 License；服务器明确返回停用或过期时会清除本机云端 License。
 
 ### License 换取会话
 
@@ -91,7 +105,9 @@ npm run build
 
 ## 管理员额度工作台
 
-`/v1/admin` 只供私有 Tauri 工作台使用。服务器仅保存管理员密钥的 SHA-256 哈希；额度发放在 PostgreSQL 事务中同时更新钱包、写额度流水和管理员审计记录，并通过幂等键防止重复加款。工作台还可以创建、更新、启停和测试 NewAPI/XAIS 渠道，但永远无法读取已保存的完整 API Key。
+`/v1/admin` 只供私有 Tauri 工作台使用。服务器仅保存管理员密钥的 SHA-256 哈希；工作台可以修改账户显示名、状态和授权到期日，所有账户统一为高级版。额度发放在 PostgreSQL 事务中同时更新钱包、写额度流水和管理员审计记录，并通过幂等键防止重复加款。工作台还可以创建、更新、启停和测试 NewAPI/XAIS 渠道，但永远无法读取已保存的完整 API Key。
+
+桌面端已有的本地 API 配置不会上传或迁移到服务器，仍由用户电脑本地保存并优先使用。服务器渠道是独立的云额度能力，待 AI 代理接口完成后作为无本地额度时的兜底。
 
 完整密钥生成、生产配置、迁移和轮换步骤见 [ADMIN_WORKBENCH.md](./ADMIN_WORKBENCH.md)。
 

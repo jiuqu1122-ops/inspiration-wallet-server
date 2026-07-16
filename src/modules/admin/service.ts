@@ -75,6 +75,8 @@ export async function listAdminUsers(
       ? { where: {
           OR: [
             { id: { contains: query, mode: 'insensitive' } },
+            { email: { contains: query, mode: 'insensitive' } },
+            { displayName: { contains: query, mode: 'insensitive' } },
             { licenses: { some: { customer: { contains: query, mode: 'insensitive' } } } },
           ],
         } }
@@ -84,6 +86,11 @@ export async function listAdminUsers(
     take: input.limit + 1,
     select: {
       id: true,
+      email: true,
+      displayName: true,
+      emailVerifiedAt: true,
+      entitlementExpiresAt: true,
+      entitlementEdition: true,
       status: true,
       createdAt: true,
       updatedAt: true,
@@ -110,6 +117,11 @@ export async function listAdminUsers(
   return {
     items: page.map((user) => ({
       id: user.id,
+      email: user.email,
+      displayName: user.displayName,
+      emailVerifiedAt: user.emailVerifiedAt?.toISOString() ?? null,
+      entitlementExpiresAt: user.entitlementExpiresAt?.toISOString() ?? null,
+      entitlementEdition: user.entitlementEdition,
       status: user.status,
       createdAt: user.createdAt.toISOString(),
       updatedAt: user.updatedAt.toISOString(),
@@ -125,6 +137,11 @@ export async function getAdminUser(prisma: PrismaClient, userId: string) {
     where: { id: userId },
     select: {
       id: true,
+      email: true,
+      displayName: true,
+      emailVerifiedAt: true,
+      entitlementExpiresAt: true,
+      entitlementEdition: true,
       status: true,
       createdAt: true,
       updatedAt: true,
@@ -161,6 +178,11 @@ export async function getAdminUser(prisma: PrismaClient, userId: string) {
 
   return {
     id: user.id,
+    email: user.email,
+    displayName: user.displayName,
+    emailVerifiedAt: user.emailVerifiedAt?.toISOString() ?? null,
+    entitlementExpiresAt: user.entitlementExpiresAt?.toISOString() ?? null,
+    entitlementEdition: user.entitlementEdition,
     status: user.status,
     createdAt: user.createdAt.toISOString(),
     updatedAt: user.updatedAt.toISOString(),
@@ -294,4 +316,82 @@ export async function grantAdminCredits(
     }
     throw error;
   }
+}
+
+function authorizationExpiration(value: string) {
+  const expiresAt = new Date(`${value}T23:59:59.999Z`);
+  if (Number.isNaN(expiresAt.getTime()) || expiresAt.toISOString().slice(0, 10) !== value) {
+    throw new AdminServiceError('invalid_expiration', 'Authorization expiration is invalid', 400);
+  }
+  return expiresAt;
+}
+
+export async function updateAdminAuthorization(
+  prisma: PrismaClient,
+  input: {
+    userId: string;
+    displayName?: string | undefined;
+    expiresAt?: string | undefined;
+    status?: 'ACTIVE' | 'SUSPENDED' | 'DISABLED' | undefined;
+    idempotencyKey: string;
+  },
+) {
+  const replayed = await replayOperation(prisma, input.idempotencyKey);
+  if (replayed) {
+    const user = await getAdminUser(prisma, input.userId);
+    return { replayed: true, result: { user } };
+  }
+
+  await prisma.$transaction(
+    async (transaction) => {
+      const user = await transaction.user.findUnique({ where: { id: input.userId } });
+      if (!user) throw new AdminServiceError('user_not_found', 'User was not found', 404);
+      const expiresAt = input.expiresAt
+        ? authorizationExpiration(input.expiresAt)
+        : user.entitlementExpiresAt;
+      const licenseStatus = input.status && input.status !== 'ACTIVE'
+        ? 'REVOKED'
+        : expiresAt && expiresAt < new Date()
+          ? 'EXPIRED'
+          : 'ACTIVE';
+
+      await transaction.user.update({
+        where: { id: user.id },
+        data: {
+          ...(input.displayName ? { displayName: input.displayName.trim() } : {}),
+          ...(expiresAt ? { entitlementExpiresAt: expiresAt } : {}),
+          entitlementEdition: 'ENTERPRISE',
+          entitlementFeatures: ['*'],
+          ...(input.status ? { status: input.status } : {}),
+        },
+      });
+      await transaction.license.updateMany({
+        where: {
+          userId: user.id,
+          OR: [{ id: { startsWith: 'emaildev_' } }, { id: { startsWith: 'trial_' } }],
+        },
+        data: {
+          ...(input.displayName ? { customer: input.displayName.trim() } : {}),
+          ...(expiresAt ? { expiresAt } : {}),
+          edition: 'ENTERPRISE',
+          features: ['*'],
+          status: licenseStatus,
+        },
+      });
+      await transaction.adminOperation.create({
+        data: {
+          idempotencyKey: input.idempotencyKey,
+          type: 'UPDATE_AUTHORIZATION',
+          userId: user.id,
+          description: 'Update account authorization',
+          result: { userId: user.id },
+        },
+      });
+    },
+    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+  );
+
+  const user = await getAdminUser(prisma, input.userId);
+  if (!user) throw new Error('Updated user could not be loaded');
+  return { replayed: false, result: { user } };
 }

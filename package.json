@@ -26,15 +26,17 @@
     "@fastify/jwt": "^10.0.0",
     "@fastify/rate-limit": "^10.3.0",
     "@prisma/client": "6.19.3",
+    "fast-jwt": "^6.2.4",
     "fastify": "^5.6.0",
     "fastify-plugin": "^5.1.0",
-    "fast-jwt": "^6.2.4",
+    "nodemailer": "^9.0.3",
     "prisma": "6.19.3",
     "zod": "^4.1.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.0",
     "@types/node": "^22.18.0",
+    "@types/nodemailer": "^8.0.1",
     "eslint": "^9.39.0",
     "tsx": "^4.20.0",
     "typescript": "^5.9.0",

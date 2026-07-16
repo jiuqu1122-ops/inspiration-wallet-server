@@ -68,8 +68,8 @@ describe('verifyLicense', () => {
     expect(result).toEqual({
       codeHash: expect.stringMatching(/^[a-f0-9]{64}$/),
       machineIdHash: expect.stringMatching(/^[a-f0-9]{64}$/),
-      edition: 'PRO',
-      features: ['canvas', 'ai'],
+      edition: 'ENTERPRISE',
+      features: ['*'],
       expiresAt: new Date('2099-12-31T23:59:59.999Z'),
     });
     expect(result).not.toHaveProperty('customer');

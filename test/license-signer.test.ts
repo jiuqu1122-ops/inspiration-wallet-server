@@ -10,14 +10,14 @@ describe('signServerLicense', () => {
       licenseId,
       customer: '测试用户',
       machineId,
-      edition: 'trial',
+      edition: 'enterprise',
       features: ['*'],
       expiresAt: new Date('2099-01-30T23:59:59.999Z'),
     });
 
     const verified = verifySignedLicenseForProvision(license, machineId);
     expect(verified.customer).toBe('测试用户');
-    expect(verified.edition).toBe('TRIAL');
+    expect(verified.edition).toBe('ENTERPRISE');
     expect(verified.features).toEqual(['*']);
     expect(verified.codeHash).toMatch(/^[a-f0-9]{64}$/);
   });

@@ -105,7 +105,9 @@ nano .env
 - `JWT_ACCESS_SECRET`、`JWT_REFRESH_SECRET`：至少 32 字符、随机生成且彼此不同。
 - `JWT_ACCESS_EXPIRES_IN=15m`、`JWT_REFRESH_EXPIRES_IN=30d`
 - `LICENSE_SIGNING_PUBLIC_KEY`：当前灵感抽屉 License 签发方的 32 字节 Ed25519 公钥（Base64）。这是公开验证材料，不是私钥；轮换签发密钥时必须先安排兼容升级。
-- `LICENSE_SIGNING_PRIVATE_KEY`：与上面公钥匹配的 32 字节 Ed25519 私钥种子（Base64），仅用于服务器自动签发 30 天试用授权。只能保存在服务器权限为 `600` 的 `.env` 和离线密码库中，禁止写入 Git、数据库、日志或客户端。
+- `LICENSE_SIGNING_PRIVATE_KEY`：与上面公钥匹配的 32 字节 Ed25519 私钥种子（Base64），用于服务器签发邮箱账户的设备 License。只能保存在服务器权限为 `600` 的 `.env` 和离线密码库中，禁止写入 Git、数据库、日志或客户端。
+- `SMTP_HOST`、`SMTP_PORT`、`SMTP_SECURE`、`SMTP_USER`、`SMTP_PASSWORD`、`SMTP_FROM`：用于发送邮箱验证码。`465` 通常对应 `SMTP_SECURE=true`，`587` 通常对应 `false`；以邮件服务商说明为准。生产上线前必须用真实邮箱完成一次收信测试。
+- `EMAIL_CODE_TTL_MINUTES`：验证码有效分钟数，允许 5 到 30，默认 10。
 - `ADMIN_API_KEY_HASH`：私有运营工作台管理员密钥的 SHA-256 哈希；原始管理员密钥只放密码管理器。
 - `PROVIDER_SECRETS_ENCRYPTION_KEY`：Base64 编码的 32 字节随机主密钥，用于 AES-256-GCM 加密上游渠道凭据。必须长期备份且不能随意轮换。
 - `CORS_ALLOWED_ORIGINS`：逗号分隔的精确来源。未确认 Tauri 实际 Origin 前保持为空，浏览器跨域请求将被拒绝；原生无 Origin 请求仍可访问。
@@ -188,6 +190,7 @@ docker compose logs --since=30m api caddy
 - Caddy 证书失败：检查 DNS、云安全组、UFW、80/443 占用和 Caddy 日志。
 - `/health` 返回 503：检查 PostgreSQL 健康状态和 `DATABASE_URL`，不要重置数据库。
 - API 启动失败：检查 Secret 长度、两个 Secret 是否相同、是否仍为 `CHANGE_ME`。
+- 验证码发送返回 503：检查 SMTP 主机、端口、安全模式、授权码和发件人；不要把 SMTP 密码打印到日志或截图。
 - CORS 被拒绝：捕获客户端的真实 Origin，只把确认过的精确值加入 `CORS_ALLOWED_ORIGINS`。
 
 ## 9. 标准更新流程
@@ -282,9 +285,9 @@ curl --fail --show-error https://api.unmind.art/health
 - Redis/BullMQ/Worker 后续加入同一专用网络；Worker 单独迁移和扩容，不能让每个副本自动执行 migration。
 - 数据库凭据或 JWT Secret 泄露时立即轮换。轮换 JWT Secret 会使对应现有 Token 失效，应安排兼容窗口。
 
-## 14. 本次账户系统升级与人工加额度
+## 14. 邮箱账户升级与人工加额度
 
-从旧的基础骨架升级到 License 登录版本时，先备份，再应用仓库内新增的 `AuthSession` 迁移。该迁移只增加可空的 License 字段、会话表和索引，不会删除现有钱包或流水数据：
+本次升级会增加邮箱账户、验证码挑战、统一高级版权益字段，并把数据库内旧 `TRIAL` / `PRO` License 标记升级为 `ENTERPRISE`。迁移不会删除现有钱包、流水或旧 License；部署前仍必须先备份：
 
 ```bash
 cd /opt/inspiration-wallet-server
@@ -298,7 +301,7 @@ docker compose ps
 curl --fail --show-error https://api.unmind.art/health
 ```
 
-不要重新生成服务器现有的 JWT Secret，否则现有会话会全部失效。也不要替换 `PROVIDER_SECRETS_ENCRYPTION_KEY`，否则已保存的上游凭据无法解密。`LICENSE_SIGNING_PRIVATE_KEY` 现在是自动试用签发所需的服务器 Secret；它必须与 `LICENSE_SIGNING_PUBLIC_KEY` 匹配，并且绝不能进入 Git 仓库、数据库、日志或客户端安装包。
+不要重新生成服务器现有的 JWT Secret，否则现有会话会全部失效。也不要替换 `PROVIDER_SECRETS_ENCRYPTION_KEY`，否则已保存的上游凭据无法解密。`LICENSE_SIGNING_PRIVATE_KEY` 是邮箱账户设备授权签发所需的服务器 Secret；它必须与 `LICENSE_SIGNING_PUBLIC_KEY` 匹配，并且绝不能进入 Git 仓库、数据库、日志或客户端安装包。部署新版本前先补齐 SMTP 配置，否则客户端无法收到验证码。
 
 用户完成一次 License 交换后，可以通过 `GET /v1/account` 得到用户 ID。管理员只在服务器上执行人工加额度：
 

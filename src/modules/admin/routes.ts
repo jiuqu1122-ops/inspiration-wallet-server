@@ -8,6 +8,7 @@ import {
   grantAdminCredits,
   listAdminUsers,
   provisionAdminLicense,
+  updateAdminAuthorization,
 } from './service.js';
 import { providerAdminRoutes } from '../providers/routes.js';
 
@@ -34,6 +35,18 @@ const grantSchema = z
     idempotencyKey: operationKeySchema,
   })
   .strict();
+
+const authorizationUpdateSchema = z
+  .object({
+    displayName: z.string().trim().min(2).max(32).optional(),
+    expiresAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    status: z.enum(['ACTIVE', 'SUSPENDED', 'DISABLED']).optional(),
+    idempotencyKey: operationKeySchema,
+  })
+  .strict()
+  .refine(
+    (value) => value.displayName !== undefined || value.expiresAt !== undefined || value.status !== undefined,
+  );
 
 function invalid(reply: FastifyReply, message: string) {
   return reply.code(400).send({ error: 'invalid_request', message });
@@ -99,6 +112,29 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
           amount: BigInt(body.data.amount),
           description: body.data.description,
           idempotencyKey: body.data.idempotencyKey,
+        });
+      } catch (error) {
+        if (error instanceof AdminServiceError) {
+          return reply.code(error.statusCode).send({ error: error.code, message: error.message });
+        }
+        throw error;
+      }
+    },
+  );
+
+  app.patch(
+    '/users/:userId/authorization',
+    { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const params = userParamsSchema.safeParse(request.params);
+      const body = authorizationUpdateSchema.safeParse(request.body);
+      if (!params.success || !body.success) {
+        return invalid(reply, 'Authorization update is invalid');
+      }
+      try {
+        return await updateAdminAuthorization(app.prisma, {
+          userId: params.data.userId,
+          ...body.data,
         });
       } catch (error) {
         if (error instanceof AdminServiceError) {
