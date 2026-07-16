@@ -10,8 +10,8 @@ import {
 import { getAccountSnapshot } from '../users/service.js';
 import {
   hashRefreshToken,
-  verifySignedLicense,
-  type VerifiedLicense,
+  verifySignedLicenseForProvision,
+  type VerifiedLicenseWithCustomer,
 } from './license-verifier.js';
 
 export class AuthFlowError extends Error {
@@ -48,8 +48,12 @@ function assertActiveIdentity(identity: {
   }
 }
 
-async function resolveLicenseIdentity(app: FastifyInstance, verified: VerifiedLicense) {
-  const now = new Date();
+export async function resolveLicenseIdentity(
+  app: FastifyInstance,
+  verified: VerifiedLicenseWithCustomer,
+  markExchanged = false,
+) {
+  const now = markExchanged ? new Date() : undefined;
 
   return app.prisma.$transaction(
     async (transaction) => {
@@ -63,11 +67,12 @@ async function resolveLicenseIdentity(app: FastifyInstance, verified: VerifiedLi
         const license = await transaction.license.update({
           where: { id: existing.id },
           data: {
+            customer: verified.customer,
             machineIdHash: verified.machineIdHash,
             edition: verified.edition,
             features: verified.features,
             expiresAt: verified.expiresAt,
-            lastExchangedAt: now,
+            ...(now ? { lastExchangedAt: now } : {}),
           },
         });
         return { userId: existing.userId, licenseId: license.id };
@@ -96,13 +101,14 @@ async function resolveLicenseIdentity(app: FastifyInstance, verified: VerifiedLi
       const license = await transaction.license.create({
         data: {
           codeHash: verified.codeHash,
+          customer: verified.customer,
           machineIdHash: verified.machineIdHash,
           userId,
           status: 'ACTIVE',
           edition: verified.edition,
           features: verified.features,
           expiresAt: verified.expiresAt,
-          lastExchangedAt: now,
+          ...(now ? { lastExchangedAt: now } : {}),
         },
         select: { id: true },
       });
@@ -136,10 +142,10 @@ export async function exchangeLicense(
   app: FastifyInstance,
   input: { license: string; machineId: string },
 ) {
-  const verified = verifySignedLicense(input.license, input.machineId);
+  const verified = verifySignedLicenseForProvision(input.license, input.machineId);
   let identity: { userId: string; licenseId: string };
   try {
-    identity = await resolveLicenseIdentity(app, verified);
+    identity = await resolveLicenseIdentity(app, verified, true);
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
       const existing = await app.prisma.license.findUnique({

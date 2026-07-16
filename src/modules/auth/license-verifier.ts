@@ -15,7 +15,7 @@ const licenseFileSchema = z
 const licensePayloadSchema = z.object({
   product: z.string().min(1).max(128),
   customer: z.string().min(1).max(512),
-  machine_id: z.string().min(1).max(256),
+  machine_id: z.string().regex(/^[a-fA-F0-9]{64}$/),
   edition: z.enum(['trial', 'pro', 'enterprise']),
   features: z.array(z.string().max(128)).max(200).default([]),
   expire_at: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
@@ -28,6 +28,8 @@ export type VerifiedLicense = {
   features: string[];
   expiresAt: Date;
 };
+
+export type VerifiedLicenseWithCustomer = VerifiedLicense & { customer: string };
 
 export type LicenseVerificationErrorCode =
   | 'malformed_license'
@@ -83,7 +85,10 @@ export function hashRefreshToken(token: string) {
   return createHash('sha256').update('inspiration-wallet-refresh-v1\0').update(token).digest('hex');
 }
 
-export function verifySignedLicense(content: string, submittedMachineId: string): VerifiedLicense {
+function verifySignedLicenseDocument(
+  content: string,
+  submittedMachineId?: string,
+): VerifiedLicenseWithCustomer {
   const fileResult = licenseFileSchema.safeParse(parseJson(content, 'License file is not valid JSON'));
   if (!fileResult.success) {
     throw new LicenseVerificationError('malformed_license', 'License file format is invalid');
@@ -139,8 +144,9 @@ export function verifySignedLicense(content: string, submittedMachineId: string)
   if (payload.product.trim() !== productName) {
     throw new LicenseVerificationError('product_mismatch', 'License product does not match');
   }
-  const machineId = submittedMachineId.trim().toLowerCase();
-  if (!/^[a-f0-9]{64}$/.test(machineId) || payload.machine_id.trim().toLowerCase() !== machineId) {
+  const machineId = payload.machine_id.trim().toLowerCase();
+  const claimedMachineId = submittedMachineId?.trim().toLowerCase();
+  if (claimedMachineId !== undefined && claimedMachineId !== machineId) {
     throw new LicenseVerificationError('machine_mismatch', 'License machine ID does not match');
   }
 
@@ -163,9 +169,31 @@ export function verifySignedLicense(content: string, submittedMachineId: string)
 
   return {
     codeHash,
+    customer: payload.customer.trim(),
     machineIdHash,
     edition: payload.edition.toUpperCase() as VerifiedLicense['edition'],
     features: normalizeFeatures(payload.features),
     expiresAt,
   };
+}
+
+export function verifySignedLicense(content: string, submittedMachineId?: string): VerifiedLicense {
+  const verified = verifySignedLicenseDocument(
+    content,
+    submittedMachineId,
+  );
+  return {
+    codeHash: verified.codeHash,
+    machineIdHash: verified.machineIdHash,
+    edition: verified.edition,
+    features: verified.features,
+    expiresAt: verified.expiresAt,
+  };
+}
+
+export function verifySignedLicenseForProvision(
+  content: string,
+  submittedMachineId?: string,
+): VerifiedLicenseWithCustomer {
+  return verifySignedLicenseDocument(content, submittedMachineId);
 }

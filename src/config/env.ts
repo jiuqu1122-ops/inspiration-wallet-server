@@ -30,6 +30,12 @@ const envSchema = z
       .string()
       .refine(isCanonicalEd25519PublicKey, 'must be a Base64-encoded 32-byte Ed25519 public key')
       .default(defaultLicenseSigningPublicKey),
+    ADMIN_API_KEY_HASH: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/, 'must be a lowercase SHA-256 hex digest')
+      .optional()
+      .or(z.literal(''))
+      .default(''),
     CORS_ALLOWED_ORIGINS: z.string().default(''),
   })
   .superRefine((value, context) => {
