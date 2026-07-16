@@ -14,6 +14,8 @@ describe('provider URL safety and normalization', () => {
   it('rejects unsafe schemes, credentials, and local hosts', () => {
     expect(() => normalizeProviderBaseUrl('NEW_API', 'http://gateway.example.com'))
       .toThrow('HTTPS');
+    expect(normalizeProviderBaseUrl('NEW_API', 'http://38.145.218.40:12001/v1', true))
+      .toBe('http://38.145.218.40:12001');
     expect(() => normalizeProviderBaseUrl('NEW_API', 'https://user:pass@gateway.example.com'))
       .toThrow('credentials');
     expect(() => normalizeProviderBaseUrl('XAIS', 'https://127.0.0.1'))

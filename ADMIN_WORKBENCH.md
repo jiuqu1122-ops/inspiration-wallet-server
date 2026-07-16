@@ -71,7 +71,7 @@ curl --fail --show-error https://api.unmind.art/health
 - 管理接口有独立限流；额度发放需要唯一幂等键。
 - 发放事务同时更新钱包、写 `WalletLedger` 并写 `AdminOperation`，任一步失败都会回滚。
 - 工作台固定访问 `https://api.unmind.art`，不会接受用户指定的任意 URL。
-- 上游 Base URL 只允许公网 HTTPS；保存与测试都会拒绝 localhost、私网、链路本地地址和危险 Header。
+- 上游 Base URL 默认只允许公网 HTTPS。确实只有 HTTP 的中转可在单条渠道上显式开启“不安全 HTTP”；保存与测试仍会拒绝 localhost、私网、链路本地地址和危险 Header。
 - 上游 API Key 与自定义 Header 使用 AES-256-GCM 加密，管理接口只返回密钥末四位，永不返回明文。
 
 ## 4. 当前管理接口

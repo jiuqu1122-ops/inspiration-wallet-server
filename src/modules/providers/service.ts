@@ -33,6 +33,7 @@ type ProviderInput = {
   baseUrl: string;
   apiKey: string;
   headers: Record<string, string>;
+  allowInsecureHttp?: boolean | undefined;
   capabilities?: AiCapability[] | undefined;
   enabled?: boolean | undefined;
   idempotencyKey: string;
@@ -43,6 +44,7 @@ type ProviderUpdateInput = {
   baseUrl?: string | undefined;
   apiKey?: string | undefined;
   headers?: Record<string, string> | undefined;
+  allowInsecureHttp?: boolean | undefined;
   capabilities?: AiCapability[] | undefined;
   enabled?: boolean | undefined;
   idempotencyKey: string;
@@ -62,6 +64,7 @@ function serializeProvider(provider: AiProviderChannel) {
     kind: provider.kind,
     enabled: provider.status === 'ACTIVE',
     baseUrl: provider.baseUrl,
+    allowInsecureHttp: provider.allowInsecureHttp,
     apiKeyConfigured: true,
     apiKeyLast4: provider.apiKeyLast4,
     capabilities: provider.capabilities,
@@ -108,10 +111,14 @@ function cleanHeaders(headers: Record<string, string>) {
   return result;
 }
 
-async function normalizeAndValidate(kind: AiProviderKind, baseUrl: string) {
+async function normalizeAndValidate(
+  kind: AiProviderKind,
+  baseUrl: string,
+  allowInsecureHttp: boolean,
+) {
   let normalized: string;
   try {
-    normalized = normalizeProviderBaseUrl(kind, baseUrl);
+    normalized = normalizeProviderBaseUrl(kind, baseUrl, allowInsecureHttp);
     await assertPublicProviderUrl(normalized);
   } catch (error) {
     throw new ProviderServiceError(
@@ -138,7 +145,8 @@ export async function createProvider(prisma: PrismaClient, input: ProviderInput)
   const replayed = await replayProviderOperation(prisma, input.idempotencyKey);
   if (replayed) return { replayed: true, provider: replayed.result };
 
-  const baseUrl = await normalizeAndValidate(input.kind, input.baseUrl);
+  const allowInsecureHttp = input.allowInsecureHttp === true;
+  const baseUrl = await normalizeAndValidate(input.kind, input.baseUrl, allowInsecureHttp);
   const headers = cleanHeaders(input.headers);
   let encryptedSecrets: string;
   try {
@@ -156,6 +164,7 @@ export async function createProvider(prisma: PrismaClient, input: ProviderInput)
           kind: input.kind,
           status: input.enabled === false ? 'DISABLED' : 'ACTIVE',
           baseUrl,
+          allowInsecureHttp,
           encryptedSecrets,
           apiKeyLast4: input.apiKey.trim().slice(-4),
           capabilities,
@@ -192,8 +201,9 @@ export async function updateProvider(
   const current = await prisma.aiProviderChannel.findUnique({ where: { id: providerId } });
   if (!current) throw new ProviderServiceError('provider_not_found', 'Provider not found', 404);
 
-  const baseUrl = input.baseUrl
-    ? await normalizeAndValidate(current.kind, input.baseUrl)
+  const allowInsecureHttp = input.allowInsecureHttp ?? current.allowInsecureHttp;
+  const baseUrl = input.baseUrl || input.allowInsecureHttp !== undefined
+    ? await normalizeAndValidate(current.kind, input.baseUrl ?? current.baseUrl, allowInsecureHttp)
     : current.baseUrl;
   let encryptedSecrets = current.encryptedSecrets;
   let apiKeyLast4 = current.apiKeyLast4;
@@ -223,6 +233,7 @@ export async function updateProvider(
           ...(input.enabled !== undefined ? { status: input.enabled ? 'ACTIVE' : 'DISABLED' } : {}),
           ...(input.capabilities !== undefined ? { capabilities: input.capabilities } : {}),
           baseUrl,
+          allowInsecureHttp,
           encryptedSecrets,
           apiKeyLast4,
           lastTestStatus: null,
@@ -319,7 +330,7 @@ function modelIds(value: unknown) {
 export async function testProvider(prisma: PrismaClient, providerId: string) {
   const provider = await prisma.aiProviderChannel.findUnique({ where: { id: providerId } });
   if (!provider) throw new ProviderServiceError('provider_not_found', 'Provider not found', 404);
-  await normalizeAndValidate(provider.kind, provider.baseUrl);
+  await normalizeAndValidate(provider.kind, provider.baseUrl, provider.allowInsecureHttp);
 
   let secrets: ProviderSecrets;
   try {

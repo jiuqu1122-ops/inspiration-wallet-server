@@ -187,6 +187,7 @@ model AiProviderChannel {
   kind               AiProviderKind
   status             AiProviderStatus @default(ACTIVE)
   baseUrl            String
+  allowInsecureHttp  Boolean          @default(false)
   encryptedSecrets   String
   apiKeyLast4        String
   capabilities       AiCapability[]

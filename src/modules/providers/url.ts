@@ -46,7 +46,11 @@ export function isPublicIp(value: string) {
   );
 }
 
-export function normalizeProviderBaseUrl(kind: AiProviderKind, input: string) {
+export function normalizeProviderBaseUrl(
+  kind: AiProviderKind,
+  input: string,
+  allowInsecureHttp = false,
+) {
   const value = input.trim();
   let url: URL;
   try {
@@ -54,7 +58,9 @@ export function normalizeProviderBaseUrl(kind: AiProviderKind, input: string) {
   } catch {
     throw new Error('Provider Base URL is invalid');
   }
-  if (url.protocol !== 'https:') throw new Error('Provider Base URL must use HTTPS');
+  if (url.protocol !== 'https:' && !(allowInsecureHttp && url.protocol === 'http:')) {
+    throw new Error('Provider Base URL must use HTTPS unless insecure HTTP is explicitly allowed');
+  }
   if (url.username || url.password) throw new Error('Provider Base URL must not contain credentials');
   if (url.search || url.hash) throw new Error('Provider Base URL must not contain a query or fragment');
   const hostname = url.hostname.toLowerCase();
