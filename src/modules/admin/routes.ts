@@ -9,6 +9,7 @@ import {
   listAdminUsers,
   provisionAdminLicense,
 } from './service.js';
+import { providerAdminRoutes } from '../providers/routes.js';
 
 const listUsersSchema = z.object({
   query: z.string().trim().max(200).optional(),
@@ -40,6 +41,8 @@ function invalid(reply: FastifyReply, message: string) {
 
 export const adminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.authenticateAdmin);
+
+  await app.register(providerAdminRoutes, { prefix: '/providers' });
 
   app.get(
     '/overview',

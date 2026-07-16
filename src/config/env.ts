@@ -10,6 +10,14 @@ function isCanonicalEd25519PublicKey(value: string) {
   return decoded.length === 32 && decoded.toString('base64') === value;
 }
 
+function isBase64Encoded32ByteKey(value: string) {
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    return false;
+  }
+  const decoded = Buffer.from(value, 'base64');
+  return decoded.length === 32 && decoded.toString('base64') === value;
+}
+
 const secretSchema = z
   .string()
   .min(32, 'must contain at least 32 characters')
@@ -33,6 +41,12 @@ const envSchema = z
     ADMIN_API_KEY_HASH: z
       .string()
       .regex(/^[a-f0-9]{64}$/, 'must be a lowercase SHA-256 hex digest')
+      .optional()
+      .or(z.literal(''))
+      .default(''),
+    PROVIDER_SECRETS_ENCRYPTION_KEY: z
+      .string()
+      .refine(isBase64Encoded32ByteKey, 'must be a Base64-encoded 32-byte key')
       .optional()
       .or(z.literal(''))
       .default(''),

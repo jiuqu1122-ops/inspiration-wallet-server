@@ -20,6 +20,20 @@ printf '写入服务器 .env 的哈希：\n%s\n' "$ADMIN_API_KEY_HASH"
 ADMIN_API_KEY_HASH=<64位小写SHA-256十六进制哈希>
 ```
 
+再生成一枚只用于加密上游渠道凭据的 32 字节主密钥：
+
+```bash
+openssl rand -base64 32
+```
+
+把结果写入生产 `.env`：
+
+```env
+PROVIDER_SECRETS_ENCRYPTION_KEY=<Base64编码的32字节随机密钥>
+```
+
+这枚密钥需要长期保持不变并单独备份。服务端只用它加密/解密 PostgreSQL 中的 NewAPI、XAIS 凭据；丢失后已保存的渠道 API Key 无法恢复。上游 API Key 本身不要写入 `.env`。
+
 原始 `ADMIN_API_KEY` 只保存到可信密码管理器，用于在工作台每次启动时临时登录。不要把原始值写入服务器 `.env`。退出当前终端前执行：
 
 ```bash
@@ -46,6 +60,7 @@ curl --fail --show-error https://api.unmind.art/health
 
 - `License.customer`：仅供管理员按客户标签检索；
 - `AdminOperation`：保存操作类型、幂等键、目标用户、额度、说明和结果快照；
+- `AiProviderChannel`：保存 NewAPI/XAIS 的公开配置、能力、测试状态与加密后的凭据；
 - 不删除或重置既有用户、钱包、流水和会话。
 
 ## 3. 安全边界
@@ -56,6 +71,8 @@ curl --fail --show-error https://api.unmind.art/health
 - 管理接口有独立限流；额度发放需要唯一幂等键。
 - 发放事务同时更新钱包、写 `WalletLedger` 并写 `AdminOperation`，任一步失败都会回滚。
 - 工作台固定访问 `https://api.unmind.art`，不会接受用户指定的任意 URL。
+- 上游 Base URL 只允许公网 HTTPS；保存与测试都会拒绝 localhost、私网、链路本地地址和危险 Header。
+- 上游 API Key 与自定义 Header 使用 AES-256-GCM 加密，管理接口只返回密钥末四位，永不返回明文。
 
 ## 4. 当前管理接口
 
@@ -65,6 +82,10 @@ GET  /v1/admin/users
 GET  /v1/admin/users/:userId
 POST /v1/admin/licenses/provision
 POST /v1/admin/users/:userId/credits/grant
+GET  /v1/admin/providers
+POST /v1/admin/providers
+PATCH /v1/admin/providers/:providerId
+POST /v1/admin/providers/:providerId/test
 ```
 
 客户端不应调用这些接口；它们只供你的私有 Tauri 运营工作台使用。
@@ -79,3 +100,5 @@ curl --fail --show-error https://api.unmind.art/health
 ```
 
 旧工作台会话的后续请求立即失效。JWT Secret 和 License 签发密钥不需要随管理员密钥一起更换。
+
+`PROVIDER_SECRETS_ENCRYPTION_KEY` 不应按普通管理员密钥流程轮换。需要轮换时必须先实现逐条解密并重新加密的专用迁移，不能直接替换环境变量。

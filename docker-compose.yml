@@ -37,6 +37,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?JWT_ACCESS_SECRET is required}
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required}
+      PROVIDER_SECRETS_ENCRYPTION_KEY: ${PROVIDER_SECRETS_ENCRYPTION_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy

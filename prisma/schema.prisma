@@ -52,6 +52,18 @@ enum AiRequestStatus {
 enum AdminOperationType {
   PROVISION_LICENSE
   GRANT_CREDITS
+  CREATE_PROVIDER
+  UPDATE_PROVIDER
+}
+
+enum AiProviderKind {
+  NEW_API
+  XAIS
+}
+
+enum AiProviderStatus {
+  ACTIVE
+  DISABLED
 }
 
 model User {
@@ -167,4 +179,24 @@ model AdminOperation {
 
   @@index([userId, createdAt])
   @@index([type, createdAt])
+}
+
+model AiProviderChannel {
+  id                 String           @id @default(cuid())
+  name               String           @unique
+  kind               AiProviderKind
+  status             AiProviderStatus @default(ACTIVE)
+  baseUrl            String
+  encryptedSecrets   String
+  apiKeyLast4        String
+  capabilities       AiCapability[]
+  lastTestStatus     String?
+  lastTestMessage    String?
+  lastTestModelCount Int?
+  lastTestedAt       DateTime?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  @@index([kind, status])
+  @@index([updatedAt])
 }
