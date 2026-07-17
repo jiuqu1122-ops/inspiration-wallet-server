@@ -1,13 +1,26 @@
 import { describe, expect, it } from 'vitest';
 import {
   chooseProviderForCapability,
+  collectProviderModelIds,
   resolveImageModel,
+  resolveNewApiImageModel,
   resolveXaisModel,
   sizeFromRatio,
   uniqueImages,
 } from '../src/modules/ai/image-service.js';
 
 describe('wallet image provider normalization', () => {
+  it('extracts the image channel model IDs returned by /v1/models', () => {
+    expect(collectProviderModelIds({
+      data: [
+        { id: 'gemini-3-pro-image' },
+        { id: 'gemini-3.1-flash-image' },
+        { id: 'gemini-3-pro-image' },
+        { id: '' },
+      ],
+    })).toEqual(['gemini-3-pro-image', 'gemini-3.1-flash-image']);
+  });
+
   it('prefers the dedicated IMAGE channel over an LLM channel with legacy broad capabilities', () => {
     const llm = { name: 'codex', capabilities: ['LLM', 'IMAGE', 'VIDEO'] as const };
     const image = { name: 'newapi-image', capabilities: ['IMAGE'] as const };
@@ -15,11 +28,22 @@ describe('wallet image provider normalization', () => {
     expect(chooseProviderForCapability([llm], 'IMAGE')).toBeUndefined();
   });
 
-  it('uses the manager-configured image model instead of the client model', () => {
-    expect(resolveImageModel({ defaultModel: 'gemini-3-pro-image' }))
+  it('uses the client-selected image model and keeps the manager model as fallback', () => {
+    expect(resolveImageModel({ kind: 'NEW_API', defaultModel: 'gemini-3-pro-image' }, 'gemini-3.1-flash-image'))
+      .toBe('gemini-3.1-flash-image');
+    expect(resolveImageModel({ kind: 'NEW_API', defaultModel: 'gemini-3-pro-image' }, ''))
       .toBe('gemini-3-pro-image');
-    expect(() => resolveImageModel({ defaultModel: null }))
-      .toThrow('生图渠道没有配置默认模型');
+    expect(() => resolveImageModel({ kind: 'NEW_API', defaultModel: null }, ''))
+      .toThrow('生图请求和渠道都没有配置模型');
+  });
+
+  it('maps the main app image aliases back to NewAPI model IDs', () => {
+    expect(resolveNewApiImageModel('Nano Banana Pro')).toBe('gemini-3-pro-image');
+    expect(resolveNewApiImageModel('google/gemini_3_pro_image_preview')).toBe('gemini-3-pro-image');
+    expect(resolveNewApiImageModel('Nano Banana 2')).toBe('gemini-3.1-flash-image');
+    expect(resolveNewApiImageModel('Gemini31FlashImage')).toBe('gemini-3.1-flash-image');
+    expect(resolveNewApiImageModel('GPT Image 2')).toBe('gpt-image-2');
+    expect(resolveNewApiImageModel('custom-image-model')).toBe('custom-image-model');
   });
 
   it('extracts URL and Base64 image results while excluding reference inputs', () => {

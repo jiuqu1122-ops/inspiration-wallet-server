@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { CloudAiError, executeWalletAgentChat } from './service.js';
-import { executeWalletImageGeneration } from './image-service.js';
+import { executeWalletImageGeneration, listWalletImageModels } from './image-service.js';
 import { executeWalletVideoGeneration, executeWalletVideoStatus } from './image-service.js';
 
 const chatSchema = z.object({
@@ -47,6 +47,11 @@ const videoStatusSchema = z.object({
   taskId: z.string().trim().min(1).max(256),
 }).strict();
 
+const imageModelsQuerySchema = z.object({
+  provider: z.enum(['new-api', 'xais-chat', 'openai-compatible', 'custom']).nullish()
+    .transform((value) => value ?? undefined),
+}).strict();
+
 export const normalizeImageRequestBody = (body: unknown) => imageSchema.parse(body);
 export const normalizeVideoRequestBody = (body: unknown) => videoSchema.parse(body);
 
@@ -58,6 +63,25 @@ function knownError(reply: FastifyReply, error: unknown) {
 }
 
 export const aiRoutes: FastifyPluginAsync = async (app) => {
+  app.get(
+    '/images/models',
+    {
+      preHandler: app.authenticateAccessToken,
+      config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    },
+    async (request, reply) => {
+      const parsed = imageModelsQuerySchema.safeParse(request.query);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'invalid_request', message: '生图模型请求格式无效' });
+      }
+      try {
+        return await listWalletImageModels(app.prisma, parsed.data.provider);
+      } catch (error) {
+        return knownError(reply, error);
+      }
+    },
+  );
+
   app.post(
     '/chat/completions',
     {

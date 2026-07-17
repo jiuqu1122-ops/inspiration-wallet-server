@@ -20,6 +20,34 @@ const XAIS_MODEL_MAP: Record<string, string> = {
   'Xais Img2_4K(高画质)': 'Xais_Img2_4K_H',
 };
 
+const NEW_API_IMAGE_MODEL_MAP: Record<string, string> = {
+  nanobananapro: 'gemini-3-pro-image',
+  gemini3pro: 'gemini-3-pro-image',
+  gemini3proimage: 'gemini-3-pro-image',
+  gemini31proimage: 'gemini-3-pro-image',
+  nanobanana2: 'gemini-3.1-flash-image',
+  gemini31flashimage: 'gemini-3.1-flash-image',
+  gemini3flashimage: 'gemini-3.1-flash-image',
+  gptimage2: 'gpt-image-2',
+};
+
+const imageModelToken = (model: string) => model
+  .trim()
+  .toLowerCase()
+  .replace(/preview/g, '')
+  .replace(/[^a-z0-9]+/g, '');
+
+export function resolveNewApiImageModel(model: string) {
+  const trimmed = model.trim();
+  const token = imageModelToken(trimmed);
+  const exact = NEW_API_IMAGE_MODEL_MAP[token];
+  if (exact) return exact;
+  if (token.endsWith('gemini3proimage') || token.endsWith('gemini31proimage')) return 'gemini-3-pro-image';
+  if (token.endsWith('gemini31flashimage') || token.endsWith('gemini3flashimage')) return 'gemini-3.1-flash-image';
+  if (token.endsWith('gptimage2')) return 'gpt-image-2';
+  return trimmed;
+}
+
 type ImageInput = {
   userId: string;
   clientRequestId: string;
@@ -82,10 +110,15 @@ export function chooseProviderForCapability<T extends Pick<AiProviderChannel, 'c
   ), undefined);
 }
 
-export function resolveImageModel(provider: Pick<AiProviderChannel, 'defaultModel'>) {
+export function resolveImageModel(
+  provider: Pick<AiProviderChannel, 'defaultModel' | 'kind'>,
+  requestedModel: string,
+) {
+  const requested = requestedModel.trim();
+  if (requested) return provider.kind === 'NEW_API' ? resolveNewApiImageModel(requested) : requested;
   const configured = provider.defaultModel?.trim();
-  if (configured) return configured;
-  throw new CloudAiError('provider_model_missing', '生图渠道没有配置默认模型', 503);
+  if (configured) return provider.kind === 'NEW_API' ? resolveNewApiImageModel(configured) : configured;
+  throw new CloudAiError('provider_model_missing', '生图请求和渠道都没有配置模型', 503);
 }
 
 function upstreamHeaders(secrets: ProviderSecrets) {
@@ -172,6 +205,43 @@ function collectImageStrings(value: unknown, output: string[] = []): string[] {
     }
   }
   return output;
+}
+
+export function collectProviderModelIds(value: unknown) {
+  if (!value || typeof value !== 'object') return [];
+  const data: unknown = (value as Record<string, unknown>).data;
+  if (!Array.isArray(data)) return [];
+  return Array.from(new Set(data.map((item: unknown) => (
+    item && typeof item === 'object' ? (item as Record<string, unknown>).id : null
+  )).filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+    .map((id) => id.trim())))
+    .slice(0, 200);
+}
+
+export async function listWalletImageModels(
+  prisma: PrismaClient,
+  preference?: ImageInput['provider'],
+) {
+  const provider = await selectImageProvider(prisma, preference);
+  try {
+    const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+    const value = await providerRequest(provider, secrets, '/v1/models');
+    return {
+      provider: provider.kind,
+      defaultModel: provider.defaultModel,
+      models: collectProviderModelIds(value),
+    };
+  } catch (error) {
+    if (error instanceof CloudAiError) throw error;
+    if (error instanceof UpstreamImageError) {
+      throw new CloudAiError(
+        error.status === 401 ? 'provider_auth_failed' : 'provider_models_failed',
+        error.status === 401 ? '生图渠道鉴权失败，请管理员检查渠道密钥' : `读取生图模型失败${error.status ? `（HTTP ${error.status}）` : ''}`,
+        502,
+      );
+    }
+    throw new CloudAiError('provider_models_failed', error instanceof Error ? error.message : '读取生图模型失败', 502);
+  }
 }
 
 export function uniqueImages(value: unknown, inputImages: string[], count: number) {
@@ -499,7 +569,7 @@ async function releaseImageCredits(
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
   const provider = await selectImageProvider(prisma, input.provider);
-  const effectiveInput = { ...input, model: resolveImageModel(provider) };
+  const effectiveInput = { ...input, model: resolveImageModel(provider, input.model) };
   const reservation = await reserveImageCredits(prisma, effectiveInput);
   try {
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
