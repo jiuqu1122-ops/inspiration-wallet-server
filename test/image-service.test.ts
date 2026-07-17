@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   chooseProviderForCapability,
   collectProviderModelIds,
+  newApiImageRequestParams,
   resolveImageModel,
   resolveNewApiImageModel,
   resolveXaisModel,
@@ -78,5 +79,22 @@ describe('wallet image provider normalization', () => {
     expect(sizeFromRatio('1:1')).toBe('1024x1024');
     expect(sizeFromRatio('16:9')).toBe('1792x1024');
     expect(sizeFromRatio('9:16')).toBe('1024x1792');
+  });
+
+  it('matches the main app NewAPI image dimensions and quality', () => {
+    expect(newApiImageRequestParams('gemini-3-pro-image', 1, '16:9', '2K')).toEqual({
+      n: 1,
+      size: '1920x1088',
+      aspect_ratio: '16:9',
+      ratio: '16:9',
+      quality: 'standard',
+    });
+    expect(newApiImageRequestParams('gemini-3.1-flash-image', 2, '9:16', '4K')).toEqual({
+      n: 2,
+      size: '2160x3840',
+      aspect_ratio: '9:16',
+      ratio: '9:16',
+      quality: 'high',
+    });
   });
 });

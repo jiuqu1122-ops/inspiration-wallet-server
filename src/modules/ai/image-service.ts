@@ -69,6 +69,26 @@ class UpstreamImageError extends Error {
   }
 }
 
+function upstreamErrorMessage(status: number, text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) return `HTTP ${status}`;
+  let detail = trimmed;
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (parsed && typeof parsed === 'object') {
+      const record = parsed as Record<string, unknown>;
+      const nested = record.error && typeof record.error === 'object'
+        ? record.error as Record<string, unknown>
+        : null;
+      const candidate = nested?.message ?? record.message ?? record.error;
+      if (typeof candidate === 'string' && candidate.trim()) detail = candidate.trim();
+    }
+  } catch {
+    // Plain-text upstream errors are already useful.
+  }
+  return `HTTP ${status}: ${detail.replace(/\s+/g, ' ').slice(0, 800)}`;
+}
+
 async function selectImageProvider(prisma: PrismaClient) {
   const common = { status: 'ACTIVE' as const, capabilities: { has: 'IMAGE' as const } };
   const providers = await prisma.aiProviderChannel.findMany({
@@ -157,7 +177,9 @@ async function providerRequest(
       signal: controller.signal,
     });
     const text = await response.text();
-    if (!response.ok) throw new UpstreamImageError(response.status, `HTTP ${response.status}`);
+    if (!response.ok) {
+      throw new UpstreamImageError(response.status, upstreamErrorMessage(response.status, text));
+    }
     return parseProviderValue(text);
   } catch (error) {
     if (error instanceof UpstreamImageError) throw error;
@@ -251,6 +273,43 @@ export function sizeFromRatio(ratio: ImageInput['aspectRatio']) {
   return '1024x1024';
 }
 
+function supportsNewApiImageResolution(model: string) {
+  const token = imageModelToken(model);
+  return token.includes('gemini3proimage')
+    || token.includes('gemini31proimage')
+    || token.includes('gemini31flashimage')
+    || token.includes('gemini3flashimage')
+    || token.includes('gptimage2');
+}
+
+export function newApiImageRequestParams(
+  model: string,
+  count: number,
+  ratio: ImageInput['aspectRatio'],
+  resolution?: string,
+) {
+  if (!supportsNewApiImageResolution(model)) {
+    return { n: count, size: sizeFromRatio(ratio), aspect_ratio: ratio, ratio };
+  }
+  const highResolution = resolution?.trim().toLowerCase() === '4k';
+  const size = ratio === '9:16'
+    ? highResolution ? '2160x3840' : '1088x1920'
+    : ratio === '16:9'
+      ? highResolution ? '3840x2160' : '1920x1088'
+      : ratio === '3:4'
+        ? highResolution ? '2400x3200' : '960x1280'
+        : ratio === '4:3'
+          ? highResolution ? '3200x2400' : '1280x960'
+          : highResolution ? '2880x2880' : '1024x1024';
+  return {
+    n: count,
+    size,
+    aspect_ratio: ratio,
+    ratio,
+    quality: highResolution ? 'high' : 'standard',
+  };
+}
+
 function promptWithConstraints(input: ImageInput) {
   const constraints = [`must output exactly ${input.aspectRatio} aspect ratio`];
   if (input.resolution) constraints.push(`target resolution ${input.resolution}`);
@@ -271,12 +330,15 @@ async function generateNewApiImages(
   secrets: ProviderSecrets,
   input: ImageInput,
 ) {
+  const imageParams = newApiImageRequestParams(
+    input.model,
+    input.count,
+    input.aspectRatio,
+    input.resolution,
+  );
   const body = {
     model: input.model,
-    n: input.count,
-    size: sizeFromRatio(input.aspectRatio),
-    aspect_ratio: input.aspectRatio,
-    ratio: input.aspectRatio,
+    ...imageParams,
     ...(input.negativePrompt ? { negative_prompt: input.negativePrompt } : {}),
     messages: [{ role: 'user', content: chatContent(input) }],
     stream: false,
@@ -588,7 +650,9 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     if (error instanceof UpstreamImageError) {
       throw new CloudAiError(
         error.status === 401 ? 'provider_auth_failed' : 'provider_request_failed',
-        error.status === 401 ? '生图渠道鉴权失败，请管理员检查渠道密钥' : `生图渠道请求失败${error.status ? `（HTTP ${error.status}）` : ''}`,
+        error.status === 401
+          ? '生图渠道鉴权失败，请管理员检查渠道密钥'
+          : `生图渠道请求失败：${error.message}`,
         502,
       );
     }
