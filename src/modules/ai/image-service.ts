@@ -390,18 +390,23 @@ function getTaskId(value: unknown): string {
     }
     return '';
   }
+  if (typeof value === 'string' || typeof value === 'number') {
+    return String(value).trim().replace(/^"+|"+$/g, '');
+  }
   if (typeof value !== 'object') return '';
   const record = value as Record<string, unknown>;
-  for (const key of ['task_id', 'taskId', 'id']) {
+  for (const key of ['task_id', 'taskId', 'taskid', 'id']) {
     const candidate = record[key];
     if (typeof candidate === 'string' || typeof candidate === 'number') return String(candidate).trim();
   }
-  for (const key of ['data', 'result', 'task', 'response']) {
+  for (const key of ['data', 'result', 'results', 'task', 'tasks', 'response']) {
     const found = getTaskId(record[key]);
     if (found) return found;
   }
   return '';
 }
+
+export const parseXaisTaskId = getTaskId;
 
 function getFailure(value: unknown): string {
   if (!value || typeof value !== 'object') return '';
@@ -470,7 +475,9 @@ async function runXaisWorkerTask(
   const startFailure = getFailure(started);
   if (startFailure) throw new Error(startFailure);
   const taskId = getTaskId(started);
-  if (!taskId) throw new Error('Xais 没有返回任务 ID');
+  if (!taskId) {
+    throw new Error(`Xais 没有返回任务 ID：${JSON.stringify(started).slice(0, 240)}`);
+  }
   const deadline = Date.now() + 95_000;
   while (Date.now() < deadline) {
     await delay(2_200);

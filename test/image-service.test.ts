@@ -3,6 +3,7 @@ import {
   chooseProviderForCapability,
   collectProviderModelIds,
   newApiImageRequestParams,
+  parseXaisTaskId,
   resolveImageModel,
   resolveNewApiImageModel,
   resolveXaisModel,
@@ -79,6 +80,11 @@ describe('wallet image provider normalization', () => {
     expect(sizeFromRatio('1:1')).toBe('1024x1024');
     expect(sizeFromRatio('16:9')).toBe('1792x1024');
     expect(sizeFromRatio('9:16')).toBe('1024x1792');
+  });
+
+  it('accepts XAIS task IDs returned as plain text or nested results', () => {
+    expect(parseXaisTaskId('task-plain-123')).toBe('task-plain-123');
+    expect(parseXaisTaskId({ results: [{ taskid: 456789 }] })).toBe('456789');
   });
 
   it('matches the main app NewAPI image dimensions and quality', () => {
