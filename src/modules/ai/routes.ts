@@ -75,7 +75,7 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
         return reply.code(400).send({ error: 'invalid_request', message: '生图模型请求格式无效' });
       }
       try {
-        return await listWalletImageModels(app.prisma, parsed.data.provider);
+        return await listWalletImageModels(app.prisma);
       } catch (error) {
         return knownError(reply, error);
       }

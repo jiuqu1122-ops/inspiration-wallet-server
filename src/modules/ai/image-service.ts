@@ -1,4 +1,4 @@
-import type { AiCapability, AiProviderChannel, AiProviderKind, PrismaClient } from '@prisma/client';
+import type { AiCapability, AiProviderChannel, PrismaClient } from '@prisma/client';
 import { env } from '../../config/env.js';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
@@ -69,24 +69,17 @@ class UpstreamImageError extends Error {
   }
 }
 
-function preferredKind(provider?: ImageInput['provider']): AiProviderKind | undefined {
-  if (provider === 'xais-chat') return 'XAIS';
-  if (provider === 'new-api') return 'NEW_API';
-  return undefined;
-}
-
-async function selectImageProvider(prisma: PrismaClient, preference?: ImageInput['provider']) {
-  const kind = preferredKind(preference);
+async function selectImageProvider(prisma: PrismaClient) {
   const common = { status: 'ACTIVE' as const, capabilities: { has: 'IMAGE' as const } };
   const providers = await prisma.aiProviderChannel.findMany({
-    where: kind ? { ...common, kind } : common,
+    where: common,
     orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }],
   });
   const provider = chooseProviderForCapability(providers, 'IMAGE');
   if (!provider) {
     throw new CloudAiError(
       'provider_unavailable',
-      kind ? `当前没有启用的 ${kind === 'XAIS' ? 'XAIS' : 'NewAPI'} 生图渠道` : '当前没有可用的生图渠道',
+      '当前没有可用的生图渠道',
       503,
     );
   }
@@ -220,9 +213,8 @@ export function collectProviderModelIds(value: unknown) {
 
 export async function listWalletImageModels(
   prisma: PrismaClient,
-  preference?: ImageInput['provider'],
 ) {
-  const provider = await selectImageProvider(prisma, preference);
+  const provider = await selectImageProvider(prisma);
   try {
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
     const value = await providerRequest(provider, secrets, '/v1/models');
@@ -568,7 +560,7 @@ async function releaseImageCredits(
 }
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
-  const provider = await selectImageProvider(prisma, input.provider);
+  const provider = await selectImageProvider(prisma);
   const effectiveInput = { ...input, model: resolveImageModel(provider, input.model) };
   const reservation = await reserveImageCredits(prisma, effectiveInput);
   try {

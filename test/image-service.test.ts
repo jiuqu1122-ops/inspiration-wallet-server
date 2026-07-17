@@ -28,6 +28,13 @@ describe('wallet image provider normalization', () => {
     expect(chooseProviderForCapability([llm], 'IMAGE')).toBeUndefined();
   });
 
+  it('keeps channel selection independent from the client provider label', () => {
+    const xais = { name: 'xais-image', capabilities: ['IMAGE'] as const };
+    const newApi = { name: 'newapi-image', capabilities: ['IMAGE'] as const };
+    expect(chooseProviderForCapability([newApi, xais], 'IMAGE')).toBe(newApi);
+    expect(chooseProviderForCapability([xais, newApi], 'IMAGE')).toBe(xais);
+  });
+
   it('uses the client-selected image model and keeps the manager model as fallback', () => {
     expect(resolveImageModel({ kind: 'NEW_API', defaultModel: 'gemini-3-pro-image' }, 'gemini-3.1-flash-image'))
       .toBe('gemini-3.1-flash-image');
