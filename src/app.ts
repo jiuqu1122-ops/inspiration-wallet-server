@@ -20,7 +20,9 @@ export async function buildApp() {
     trustProxy: true,
     bodyLimit: 25 * 1024 * 1024,
     requestTimeout: 5 * 60 * 1_000,
-    connectionTimeout: 10_000,
+    // Image generation handlers can legitimately stay silent for minutes while
+    // the upstream model works. Caddy and the client enforce bounded timeouts.
+    connectionTimeout: 0,
   });
 
   await app.register(helmet, {
