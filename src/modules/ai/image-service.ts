@@ -1,4 +1,4 @@
-import type { AiProviderChannel, AiProviderKind, PrismaClient } from '@prisma/client';
+import type { AiCapability, AiProviderChannel, AiProviderKind, PrismaClient } from '@prisma/client';
 import { env } from '../../config/env.js';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
@@ -50,10 +50,11 @@ function preferredKind(provider?: ImageInput['provider']): AiProviderKind | unde
 async function selectImageProvider(prisma: PrismaClient, preference?: ImageInput['provider']) {
   const kind = preferredKind(preference);
   const common = { status: 'ACTIVE' as const, capabilities: { has: 'IMAGE' as const } };
-  const provider = await prisma.aiProviderChannel.findFirst({
+  const providers = await prisma.aiProviderChannel.findMany({
     where: kind ? { ...common, kind } : common,
     orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }],
   });
+  const provider = chooseProviderForCapability(providers, 'IMAGE');
   if (!provider) {
     throw new CloudAiError(
       'provider_unavailable',
@@ -63,6 +64,28 @@ async function selectImageProvider(prisma: PrismaClient, preference?: ImageInput
   }
   await assertPublicProviderUrl(provider.baseUrl);
   return provider;
+}
+
+export function chooseProviderForCapability<T extends Pick<AiProviderChannel, 'capabilities'>>(
+  providers: T[],
+  capability: AiCapability,
+) {
+  const eligible = capability === 'LLM'
+    ? providers
+    : providers.filter((provider) => !provider.capabilities.includes('LLM'));
+  const rank = (provider: T) => {
+    if (provider.capabilities.length === 1 && provider.capabilities[0] === capability) return 0;
+    return 1;
+  };
+  return eligible.reduce<T | undefined>((selected, provider) => (
+    !selected || rank(provider) < rank(selected) ? provider : selected
+  ), undefined);
+}
+
+export function resolveImageModel(provider: Pick<AiProviderChannel, 'defaultModel'>) {
+  const configured = provider.defaultModel?.trim();
+  if (configured) return configured;
+  throw new CloudAiError('provider_model_missing', '生图渠道没有配置默认模型', 503);
 }
 
 function upstreamHeaders(secrets: ProviderSecrets) {
@@ -197,29 +220,9 @@ async function generateNewApiImages(
     stream: false,
     max_tokens: 8192,
   };
-  let firstError: unknown = null;
-  try {
-    const value = await providerRequest(provider, secrets, '/v1/chat/completions', body);
-    const images = uniqueImages(value, input.inputImages, input.count);
-    if (images.length) return images;
-  } catch (error) {
-    firstError = error;
-    if (error instanceof UpstreamImageError && error.status === 401) throw error;
-  }
-  try {
-    const value = await providerRequest(provider, secrets, '/v1/images/generations', {
-      model: input.model,
-      prompt: promptWithConstraints(input),
-      n: input.count,
-      size: sizeFromRatio(input.aspectRatio),
-      response_format: 'url',
-    });
-    const images = uniqueImages(value, input.inputImages, input.count);
-    if (images.length) return images;
-  } catch (error) {
-    if (!firstError) firstError = error;
-  }
-  if (firstError instanceof Error) throw firstError;
+  const value = await providerRequest(provider, secrets, '/v1/chat/completions', body);
+  const images = uniqueImages(value, input.inputImages, input.count);
+  if (images.length) return images;
   throw new Error('渠道没有返回图片数据');
 }
 
@@ -495,17 +498,18 @@ async function releaseImageCredits(
 }
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
-  const reservation = await reserveImageCredits(prisma, input);
+  const provider = await selectImageProvider(prisma, input.provider);
+  const effectiveInput = { ...input, model: resolveImageModel(provider) };
+  const reservation = await reserveImageCredits(prisma, effectiveInput);
   try {
-    const provider = await selectImageProvider(prisma, input.provider);
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
     const images = provider.kind === 'XAIS'
-      ? await generateXaisImages(provider, secrets, input)
-      : await generateNewApiImages(provider, secrets, input);
+      ? await generateXaisImages(provider, secrets, effectiveInput)
+      : await generateNewApiImages(provider, secrets, effectiveInput);
     if (!images.length) throw new Error('渠道没有返回图片数据');
     const charged = await settleImageCredits(
       prisma,
-      input,
+      effectiveInput,
       reservation.requestId,
       reservation.estimated,
       images.length,
@@ -513,11 +517,11 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     return {
       images,
       provider: provider.kind,
-      model: input.model,
+      model: effectiveInput.model,
       chargedCredits: charged.toString(),
     };
   } catch (error) {
-    await releaseImageCredits(prisma, input, reservation.requestId, reservation.estimated);
+    await releaseImageCredits(prisma, effectiveInput, reservation.requestId, reservation.estimated);
     if (error instanceof CloudAiError) throw error;
     if (error instanceof UpstreamImageError) {
       throw new CloudAiError(
@@ -564,9 +568,12 @@ async function selectVideoProvider(prisma: PrismaClient, preference?: VideoInput
   const kind = videoProviderKind(preference);
   const common = { status: 'ACTIVE' as const, capabilities: { has: 'VIDEO' as const } };
   const preferred = kind
-    ? await prisma.aiProviderChannel.findFirst({ where: { ...common, kind }, orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }] })
-    : null;
-  const provider = preferred ?? await prisma.aiProviderChannel.findFirst({ where: common, orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }] });
+    ? await prisma.aiProviderChannel.findMany({ where: { ...common, kind }, orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }] })
+    : [];
+  const fallback = preferred.length === 0
+    ? await prisma.aiProviderChannel.findMany({ where: common, orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }] })
+    : [];
+  const provider = chooseProviderForCapability(preferred.length ? preferred : fallback, 'VIDEO');
   if (!provider) throw new CloudAiError('provider_unavailable', '当前没有可用的视频渠道', 503);
   await assertPublicProviderUrl(provider.baseUrl);
   return provider;

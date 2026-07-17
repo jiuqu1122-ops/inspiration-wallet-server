@@ -1,11 +1,27 @@
 import { describe, expect, it } from 'vitest';
 import {
+  chooseProviderForCapability,
+  resolveImageModel,
   resolveXaisModel,
   sizeFromRatio,
   uniqueImages,
 } from '../src/modules/ai/image-service.js';
 
 describe('wallet image provider normalization', () => {
+  it('prefers the dedicated IMAGE channel over an LLM channel with legacy broad capabilities', () => {
+    const llm = { name: 'codex', capabilities: ['LLM', 'IMAGE', 'VIDEO'] as const };
+    const image = { name: 'newapi-image', capabilities: ['IMAGE'] as const };
+    expect(chooseProviderForCapability([llm, image], 'IMAGE')).toBe(image);
+    expect(chooseProviderForCapability([llm], 'IMAGE')).toBeUndefined();
+  });
+
+  it('uses the manager-configured image model instead of the client model', () => {
+    expect(resolveImageModel({ defaultModel: 'gemini-3-pro-image' }))
+      .toBe('gemini-3-pro-image');
+    expect(() => resolveImageModel({ defaultModel: null }))
+      .toThrow('生图渠道没有配置默认模型');
+  });
+
   it('extracts URL and Base64 image results while excluding reference inputs', () => {
     const reference = 'https://assets.example.test/reference.png';
     const images = uniqueImages({

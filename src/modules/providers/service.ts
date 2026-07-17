@@ -81,7 +81,7 @@ function serializeProvider(provider: AiProviderChannel) {
 }
 
 function defaultCapabilities(): AiCapability[] {
-  return ['LLM', 'IMAGE', 'VIDEO'];
+  return ['LLM'];
 }
 
 function cleanHeaders(headers: Record<string, string>) {
