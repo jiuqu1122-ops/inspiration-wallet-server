@@ -110,6 +110,7 @@ nano .env
 - `EMAIL_CODE_TTL_MINUTES`：验证码有效分钟数，允许 5 到 30，默认 10。
 - `AGENT_REQUEST_CREDITS`：每次钱包 Agent 请求的预扣额度，必须是正整数；测试环境可从 `1` 开始，后续按实际计费策略调整。
 - `IMAGE_REQUEST_CREDITS`：每张钱包生图的预扣与结算额度，必须是正整数；默认测试值为 `100`。
+- `VIDEO_REQUEST_CREDITS`：每个钱包视频任务的预扣与结算额度，必须是正整数；默认测试值为 `500`，请求数量大于 1 时按数量倍增。
 - `ADMIN_API_KEY_HASH`：私有运营工作台管理员密钥的 SHA-256 哈希；原始管理员密钥只放密码管理器。
 - `PROVIDER_SECRETS_ENCRYPTION_KEY`：Base64 编码的 32 字节随机主密钥，用于 AES-256-GCM 加密上游渠道凭据。必须长期备份且不能随意轮换。
 - `CORS_ALLOWED_ORIGINS`：逗号分隔的精确来源。未确认 Tauri 实际 Origin 前保持为空，浏览器跨域请求将被拒绝；原生无 Origin 请求仍可访问。

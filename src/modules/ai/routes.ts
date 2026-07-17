@@ -2,6 +2,7 @@ import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { CloudAiError, executeWalletAgentChat } from './service.js';
 import { executeWalletImageGeneration } from './image-service.js';
+import { executeWalletVideoGeneration, executeWalletVideoStatus } from './image-service.js';
 
 const chatSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
@@ -20,6 +21,24 @@ const imageSchema = z.object({
   resolution: z.string().trim().max(20).optional(),
   outputFormat: z.enum(['jpg', 'jpeg', 'png', 'webp']).default('jpg'),
   count: z.number().int().min(1).max(4).default(1),
+}).strict();
+
+const videoSchema = z.object({
+  clientRequestId: z.string().trim().min(8).max(128),
+  provider: z.enum(['new-api', 'xais-chat']).optional(),
+  model: z.string().trim().min(1).max(200),
+  prompt: z.string().trim().min(1).max(50_000),
+  inputImages: z.array(z.string().min(1).max(12_000_000)).max(13).default([]),
+  aspectRatio: z.string().trim().max(20).default('16:9'),
+  resolution: z.string().trim().max(20).optional(),
+  duration: z.number().positive().max(120).optional(),
+  inputMode: z.enum(['REF', 'FLF']).optional(),
+  count: z.number().int().min(1).max(4).default(1),
+}).strict();
+
+const videoStatusSchema = z.object({
+  provider: z.enum(['new-api', 'xais-chat']).optional(),
+  taskId: z.string().trim().min(1).max(256),
 }).strict();
 
 function knownError(reply: FastifyReply, error: unknown) {
@@ -68,6 +87,40 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
           userId: request.user.sub,
           ...parsed.data,
         });
+      } catch (error) {
+        return knownError(reply, error);
+      }
+    },
+  );
+
+  app.post(
+    '/videos',
+    {
+      preHandler: app.authenticateAccessToken,
+      config: { rateLimit: { max: 4, timeWindow: '1 minute' } },
+    },
+    async (request, reply) => {
+      const parsed = videoSchema.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', message: '视频请求格式无效' });
+      try {
+        return await executeWalletVideoGeneration(app.prisma, { userId: request.user.sub, ...parsed.data });
+      } catch (error) {
+        return knownError(reply, error);
+      }
+    },
+  );
+
+  app.get(
+    '/videos/:taskId',
+    { preHandler: app.authenticateAccessToken },
+    async (request, reply) => {
+      const parsed = videoStatusSchema.safeParse({
+        ...(request.query as Record<string, unknown>),
+        taskId: (request.params as { taskId?: unknown }).taskId,
+      });
+      if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', message: '视频任务 ID 无效' });
+      try {
+        return await executeWalletVideoStatus(app.prisma, parsed.data);
       } catch (error) {
         return knownError(reply, error);
       }
