@@ -10,36 +10,45 @@ const chatSchema = z.object({
   tools: z.array(z.unknown()).max(100).optional(),
 }).strict();
 
+const optionalString = (max: number) => z.string().trim().max(max).nullish()
+  .transform((value) => value ?? undefined);
+
 const imageSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
-  provider: z.enum(['new-api', 'xais-chat', 'openai-compatible', 'custom']).optional(),
+  provider: z.enum(['new-api', 'xais-chat', 'openai-compatible', 'custom']).nullish()
+    .transform((value) => value ?? undefined),
   model: z.string().trim().min(1).max(200),
   prompt: z.string().trim().min(1).max(50_000),
-  negativePrompt: z.string().trim().max(20_000).optional(),
+  negativePrompt: optionalString(20_000),
   inputImages: z.array(z.string().min(1).max(12_000_000)).max(8).default([]),
   aspectRatio: z.enum(['1:1', '3:4', '4:3', '9:16', '16:9']).default('1:1'),
-  resolution: z.string().trim().max(20).optional(),
+  resolution: optionalString(20),
   outputFormat: z.enum(['jpg', 'jpeg', 'png', 'webp']).default('jpg'),
   count: z.number().int().min(1).max(4).default(1),
 }).strict();
 
 const videoSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
-  provider: z.enum(['new-api', 'xais-chat']).optional(),
+  provider: z.enum(['new-api', 'xais-chat']).nullish()
+    .transform((value) => value ?? undefined),
   model: z.string().trim().min(1).max(200),
   prompt: z.string().trim().min(1).max(50_000),
   inputImages: z.array(z.string().min(1).max(12_000_000)).max(13).default([]),
   aspectRatio: z.string().trim().max(20).default('16:9'),
-  resolution: z.string().trim().max(20).optional(),
-  duration: z.number().positive().max(120).optional(),
-  inputMode: z.enum(['REF', 'FLF']).optional(),
+  resolution: optionalString(20),
+  duration: z.number().positive().max(120).nullish().transform((value) => value ?? undefined),
+  inputMode: z.enum(['REF', 'FLF']).nullish().transform((value) => value ?? undefined),
   count: z.number().int().min(1).max(4).default(1),
 }).strict();
 
 const videoStatusSchema = z.object({
-  provider: z.enum(['new-api', 'xais-chat']).optional(),
+  provider: z.enum(['new-api', 'xais-chat']).nullish()
+    .transform((value) => value ?? undefined),
   taskId: z.string().trim().min(1).max(256),
 }).strict();
+
+export const normalizeImageRequestBody = (body: unknown) => imageSchema.parse(body);
+export const normalizeVideoRequestBody = (body: unknown) => videoSchema.parse(body);
 
 function knownError(reply: FastifyReply, error: unknown) {
   if (error instanceof CloudAiError) {
