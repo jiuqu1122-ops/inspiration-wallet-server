@@ -172,9 +172,10 @@ async function providerRequest(
   secrets: ProviderSecrets,
   path: string,
   body?: unknown,
+  timeoutOverrideMs?: number,
 ) {
   const controller = new AbortController();
-  const timeoutMs = /(?:video|workerTask)/i.test(path) ? 10 * 60_000 : 4 * 60_000;
+  const timeoutMs = timeoutOverrideMs ?? (/(?:video|workerTask)/i.test(path) ? 10 * 60_000 : 4 * 60_000);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(providerEndpoint(provider.baseUrl, path), {
@@ -452,7 +453,7 @@ function collectAttachmentIds(value: unknown, output: string[] = [], trusted = f
   }
   if (value && typeof value === 'object') {
     for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-      collectAttachmentIds(nested, output, trusted || /^(result|results|att|atts|attachment|attachments|output|outputs|file|files)$/i.test(key));
+      collectAttachmentIds(nested, output, trusted || /^(result|results|att|atts|attachment|attachments|output|outputs|file|files|url|urls|uri|uris|href|download|downloads)$/i.test(key));
     }
   }
   return Array.from(new Set(output));
@@ -476,7 +477,7 @@ async function runXaisWorkerTask(
       outputFormat: input.outputFormat === 'png' ? 'image/png' : 'image/jpeg',
       ...(!/^Nano_Banana/i.test(model) || /Lite/i.test(model) ? { quality: /高画质|_H$/i.test(input.model) ? 'high' : 'medium' } : {}),
     },
-  });
+  }, 90_000);
   const immediate = uniqueImages(started, input.inputImages, 1);
   if (immediate.length) return immediate[0]!;
   const startFailure = getFailure(started);
@@ -485,13 +486,15 @@ async function runXaisWorkerTask(
   if (!taskId) {
     throw new Error(`Xais 没有返回任务 ID：${JSON.stringify(started).slice(0, 240)}`);
   }
-  const deadline = Date.now() + 95_000;
+  const deadline = Date.now() + 3 * 60_000;
   while (Date.now() < deadline) {
     await delay(2_200);
     const waited = await providerRequest(
       provider,
       secrets,
       `/xais/workerTaskWait?json=1&id=${encodeURIComponent(taskId)}`,
+      undefined,
+      30_000,
     );
     const failure = getFailure(waited);
     if (failure) throw new Error(failure);
@@ -502,6 +505,8 @@ async function runXaisWorkerTask(
         provider,
         secrets,
         `/xais/attUrls?att=${encodeURIComponent(attachment)}`,
+        undefined,
+        30_000,
       );
       const resolvedImages = uniqueImages(resolved, input.inputImages, 1);
       if (resolvedImages.length) return resolvedImages[0]!;

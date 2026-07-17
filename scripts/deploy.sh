@@ -65,6 +65,9 @@ fi
 log 'Starting or updating API and Caddy...'
 docker compose up -d api caddy
 
+log 'Reloading Caddy configuration...'
+docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+
 log 'Current service state:'
 docker compose ps
 
