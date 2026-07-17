@@ -82,6 +82,16 @@ describe('wallet image provider normalization', () => {
     expect(sizeFromRatio('9:16')).toBe('1024x1792');
   });
 
+  it('extracts Gemini inline_data image results', () => {
+    expect(uniqueImages({
+      choices: [{
+        message: {
+          content: [{ inline_data: { mime_type: 'image/png', data: 'aGVsbG8=' } }],
+        },
+      }],
+    }, [], 1)).toEqual(['data:image/png;base64,aGVsbG8=']);
+  });
+
   it('accepts XAIS task IDs returned as plain text or nested results', () => {
     expect(parseXaisTaskId('task-plain-123')).toBe('task-plain-123');
     expect(parseXaisTaskId({ results: [{ taskid: 456789 }] })).toBe('456789');

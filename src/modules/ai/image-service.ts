@@ -212,7 +212,13 @@ function collectImageStrings(value: unknown, output: string[] = []): string[] {
     return output;
   }
   if (typeof value === 'object') {
-    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    const record = value as Record<string, unknown>;
+    const inlineMime = record.mime_type ?? record.mimeType;
+    const inlineData = record.data;
+    if (typeof inlineMime === 'string' && inlineMime.startsWith('image/') && typeof inlineData === 'string') {
+      output.push(`data:${inlineMime};base64,${inlineData.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '')}`);
+    }
+    for (const [key, nested] of Object.entries(record)) {
       const normalized = key.toLowerCase();
       if (typeof nested === 'string') {
         if (normalized === 'b64_json' || normalized === 'image_base64' || normalized === 'base64') {
@@ -364,6 +370,7 @@ async function generateNewApiImages(
     ...imageParams,
     ...(input.negativePrompt ? { negative_prompt: input.negativePrompt } : {}),
     messages: [{ role: 'user', content: chatContent(input) }],
+    modalities: ['text', 'image'],
     stream: false,
     max_tokens: 8192,
   };
