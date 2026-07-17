@@ -52,6 +52,7 @@ type ImageInput = {
   userId: string;
   clientRequestId: string;
   provider?: 'new-api' | 'xais-chat' | 'openai-compatible' | 'custom' | undefined;
+  providerChannelId?: string | undefined;
   model: string;
   prompt: string;
   negativePrompt?: string | undefined;
@@ -89,17 +90,24 @@ function upstreamErrorMessage(status: number, text: string) {
   return `HTTP ${status}: ${detail.replace(/\s+/g, ' ').slice(0, 800)}`;
 }
 
-async function selectImageProvider(prisma: PrismaClient) {
+async function listImageProviders(prisma: PrismaClient) {
   const common = { status: 'ACTIVE' as const, capabilities: { has: 'IMAGE' as const } };
   const providers = await prisma.aiProviderChannel.findMany({
     where: common,
     orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }],
   });
-  const provider = chooseProviderForCapability(providers, 'IMAGE');
+  return providers.filter((provider) => !provider.capabilities.includes('LLM'));
+}
+
+async function selectImageProvider(prisma: PrismaClient, providerChannelId?: string) {
+  const providers = await listImageProviders(prisma);
+  const provider = providerChannelId
+    ? providers.find((candidate) => candidate.id === providerChannelId)
+    : chooseProviderForCapability(providers, 'IMAGE');
   if (!provider) {
     throw new CloudAiError(
       'provider_unavailable',
-      '当前没有可用的生图渠道',
+      providerChannelId ? '所选生图渠道不可用或已被停用' : '当前没有可用的生图渠道',
       503,
     );
   }
@@ -236,26 +244,41 @@ export function collectProviderModelIds(value: unknown) {
 export async function listWalletImageModels(
   prisma: PrismaClient,
 ) {
-  const provider = await selectImageProvider(prisma);
-  try {
-    const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-    const value = await providerRequest(provider, secrets, '/v1/models');
-    return {
-      provider: provider.kind,
-      defaultModel: provider.defaultModel,
-      models: collectProviderModelIds(value),
-    };
-  } catch (error) {
-    if (error instanceof CloudAiError) throw error;
-    if (error instanceof UpstreamImageError) {
-      throw new CloudAiError(
-        error.status === 401 ? 'provider_auth_failed' : 'provider_models_failed',
-        error.status === 401 ? '生图渠道鉴权失败，请管理员检查渠道密钥' : `读取生图模型失败${error.status ? `（HTTP ${error.status}）` : ''}`,
-        502,
-      );
-    }
-    throw new CloudAiError('provider_models_failed', error instanceof Error ? error.message : '读取生图模型失败', 502);
+  const providers = await listImageProviders(prisma);
+  if (!providers.length) {
+    throw new CloudAiError('provider_unavailable', '当前没有可用的生图渠道', 503);
   }
+  const channels = await Promise.all(providers.map(async (provider) => {
+    try {
+      await assertPublicProviderUrl(provider.baseUrl);
+      const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+      const value = await providerRequest(provider, secrets, '/v1/models');
+      return {
+        id: provider.id,
+        name: provider.name,
+        provider: provider.kind,
+        defaultModel: provider.defaultModel,
+        models: collectProviderModelIds(value),
+        error: null,
+      };
+    } catch (error) {
+      return {
+        id: provider.id,
+        name: provider.name,
+        provider: provider.kind,
+        defaultModel: provider.defaultModel,
+        models: [] as string[],
+        error: error instanceof Error ? error.message.slice(0, 800) : '读取模型失败',
+      };
+    }
+  }));
+  const firstAvailable = channels.find((channel) => !channel.error) ?? channels[0]!;
+  return {
+    provider: firstAvailable.provider,
+    defaultModel: firstAvailable.defaultModel,
+    models: Array.from(new Set(channels.flatMap((channel) => channel.models))),
+    channels,
+  };
 }
 
 export function uniqueImages(value: unknown, inputImages: string[], count: number) {
@@ -622,7 +645,7 @@ async function releaseImageCredits(
 }
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
-  const provider = await selectImageProvider(prisma);
+  const provider = await selectImageProvider(prisma, input.providerChannelId);
   const effectiveInput = { ...input, model: resolveImageModel(provider, input.model) };
   const reservation = await reserveImageCredits(prisma, effectiveInput);
   try {
@@ -641,6 +664,8 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     return {
       images,
       provider: provider.kind,
+      providerChannelId: provider.id,
+      providerChannelName: provider.name,
       model: effectiveInput.model,
       chargedCredits: charged.toString(),
     };

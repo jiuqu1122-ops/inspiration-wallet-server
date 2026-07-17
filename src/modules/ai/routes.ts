@@ -17,6 +17,8 @@ const imageSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
   provider: z.enum(['new-api', 'xais-chat', 'openai-compatible', 'custom']).nullish()
     .transform((value) => value ?? undefined),
+  providerChannelId: z.string().trim().min(1).max(128).nullish()
+    .transform((value) => value ?? undefined),
   model: z.string().trim().min(1).max(200),
   prompt: z.string().trim().min(1).max(50_000),
   negativePrompt: optionalString(20_000),
