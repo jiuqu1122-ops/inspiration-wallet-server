@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { CloudAiError, executeWalletAgentChat } from './service.js';
 import { executeWalletImageGeneration, listWalletImageModels } from './image-service.js';
 import { executeWalletVideoGeneration, executeWalletVideoStatus } from './image-service.js';
+import { getImageReference } from './reference-store.js';
 
 const chatSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
@@ -71,6 +72,28 @@ function knownError(reply: FastifyReply, error: unknown) {
 }
 
 export const aiRoutes: FastifyPluginAsync = async (app) => {
+  app.get(
+    '/references/:key',
+    { config: { rateLimit: { max: 240, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const rawKey = (request.params as { key?: unknown }).key;
+      const key = typeof rawKey === 'string' ? rawKey.trim() : '';
+      if (!/^[a-f0-9]{64}\.(?:png|jpe?g|webp|gif)$/.test(key)) {
+        return reply.code(404).send({ error: 'not_found', message: 'Image reference not found' });
+      }
+      const reference = getImageReference(key);
+      if (!reference) {
+        return reply.code(404).send({ error: 'not_found', message: 'Image reference expired' });
+      }
+      return reply
+        .header('content-type', reference.mime)
+        .header('content-length', String(reference.bytes.byteLength))
+        .header('cache-control', 'public, max-age=900, immutable')
+        .header('x-content-type-options', 'nosniff')
+        .send(reference.bytes);
+    },
+  );
+
   app.get(
     '/images/models',
     {

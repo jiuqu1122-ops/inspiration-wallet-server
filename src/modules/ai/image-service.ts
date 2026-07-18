@@ -3,6 +3,7 @@ import { env } from '../../config/env.js';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
 import { CloudAiError } from './service.js';
+import { createImageReference } from './reference-store.js';
 
 const DEFAULT_IMAGE_UNIT_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
 const IMAGE_GENERATION_TIMEOUT_MS = 10 * 60_000;
@@ -497,7 +498,10 @@ async function generateNewApiImages(
 ) {
   const preparedInputImages = await Promise.all(input.inputImages.map(async (source) => {
     try {
-      return await materializeNewApiReferenceImage(source);
+      const dataUrl = await materializeNewApiReferenceImage(source);
+      if (!/^data:image\//i.test(dataUrl)) return dataUrl;
+      const { bytes, mime } = dataUrlImageBytes(dataUrl);
+      return createImageReference(bytes, mime);
     } catch {
       // Keep the public URL as a compatibility fallback when a remote host
       // cannot be fetched by the wallet server.
