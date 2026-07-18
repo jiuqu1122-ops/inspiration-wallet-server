@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildGeminiNativeImageBody,
+  buildNewApiChatImageBody,
   chooseProviderForCapability,
   collectProviderModelIds,
   imageUnitCredits,
@@ -187,5 +188,25 @@ describe('wallet image provider normalization', () => {
       responseModalities: ['TEXT', 'IMAGE'],
       imageConfig: { aspectRatio: '16:9', imageSize: '4K' },
     });
+  });
+
+  it('preserves ready public image URLs for NewAPI chat image requests', () => {
+    const publicReference = 'https://example.com/reference.png';
+    const body = buildNewApiChatImageBody({
+      userId: 'user-1',
+      clientRequestId: 'request-1',
+      model: 'gemini-3-pro-image',
+      prompt: 'render the projector',
+      inputImages: [publicReference],
+      aspectRatio: '16:9',
+      resolution: '2K',
+      outputFormat: 'jpg',
+      count: 1,
+    });
+
+    expect(body.messages[0]?.content).toEqual([
+      { type: 'text', text: expect.stringContaining('render the projector') },
+      { type: 'image_url', image_url: { url: publicReference } },
+    ]);
   });
 });

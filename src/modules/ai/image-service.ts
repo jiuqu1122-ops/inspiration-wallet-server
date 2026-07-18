@@ -403,6 +403,24 @@ function chatContent(input: ImageInput, inputImages = input.inputImages) {
   ];
 }
 
+export function buildNewApiChatImageBody(input: ImageInput, inputImages = input.inputImages) {
+  const imageParams = newApiImageRequestParams(
+    input.model,
+    input.count,
+    input.aspectRatio,
+    input.resolution,
+  );
+  return {
+    model: input.model,
+    ...imageParams,
+    ...(input.negativePrompt ? { negative_prompt: input.negativePrompt } : {}),
+    messages: [{ role: 'user', content: chatContent(input, inputImages) }],
+    modalities: ['image'],
+    stream: false,
+    max_tokens: 8192,
+  };
+}
+
 export function isGeminiNativeImageModel(model: string) {
   const token = imageModelToken(model);
   return token.includes('gemini') || token.includes('nanobanana');
@@ -569,8 +587,22 @@ async function generateNewApiImages(
   secrets: ProviderSecrets,
   input: ImageInput,
 ) {
-  const materializedInputImages = await materializeNewApiReferenceImages(input.inputImages);
   if (isGeminiNativeImageModel(input.model)) {
+    const directPublicReferences = input.inputImages.every((source) => /^https?:\/\//i.test(source.trim()));
+    if (directPublicReferences) {
+      for (const source of input.inputImages) await assertPublicProviderUrl(source);
+      const value = await providerRequest(
+        provider,
+        secrets,
+        '/v1/chat/completions',
+        buildNewApiChatImageBody(input, input.inputImages),
+        IMAGE_GENERATION_TIMEOUT_MS,
+      );
+      const images = uniqueImages(value, input.inputImages, input.count);
+      if (images.length) return images;
+      throw new Error('渠道没有返回图片数据');
+    }
+    const materializedInputImages = await materializeNewApiReferenceImages(input.inputImages);
     const value = await generateGeminiNativeImages(
       provider,
       secrets,
@@ -579,8 +611,9 @@ async function generateNewApiImages(
     );
     const images = uniqueImages(value, input.inputImages, input.count);
     if (images.length) return images;
-    throw new Error('娓犻亾娌℃湁杩斿洖鍥剧墖鏁版嵁');
+    throw new Error('渠道没有返回图片数据');
   }
+  const materializedInputImages = await materializeNewApiReferenceImages(input.inputImages);
   const preparedInputImages = materializedInputImages.map((source, index) => {
     try {
       const dataUrl = source;
@@ -593,26 +626,11 @@ async function generateNewApiImages(
       return input.inputImages[index] ?? source;
     }
   });
-  const imageParams = newApiImageRequestParams(
-    input.model,
-    input.count,
-    input.aspectRatio,
-    input.resolution,
-  );
-  const body = {
-    model: input.model,
-    ...imageParams,
-    ...(input.negativePrompt ? { negative_prompt: input.negativePrompt } : {}),
-    messages: [{ role: 'user', content: chatContent(input, preparedInputImages) }],
-    modalities: ['image'],
-    stream: false,
-    max_tokens: 8192,
-  };
   const value = await providerRequest(
     provider,
     secrets,
     '/v1/chat/completions',
-    body,
+    buildNewApiChatImageBody(input, preparedInputImages),
     IMAGE_GENERATION_TIMEOUT_MS,
   );
   const images = uniqueImages(value, input.inputImages, input.count);
