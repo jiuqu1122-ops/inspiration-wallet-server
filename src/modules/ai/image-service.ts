@@ -371,7 +371,7 @@ async function generateNewApiImages(
     ...imageParams,
     ...(input.negativePrompt ? { negative_prompt: input.negativePrompt } : {}),
     messages: [{ role: 'user', content: chatContent(input) }],
-    modalities: ['text', 'image'],
+    modalities: ['image'],
     stream: false,
     max_tokens: 8192,
   };
