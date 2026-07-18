@@ -4,6 +4,7 @@ import {
   chooseProviderForCapability,
   collectProviderModelIds,
   imageUnitCredits,
+  isGeminiNativeImageModel,
   materializeNewApiReferenceImage,
   newApiImageRequestParams,
   parseXaisTaskId,
@@ -11,7 +12,6 @@ import {
   resolveNewApiImageModel,
   resolveXaisModel,
   resolveXaisWorkerRatio,
-  shouldUseGeminiNativeFallback,
   sizeFromRatio,
   uniqueImages,
 } from '../src/modules/ai/image-service.js';
@@ -153,18 +153,10 @@ describe('wallet image provider normalization', () => {
     });
   });
 
-  it('falls back to the Gemini native endpoint only for explicit compatibility failures', () => {
-    expect(shouldUseGeminiNativeFallback(
-      'gemini-3-pro-image',
-      new Error('HTTP 500: operation copy failed: source path does not exist: output.text'),
-    )).toBe(true);
-    expect(shouldUseGeminiNativeFallback(
-      'gemini-3.1-flash-image',
-      new Error('HTTP 400: Bad request to gemini-flash: Provided image is not valid.'),
-    )).toBe(true);
-    expect(shouldUseGeminiNativeFallback('gemini-3-pro-image', new Error('HTTP 500'))).toBe(false);
-    expect(shouldUseGeminiNativeFallback('gpt-image-2', new Error('source path does not exist: output.text')))
-      .toBe(false);
+  it('identifies Gemini image models that must use the native endpoint', () => {
+    expect(isGeminiNativeImageModel('gemini-3-pro-image')).toBe(true);
+    expect(isGeminiNativeImageModel('Nano Banana 2')).toBe(true);
+    expect(isGeminiNativeImageModel('gpt-image-2')).toBe(false);
   });
 
   it('builds Gemini native inline image parts without file paths or remote URLs', () => {
