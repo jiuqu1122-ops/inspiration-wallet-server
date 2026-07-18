@@ -108,6 +108,12 @@ describe('wallet image provider normalization', () => {
     }, [], 1)).toEqual(['data:image/png;base64,aGVsbG8=']);
   });
 
+  it('extracts raw image Base64 returned in result fields', () => {
+    const rawPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
+    expect(uniqueImages({ output: [{ result: rawPng }] }, [], 1))
+      .toEqual([`data:image/png;base64,${rawPng}`]);
+  });
+
   it('accepts XAIS task IDs returned as plain text or nested results', () => {
     expect(parseXaisTaskId('task-plain-123')).toBe('task-plain-123');
     expect(parseXaisTaskId({ results: [{ taskid: 456789 }] })).toBe('456789');

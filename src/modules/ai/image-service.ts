@@ -240,24 +240,41 @@ async function providerRequest(
   }
 }
 
-function collectImageStrings(value: unknown, output: string[] = []): string[] {
+function looksLikeRawImageBase64(value: string) {
+  const compact = value.replace(/\s+/g, '');
+  return compact.length >= 32 && /^(?:iVBORw0KGgo|\/9j\/|R0lGOD|UklGR)/.test(compact);
+}
+
+function rawImageBase64Mime(value: string) {
+  const compact = value.replace(/\s+/g, '');
+  if (compact.startsWith('/9j/')) return 'image/jpeg';
+  if (compact.startsWith('R0lGOD')) return 'image/gif';
+  if (compact.startsWith('UklGR')) return 'image/webp';
+  return 'image/png';
+}
+
+function collectImageStrings(value: unknown, output: string[] = [], contextKey = ''): string[] {
   if (!value) return output;
   if (typeof value === 'string') {
     const dataUrls = value.match(/data:image\/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=]+/g);
     if (dataUrls) output.push(...dataUrls);
     output.push(...Array.from(value.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)).map((match) => match[1] ?? ''));
     const urls = value.match(/https?:\/\/[^\s"'<>)}\]]+/gi);
+    if (!dataUrls && !urls && /(?:image|result|output|data|base64|source)/i.test(contextKey) && looksLikeRawImageBase64(value)) {
+      const compact = value.replace(/\s+/g, '');
+      output.push(`data:${rawImageBase64Mime(compact)};base64,${compact}`);
+    }
     if (urls) output.push(...urls.map((url) => url.replace(/[.,;，。；]+$/g, '')));
     return output;
   }
   if (Array.isArray(value)) {
-    for (const item of value) collectImageStrings(item, output);
+    for (const item of value) collectImageStrings(item, output, contextKey);
     return output;
   }
   if (typeof value === 'object') {
     const record = value as Record<string, unknown>;
-    const inlineMime = record.mime_type ?? record.mimeType;
-    const inlineData = record.data;
+    const inlineMime = record.mime_type ?? record.mimeType ?? record.media_type ?? record.mediaType;
+    const inlineData = record.data ?? record.base64 ?? record.b64_json;
     if (typeof inlineMime === 'string' && inlineMime.startsWith('image/') && typeof inlineData === 'string') {
       output.push(`data:${inlineMime};base64,${inlineData.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '')}`);
     }
@@ -273,7 +290,7 @@ function collectImageStrings(value: unknown, output: string[] = []): string[] {
           continue;
         }
       }
-      collectImageStrings(nested, output);
+      collectImageStrings(nested, output, normalized);
     }
   }
   return output;
