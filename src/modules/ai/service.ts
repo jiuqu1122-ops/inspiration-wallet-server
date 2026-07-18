@@ -39,6 +39,35 @@ function upstreamHeaders(apiKey: string, customHeaders: Record<string, string>) 
   return headers;
 }
 
+function providerFailureMessage(value: unknown): string {
+  if (!value || typeof value !== 'object') return '';
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = providerFailureMessage(item);
+      if (found) return found;
+    }
+    return '';
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of ['error', 'err', 'fail_reason', 'failure_reason']) {
+    const candidate = record[key];
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+    if (candidate && typeof candidate === 'object') {
+      const nested = providerFailureMessage(candidate);
+      if (nested) return nested;
+    }
+  }
+  const status = typeof record.status === 'string' ? record.status.trim().toLowerCase() : '';
+  if (/^(failed|failure|error|cancelled|canceled)$/.test(status)) {
+    return typeof record.message === 'string' && record.message.trim() ? record.message.trim() : status;
+  }
+  for (const key of ['data', 'result', 'task', 'response']) {
+    const found = providerFailureMessage(record[key]);
+    if (found) return found;
+  }
+  return '';
+}
+
 async function discoverModel(
   provider: { baseUrl: string; defaultModel: string | null },
   apiKey: string,
@@ -168,6 +197,8 @@ async function settleCredits(prisma: PrismaClient, userId: string, requestId: st
 
 async function releaseCredits(prisma: PrismaClient, userId: string, requestId: string) {
   await prisma.$transaction(async (transaction) => {
+    const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
+    if (!request || request.userId !== userId || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
     const wallet = await transaction.wallet.update({
       where: { userId },
       data: {
@@ -238,6 +269,10 @@ export async function executeWalletAgentChat(
       result = JSON.parse(text);
     } catch {
       throw new CloudAiError('provider_invalid_response', 'Agent 渠道返回格式无效', 502);
+    }
+    const providerFailure = providerFailureMessage(result);
+    if (providerFailure) {
+      throw new CloudAiError('provider_request_failed', `Agent upstream failed: ${providerFailure}`, 502);
     }
     await settleCredits(prisma, input.userId, requestId);
     return result;

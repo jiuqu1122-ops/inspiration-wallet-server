@@ -47,6 +47,8 @@ const videoStatusSchema = z.object({
   provider: z.enum(['new-api', 'xais-chat']).nullish()
     .transform((value) => value ?? undefined),
   taskId: z.string().trim().min(1).max(256),
+  clientRequestId: z.string().trim().min(8).max(128).nullish()
+    .transform((value) => value ?? undefined),
 }).strict();
 
 const imageModelsQuerySchema = z.object({
@@ -155,7 +157,10 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       });
       if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', message: '视频任务 ID 无效' });
       try {
-        return await executeWalletVideoStatus(app.prisma, parsed.data);
+        return await executeWalletVideoStatus(app.prisma, {
+          userId: request.user.sub,
+          ...parsed.data,
+        });
       } catch (error) {
         return knownError(reply, error);
       }

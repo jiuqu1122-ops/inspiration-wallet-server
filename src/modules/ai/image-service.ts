@@ -643,6 +643,8 @@ async function releaseImageCredits(
   estimated: bigint,
 ) {
   await prisma.$transaction(async (transaction) => {
+    const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
+    if (!request || request.userId !== input.userId || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
     const wallet = await transaction.wallet.update({
       where: { userId: input.userId },
       data: { availableCredits: { increment: estimated }, reservedCredits: { decrement: estimated } },
@@ -792,9 +794,72 @@ async function settleVideo(prisma: PrismaClient, userId: string, requestId: stri
 
 async function releaseVideo(prisma: PrismaClient, userId: string, requestId: string, released: bigint) {
   await prisma.$transaction(async (transaction) => {
+    const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
+    if (!request || request.userId !== userId || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
     const wallet = await transaction.wallet.update({ where: { userId }, data: { availableCredits: { increment: released }, reservedCredits: { decrement: released } } });
     await transaction.aiRequest.update({ where: { id: requestId }, data: { status: 'FAILED', completedAt: new Date() } });
     await transaction.walletLedger.create({ data: { userId, requestId, type: 'RELEASE', amount: released, balanceAfter: wallet.availableCredits, description: '视频请求失败，释放额度' } });
+  });
+}
+
+async function refundVideoRequest(prisma: PrismaClient, userId: string, clientRequestId: string) {
+  return prisma.$transaction(async (transaction) => {
+    const request = await transaction.aiRequest.findUnique({
+      where: { userId_clientRequestId: { userId, clientRequestId } },
+    });
+    if (!request || request.capability !== 'VIDEO' || request.status === 'REFUNDED') return false;
+
+    if (request.status === 'SUCCEEDED') {
+      const refund = request.chargedCredits;
+      if (refund <= 0n) return false;
+      const wallet = await transaction.wallet.update({
+        where: { userId },
+        data: {
+          availableCredits: { increment: refund },
+          lifetimeConsumed: { decrement: refund },
+        },
+      });
+      await transaction.aiRequest.update({
+        where: { id: request.id },
+        data: { status: 'REFUNDED', completedAt: new Date() },
+      });
+      await transaction.walletLedger.create({
+        data: {
+          userId,
+          requestId: request.id,
+          type: 'REFUND',
+          amount: refund,
+          balanceAfter: wallet.availableCredits,
+          description: '视频任务失败，退回已结算额度',
+        },
+      });
+      return true;
+    }
+
+    if (request.status !== 'RESERVED' && request.status !== 'PROCESSING') return false;
+    const release = request.estimatedCredits;
+    const wallet = await transaction.wallet.update({
+      where: { userId },
+      data: {
+        availableCredits: { increment: release },
+        reservedCredits: { decrement: release },
+      },
+    });
+    await transaction.aiRequest.update({
+      where: { id: request.id },
+      data: { status: 'FAILED', completedAt: new Date() },
+    });
+    await transaction.walletLedger.create({
+      data: {
+        userId,
+        requestId: request.id,
+        type: 'RELEASE',
+        amount: release,
+        balanceAfter: wallet.availableCredits,
+        description: '视频任务失败，释放预扣额度',
+      },
+    });
+    return true;
   });
 }
 
@@ -815,7 +880,10 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
         ...(input.resolution ? { resolution: input.resolution } : {}),
         ...(input.duration ? { duration: input.duration } : {}),
       };
-      results.push((await providerRequest(provider, secrets, path, body)));
+      const result = await providerRequest(provider, secrets, path, body);
+      const failure = getFailure(result);
+      if (failure) throw new CloudAiError('video_generation_failed', failure, 502);
+      results.push(result);
     }
     await settleVideo(prisma, input.userId, reservation.requestId, reservation.estimated);
     return { results, provider: provider.kind, model: input.model, chargedCredits: reservation.estimated.toString() };
@@ -826,13 +894,23 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
   }
 }
 
-export async function executeWalletVideoStatus(prisma: PrismaClient, input: { provider?: VideoInput['provider']; taskId: string }) {
+export async function executeWalletVideoStatus(
+  prisma: PrismaClient,
+  input: { userId: string; provider?: VideoInput['provider']; taskId: string; clientRequestId?: string | undefined },
+) {
   const provider = await selectVideoProvider(prisma, input.provider);
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
   const path = provider.kind === 'XAIS'
     ? `/xais/workerTaskWait?json=1&id=${encodeURIComponent(input.taskId)}`
     : `/v1/video/generations/${encodeURIComponent(input.taskId)}`;
   const waited = await providerRequest(provider, secrets, path);
+  const failure = getFailure(waited);
+  if (failure) {
+    if (input.clientRequestId) {
+      await refundVideoRequest(prisma, input.userId, input.clientRequestId);
+    }
+    throw new CloudAiError('video_generation_failed', failure, 502);
+  }
   if (provider.kind !== 'XAIS') return waited;
   const attachments = collectAttachmentIds(waited)
     .filter((value) => !/^(?:pending|processing|queued|completed|success|succeeded|failed|failure|error|cancelled|canceled)$/i.test(value));

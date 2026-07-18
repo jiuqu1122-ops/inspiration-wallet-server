@@ -105,7 +105,7 @@ npm run build
 
 `POST /v1/ai/images/generations` 需要 Access Token，接受客户端幂等 ID、渠道类型、模型、提示词、参考图、比例、分辨率、格式和数量。服务器只会选择已启用、声明 `IMAGE` 能力且未同时声明 `LLM` 能力的同类 NewAPI/XAIS 生图渠道；具体模型优先使用客户端节点本次选择的模型，管理器中的渠道默认模型只在客户端未指定时兜底。服务端会把主程序的 Nano Banana Pro、Nano Banana 2、GPT Image 2 显示名或旧别名归一化为标准 NewAPI 模型 ID，其他自定义模型保持原样。NewAPI 生图固定调用 `/v1/chat/completions`。服务按 `IMAGE_REQUEST_CREDITS × 请求数量` 预扣；成功后按实际返回图片数结算，少返回的部分自动退回，失败则释放全部预扣额度。上游 API Key 只在服务器解密和使用。
 
-`POST /v1/ai/videos` 与 `GET /v1/ai/videos/:taskId` 需要 Access Token。创建视频任务时服务器会选择已启用且声明 `VIDEO` 能力的 NewAPI/XAIS 渠道，按 `VIDEO_REQUEST_CREDITS × 请求数量` 预扣，创建上游任务成功后结算，创建失败自动释放。客户端只轮询本服务，不接触上游地址或 API Key。
+`POST /v1/ai/videos` 与 `GET /v1/ai/videos/:taskId` 需要 Access Token。创建视频任务时服务器会选择已启用且声明 `VIDEO` 能力的 NewAPI/XAIS 渠道，按 `VIDEO_REQUEST_CREDITS × 请求数量` 预扣，创建上游任务成功后结算，创建失败自动释放；客户端轮询到上游明确失败状态时，服务端会按原请求 ID 一次性退款，重复轮询不会重复退款。客户端只轮询本服务，不接触上游地址或 API Key。
 
 ### 基础接口
 
