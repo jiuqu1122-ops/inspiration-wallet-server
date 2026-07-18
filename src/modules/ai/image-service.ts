@@ -25,6 +25,10 @@ const NEW_API_IMAGE_MODEL_MAP: Record<string, string> = {
   gemini3pro: 'gemini-3-pro-image',
   gemini3proimage: 'gemini-3-pro-image',
   gemini31proimage: 'gemini-3-pro-image',
+  googlegemini3proimage: 'gemini-3-pro-image',
+  googlegemini31proimage: 'gemini-3-pro-image',
+  modelsgemini3proimage: 'gemini-3-pro-image',
+  modelsgemini31proimage: 'gemini-3-pro-image',
   nanobanana2: 'gemini-3.1-flash-image',
   gemini31flashimage: 'gemini-3.1-flash-image',
   gemini3flashimage: 'gemini-3.1-flash-image',
@@ -42,9 +46,6 @@ export function resolveNewApiImageModel(model: string) {
   const token = imageModelToken(trimmed);
   const exact = NEW_API_IMAGE_MODEL_MAP[token];
   if (exact) return exact;
-  if (token.endsWith('gemini3proimage') || token.endsWith('gemini31proimage')) return 'gemini-3-pro-image';
-  if (token.endsWith('gemini31flashimage') || token.endsWith('gemini3flashimage')) return 'gemini-3.1-flash-image';
-  if (token.endsWith('gptimage2')) return 'gpt-image-2';
   return trimmed;
 }
 

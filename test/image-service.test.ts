@@ -52,6 +52,9 @@ describe('wallet image provider normalization', () => {
     expect(resolveNewApiImageModel('Nano Banana 2')).toBe('gemini-3.1-flash-image');
     expect(resolveNewApiImageModel('Gemini31FlashImage')).toBe('gemini-3.1-flash-image');
     expect(resolveNewApiImageModel('GPT Image 2')).toBe('gpt-image-2');
+    expect(resolveNewApiImageModel('「Hu」gpt-image-2')).toBe('「Hu」gpt-image-2');
+    expect(resolveNewApiImageModel('「CS」gpt-image-2')).toBe('「CS」gpt-image-2');
+    expect(resolveNewApiImageModel('「Rim」gemini-3-pro-image-preview')).toBe('「Rim」gemini-3-pro-image-preview');
     expect(resolveNewApiImageModel('custom-image-model')).toBe('custom-image-model');
   });
 
