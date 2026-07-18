@@ -184,7 +184,7 @@ describe('wallet image provider normalization', () => {
       { inlineData: { mimeType: 'image/png', data: 'aGVsbG8=' } },
     ]);
     expect(body.generationConfig).toEqual({
-      responseModalities: ['TEXT', 'IMAGE'],
+      responseModalities: ['IMAGE'],
       imageConfig: { aspectRatio: '16:9', imageSize: '4K' },
     });
   });

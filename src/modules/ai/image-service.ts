@@ -9,6 +9,10 @@ const DEFAULT_IMAGE_UNIT_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
 const IMAGE_GENERATION_TIMEOUT_MS = 10 * 60_000;
 const IMAGE_REFERENCE_FETCH_TIMEOUT_MS = 30_000;
 const MAX_IMAGE_REFERENCE_BYTES = 16 * 1024 * 1024;
+const IMAGE_REFERENCE_CACHE_TTL_MS = 10 * 60_000;
+const IMAGE_REFERENCE_CACHE_MAX_ENTRIES = 32;
+const imageReferenceCache = new Map<string, { dataUrl: string; expiresAt: number }>();
+const pendingImageReferenceFetches = new Map<string, Promise<string>>();
 const XAIS_MODEL_MAP: Record<string, string> = {
   'Xais Nano Pro_2K': 'Nano_Banana_Pro_2K_0',
   'Xais Nano Pro_4K': 'Nano_Banana_Pro_4K_0',
@@ -447,7 +451,10 @@ export function buildGeminiNativeImageBody(input: ImageInput, inputImages = inpu
       ],
     }],
     generationConfig: {
-      responseModalities: ['TEXT', 'IMAGE'],
+      // Some NewAPI Gemini adapters try to copy the optional text artifact
+      // into a temporary `.text` path and fail the whole image request when
+      // that artifact is absent. This endpoint only needs the image result.
+      responseModalities: ['IMAGE'],
       imageConfig: {
         aspectRatio: input.aspectRatio,
         imageSize,
@@ -544,18 +551,37 @@ async function readLimitedImageBody(response: Response) {
   return `data:${mime};base64,${bytes.toString('base64')}`;
 }
 
-/**
- * NewAPI-compatible image endpoints handle data URLs more consistently than
- * temporary public URLs. Materialize public references in memory only; never
- * persist them, log them, or forward a local/private URL.
- */
-export async function materializeNewApiReferenceImage(source: string) {
-  const trimmed = source.trim();
-  if (!/^https?:\/\//i.test(trimmed)) return trimmed;
+function readCachedImageReference(source: string) {
+  const cached = imageReferenceCache.get(source);
+  if (!cached) return undefined;
+  if (cached.expiresAt <= Date.now()) {
+    imageReferenceCache.delete(source);
+    return undefined;
+  }
+  // Refresh insertion order so active references are evicted last.
+  imageReferenceCache.delete(source);
+  imageReferenceCache.set(source, cached);
+  return cached.dataUrl;
+}
+
+function cacheImageReference(source: string, dataUrl: string) {
+  imageReferenceCache.delete(source);
+  imageReferenceCache.set(source, {
+    dataUrl,
+    expiresAt: Date.now() + IMAGE_REFERENCE_CACHE_TTL_MS,
+  });
+  while (imageReferenceCache.size > IMAGE_REFERENCE_CACHE_MAX_ENTRIES) {
+    const oldest = imageReferenceCache.keys().next().value;
+    if (!oldest) break;
+    imageReferenceCache.delete(oldest);
+  }
+}
+
+async function fetchPublicImageReference(source: string) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), IMAGE_REFERENCE_FETCH_TIMEOUT_MS);
   try {
-    let current = new URL(trimmed);
+    let current = new URL(source);
     for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
       await assertPublicProviderUrl(current.toString());
       const response = await fetch(current, {
@@ -573,9 +599,36 @@ export async function materializeNewApiReferenceImage(source: string) {
       if (!response.ok) throw new Error(`reference image HTTP ${response.status}`);
       return await readLimitedImageBody(response);
     }
-    return trimmed;
+    throw new Error('reference image redirect limit exceeded');
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+/**
+ * NewAPI-compatible image endpoints handle data URLs more consistently than
+ * temporary public URLs. Materialize public references in memory only. A
+ * short-lived cache lets sequential provider failover reuse the bytes even if
+ * a temporary tunnel disappears between attempts; nothing is persisted or
+ * logged.
+ */
+export async function materializeNewApiReferenceImage(source: string) {
+  const trimmed = source.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return trimmed;
+  const cached = readCachedImageReference(trimmed);
+  if (cached) return cached;
+  const pending = pendingImageReferenceFetches.get(trimmed);
+  if (pending) return pending;
+  const fetchPromise = fetchPublicImageReference(trimmed);
+  pendingImageReferenceFetches.set(trimmed, fetchPromise);
+  try {
+    const dataUrl = await fetchPromise;
+    cacheImageReference(trimmed, dataUrl);
+    return dataUrl;
+  } finally {
+    if (pendingImageReferenceFetches.get(trimmed) === fetchPromise) {
+      pendingImageReferenceFetches.delete(trimmed);
+    }
   }
 }
 
