@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   chooseProviderForCapability,
   collectProviderModelIds,
+  imageUnitCredits,
   newApiImageRequestParams,
   parseXaisTaskId,
   resolveImageModel,
@@ -83,6 +84,18 @@ describe('wallet image provider normalization', () => {
     expect(sizeFromRatio('1:1')).toBe('1024x1024');
     expect(sizeFromRatio('16:9')).toBe('1792x1024');
     expect(sizeFromRatio('9:16')).toBe('1024x1792');
+  });
+
+  it('prices unified image families by clarity without depending on the provider', () => {
+    expect(imageUnitCredits('gemini-3-pro-image', '2K')).toBe(18n);
+    expect(imageUnitCredits('Xais Nano Pro_4K', '2K')).toBe(20n);
+    expect(imageUnitCredits('gemini-3.1-flash-image', '2K')).toBe(15n);
+    expect(imageUnitCredits('Xais Nano2_4K', '2K')).toBe(18n);
+    expect(imageUnitCredits('gpt-image-2', '1K')).toBe(10n);
+    expect(imageUnitCredits('Image2_2K', '4K')).toBe(15n);
+    expect(imageUnitCredits('Xais Img2_4K', '2K')).toBe(18n);
+    expect(imageUnitCredits('Xais Img2_2K(高画质)', '4K')).toBe(30n);
+    expect(imageUnitCredits('Xais_Img2_4K_H', '2K')).toBe(35n);
   });
 
   it('extracts Gemini inline_data image results', () => {

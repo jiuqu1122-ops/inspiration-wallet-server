@@ -19,7 +19,7 @@ export class CloudAiError extends Error {
 async function selectProvider(prisma: PrismaClient) {
   const provider = await prisma.aiProviderChannel.findFirst({
     where: { status: 'ACTIVE', capabilities: { has: 'LLM' } },
-    orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }],
+    orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }],
   });
   if (!provider) {
     throw new CloudAiError('provider_unavailable', '当前没有可用的 Agent 渠道', 503);

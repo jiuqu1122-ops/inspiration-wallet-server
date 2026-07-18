@@ -4,7 +4,7 @@ import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
 import { CloudAiError } from './service.js';
 
-const UNIT_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
+const DEFAULT_IMAGE_UNIT_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
 const XAIS_MODEL_MAP: Record<string, string> = {
   'Xais Nano Pro_2K': 'Nano_Banana_Pro_2K_0',
   'Xais Nano Pro_4K': 'Nano_Banana_Pro_4K_0',
@@ -40,6 +40,53 @@ const imageModelToken = (model: string) => model
   .toLowerCase()
   .replace(/preview/g, '')
   .replace(/[^a-z0-9]+/g, '');
+
+type PricedImageResolution = '1k' | '2k' | '4k';
+
+const pricedImageResolution = (model: string, resolution?: string): PricedImageResolution => {
+  const token = imageModelToken(model);
+  if (token.includes('4k')) return '4k';
+  if (token.includes('2k')) return '2k';
+  if (token.includes('1k')) return '1k';
+  const requested = resolution?.trim().toLowerCase();
+  if (requested === '1k' || requested === '4k') return requested;
+  return '2k';
+};
+
+export function imageUnitCredits(model: string, resolution?: string) {
+  const token = imageModelToken(model);
+  const selectedResolution = pricedImageResolution(model, resolution);
+  const isGptImage2 = token.includes('gptimage2')
+    || token.includes('image2')
+    || token.includes('img2');
+  const isHighQuality = isGptImage2 && (
+    model.includes('高画质')
+    || token.endsWith('h')
+    || token.includes('highquality')
+  );
+
+  if (isHighQuality) return selectedResolution === '4k' ? 35n : 30n;
+  if (isGptImage2) {
+    if (selectedResolution === '1k') return 10n;
+    return selectedResolution === '4k' ? 18n : 15n;
+  }
+
+  const isNanoBananaPro = token.includes('nanobananapro')
+    || token.includes('xaisnanopro')
+    || token.includes('nanopro')
+    || token.includes('gemini3proimage')
+    || token.includes('gemini31proimage');
+  if (isNanoBananaPro) return selectedResolution === '4k' ? 20n : 18n;
+
+  const isNanoBanana2 = token.includes('nanobanana2')
+    || token.includes('xaisnano2')
+    || token.includes('nano2')
+    || token.includes('gemini31flashimage')
+    || token.includes('gemini3flashimage');
+  if (isNanoBanana2) return selectedResolution === '4k' ? 18n : 15n;
+
+  return DEFAULT_IMAGE_UNIT_CREDITS;
+}
 
 export function resolveNewApiImageModel(model: string) {
   const trimmed = model.trim();
@@ -95,7 +142,7 @@ async function listImageProviders(prisma: PrismaClient) {
   const common = { status: 'ACTIVE' as const, capabilities: { has: 'IMAGE' as const } };
   const providers = await prisma.aiProviderChannel.findMany({
     where: common,
-    orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }],
+    orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }],
   });
   return providers.filter((provider) => !provider.capabilities.includes('LLM'));
 }
@@ -123,13 +170,7 @@ export function chooseProviderForCapability<T extends Pick<AiProviderChannel, 'c
   const eligible = capability === 'LLM'
     ? providers
     : providers.filter((provider) => !provider.capabilities.includes('LLM'));
-  const rank = (provider: T) => {
-    if (provider.capabilities.length === 1 && provider.capabilities[0] === capability) return 0;
-    return 1;
-  };
-  return eligible.reduce<T | undefined>((selected, provider) => (
-    !selected || rank(provider) < rank(selected) ? provider : selected
-  ), undefined);
+  return eligible[0];
 }
 
 export function resolveImageModel(
@@ -551,7 +592,7 @@ async function generateXaisImages(
 }
 
 async function reserveImageCredits(prisma: PrismaClient, input: ImageInput) {
-  const estimated = UNIT_CREDITS * BigInt(input.count);
+  const estimated = imageUnitCredits(input.model, input.resolution) * BigInt(input.count);
   const requestId = await prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({
       where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } },
@@ -616,7 +657,7 @@ async function settleImageCredits(
   estimated: bigint,
   generatedCount: number,
 ) {
-  const charged = UNIT_CREDITS * BigInt(generatedCount);
+  const charged = imageUnitCredits(input.model, input.resolution) * BigInt(generatedCount);
   const refund = estimated - charged;
   await prisma.$transaction(async (transaction) => {
     const wallet = await transaction.wallet.update({
@@ -769,10 +810,10 @@ async function selectVideoProvider(prisma: PrismaClient, preference?: VideoInput
     return selected;
   }
   const preferred = kind
-    ? await prisma.aiProviderChannel.findMany({ where: { ...common, kind }, orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }] })
+    ? await prisma.aiProviderChannel.findMany({ where: { ...common, kind }, orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }] })
     : [];
   const fallback = preferred.length === 0
-    ? await prisma.aiProviderChannel.findMany({ where: common, orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }] })
+    ? await prisma.aiProviderChannel.findMany({ where: common, orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }] })
     : [];
   const provider = chooseProviderForCapability(preferred.length ? preferred : fallback, 'VIDEO');
   if (!provider) throw new CloudAiError('provider_unavailable', '当前没有可用的视频渠道', 503);

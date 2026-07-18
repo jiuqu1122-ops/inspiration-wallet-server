@@ -30,6 +30,7 @@ export class ProviderServiceError extends Error {
 type ProviderInput = {
   name: string;
   kind: AiProviderKind;
+  priority?: number | undefined;
   baseUrl: string;
   defaultModel?: string | undefined;
   apiKey: string;
@@ -42,6 +43,7 @@ type ProviderInput = {
 
 type ProviderUpdateInput = {
   name?: string | undefined;
+  priority?: number | undefined;
   baseUrl?: string | undefined;
   defaultModel?: string | undefined;
   apiKey?: string | undefined;
@@ -65,6 +67,7 @@ function serializeProvider(provider: AiProviderChannel) {
     name: provider.name,
     kind: provider.kind,
     enabled: provider.status === 'ACTIVE',
+    priority: provider.priority,
     baseUrl: provider.baseUrl,
     defaultModel: provider.defaultModel,
     allowInsecureHttp: provider.allowInsecureHttp,
@@ -139,7 +142,7 @@ async function replayProviderOperation(prisma: PrismaClient, idempotencyKey: str
 
 export async function listProviders(prisma: PrismaClient) {
   const providers = await prisma.aiProviderChannel.findMany({
-    orderBy: [{ kind: 'asc' }, { updatedAt: 'desc' }],
+    orderBy: [{ priority: 'asc' }, { kind: 'asc' }, { name: 'asc' }],
   });
   return { items: providers.map(serializeProvider) };
 }
@@ -166,6 +169,7 @@ export async function createProvider(prisma: PrismaClient, input: ProviderInput)
           name: input.name.trim(),
           kind: input.kind,
           status: input.enabled === false ? 'DISABLED' : 'ACTIVE',
+          priority: input.priority ?? 100,
           baseUrl,
           defaultModel: input.defaultModel?.trim() || null,
           allowInsecureHttp,
@@ -234,6 +238,7 @@ export async function updateProvider(
         where: { id: providerId },
         data: {
           ...(input.name !== undefined ? { name: input.name.trim() } : {}),
+          ...(input.priority !== undefined ? { priority: input.priority } : {}),
           ...(input.enabled !== undefined ? { status: input.enabled ? 'ACTIVE' : 'DISABLED' } : {}),
           ...(input.capabilities !== undefined ? { capabilities: input.capabilities } : {}),
           ...(input.defaultModel !== undefined ? { defaultModel: input.defaultModel.trim() || null } : {}),

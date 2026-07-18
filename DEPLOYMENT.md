@@ -109,7 +109,7 @@ nano .env
 - `SMTP_HOST`、`SMTP_PORT`、`SMTP_SECURE`、`SMTP_USER`、`SMTP_PASSWORD`、`SMTP_FROM`：用于发送邮箱验证码。`465` 通常对应 `SMTP_SECURE=true`，`587` 通常对应 `false`；以邮件服务商说明为准。生产上线前必须用真实邮箱完成一次收信测试。
 - `EMAIL_CODE_TTL_MINUTES`：验证码有效分钟数，允许 5 到 30，默认 10。
 - `AGENT_REQUEST_CREDITS`：每次钱包 Agent 请求的预扣额度，必须是正整数；测试环境可从 `1` 开始，后续按实际计费策略调整。
-- `IMAGE_REQUEST_CREDITS`：每张钱包生图的预扣与结算额度，必须是正整数；默认测试值为 `100`。
+- `IMAGE_REQUEST_CREDITS`：未列入内置价格表的模型所使用的每张默认额度，必须是正整数；Nano Banana Pro、Nano Banana 2、GPT Image 2 和 GPT Image 2 H 按代码中的模型与清晰度价格表计费。
 - `VIDEO_REQUEST_CREDITS`：每个钱包视频任务的预扣与结算额度，必须是正整数；默认测试值为 `500`，请求数量大于 1 时按数量倍增。
 - `ADMIN_API_KEY_HASH`：私有运营工作台管理员密钥的 SHA-256 哈希；原始管理员密钥只放密码管理器。
 - `PROVIDER_SECRETS_ENCRYPTION_KEY`：Base64 编码的 32 字节随机主密钥，用于 AES-256-GCM 加密上游渠道凭据。必须长期备份且不能随意轮换。

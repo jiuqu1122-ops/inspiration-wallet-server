@@ -14,6 +14,7 @@ const providerIdSchema = z.object({ providerId: z.string().min(1).max(64) });
 const operationKeySchema = z.string().min(16).max(128).regex(/^[a-zA-Z0-9_-]+$/);
 const kindSchema = z.enum(['NEW_API', 'XAIS']);
 const capabilitySchema = z.enum(['LLM', 'IMAGE', 'VIDEO']);
+const prioritySchema = z.number().int().min(0).max(9_999);
 const headersSchema = z.record(z.string().max(100), z.string().max(2_000)).refine(
   (headers) => Object.keys(headers).length <= 20,
   'Too many custom headers',
@@ -21,6 +22,7 @@ const headersSchema = z.record(z.string().max(100), z.string().max(2_000)).refin
 const createSchema = z.object({
   name: z.string().trim().min(2).max(80),
   kind: kindSchema,
+  priority: prioritySchema.default(100),
   baseUrl: z.url().max(2_000),
   defaultModel: z.string().trim().max(200).optional(),
   apiKey: z.string().trim().min(8).max(2_000),
@@ -32,6 +34,7 @@ const createSchema = z.object({
 }).strict();
 const updateSchema = z.object({
   name: z.string().trim().min(2).max(80).optional(),
+  priority: prioritySchema.optional(),
   baseUrl: z.url().max(2_000).optional(),
   defaultModel: z.string().trim().max(200).optional(),
   apiKey: z.string().trim().min(8).max(2_000).optional(),

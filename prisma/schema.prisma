@@ -73,38 +73,38 @@ enum CreditRedemptionCodeStatus {
 }
 
 model User {
-  id              String           @id @default(cuid())
-  email           String?          @unique
-  displayName     String?
-  emailVerifiedAt DateTime?
+  id                   String                       @id @default(cuid())
+  email                String?                      @unique
+  displayName          String?
+  emailVerifiedAt      DateTime?
   entitlementExpiresAt DateTime?
-  entitlementEdition LicenseEdition @default(ENTERPRISE)
-  entitlementFeatures String[]      @default([])
-  status          UserStatus       @default(ACTIVE)
-  createdAt       DateTime         @default(now())
-  updatedAt       DateTime         @updatedAt
-  licenses        License[]
-  wallet          Wallet?
-  ledger          WalletLedger[]
-  aiRequests      AiRequest[]
-  sessions        AuthSession[]
-  adminOperations AdminOperation[]
-  emailChallenges EmailVerificationChallenge[]
-  creditRedemptions CreditRedemption[]
+  entitlementEdition   LicenseEdition               @default(ENTERPRISE)
+  entitlementFeatures  String[]                     @default([])
+  status               UserStatus                   @default(ACTIVE)
+  createdAt            DateTime                     @default(now())
+  updatedAt            DateTime                     @updatedAt
+  licenses             License[]
+  wallet               Wallet?
+  ledger               WalletLedger[]
+  aiRequests           AiRequest[]
+  sessions             AuthSession[]
+  adminOperations      AdminOperation[]
+  emailChallenges      EmailVerificationChallenge[]
+  creditRedemptions    CreditRedemption[]
 
   @@index([status])
 }
 
 model EmailVerificationChallenge {
-  id         String   @id
+  id         String    @id
   email      String
   codeHash   String
-  attempts   Int      @default(0)
+  attempts   Int       @default(0)
   expiresAt  DateTime
   consumedAt DateTime?
-  createdAt  DateTime @default(now())
+  createdAt  DateTime  @default(now())
   userId     String?
-  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  user       User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   @@index([email, createdAt])
   @@index([expiresAt])
@@ -177,17 +177,17 @@ model WalletLedger {
 }
 
 model CreditRedemptionCode {
-  id              String                     @id @default(cuid())
-  codeHash        String                     @unique
-  codeHint        String
-  credits         BigInt
-  maxRedemptions  Int                        @default(1)
-  redeemedCount   Int                        @default(0)
-  status          CreditRedemptionCodeStatus @default(ACTIVE)
-  expiresAt       DateTime?
-  note            String?
-  createdAt       DateTime                   @default(now())
-  redemptions     CreditRedemption[]
+  id             String                     @id @default(cuid())
+  codeHash       String                     @unique
+  codeHint       String
+  credits        BigInt
+  maxRedemptions Int                        @default(1)
+  redeemedCount  Int                        @default(0)
+  status         CreditRedemptionCodeStatus @default(ACTIVE)
+  expiresAt      DateTime?
+  note           String?
+  createdAt      DateTime                   @default(now())
+  redemptions    CreditRedemption[]
 
   @@index([status, expiresAt])
   @@index([createdAt])
@@ -245,6 +245,7 @@ model AiProviderChannel {
   name               String           @unique
   kind               AiProviderKind
   status             AiProviderStatus @default(ACTIVE)
+  priority           Int              @default(100)
   baseUrl            String
   defaultModel       String?
   allowInsecureHttp  Boolean          @default(false)
@@ -259,5 +260,6 @@ model AiProviderChannel {
   updatedAt          DateTime         @updatedAt
 
   @@index([kind, status])
+  @@index([status, priority])
   @@index([updatedAt])
 }
