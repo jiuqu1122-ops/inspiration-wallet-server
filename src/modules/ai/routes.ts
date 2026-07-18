@@ -33,6 +33,8 @@ const videoSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
   provider: z.enum(['new-api', 'xais-chat']).nullish()
     .transform((value) => value ?? undefined),
+  providerChannelId: z.string().trim().min(1).max(128).nullish()
+    .transform((value) => value ?? undefined),
   model: z.string().trim().min(1).max(200),
   prompt: z.string().trim().min(1).max(50_000),
   inputImages: z.array(z.string().min(1).max(12_000_000)).max(13).default([]),
@@ -45,6 +47,8 @@ const videoSchema = z.object({
 
 const videoStatusSchema = z.object({
   provider: z.enum(['new-api', 'xais-chat']).nullish()
+    .transform((value) => value ?? undefined),
+  providerChannelId: z.string().trim().min(1).max(128).nullish()
     .transform((value) => value ?? undefined),
   taskId: z.string().trim().min(1).max(256),
   clientRequestId: z.string().trim().min(8).max(128).nullish()

@@ -715,6 +715,7 @@ export type VideoInput = {
   userId: string;
   clientRequestId: string;
   provider?: 'new-api' | 'xais-chat' | undefined;
+  providerChannelId?: string | undefined;
   model: string;
   prompt: string;
   inputImages: string[];
@@ -737,9 +738,15 @@ function videoProviderKind(provider?: VideoInput['provider']) {
   return undefined;
 }
 
-async function selectVideoProvider(prisma: PrismaClient, preference?: VideoInput['provider']) {
+async function selectVideoProvider(prisma: PrismaClient, preference?: VideoInput['provider'], providerChannelId?: string) {
   const kind = videoProviderKind(preference);
   const common = { status: 'ACTIVE' as const, capabilities: { has: 'VIDEO' as const } };
+  if (providerChannelId) {
+    const selected = await prisma.aiProviderChannel.findFirst({ where: { ...common, id: providerChannelId, ...(kind ? { kind } : {}) } });
+    if (!selected) throw new CloudAiError('provider_unavailable', '所选视频渠道不可用或已被停用', 503);
+    await assertPublicProviderUrl(selected.baseUrl);
+    return selected;
+  }
   const preferred = kind
     ? await prisma.aiProviderChannel.findMany({ where: { ...common, kind }, orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }] })
     : [];
@@ -866,7 +873,7 @@ async function refundVideoRequest(prisma: PrismaClient, userId: string, clientRe
 export async function executeWalletVideoGeneration(prisma: PrismaClient, input: VideoInput) {
   const reservation = await reserveVideo(prisma, input);
   try {
-    const provider = await selectVideoProvider(prisma, input.provider);
+    const provider = await selectVideoProvider(prisma, input.provider, input.providerChannelId);
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
     const results: unknown[] = [];
     for (let index = 0; index < input.count; index += 1) {
@@ -896,9 +903,9 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
 
 export async function executeWalletVideoStatus(
   prisma: PrismaClient,
-  input: { userId: string; provider?: VideoInput['provider']; taskId: string; clientRequestId?: string | undefined },
+  input: { userId: string; provider?: VideoInput['provider']; providerChannelId?: string | undefined; taskId: string; clientRequestId?: string | undefined },
 ) {
-  const provider = await selectVideoProvider(prisma, input.provider);
+  const provider = await selectVideoProvider(prisma, input.provider, input.providerChannelId);
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
   const path = provider.kind === 'XAIS'
     ? `/xais/workerTaskWait?json=1&id=${encodeURIComponent(input.taskId)}`
