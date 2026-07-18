@@ -24,6 +24,21 @@ const XAIS_MODEL_MAP: Record<string, string> = {
   'Xais Img2_4K(高画质)': 'Xais_Img2_4K_H',
 };
 
+const NEW_API_IMAGE_MODEL_MAP: Record<string, string> = {
+  nanobananapro: 'gemini-3-pro-image',
+  gemini3pro: 'gemini-3-pro-image',
+  gemini3proimage: 'gemini-3-pro-image',
+  gemini31proimage: 'gemini-3-pro-image',
+  googlegemini3proimage: 'gemini-3-pro-image',
+  googlegemini31proimage: 'gemini-3-pro-image',
+  modelsgemini3proimage: 'gemini-3-pro-image',
+  modelsgemini31proimage: 'gemini-3-pro-image',
+  nanobanana2: 'gemini-3.1-flash-image',
+  gemini31flashimage: 'gemini-3.1-flash-image',
+  gemini3flashimage: 'gemini-3.1-flash-image',
+  gptimage2: 'gpt-image-2',
+};
+
 const imageModelToken = (model: string) => model
   .trim()
   .toLowerCase()
@@ -79,9 +94,9 @@ export function imageUnitCredits(model: string, resolution?: string) {
 
 export function resolveNewApiImageModel(model: string) {
   const trimmed = model.trim();
-  if (/^nano[\s_-]*banana[\s_-]*pro$/i.test(trimmed)) return 'gemini-3-pro-image';
-  if (/^nano[\s_-]*banana[\s_-]*2$/i.test(trimmed)) return 'gemini-3.1-flash-image';
-  if (/^gpt[\s_-]*image[\s_-]*2$/i.test(trimmed)) return 'gpt-image-2';
+  const token = imageModelToken(trimmed);
+  const exact = NEW_API_IMAGE_MODEL_MAP[token];
+  if (exact) return exact;
   return trimmed;
 }
 
@@ -403,24 +418,6 @@ function chatContent(input: ImageInput, inputImages = input.inputImages) {
   ];
 }
 
-export function buildNewApiChatImageBody(input: ImageInput, inputImages = input.inputImages) {
-  const imageParams = newApiImageRequestParams(
-    input.model,
-    input.count,
-    input.aspectRatio,
-    input.resolution,
-  );
-  return {
-    model: input.model,
-    ...imageParams,
-    ...(input.negativePrompt ? { negative_prompt: input.negativePrompt } : {}),
-    messages: [{ role: 'user', content: chatContent(input, inputImages) }],
-    modalities: ['image'],
-    stream: false,
-    max_tokens: 8192,
-  };
-}
-
 export function isGeminiNativeImageModel(model: string) {
   const token = imageModelToken(model);
   return token.includes('gemini') || token.includes('nanobanana');
@@ -587,22 +584,8 @@ async function generateNewApiImages(
   secrets: ProviderSecrets,
   input: ImageInput,
 ) {
+  const materializedInputImages = await materializeNewApiReferenceImages(input.inputImages);
   if (isGeminiNativeImageModel(input.model)) {
-    const directPublicReferences = input.inputImages.every((source) => /^https?:\/\//i.test(source.trim()));
-    if (directPublicReferences) {
-      for (const source of input.inputImages) await assertPublicProviderUrl(source);
-      const value = await providerRequest(
-        provider,
-        secrets,
-        '/v1/chat/completions',
-        buildNewApiChatImageBody(input, input.inputImages),
-        IMAGE_GENERATION_TIMEOUT_MS,
-      );
-      const images = uniqueImages(value, input.inputImages, input.count);
-      if (images.length) return images;
-      throw new Error('渠道没有返回图片数据');
-    }
-    const materializedInputImages = await materializeNewApiReferenceImages(input.inputImages);
     const value = await generateGeminiNativeImages(
       provider,
       secrets,
@@ -613,7 +596,6 @@ async function generateNewApiImages(
     if (images.length) return images;
     throw new Error('渠道没有返回图片数据');
   }
-  const materializedInputImages = await materializeNewApiReferenceImages(input.inputImages);
   const preparedInputImages = materializedInputImages.map((source, index) => {
     try {
       const dataUrl = source;
@@ -626,11 +608,26 @@ async function generateNewApiImages(
       return input.inputImages[index] ?? source;
     }
   });
+  const imageParams = newApiImageRequestParams(
+    input.model,
+    input.count,
+    input.aspectRatio,
+    input.resolution,
+  );
+  const body = {
+    model: input.model,
+    ...imageParams,
+    ...(input.negativePrompt ? { negative_prompt: input.negativePrompt } : {}),
+    messages: [{ role: 'user', content: chatContent(input, preparedInputImages) }],
+    modalities: ['image'],
+    stream: false,
+    max_tokens: 8192,
+  };
   const value = await providerRequest(
     provider,
     secrets,
     '/v1/chat/completions',
-    buildNewApiChatImageBody(input, preparedInputImages),
+    body,
     IMAGE_GENERATION_TIMEOUT_MS,
   );
   const images = uniqueImages(value, input.inputImages, input.count);

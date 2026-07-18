@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildGeminiNativeImageBody,
-  buildNewApiChatImageBody,
   chooseProviderForCapability,
   collectProviderModelIds,
   imageUnitCredits,
@@ -55,9 +54,9 @@ describe('wallet image provider normalization', () => {
 
   it('maps the main app image aliases back to NewAPI model IDs', () => {
     expect(resolveNewApiImageModel('Nano Banana Pro')).toBe('gemini-3-pro-image');
-    expect(resolveNewApiImageModel('google/gemini_3_pro_image_preview')).toBe('google/gemini_3_pro_image_preview');
+    expect(resolveNewApiImageModel('google/gemini_3_pro_image_preview')).toBe('gemini-3-pro-image');
     expect(resolveNewApiImageModel('Nano Banana 2')).toBe('gemini-3.1-flash-image');
-    expect(resolveNewApiImageModel('Gemini31FlashImage')).toBe('Gemini31FlashImage');
+    expect(resolveNewApiImageModel('Gemini31FlashImage')).toBe('gemini-3.1-flash-image');
     expect(resolveNewApiImageModel('GPT Image 2')).toBe('gpt-image-2');
     expect(resolveNewApiImageModel('「Hu」gpt-image-2')).toBe('「Hu」gpt-image-2');
     expect(resolveNewApiImageModel('「CS」gpt-image-2')).toBe('「CS」gpt-image-2');
@@ -188,25 +187,5 @@ describe('wallet image provider normalization', () => {
       responseModalities: ['TEXT', 'IMAGE'],
       imageConfig: { aspectRatio: '16:9', imageSize: '4K' },
     });
-  });
-
-  it('preserves ready public image URLs for NewAPI chat image requests', () => {
-    const publicReference = 'https://example.com/reference.png';
-    const body = buildNewApiChatImageBody({
-      userId: 'user-1',
-      clientRequestId: 'request-1',
-      model: 'gemini-3-pro-image',
-      prompt: 'render the projector',
-      inputImages: [publicReference],
-      aspectRatio: '16:9',
-      resolution: '2K',
-      outputFormat: 'jpg',
-      count: 1,
-    });
-
-    expect(body.messages[0]?.content).toEqual([
-      { type: 'text', text: expect.stringContaining('render the projector') },
-      { type: 'image_url', image_url: { url: publicReference } },
-    ]);
   });
 });
