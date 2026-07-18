@@ -553,9 +553,13 @@ async function generateXaisImages(
 async function reserveImageCredits(prisma: PrismaClient, input: ImageInput) {
   const estimated = UNIT_CREDITS * BigInt(input.count);
   const requestId = await prisma.$transaction(async (transaction) => {
-    const existing = await transaction.aiRequest.findUnique({
+    let existing = await transaction.aiRequest.findUnique({
       where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } },
     });
+    const reusableRequest = existing && (existing.status === 'FAILED' || existing.status === 'REFUNDED')
+      ? existing
+      : null;
+    if (reusableRequest) existing = null;
     if (existing) throw new CloudAiError('duplicate_request', '该生图请求已经提交过', 409);
     const updated = await transaction.wallet.updateMany({
       where: { userId: input.userId, availableCredits: { gte: estimated } },
@@ -563,6 +567,23 @@ async function reserveImageCredits(prisma: PrismaClient, input: ImageInput) {
     });
     if (updated.count !== 1) throw new CloudAiError('insufficient_credits', '授权钱包余额不足', 402);
     const wallet = await transaction.wallet.findUniqueOrThrow({ where: { userId: input.userId } });
+    if (reusableRequest) {
+      const request = await transaction.aiRequest.update({
+        where: { id: reusableRequest.id },
+        data: { status: 'RESERVED', logicalModel: input.model, estimatedCredits: estimated, chargedCredits: 0n, completedAt: null },
+      });
+      await transaction.walletLedger.create({
+        data: {
+          userId: input.userId,
+          requestId: request.id,
+          type: 'RESERVE',
+          amount: -estimated,
+          balanceAfter: wallet.availableCredits,
+          description: '生图重试预扣',
+        },
+      });
+      return request.id;
+    }
     const request = await transaction.aiRequest.create({
       data: {
         userId: input.userId,
@@ -777,7 +798,11 @@ function xaisVideoBody(input: VideoInput) {
 async function reserveVideo(prisma: PrismaClient, input: VideoInput) {
   const estimated = estimatedVideoCredits(input);
   return prisma.$transaction(async (transaction) => {
-    const existing = await transaction.aiRequest.findUnique({ where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } } });
+    let existing = await transaction.aiRequest.findUnique({ where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } } });
+    const reusableRequest = existing && (existing.status === 'FAILED' || existing.status === 'REFUNDED')
+      ? existing
+      : null;
+    if (reusableRequest) existing = null;
     if (existing) throw new CloudAiError('duplicate_request', '该视频请求已经提交过', 409);
     const updated = await transaction.wallet.updateMany({
       where: { userId: input.userId, availableCredits: { gte: estimated } },
@@ -785,7 +810,9 @@ async function reserveVideo(prisma: PrismaClient, input: VideoInput) {
     });
     if (updated.count !== 1) throw new CloudAiError('insufficient_credits', '授权钱包余额不足', 402);
     const wallet = await transaction.wallet.findUniqueOrThrow({ where: { userId: input.userId } });
-    const request = await transaction.aiRequest.create({ data: { userId: input.userId, clientRequestId: input.clientRequestId, capability: 'VIDEO', logicalModel: input.model, status: 'RESERVED', estimatedCredits: estimated } });
+    const request = reusableRequest
+      ? await transaction.aiRequest.update({ where: { id: reusableRequest.id }, data: { status: 'RESERVED', logicalModel: input.model, estimatedCredits: estimated, chargedCredits: 0n, completedAt: null } })
+      : await transaction.aiRequest.create({ data: { userId: input.userId, clientRequestId: input.clientRequestId, capability: 'VIDEO', logicalModel: input.model, status: 'RESERVED', estimatedCredits: estimated } });
     await transaction.walletLedger.create({ data: { userId: input.userId, requestId: request.id, type: 'RESERVE', amount: -estimated, balanceAfter: wallet.availableCredits, description: '视频请求预扣' } });
     return { requestId: request.id, estimated };
   });
