@@ -3,11 +3,13 @@ import {
   chooseProviderForCapability,
   collectProviderModelIds,
   imageUnitCredits,
+  materializeNewApiReferenceImage,
   newApiImageRequestParams,
   parseXaisTaskId,
   resolveImageModel,
   resolveNewApiImageModel,
   resolveXaisModel,
+  resolveXaisWorkerRatio,
   sizeFromRatio,
   uniqueImages,
 } from '../src/modules/ai/image-service.js';
@@ -77,7 +79,20 @@ describe('wallet image provider normalization', () => {
 
   it('maps canvas XAIS display models to worker request models', () => {
     expect(resolveXaisModel('Xais Nano Pro_2K')).toBe('Nano_Banana_Pro_2K_0');
+    expect(resolveXaisModel('Nano Banana Pro 4K')).toBe('Nano_Banana_Pro_4K_0');
+    expect(resolveXaisModel('Xais Image2 2K High Quality')).toBe('Xais_Img2_2K_H');
     expect(resolveXaisModel('custom-model')).toBe('custom-model');
+  });
+
+  it('maps UI aspect ratios to the exact XAIS worker dimensions', () => {
+    expect(resolveXaisWorkerRatio('Xais Img2_2K', '16:9')).toBe('2048x1152');
+    expect(resolveXaisWorkerRatio('Xais Img2_4K', '9:16')).toBe('2160x3840');
+    expect(resolveXaisWorkerRatio('Xais Nano Pro_2K', '16:9')).toBe('16:9');
+  });
+
+  it('keeps existing data URL references unchanged', async () => {
+    const source = 'data:image/png;base64,aGVsbG8=';
+    await expect(materializeNewApiReferenceImage(source)).resolves.toBe(source);
   });
 
   it('uses stable OpenAI-compatible dimensions for supported ratios', () => {

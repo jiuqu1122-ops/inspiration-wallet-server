@@ -6,6 +6,8 @@ import { CloudAiError } from './service.js';
 
 const DEFAULT_IMAGE_UNIT_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
 const IMAGE_GENERATION_TIMEOUT_MS = 10 * 60_000;
+const IMAGE_REFERENCE_FETCH_TIMEOUT_MS = 30_000;
+const MAX_IMAGE_REFERENCE_BYTES = 16 * 1024 * 1024;
 const XAIS_MODEL_MAP: Record<string, string> = {
   'Xais Nano Pro_2K': 'Nano_Banana_Pro_2K_0',
   'Xais Nano Pro_4K': 'Nano_Banana_Pro_4K_0',
@@ -319,7 +321,7 @@ export async function listWalletImageModels(
     try {
       await assertPublicProviderUrl(provider.baseUrl);
       const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-      const value = await providerRequest(provider, secrets, '/v1/models');
+      const value = await providerRequest(provider, secrets, '/v1/models', undefined, 15_000);
       return {
         id: provider.id,
         name: provider.name,
@@ -406,13 +408,86 @@ function promptWithConstraints(input: ImageInput) {
   return `${input.prompt.trim()}\n\nStrict image constraints: ${constraints.join(', ')}.`;
 }
 
-function chatContent(input: ImageInput) {
+function chatContent(input: ImageInput, inputImages = input.inputImages) {
   const prompt = promptWithConstraints(input);
-  if (!input.inputImages.length) return prompt;
+  if (!inputImages.length) return prompt;
   return [
     { type: 'text', text: prompt },
-    ...input.inputImages.map((url) => ({ type: 'image_url', image_url: { url } })),
+    ...inputImages.map((url) => ({ type: 'image_url', image_url: { url } })),
   ];
+}
+
+function imageMimeFromBytes(bytes: Uint8Array) {
+  if (bytes.length >= 8
+    && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  if (bytes.length >= 12
+    && String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF'
+    && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP') return 'image/webp';
+  if (bytes.length >= 6 && /^GIF8[79]a$/.test(String.fromCharCode(...bytes.slice(0, 6)))) return 'image/gif';
+  return '';
+}
+
+async function readLimitedImageBody(response: Response) {
+  const declaredLength = Number(response.headers.get('content-length') || '0');
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_IMAGE_REFERENCE_BYTES) {
+    throw new Error('reference image is too large');
+  }
+  if (!response.body) throw new Error('reference image response has no body');
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const reader = response.body.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_IMAGE_REFERENCE_BYTES) {
+      await reader.cancel();
+      throw new Error('reference image is too large');
+    }
+    chunks.push(value);
+  }
+  const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+  const headerMime = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() || '';
+  const detectedMime = imageMimeFromBytes(bytes);
+  const mime = headerMime.startsWith('image/') ? headerMime : detectedMime;
+  if (!mime) throw new Error('reference URL did not return an image');
+  return `data:${mime};base64,${bytes.toString('base64')}`;
+}
+
+/**
+ * NewAPI-compatible image endpoints handle data URLs more consistently than
+ * temporary public URLs. Materialize public references in memory only; never
+ * persist them, log them, or forward a local/private URL.
+ */
+export async function materializeNewApiReferenceImage(source: string) {
+  const trimmed = source.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return trimmed;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), IMAGE_REFERENCE_FETCH_TIMEOUT_MS);
+  try {
+    let current = new URL(trimmed);
+    for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
+      await assertPublicProviderUrl(current.toString());
+      const response = await fetch(current, {
+        method: 'GET',
+        headers: { accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.1' },
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get('location');
+        if (!location || redirectCount >= 3) throw new Error('reference image redirect is invalid');
+        current = new URL(location, current);
+        continue;
+      }
+      if (!response.ok) throw new Error(`reference image HTTP ${response.status}`);
+      return await readLimitedImageBody(response);
+    }
+    return trimmed;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function generateNewApiImages(
@@ -420,6 +495,15 @@ async function generateNewApiImages(
   secrets: ProviderSecrets,
   input: ImageInput,
 ) {
+  const preparedInputImages = await Promise.all(input.inputImages.map(async (source) => {
+    try {
+      return await materializeNewApiReferenceImage(source);
+    } catch {
+      // Keep the public URL as a compatibility fallback when a remote host
+      // cannot be fetched by the wallet server.
+      return source;
+    }
+  }));
   const imageParams = newApiImageRequestParams(
     input.model,
     input.count,
@@ -430,7 +514,7 @@ async function generateNewApiImages(
     model: input.model,
     ...imageParams,
     ...(input.negativePrompt ? { negative_prompt: input.negativePrompt } : {}),
-    messages: [{ role: 'user', content: chatContent(input) }],
+    messages: [{ role: 'user', content: chatContent(input, preparedInputImages) }],
     modalities: ['image'],
     stream: false,
     max_tokens: 8192,
@@ -448,11 +532,152 @@ async function generateNewApiImages(
 }
 
 export function resolveXaisModel(model: string) {
-  return XAIS_MODEL_MAP[model.trim()] ?? model.trim();
+  const trimmed = model.trim();
+  const exact = XAIS_MODEL_MAP[trimmed];
+  if (exact) return exact;
+  const token = imageModelToken(trimmed);
+  if (/^(?:xais)?(?:nanobanana|nano)pro2k0?$/.test(token)) return 'Nano_Banana_Pro_2K_0';
+  if (/^(?:xais)?(?:nanobanana|nano)pro4k0?$/.test(token)) return 'Nano_Banana_Pro_4K_0';
+  if (/^(?:xais)?(?:nanobanana|nano)22k0?$/.test(token)) return 'Nano_Banana_2_2K_0';
+  if (/^(?:xais)?(?:nanobanana|nano)24k0?$/.test(token)) return 'Nano_Banana_2_4K_0';
+  if (/^(?:xais)?(?:img2|image2)1k$/.test(token)) return 'Image2_1K';
+  if (/^(?:xais)?(?:img2|image2)2k$/.test(token)) return 'Image2_2K';
+  if (/^(?:xais)?(?:img2|image2)4k$/.test(token)) return 'Image2_4K';
+  if (/^(?:xais)?(?:img2|image2)2k(?:h|high|highquality)$/.test(token)) return 'Xais_Img2_2K_H';
+  if (/^(?:xais)?(?:img2|image2)4k(?:h|high|highquality)$/.test(token)) return 'Xais_Img2_4K_H';
+  return trimmed;
 }
 
 function isXaisWorkerModel(model: string) {
-  return Boolean(XAIS_MODEL_MAP[model.trim()]) || /^(?:Nano_Banana|Image2_|Xais_)/i.test(model.trim());
+  return /^(?:Nano_Banana|Image2_|Xais_)/i.test(resolveXaisModel(model));
+}
+
+const XAIS_NANO_RATIO_OPTIONS = ['1:1', '16:9', '9:16', '3:2', '2:3', '4:3', '21:9', '3:4', '1:4', '4:1', '1:8', '8:1'];
+const XAIS_IMAGE2_1K_RATIO_OPTIONS = ['1:1', '9:16', '4:3', '3:4', '5:4'];
+const XAIS_IMAGE2_2K_RATIO_OPTIONS = [
+  '2048x2048', '2048x1152', '1152x2048', '2064x1376', '1376x2064', '2048x1536', '1536x2048',
+  '2016x864', '864x2016', '2080x1664', '1664x2080', '2048x1024', '2064x688',
+];
+const XAIS_IMAGE2_4K_RATIO_OPTIONS = [
+  '2880x2880', '3840x2160', '2160x3840', '3520x2352', '2352x3520', '3312x2480', '2480x3312',
+  '3840x1648', '1648x3840', '3216x2576', '2576x3216', '3840x1920', '3840x1280', '1280x3840',
+];
+
+function ratioValue(value: string) {
+  const match = value.trim().match(/^(\d+(?:\.\d+)?)\s*(?::|x)\s*(\d+(?:\.\d+)?)$/i);
+  if (!match) return 1;
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  return width > 0 && height > 0 ? width / height : 1;
+}
+
+export function resolveXaisWorkerRatio(model: string, aspectRatio: string) {
+  const requestModel = resolveXaisModel(model);
+  const options = /^Nano_Banana|^Xais_Nano_Lite/i.test(requestModel)
+    ? XAIS_NANO_RATIO_OPTIONS
+    : /(?:Img2|Image2)_.*4K/i.test(requestModel)
+      ? XAIS_IMAGE2_4K_RATIO_OPTIONS
+      : /(?:Img2|Image2)_.*2K/i.test(requestModel)
+        ? XAIS_IMAGE2_2K_RATIO_OPTIONS
+        : /(?:Img2|Image2)_.*1K/i.test(requestModel)
+          ? XAIS_IMAGE2_1K_RATIO_OPTIONS
+          : [];
+  if (!options.length) return aspectRatio || '1:1';
+  if (options.includes(aspectRatio)) return aspectRatio;
+  const target = ratioValue(aspectRatio || '1:1');
+  return options.reduce((best, option) => (
+    Math.abs(ratioValue(option) - target) < Math.abs(ratioValue(best) - target) ? option : best
+  ), options[0]!);
+}
+
+function isXaisOverloadMessage(value: unknown) {
+  const message = value instanceof Error
+    ? value.message
+    : typeof value === 'string' ? value : JSON.stringify(value ?? '');
+  return /(?:busy|overload|overloaded|capacity|no available (?:worker|resource)|resource exhausted|temporarily unavailable|算力(?:紧张|不足|已满)|暂无可用算力|资源不足|系统繁忙|服务繁忙|排队已满)/i.test(message);
+}
+
+function findXaisUploadTarget(value: unknown): { url: string; name: string } | null {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findXaisUploadTarget(item);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (!value || typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  const url = [record.url, record.uploadUrl, record.upload_url]
+    .find((candidate): candidate is string => typeof candidate === 'string' && candidate.trim().length > 0);
+  const name = [record.name, record.att, record.attachment, record.key]
+    .find((candidate): candidate is string => typeof candidate === 'string' && candidate.trim().length > 0);
+  if (url && name) return { url: url.trim(), name: name.trim() };
+  for (const key of ['data', 'result', 'upload', 'attachment']) {
+    const found = findXaisUploadTarget(record[key]);
+    if (found) return found;
+  }
+  return null;
+}
+
+function dataUrlImageBytes(source: string) {
+  const match = source.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([a-zA-Z0-9+/=\s]+)$/i);
+  if (!match) throw new Error('reference image is not a supported data URL');
+  const mime = match[1]!.toLowerCase();
+  const bytes = Buffer.from(match[2]!.replace(/\s+/g, ''), 'base64');
+  if (!bytes.length || bytes.length > MAX_IMAGE_REFERENCE_BYTES) throw new Error('reference image size is invalid');
+  return { bytes, mime };
+}
+
+async function uploadXaisReferenceImage(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  source: string,
+) {
+  const trimmed = source.trim();
+  if (!/^(?:https?:|data:image\/)/i.test(trimmed)) return trimmed;
+  const dataUrl = /^data:image\//i.test(trimmed)
+    ? trimmed
+    : await materializeNewApiReferenceImage(trimmed);
+  const { bytes, mime } = dataUrlImageBytes(dataUrl);
+  const extension = mime.includes('png') ? 'png'
+    : mime.includes('webp') ? 'webp'
+      : mime.includes('gif') ? 'gif' : 'jpg';
+  const uploadValue = await providerRequest(
+    provider,
+    secrets,
+    `/xais/fileAttachmentUploadUrl?ext=${encodeURIComponent(extension)}`,
+    undefined,
+    30_000,
+  );
+  const upload = findXaisUploadTarget(uploadValue);
+  if (!upload) throw new Error('XAIS reference upload URL response is missing url/name');
+  await assertPublicProviderUrl(upload.url);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 90_000);
+  try {
+    const response = await fetch(upload.url, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: bytes,
+      redirect: 'error',
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`XAIS reference upload failed with HTTP ${response.status}`);
+  } finally {
+    clearTimeout(timeout);
+  }
+  try {
+    await providerRequest(
+      provider,
+      secrets,
+      `/xais/attUrls?att=${encodeURIComponent(upload.name)}`,
+      undefined,
+      30_000,
+    );
+  } catch {
+    // XAIS currently treats this registration call as best-effort.
+  }
+  return upload.name;
 }
 
 function getTaskId(value: unknown): string {
@@ -527,23 +752,56 @@ function collectAttachmentIds(value: unknown, output: string[] = [], trusted = f
 
 const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+async function startXaisWorkerTaskWithRetry(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  body: unknown,
+) {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    if (attempt > 0) await delay(1_800 * attempt);
+    try {
+      const started = await providerRequest(provider, secrets, '/xais/workerTaskStart', body, 90_000);
+      const failure = getFailure(started);
+      if (!failure) return started;
+      lastError = new Error(failure);
+      if (!isXaisOverloadMessage(failure)) throw lastError;
+    } catch (error) {
+      lastError = error;
+      if (!isXaisOverloadMessage(error)) throw error;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(typeof lastError === 'string' ? lastError : JSON.stringify(lastError ?? 'XAIS worker task failed'));
+}
+
 async function runXaisWorkerTask(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   input: ImageInput,
 ) {
   const model = resolveXaisModel(input.model);
-  const started = await providerRequest(provider, secrets, '/xais/workerTaskStart', {
+  const isNanoModel = /(?:Nano_Banana|Xais_Nano)/i.test(model);
+  const isNanoLiteModel = /Lite/i.test(model);
+  const referenceInputs: string[] = [];
+  for (const source of input.inputImages) {
+    referenceInputs.push(await uploadXaisReferenceImage(provider, secrets, source));
+  }
+  const started = await startXaisWorkerTaskWithRetry(provider, secrets, {
     prompt: input.prompt,
     model,
-    ratio: input.aspectRatio,
+    ratio: resolveXaisWorkerRatio(model, input.aspectRatio),
     ...(input.negativePrompt ? { negative_prompt: input.negativePrompt } : {}),
-    ...(input.inputImages.length ? { ref: input.inputImages } : {}),
+    ...(referenceInputs.length ? { ref: referenceInputs } : {}),
+    ...(!isNanoModel ? { client: 'XAIS' } : {}),
     custom_field: {
-      outputFormat: input.outputFormat === 'png' ? 'image/png' : 'image/jpeg',
-      ...(!/^Nano_Banana/i.test(model) || /Lite/i.test(model) ? { quality: /高画质|_H$/i.test(input.model) ? 'high' : 'medium' } : {}),
+      outputFormat: input.outputFormat === 'png'
+        ? 'image/png'
+        : input.outputFormat === 'webp' ? 'image/webp' : 'image/jpeg',
+      ...(!isNanoModel || isNanoLiteModel ? { quality: /_H$/i.test(model) ? 'high' : 'medium' } : {}),
     },
-  }, 90_000);
+  });
   const immediate = uniqueImages(started, input.inputImages, 1);
   if (immediate.length) return immediate[0]!;
   const startFailure = getFailure(started);
@@ -587,9 +845,10 @@ async function generateXaisImages(
   input: ImageInput,
 ) {
   if (isXaisWorkerModel(input.model)) {
-    const results = await Promise.all(Array.from({ length: input.count }, () => (
-      runXaisWorkerTask(provider, secrets, input)
-    )));
+    const results: string[] = [];
+    for (let index = 0; index < input.count; index += 1) {
+      results.push(await runXaisWorkerTask(provider, secrets, input));
+    }
     return Array.from(new Set(results)).slice(0, input.count);
   }
   try {
