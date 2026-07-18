@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildNewApiChatImageBody,
+  buildNewApiImageEditForm,
   buildGeminiNativeImageBody,
   chooseProviderForCapability,
   collectProviderModelIds,
@@ -187,5 +189,56 @@ describe('wallet image provider normalization', () => {
       responseModalities: ['IMAGE'],
       imageConfig: { aspectRatio: '16:9', imageSize: '4K' },
     });
+  });
+
+  it('keeps public Cloudflare references as URLs for the proven NewAPI chat protocol', () => {
+    const reference = 'https://example.trycloudflare.com/reference.png';
+    const body = buildNewApiChatImageBody({
+      userId: 'user-1',
+      clientRequestId: 'request-1',
+      model: 'gemini-3-pro-image',
+      prompt: 'render the projector',
+      inputImages: [reference],
+      aspectRatio: '16:9',
+      resolution: '2K',
+      outputFormat: 'jpg',
+      count: 1,
+    }, [reference]);
+
+    expect(body.messages[0]?.content).toEqual([
+      { type: 'text', text: expect.stringContaining('render the projector') },
+      { type: 'image_url', image_url: { url: reference } },
+    ]);
+    expect(body).toMatchObject({
+      model: 'gemini-3-pro-image',
+      size: '1920x1088',
+      aspect_ratio: '16:9',
+      quality: 'standard',
+      modalities: ['image'],
+    });
+  });
+
+  it('matches the main app multipart image edit field names', () => {
+    const form = buildNewApiImageEditForm({
+      userId: 'user-1',
+      clientRequestId: 'request-1',
+      model: 'gemini-3-pro-image',
+      prompt: 'render the projector',
+      inputImages: [],
+      aspectRatio: '4:3',
+      resolution: '4K',
+      outputFormat: 'png',
+      count: 1,
+    }, [
+      'data:image/png;base64,aGVsbG8=',
+      'data:image/jpeg;base64,aGVsbG8=',
+    ]);
+
+    expect(form.get('model')).toBe('gemini-3-pro-image');
+    expect(form.get('size')).toBe('3200x2400');
+    expect(form.get('quality')).toBe('high');
+    expect(form.get('response_format')).toBe('b64_json');
+    expect((form.get('image') as File).name).toBe('input-1.png');
+    expect((form.get('image[]') as File).name).toBe('input-2.jpg');
   });
 });
