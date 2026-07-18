@@ -686,6 +686,21 @@ function isXaisOverloadMessage(value: unknown) {
   return /(?:busy|overload|overloaded|capacity|no available (?:worker|resource)|resource exhausted|temporarily unavailable|算力(?:紧张|不足|已满)|暂无可用算力|资源不足|系统繁忙|服务繁忙|排队已满)/i.test(message);
 }
 
+export function isRetryableXaisPollError(value: unknown) {
+  if (value instanceof UpstreamImageError) {
+    return value.status === 0
+      || value.status === 408
+      || value.status === 409
+      || value.status === 425
+      || value.status === 429
+      || value.status >= 500;
+  }
+  const message = value instanceof Error
+    ? value.message
+    : typeof value === 'string' ? value : JSON.stringify(value ?? '');
+  return /(?:abort|timed?\s*out|timeout|fetch failed|network|connection|socket|temporar(?:y|ily)|ECONNRESET|ETIMEDOUT|EAI_AGAIN)/i.test(message);
+}
+
 function findXaisUploadTarget(value: unknown): { url: string; name: string } | null {
   if (Array.isArray(value)) {
     for (const item of value) {
@@ -899,33 +914,51 @@ async function runXaisWorkerTask(
   if (!taskId) {
     throw new Error(`Xais 没有返回任务 ID：${JSON.stringify(started).slice(0, 240)}`);
   }
-  const deadline = Date.now() + 3 * 60_000;
+  const deadline = Date.now() + IMAGE_GENERATION_TIMEOUT_MS;
+  let lastTransientError: unknown = null;
   while (Date.now() < deadline) {
     await delay(2_200);
-    const waited = await providerRequest(
-      provider,
-      secrets,
-      `/xais/workerTaskWait?json=1&id=${encodeURIComponent(taskId)}`,
-      undefined,
-      30_000,
-    );
+    let waited: unknown;
+    try {
+      waited = await providerRequest(
+        provider,
+        secrets,
+        `/xais/workerTaskWait?json=1&id=${encodeURIComponent(taskId)}`,
+        undefined,
+        45_000,
+      );
+      lastTransientError = null;
+    } catch (error) {
+      if (!isRetryableXaisPollError(error)) throw error;
+      lastTransientError = error;
+      continue;
+    }
     const failure = getFailure(waited);
     if (failure) throw new Error(failure);
     const images = uniqueImages(waited, input.inputImages, 1);
     if (images.length) return images[0]!;
     for (const attachment of collectAttachmentIds(waited)) {
-      const resolved = await providerRequest(
-        provider,
-        secrets,
-        `/xais/attUrls?att=${encodeURIComponent(attachment)}`,
-        undefined,
-        30_000,
-      );
+      let resolved: unknown;
+      try {
+        resolved = await providerRequest(
+          provider,
+          secrets,
+          `/xais/attUrls?att=${encodeURIComponent(attachment)}`,
+          undefined,
+          45_000,
+        );
+        lastTransientError = null;
+      } catch (error) {
+        if (!isRetryableXaisPollError(error)) throw error;
+        lastTransientError = error;
+        continue;
+      }
       const resolvedImages = uniqueImages(resolved, input.inputImages, 1);
       if (resolvedImages.length) return resolvedImages[0]!;
     }
   }
-  throw new Error('Xais 生图任务等待超时');
+  const detail = lastTransientError instanceof Error ? `：${lastTransientError.message}` : '';
+  throw new Error(`XAIS 生图任务等待超时${detail}`);
 }
 
 async function generateXaisImages(

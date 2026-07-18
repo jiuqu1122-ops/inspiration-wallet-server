@@ -5,6 +5,7 @@ import {
   collectProviderModelIds,
   imageUnitCredits,
   isGeminiNativeImageModel,
+  isRetryableXaisPollError,
   materializeNewApiReferenceImage,
   newApiImageRequestParams,
   parseXaisTaskId,
@@ -134,6 +135,12 @@ describe('wallet image provider normalization', () => {
   it('accepts XAIS task IDs returned as plain text or nested results', () => {
     expect(parseXaisTaskId('task-plain-123')).toBe('task-plain-123');
     expect(parseXaisTaskId({ results: [{ taskid: 456789 }] })).toBe('456789');
+  });
+
+  it('keeps polling an XAIS task after transient transport failures', () => {
+    expect(isRetryableXaisPollError(new Error('This operation was aborted'))).toBe(true);
+    expect(isRetryableXaisPollError(new Error('fetch failed: ECONNRESET'))).toBe(true);
+    expect(isRetryableXaisPollError(new Error('provided image is not valid'))).toBe(false);
   });
 
   it('matches the main app NewAPI image dimensions and quality', () => {
