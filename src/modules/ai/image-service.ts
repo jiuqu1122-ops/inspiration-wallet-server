@@ -24,21 +24,6 @@ const XAIS_MODEL_MAP: Record<string, string> = {
   'Xais Img2_4K(高画质)': 'Xais_Img2_4K_H',
 };
 
-const NEW_API_IMAGE_MODEL_MAP: Record<string, string> = {
-  nanobananapro: 'gemini-3-pro-image',
-  gemini3pro: 'gemini-3-pro-image',
-  gemini3proimage: 'gemini-3-pro-image',
-  gemini31proimage: 'gemini-3-pro-image',
-  googlegemini3proimage: 'gemini-3-pro-image',
-  googlegemini31proimage: 'gemini-3-pro-image',
-  modelsgemini3proimage: 'gemini-3-pro-image',
-  modelsgemini31proimage: 'gemini-3-pro-image',
-  nanobanana2: 'gemini-3.1-flash-image',
-  gemini31flashimage: 'gemini-3.1-flash-image',
-  gemini3flashimage: 'gemini-3.1-flash-image',
-  gptimage2: 'gpt-image-2',
-};
-
 const imageModelToken = (model: string) => model
   .trim()
   .toLowerCase()
@@ -94,9 +79,9 @@ export function imageUnitCredits(model: string, resolution?: string) {
 
 export function resolveNewApiImageModel(model: string) {
   const trimmed = model.trim();
-  const token = imageModelToken(trimmed);
-  const exact = NEW_API_IMAGE_MODEL_MAP[token];
-  if (exact) return exact;
+  if (/^nano[\s_-]*banana[\s_-]*pro$/i.test(trimmed)) return 'gemini-3-pro-image';
+  if (/^nano[\s_-]*banana[\s_-]*2$/i.test(trimmed)) return 'gemini-3.1-flash-image';
+  if (/^gpt[\s_-]*image[\s_-]*2$/i.test(trimmed)) return 'gpt-image-2';
   return trimmed;
 }
 

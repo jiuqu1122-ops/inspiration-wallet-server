@@ -53,9 +53,9 @@ describe('wallet image provider normalization', () => {
 
   it('maps the main app image aliases back to NewAPI model IDs', () => {
     expect(resolveNewApiImageModel('Nano Banana Pro')).toBe('gemini-3-pro-image');
-    expect(resolveNewApiImageModel('google/gemini_3_pro_image_preview')).toBe('gemini-3-pro-image');
+    expect(resolveNewApiImageModel('google/gemini_3_pro_image_preview')).toBe('google/gemini_3_pro_image_preview');
     expect(resolveNewApiImageModel('Nano Banana 2')).toBe('gemini-3.1-flash-image');
-    expect(resolveNewApiImageModel('Gemini31FlashImage')).toBe('gemini-3.1-flash-image');
+    expect(resolveNewApiImageModel('Gemini31FlashImage')).toBe('Gemini31FlashImage');
     expect(resolveNewApiImageModel('GPT Image 2')).toBe('gpt-image-2');
     expect(resolveNewApiImageModel('「Hu」gpt-image-2')).toBe('「Hu」gpt-image-2');
     expect(resolveNewApiImageModel('「CS」gpt-image-2')).toBe('「CS」gpt-image-2');
