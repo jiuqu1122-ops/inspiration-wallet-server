@@ -418,6 +418,53 @@ function chatContent(input: ImageInput, inputImages = input.inputImages) {
   ];
 }
 
+export function shouldUseGeminiNativeFallback(model: string, error: unknown) {
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string' ? error : JSON.stringify(error ?? '');
+  const token = imageModelToken(model);
+  const isGeminiImageModel = token.includes('gemini')
+    || token.includes('nanobanana');
+  return isGeminiImageModel && /(?:operation copy failed|source path does not exist|provided image is not valid|bad request to gemini|\.text\b)/i.test(message);
+}
+
+export function buildGeminiNativeImageBody(input: ImageInput, inputImages = input.inputImages) {
+  const imageParts = inputImages.map((source) => {
+    const { bytes, mime } = dataUrlImageBytes(source);
+    return {
+      inlineData: {
+        mimeType: mime,
+        data: bytes.toString('base64'),
+      },
+    };
+  });
+  const imageSize = pricedImageResolution(input.model, input.resolution).toUpperCase();
+  return {
+    contents: [{
+      role: 'user',
+      parts: [
+        {
+          text: input.negativePrompt
+            ? `${promptWithConstraints(input)}\n\nAvoid: ${input.negativePrompt.trim()}`
+            : promptWithConstraints(input),
+        },
+        ...imageParts,
+      ],
+    }],
+    generationConfig: {
+      responseModalities: ['TEXT', 'IMAGE'],
+      imageConfig: {
+        aspectRatio: input.aspectRatio,
+        imageSize,
+      },
+    },
+  };
+}
+
+function geminiNativeModelName(model: string) {
+  return model.trim().replace(/^models\//i, '');
+}
+
 function imageMimeFromBytes(bytes: Uint8Array) {
   if (bytes.length >= 8
     && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
@@ -496,18 +543,25 @@ async function generateNewApiImages(
   secrets: ProviderSecrets,
   input: ImageInput,
 ) {
-  const preparedInputImages = await Promise.all(input.inputImages.map(async (source) => {
+  const materializedInputImages = await Promise.all(input.inputImages.map(async (source) => {
     try {
-      const dataUrl = await materializeNewApiReferenceImage(source);
+      return await materializeNewApiReferenceImage(source);
+    } catch {
+      return source;
+    }
+  }));
+  const preparedInputImages = materializedInputImages.map((source, index) => {
+    try {
+      const dataUrl = source;
       if (!/^data:image\//i.test(dataUrl)) return dataUrl;
       const { bytes, mime } = dataUrlImageBytes(dataUrl);
       return createImageReference(bytes, mime);
     } catch {
       // Keep the public URL as a compatibility fallback when a remote host
       // cannot be fetched by the wallet server.
-      return source;
+      return input.inputImages[index] ?? source;
     }
-  }));
+  });
   const imageParams = newApiImageRequestParams(
     input.model,
     input.count,
@@ -523,13 +577,30 @@ async function generateNewApiImages(
     stream: false,
     max_tokens: 8192,
   };
-  const value = await providerRequest(
-    provider,
-    secrets,
-    '/v1/chat/completions',
-    body,
-    IMAGE_GENERATION_TIMEOUT_MS,
-  );
+  let value: unknown;
+  try {
+    value = await providerRequest(
+      provider,
+      secrets,
+      '/v1/chat/completions',
+      body,
+      IMAGE_GENERATION_TIMEOUT_MS,
+    );
+  } catch (error) {
+    if (!shouldUseGeminiNativeFallback(input.model, error)) throw error;
+    const nativeBody = buildGeminiNativeImageBody(input, materializedInputImages);
+    const nativeValues: unknown[] = [];
+    for (let index = 0; index < input.count; index += 1) {
+      nativeValues.push(await providerRequest(
+        provider,
+        secrets,
+        `/v1beta/models/${encodeURIComponent(geminiNativeModelName(input.model))}:generateContent`,
+        nativeBody,
+        IMAGE_GENERATION_TIMEOUT_MS,
+      ));
+    }
+    value = nativeValues;
+  }
   const images = uniqueImages(value, input.inputImages, input.count);
   if (images.length) return images;
   throw new Error('渠道没有返回图片数据');

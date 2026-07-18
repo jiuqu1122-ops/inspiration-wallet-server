@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildGeminiNativeImageBody,
   chooseProviderForCapability,
   collectProviderModelIds,
   imageUnitCredits,
@@ -10,6 +11,7 @@ import {
   resolveNewApiImageModel,
   resolveXaisModel,
   resolveXaisWorkerRatio,
+  shouldUseGeminiNativeFallback,
   sizeFromRatio,
   uniqueImages,
 } from '../src/modules/ai/image-service.js';
@@ -148,6 +150,43 @@ describe('wallet image provider normalization', () => {
       aspect_ratio: '9:16',
       ratio: '9:16',
       quality: 'high',
+    });
+  });
+
+  it('falls back to the Gemini native endpoint only for explicit compatibility failures', () => {
+    expect(shouldUseGeminiNativeFallback(
+      'gemini-3-pro-image',
+      new Error('HTTP 500: operation copy failed: source path does not exist: output.text'),
+    )).toBe(true);
+    expect(shouldUseGeminiNativeFallback(
+      'gemini-3.1-flash-image',
+      new Error('HTTP 400: Bad request to gemini-flash: Provided image is not valid.'),
+    )).toBe(true);
+    expect(shouldUseGeminiNativeFallback('gemini-3-pro-image', new Error('HTTP 500'))).toBe(false);
+    expect(shouldUseGeminiNativeFallback('gpt-image-2', new Error('source path does not exist: output.text')))
+      .toBe(false);
+  });
+
+  it('builds Gemini native inline image parts without file paths or remote URLs', () => {
+    const body = buildGeminiNativeImageBody({
+      userId: 'user-1',
+      clientRequestId: 'request-1',
+      model: 'gemini-3-pro-image',
+      prompt: 'render the projector',
+      inputImages: ['data:image/png;base64,aGVsbG8='],
+      aspectRatio: '16:9',
+      resolution: '4K',
+      outputFormat: 'jpg',
+      count: 1,
+    });
+
+    expect(body.contents[0]?.parts).toEqual([
+      { text: expect.stringContaining('render the projector') },
+      { inlineData: { mimeType: 'image/png', data: 'aGVsbG8=' } },
+    ]);
+    expect(body.generationConfig).toEqual({
+      responseModalities: ['TEXT', 'IMAGE'],
+      imageConfig: { aspectRatio: '16:9', imageSize: '4K' },
     });
   });
 });
