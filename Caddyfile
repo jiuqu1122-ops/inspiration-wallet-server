@@ -4,8 +4,8 @@
         timeouts {
             read_body 5m
             read_header 15s
-            write 5m
-            idle 10m
+            write 12m
+            idle 15m
         }
     }
 }
@@ -31,7 +31,7 @@ api.unmind.art {
     reverse_proxy api:3000 {
         transport http {
             dial_timeout 10s
-            response_header_timeout 5m
+            response_header_timeout 11m
         }
     }
 

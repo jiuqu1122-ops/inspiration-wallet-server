@@ -5,6 +5,7 @@ import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
 import { CloudAiError } from './service.js';
 
 const DEFAULT_IMAGE_UNIT_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
+const IMAGE_GENERATION_TIMEOUT_MS = 10 * 60_000;
 const XAIS_MODEL_MAP: Record<string, string> = {
   'Xais Nano Pro_2K': 'Nano_Banana_Pro_2K_0',
   'Xais Nano Pro_4K': 'Nano_Banana_Pro_4K_0',
@@ -434,7 +435,13 @@ async function generateNewApiImages(
     stream: false,
     max_tokens: 8192,
   };
-  const value = await providerRequest(provider, secrets, '/v1/chat/completions', body);
+  const value = await providerRequest(
+    provider,
+    secrets,
+    '/v1/chat/completions',
+    body,
+    IMAGE_GENERATION_TIMEOUT_MS,
+  );
   const images = uniqueImages(value, input.inputImages, input.count);
   if (images.length) return images;
   throw new Error('渠道没有返回图片数据');
@@ -592,7 +599,7 @@ async function generateXaisImages(
       n: input.count,
       size: sizeFromRatio(input.aspectRatio),
       response_format: 'url',
-    });
+    }, IMAGE_GENERATION_TIMEOUT_MS);
     const images = uniqueImages(value, input.inputImages, input.count);
     if (images.length) return images;
   } catch (error) {
@@ -604,7 +611,7 @@ async function generateXaisImages(
     messages: [{ role: 'user', content: chatContent(input) }],
     stream: false,
     max_tokens: 8192,
-  });
+  }, IMAGE_GENERATION_TIMEOUT_MS);
   return uniqueImages(value, input.inputImages, input.count);
 }
 
