@@ -1,6 +1,6 @@
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { z } from 'zod';
-import { CloudAiError, executeWalletAgentChat } from './service.js';
+import { CloudAiError, executeFreeInspirationAnalysis, executeWalletAgentChat } from './service.js';
 import { executeWalletImageGeneration, listWalletImageModels } from './image-service.js';
 import { executeWalletVideoGeneration, executeWalletVideoStatus } from './image-service.js';
 import { getImageReference } from './reference-store.js';
@@ -9,6 +9,14 @@ const chatSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
   messages: z.array(z.unknown()).min(1).max(200),
   tools: z.array(z.unknown()).max(100).optional(),
+}).strict();
+
+const inspirationAnalysisSchema = z.object({
+  itemId: z.string().trim().min(1).max(256),
+  imageSource: z.string().min(1).max(12_000_000),
+  userTags: z.array(z.string().trim().min(1).max(100)).max(50).optional(),
+  userNotes: z.array(z.string().trim().min(1).max(2_000)).max(50).optional(),
+  existingProfile: z.unknown().optional(),
 }).strict();
 
 const optionalString = (max: number) => z.string().trim().max(max).nullish()
@@ -107,6 +115,25 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       }
       try {
         return await listWalletImageModels(app.prisma);
+      } catch (error) {
+        return knownError(reply, error);
+      }
+    },
+  );
+
+  app.post(
+    '/inspirations/analyze',
+    {
+      preHandler: app.authenticateAccessToken,
+      config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    },
+    async (request, reply) => {
+      const parsed = inspirationAnalysisSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'invalid_request', message: '灵感自动分析请求格式无效' });
+      }
+      try {
+        return await executeFreeInspirationAnalysis(app.prisma, parsed.data);
       } catch (error) {
         return knownError(reply, error);
       }

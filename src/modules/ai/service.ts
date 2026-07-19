@@ -281,3 +281,68 @@ export async function executeWalletAgentChat(
     throw error;
   }
 }
+
+export async function executeFreeInspirationAnalysis(
+  prisma: PrismaClient,
+  input: {
+    itemId: string;
+    imageSource: string;
+    userTags?: string[] | undefined;
+    userNotes?: string[] | undefined;
+    existingProfile?: unknown;
+  },
+) {
+  const provider = await selectProvider(prisma);
+  const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+  const model = await discoverModel(provider, secrets.apiKey, secrets.headers);
+  const prompt = `Analyze this saved design inspiration image. Return JSON only with this exact shape:
+{"itemId":"${input.itemId}","summary":"","objects":[],"category":"","form":{"silhouette":[],"geometry":[],"proportion":[]},"cmf":{"colors":[],"materials":[],"finishes":[]},"style":[],"interaction":[],"scene":[],"mood":[],"userTags":[],"userNotes":[]}
+Explain what it is useful as a design reference for. Keep fields concise. Preserve supplied user tags and notes.
+User tags: ${JSON.stringify(input.userTags ?? [])}
+User notes: ${JSON.stringify(input.userNotes ?? '')}
+Existing profile: ${JSON.stringify(input.existingProfile ?? null)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4 * 60_000);
+  let response: Response;
+  try {
+    response = await fetch(providerEndpoint(provider.baseUrl, '/v1/chat/completions'), {
+      method: 'POST',
+      headers: upstreamHeaders(secrets.apiKey, secrets.headers),
+      body: JSON.stringify({
+        model,
+        stream: false,
+        response_format: { type: 'json_object' },
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: prompt },
+            { type: 'image_url', image_url: { url: input.imageSource, detail: 'low' } },
+          ],
+        }],
+      }),
+      redirect: 'error',
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+  const text = await response.text();
+  if (!response.ok) {
+    throw new CloudAiError('provider_request_failed', `灵感自动分析渠道请求失败（HTTP ${response.status}）`, 502);
+  }
+  let value: unknown;
+  try { value = JSON.parse(text); } catch {
+    throw new CloudAiError('provider_invalid_response', '灵感自动分析渠道返回格式无效', 502);
+  }
+  const content = (value as { choices?: Array<{ message?: { content?: unknown } }> })
+    ?.choices?.[0]?.message?.content;
+  const raw = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.map((part) => (part && typeof part === 'object' && 'text' in part ? String(part.text) : '')).join('')
+      : '';
+  const jsonText = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+  try { return { profile: JSON.parse(jsonText) as unknown }; } catch {
+    throw new CloudAiError('provider_invalid_response', '灵感自动分析未返回有效 JSON', 502);
+  }
+}
