@@ -72,7 +72,9 @@ async function discoverModel(
   provider: { baseUrl: string; defaultModel: string | null },
   apiKey: string,
   customHeaders: Record<string, string>,
+  preferredModel?: string,
 ) {
+  if (preferredModel?.trim()) return preferredModel.trim();
   if (provider.defaultModel?.trim()) return provider.defaultModel.trim();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15_000);
@@ -112,6 +114,33 @@ async function discoverModel(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function readProviderModels(
+  provider: { baseUrl: string },
+  apiKey: string,
+  customHeaders: Record<string, string>,
+) {
+  const response = await fetch(providerEndpoint(provider.baseUrl, '/v1/models'), {
+    headers: upstreamHeaders(apiKey, customHeaders),
+    redirect: 'error',
+  });
+  if (!response.ok) throw new CloudAiError('provider_request_failed', `Agent 妯″瀷鍒楄〃璇锋眰澶辫触（HTTP ${response.status}）`, 502);
+  const value: unknown = await response.json();
+  const data = value && typeof value === 'object' && 'data' in value
+    ? (value as { data?: unknown }).data
+    : value;
+  return Array.from(new Set((Array.isArray(data) ? data : [])
+    .map((item: unknown) => item && typeof item === 'object' && 'id' in item ? (item as { id?: unknown }).id : item)
+    .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+    .map(id => id.trim())));
+}
+
+export async function listWalletAgentModels(prisma: PrismaClient) {
+  const provider = await selectProvider(prisma);
+  const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+  const models = await readProviderModels(provider, secrets.apiKey, secrets.headers);
+  return { models, defaultModel: provider.defaultModel?.trim() || models[0] || null };
 }
 
 async function reserveCredits(
@@ -230,13 +259,14 @@ export async function executeWalletAgentChat(
     clientRequestId: string;
     messages: unknown[];
     tools?: unknown[] | undefined;
+    model?: string | undefined;
   },
 ) {
   const requestId = await reserveCredits(prisma, input);
   try {
     const provider = await selectProvider(prisma);
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-    const model = await discoverModel(provider, secrets.apiKey, secrets.headers);
+    const model = await discoverModel(provider, secrets.apiKey, secrets.headers, input.model);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 4 * 60_000);
     let response: Response;
@@ -290,11 +320,12 @@ export async function executeFreeInspirationAnalysis(
     userTags?: string[] | undefined;
     userNotes?: string[] | undefined;
     existingProfile?: unknown;
+    model?: string | undefined;
   },
 ) {
   const provider = await selectProvider(prisma);
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-  const model = await discoverModel(provider, secrets.apiKey, secrets.headers);
+  const model = await discoverModel(provider, secrets.apiKey, secrets.headers, input.model);
   const prompt = `Analyze this saved design inspiration image. Return JSON only with this exact shape:
 {"itemId":"${input.itemId}","summary":"","objects":[],"category":"","form":{"silhouette":[],"geometry":[],"proportion":[]},"cmf":{"colors":[],"materials":[],"finishes":[]},"style":[],"interaction":[],"scene":[],"mood":[],"userTags":[],"userNotes":[]}
 Explain what it is useful as a design reference for. Keep fields concise. Preserve supplied user tags and notes.

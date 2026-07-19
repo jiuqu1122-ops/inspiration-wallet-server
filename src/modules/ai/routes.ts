@@ -1,6 +1,6 @@
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { z } from 'zod';
-import { CloudAiError, executeFreeInspirationAnalysis, executeWalletAgentChat } from './service.js';
+import { CloudAiError, executeFreeInspirationAnalysis, executeWalletAgentChat, listWalletAgentModels } from './service.js';
 import { executeWalletImageGeneration, listWalletImageModels } from './image-service.js';
 import { executeWalletVideoGeneration, executeWalletVideoStatus } from './image-service.js';
 import { getImageReference } from './reference-store.js';
@@ -9,6 +9,7 @@ const chatSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
   messages: z.array(z.unknown()).min(1).max(200),
   tools: z.array(z.unknown()).max(100).optional(),
+  model: z.string().trim().min(1).max(200).optional(),
 }).strict();
 
 const inspirationAnalysisSchema = z.object({
@@ -17,6 +18,7 @@ const inspirationAnalysisSchema = z.object({
   userTags: z.array(z.string().trim().min(1).max(100)).max(50).optional(),
   userNotes: z.array(z.string().trim().min(1).max(2_000)).max(50).optional(),
   existingProfile: z.unknown().optional(),
+  model: z.string().trim().min(1).max(200).optional(),
 }).strict();
 
 const optionalString = (max: number) => z.string().trim().max(max).nullish()
@@ -80,6 +82,21 @@ function knownError(reply: FastifyReply, error: unknown) {
 }
 
 export const aiRoutes: FastifyPluginAsync = async (app) => {
+  app.get(
+    '/models',
+    {
+      preHandler: app.authenticateAccessToken,
+      config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    },
+    async (_request, reply) => {
+      try {
+        return await listWalletAgentModels(app.prisma);
+      } catch (error) {
+        return knownError(reply, error);
+      }
+    },
+  );
+
   app.get(
     '/references/:key',
     { config: { rateLimit: { max: 240, timeWindow: '1 minute' } } },
