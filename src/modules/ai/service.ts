@@ -151,6 +151,32 @@ export function resolveConfiguredAgentModel(
     : requested || configured || null;
 }
 
+const NON_AGENT_TEXT_MODEL_PATTERN = /(?:^|[-_/.\s])(?:embeddings?|embed|rerank|re-rank|image|images|imagen|img2|flux|sdxl|stable[-_.\s]?diffusion|dall[-_.\s]?e|recraft|ideogram|midjourney|seedream|nano[-_.\s]?banana|hidream|kolors|jimeng|video|sora|veo|kling|seedance|tts|speech|whisper|transcrib(?:e|er)|transcription|moderation)(?:$|[-_/.\s\d])/i;
+
+export function isLikelyAgentTextModel(model: string) {
+  const normalized = model.trim();
+  if (!normalized) return false;
+  if (/^xais\s+(?:nano|img)/i.test(normalized)) return false;
+  return !NON_AGENT_TEXT_MODEL_PATTERN.test(normalized);
+}
+
+export function buildAgentModelCandidates(
+  provider: { defaultModel: string | null },
+  requestedModel: string | null | undefined,
+  discoveredModels: string[],
+  preferProviderDefault = false,
+) {
+  const requested = isDefaultAgentModelSentinel(requestedModel) ? '' : requestedModel?.trim() ?? '';
+  const configured = provider.defaultModel?.trim() ?? '';
+  const preferred = preferProviderDefault
+    ? [configured, requested]
+    : [requested, configured];
+  return Array.from(new Set([
+    ...preferred,
+    ...discoveredModels.filter(isLikelyAgentTextModel),
+  ].filter(Boolean)));
+}
+
 const AGENT_PROTOCOL_FALLBACK_STATUSES = new Set([400, 401, 403, 404, 405, 422, 429]);
 
 export function isAgentProtocolFallbackStatus(status: number) {
@@ -255,6 +281,18 @@ function canRetrySingleAgentProvider(error: unknown) {
   return error instanceof Error && (error.name === 'AbortError' || error.name === 'TypeError');
 }
 
+function canTryAlternativeAgentModel(error: unknown) {
+  if (error instanceof AgentUpstreamHttpError) {
+    return error.status !== 401
+      && error.status !== 403
+      && (isAgentProviderRetryStatus(error.status) || [400, 404, 405, 422, 429].includes(error.status));
+  }
+  if (error instanceof CloudAiError) {
+    return ['provider_model_missing', 'provider_request_failed', 'provider_invalid_response'].includes(error.code);
+  }
+  return error instanceof Error;
+}
+
 const waitForAgentProviderRetry = () => new Promise(resolve => setTimeout(resolve, 800));
 
 async function requestAgentCompletionFromProvider(
@@ -324,19 +362,32 @@ async function readProviderModels(
   apiKey: string,
   customHeaders: Record<string, string>,
 ) {
-  const response = await fetch(providerEndpoint(provider.baseUrl, '/v1/models'), {
-    headers: upstreamHeaders(apiKey, customHeaders),
-    redirect: 'error',
-  });
-  if (!response.ok) throw new CloudAiError('provider_request_failed', `Agent 妯″瀷鍒楄〃璇锋眰澶辫触（HTTP ${response.status}）`, 502);
-  const value: unknown = await response.json();
-  const data = value && typeof value === 'object' && 'data' in value
-    ? (value as { data?: unknown }).data
-    : value;
-  return Array.from(new Set((Array.isArray(data) ? data : [])
-    .map((item: unknown) => item && typeof item === 'object' && 'id' in item ? (item as { id?: unknown }).id : item)
-    .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
-    .map(id => id.trim())));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(providerEndpoint(provider.baseUrl, '/v1/models'), {
+      headers: upstreamHeaders(apiKey, customHeaders),
+      redirect: 'error',
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new CloudAiError(
+        'provider_request_failed',
+        `Agent 模型列表请求失败（HTTP ${response.status}）`,
+        502,
+      );
+    }
+    const value: unknown = await response.json();
+    const data = value && typeof value === 'object' && 'data' in value
+      ? (value as { data?: unknown }).data
+      : value;
+    return Array.from(new Set((Array.isArray(data) ? data : [])
+      .map((item: unknown) => item && typeof item === 'object' && 'id' in item ? (item as { id?: unknown }).id : item)
+      .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+      .map(id => id.trim())));
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export async function listWalletAgentModels(prisma: PrismaClient) {
@@ -479,16 +530,36 @@ export async function executeWalletAgentChat(
         break;
       } catch (error) {
         let finalError = error;
-        if (providers.length === 1 && canRetrySingleAgentProvider(error)) {
+        let fallbackModel = '';
+        if (providers.length === 1 && canTryAlternativeAgentModel(error)) {
+          try {
+            const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+            const models = await readProviderModels(provider, secrets.apiKey, secrets.headers);
+            const failedModel = resolveConfiguredAgentModel(provider, input.model, index > 0) || models[0] || '';
+            fallbackModel = buildAgentModelCandidates(
+              provider,
+              input.model,
+              models,
+              index > 0,
+            ).find(model => model !== failedModel) || '';
+          } catch {
+            fallbackModel = '';
+          }
+        }
+        if (providers.length === 1 && (fallbackModel || canRetrySingleAgentProvider(error))) {
           await waitForAgentProviderRetry();
           try {
-            result = await requestAgentCompletionFromProvider(provider, input);
+            result = await requestAgentCompletionFromProvider(
+              provider,
+              fallbackModel ? { ...input, model: fallbackModel } : input,
+            );
             break;
           } catch (retryError) {
             finalError = retryError;
           }
         }
-        failures.push(`${provider.name}：${agentProviderFailureDetail(finalError)}`);
+        const modelDetail = fallbackModel ? `（已自动改用模型 ${fallbackModel}）` : '';
+        failures.push(`${provider.name}${modelDetail}：${agentProviderFailureDetail(finalError)}`);
         const hasNextProvider = index + 1 < providers.length;
         if (!hasNextProvider || !canFallbackToNextAgentProvider(finalError)) {
           const lastFailure = failures[failures.length - 1] || '未知通道错误';

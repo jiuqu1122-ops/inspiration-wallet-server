@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildAgentModelCandidates,
   isAgentProtocolFallbackStatus,
   isAgentProviderFallbackStatus,
   isAgentProviderRetryStatus,
   isDefaultAgentModelSentinel,
+  isLikelyAgentTextModel,
   resolveConfiguredAgentModel,
   sanitizeAgentUpstreamDetail,
 } from '../src/modules/ai/service.js';
@@ -39,6 +41,32 @@ describe('Agent provider fallback policy', () => {
     expect(isAgentProviderRetryStatus(503)).toBe(true);
     expect(isAgentProviderRetryStatus(429)).toBe(false);
     expect(isAgentProviderRetryStatus(400)).toBe(false);
+  });
+
+  it('selects another text model from the same channel after a model failure', () => {
+    expect(buildAgentModelCandidates(
+      { defaultModel: 'claude-sonnet-4-5' },
+      'gemini-2.5-pro',
+      [
+        'gemini-3-pro-image-preview',
+        'text-embedding-3-large',
+        'gemini-2.5-flash',
+        'claude-sonnet-4-5',
+      ],
+    )).toEqual([
+      'gemini-2.5-pro',
+      'claude-sonnet-4-5',
+      'gemini-2.5-flash',
+    ]);
+  });
+
+  it('filters non-Agent models discovered on a mixed-capability channel', () => {
+    expect(isLikelyAgentTextModel('gpt-5.4')).toBe(true);
+    expect(isLikelyAgentTextModel('qwen3-vl-plus')).toBe(true);
+    expect(isLikelyAgentTextModel('gpt-image-2')).toBe(false);
+    expect(isLikelyAgentTextModel('Xais Nano Pro_2K')).toBe(false);
+    expect(isLikelyAgentTextModel('seedance-1.5-pro')).toBe(false);
+    expect(isLikelyAgentTextModel('text-embedding-3-large')).toBe(false);
   });
 
   it('redacts credentials from upstream error details', () => {
