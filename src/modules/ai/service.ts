@@ -34,7 +34,7 @@ async function selectProvider(prisma: PrismaClient) {
 
 function upstreamHeaders(apiKey: string, customHeaders: Record<string, string>) {
   const headers = new Headers({
-    accept: 'application/json',
+    accept: 'text/event-stream, application/json',
     authorization: `Bearer ${apiKey}`,
     'content-type': 'application/json',
     'user-agent': 'Inspiration-Wallet-Server/1',
@@ -238,6 +238,170 @@ function upstreamErrorDetail(status: number, text: string) {
   ].filter(Boolean).join('');
 }
 
+type AgentToolCallAccumulator = {
+  id: string;
+  type: string;
+  name: string;
+  arguments: string;
+};
+
+type AgentChoiceAccumulator = {
+  index: number;
+  role: string;
+  content: string;
+  refusal: string;
+  toolCalls: Map<number, AgentToolCallAccumulator>;
+  finishReason: unknown;
+  logprobs?: unknown;
+};
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function streamedText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (!Array.isArray(value)) return '';
+  return value.map((part) => {
+    if (typeof part === 'string') return part;
+    const record = objectValue(part);
+    return typeof record?.text === 'string' ? record.text : '';
+  }).join('');
+}
+
+function appendStableFragment(current: string, fragment: unknown) {
+  if (typeof fragment !== 'string' || !fragment) return current;
+  if (!current) return fragment;
+  return current === fragment ? current : `${current}${fragment}`;
+}
+
+function mergeStreamedToolCalls(
+  accumulator: AgentChoiceAccumulator,
+  value: unknown,
+) {
+  if (!Array.isArray(value)) return;
+  for (const [fallbackIndex, item] of value.entries()) {
+    const call = objectValue(item);
+    if (!call) continue;
+    const index = typeof call.index === 'number' ? call.index : fallbackIndex;
+    const existing = accumulator.toolCalls.get(index) ?? {
+      id: '',
+      type: 'function',
+      name: '',
+      arguments: '',
+    };
+    const fn = objectValue(call.function);
+    existing.id = appendStableFragment(existing.id, call.id);
+    existing.type = typeof call.type === 'string' && call.type ? call.type : existing.type;
+    existing.name = appendStableFragment(existing.name, fn?.name);
+    if (typeof fn?.arguments === 'string') existing.arguments += fn.arguments;
+    accumulator.toolCalls.set(index, existing);
+  }
+}
+
+function mergeStreamedChoice(
+  choices: Map<number, AgentChoiceAccumulator>,
+  value: unknown,
+  fallbackIndex: number,
+) {
+  const choice = objectValue(value);
+  if (!choice) return;
+  const index = typeof choice.index === 'number' ? choice.index : fallbackIndex;
+  const accumulator: AgentChoiceAccumulator = choices.get(index) ?? {
+    index,
+    role: 'assistant',
+    content: '',
+    refusal: '',
+    toolCalls: new Map<number, AgentToolCallAccumulator>(),
+    finishReason: null,
+  };
+  const delta = objectValue(choice.delta) ?? objectValue(choice.message);
+  if (typeof delta?.role === 'string' && delta.role) accumulator.role = delta.role;
+  accumulator.content += streamedText(delta?.content);
+  accumulator.refusal += streamedText(delta?.refusal);
+  mergeStreamedToolCalls(accumulator, delta?.tool_calls);
+  if (choice.finish_reason !== undefined && choice.finish_reason !== null) {
+    accumulator.finishReason = choice.finish_reason;
+  }
+  if (choice.logprobs !== undefined) accumulator.logprobs = choice.logprobs;
+  choices.set(index, accumulator);
+}
+
+export function parseAgentCompletionResponseText(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    throw new CloudAiError('provider_invalid_response', 'Agent channel returned an empty response', 502);
+  }
+  const eventPayloads = trimmed
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line.startsWith('data:'))
+    .map(line => line.slice(5).trim())
+    .filter(Boolean);
+  if (eventPayloads.length === 0) {
+    try {
+      return JSON.parse(trimmed) as unknown;
+    } catch {
+      throw new CloudAiError('provider_invalid_response', 'Agent channel returned invalid JSON', 502);
+    }
+  }
+
+  const metadata: Record<string, unknown> = {};
+  const choices = new Map<number, AgentChoiceAccumulator>();
+  let lastPayload: unknown;
+  for (const payload of eventPayloads) {
+    if (payload === '[DONE]') break;
+    let value: unknown;
+    try {
+      value = JSON.parse(payload) as unknown;
+    } catch {
+      throw new CloudAiError('provider_invalid_response', 'Agent channel returned an invalid stream event', 502);
+    }
+    lastPayload = value;
+    const record = objectValue(value);
+    if (!record) continue;
+    for (const key of ['id', 'created', 'model', 'system_fingerprint', 'service_tier']) {
+      if (record[key] !== undefined && record[key] !== null) metadata[key] = record[key];
+    }
+    if (record.usage !== undefined && record.usage !== null) metadata.usage = record.usage;
+    if (Array.isArray(record.choices)) {
+      record.choices.forEach((choice, index) => mergeStreamedChoice(choices, choice, index));
+    }
+  }
+
+  if (choices.size === 0) {
+    if (lastPayload !== undefined) return lastPayload;
+    throw new CloudAiError('provider_invalid_response', 'Agent channel stream did not contain a result', 502);
+  }
+  return {
+    ...metadata,
+    object: 'chat.completion',
+    choices: Array.from(choices.values())
+      .sort((left, right) => left.index - right.index)
+      .map(choice => ({
+        index: choice.index,
+        message: {
+          role: choice.role,
+          content: choice.content,
+          ...(choice.refusal ? { refusal: choice.refusal } : {}),
+          ...(choice.toolCalls.size > 0 ? {
+            tool_calls: Array.from(choice.toolCalls.entries())
+              .sort(([left], [right]) => left - right)
+              .map(([, call]) => ({
+                id: call.id,
+                type: call.type,
+                function: { name: call.name, arguments: call.arguments },
+              })),
+          } : {}),
+        },
+        finish_reason: choice.finishReason,
+        ...(choice.logprobs !== undefined ? { logprobs: choice.logprobs } : {}),
+      })),
+  };
+}
+
 class AgentUpstreamHttpError extends Error {
   constructor(
     public readonly status: number,
@@ -317,6 +481,7 @@ async function requestAgentCompletionFromProvider(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4 * 60_000);
   let response: Response;
+  let text: string;
   try {
     response = await fetch(providerEndpoint(provider.baseUrl, '/v1/chat/completions'), {
       method: 'POST',
@@ -324,16 +489,16 @@ async function requestAgentCompletionFromProvider(
       body: JSON.stringify({
         model,
         messages: input.messages,
-        stream: false,
+        stream: true,
         ...(input.tools?.length ? { tools: input.tools, tool_choice: 'auto' } : {}),
       }),
       redirect: 'error',
       signal: controller.signal,
     });
+    text = await response.text();
   } finally {
     clearTimeout(timeout);
   }
-  const text = await response.text();
   if (!response.ok) {
     throw new AgentUpstreamHttpError(
       response.status,
@@ -342,7 +507,7 @@ async function requestAgentCompletionFromProvider(
   }
   let result: unknown;
   try {
-    result = JSON.parse(text);
+    result = parseAgentCompletionResponseText(text);
   } catch {
     throw new CloudAiError('provider_invalid_response', 'Agent 渠道返回格式无效', 502);
   }
@@ -607,13 +772,14 @@ Existing profile: ${JSON.stringify(input.existingProfile ?? null)}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4 * 60_000);
   let response: Response;
+  let text: string;
   try {
     response = await fetch(providerEndpoint(provider.baseUrl, '/v1/chat/completions'), {
       method: 'POST',
       headers: upstreamHeaders(secrets.apiKey, secrets.headers),
       body: JSON.stringify({
         model,
-        stream: false,
+        stream: true,
         response_format: { type: 'json_object' },
         messages: [{
           role: 'user',
@@ -626,15 +792,15 @@ Existing profile: ${JSON.stringify(input.existingProfile ?? null)}`;
       redirect: 'error',
       signal: controller.signal,
     });
+    text = await response.text();
   } finally {
     clearTimeout(timeout);
   }
-  const text = await response.text();
   if (!response.ok) {
     throw new CloudAiError('provider_request_failed', `灵感自动分析渠道请求失败（HTTP ${response.status}）`, 502);
   }
   let value: unknown;
-  try { value = JSON.parse(text); } catch {
+  try { value = parseAgentCompletionResponseText(text); } catch {
     throw new CloudAiError('provider_invalid_response', '灵感自动分析渠道返回格式无效', 502);
   }
   const content = (value as { choices?: Array<{ message?: { content?: unknown } }> })

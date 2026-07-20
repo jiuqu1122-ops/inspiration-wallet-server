@@ -6,6 +6,7 @@ import {
   isAgentProviderRetryStatus,
   isDefaultAgentModelSentinel,
   isLikelyAgentTextModel,
+  parseAgentCompletionResponseText,
   resolveConfiguredAgentModel,
   sanitizeAgentUpstreamDetail,
 } from '../src/modules/ai/service.js';
@@ -76,5 +77,54 @@ describe('Agent provider fallback policy', () => {
     expect(detail).not.toContain('secretvalue');
     expect(detail).not.toContain('eyJabc');
     expect(detail).toContain('[REDACTED]');
+  });
+
+  it('aggregates streamed text into a regular chat completion', () => {
+    const result = parseAgentCompletionResponseText([
+      'data: {"id":"chat-1","model":"gpt-test","choices":[{"index":0,"delta":{"role":"assistant","content":"hello "},"finish_reason":null}]}',
+      '',
+      'data: {"id":"chat-1","model":"gpt-test","choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}',
+      '',
+      'data: [DONE]',
+    ].join('\n')) as Record<string, unknown>;
+
+    expect(result).toMatchObject({
+      id: 'chat-1',
+      model: 'gpt-test',
+      object: 'chat.completion',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: 'hello world' },
+        finish_reason: 'stop',
+      }],
+    });
+  });
+
+  it('aggregates streamed tool call fragments', () => {
+    const result = parseAgentCompletionResponseText([
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"create_","arguments":"{\\"name\\":"}}]},"finish_reason":null}]}',
+      '',
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"node","arguments":"\\"concept\\"}"}}]},"finish_reason":"tool_calls"}]}',
+      '',
+      'data: [DONE]',
+    ].join('\n')) as { choices: Array<Record<string, unknown>> };
+
+    expect(result.choices[0]).toMatchObject({
+      message: {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{
+          id: 'call_1',
+          type: 'function',
+          function: { name: 'create_node', arguments: '{"name":"concept"}' },
+        }],
+      },
+      finish_reason: 'tool_calls',
+    });
+  });
+
+  it('keeps non-streaming JSON responses compatible', () => {
+    const value = { choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] };
+    expect(parseAgentCompletionResponseText(JSON.stringify(value))).toEqual(value);
   });
 });
