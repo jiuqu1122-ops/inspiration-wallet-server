@@ -5,6 +5,8 @@ import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
 
 const REQUEST_CREDITS = BigInt(env.AGENT_REQUEST_CREDITS);
 
+export const getAgentRequestCredits = () => REQUEST_CREDITS;
+
 export class CloudAiError extends Error {
   constructor(
     public readonly code: string,

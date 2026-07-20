@@ -108,7 +108,7 @@ nano .env
 - `LICENSE_SIGNING_PRIVATE_KEY`：与上面公钥匹配的 32 字节 Ed25519 私钥种子（Base64），用于服务器签发邮箱账户的设备 License。只能保存在服务器权限为 `600` 的 `.env` 和离线密码库中，禁止写入 Git、数据库、日志或客户端。
 - `SMTP_HOST`、`SMTP_PORT`、`SMTP_SECURE`、`SMTP_USER`、`SMTP_PASSWORD`、`SMTP_FROM`：用于发送邮箱验证码。`465` 通常对应 `SMTP_SECURE=true`，`587` 通常对应 `false`；以邮件服务商说明为准。生产上线前必须用真实邮箱完成一次收信测试。
 - `EMAIL_CODE_TTL_MINUTES`：验证码有效分钟数，允许 5 到 30，默认 10。
-- `AGENT_REQUEST_CREDITS`：每次钱包 Agent 请求的预扣额度，必须是正整数；测试环境可从 `1` 开始，后续按实际计费策略调整。
+- `AGENT_REQUEST_CREDITS`：每次钱包 Agent 请求的服务端预扣与结算额度，当前固定配置为 `10`；生产 `.env` 必须显式设置为 `10`，客户端无权覆盖。
 - `IMAGE_REQUEST_CREDITS`：未列入内置价格表的模型所使用的每张默认额度，必须是正整数；Nano Banana Pro、Nano Banana 2、GPT Image 2 和 GPT Image 2 H 按代码中的模型与清晰度价格表计费。
 - `VIDEO_REQUEST_CREDITS`：每个钱包视频任务的预扣与结算额度，必须是正整数；默认测试值为 `500`，请求数量大于 1 时按数量倍增。
 - `AI_WORKER_CONCURRENCY`：单个 worker 同时执行的任务数，默认 2；可横向增加 worker 容器，数据库条件更新会防止重复领取。

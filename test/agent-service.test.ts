@@ -8,12 +8,17 @@ import {
   isAgentProviderRetryStatus,
   isDefaultAgentModelSentinel,
   isLikelyAgentTextModel,
+  getAgentRequestCredits,
   parseAgentCompletionResponseText,
   resolveConfiguredAgentModel,
   sanitizeAgentUpstreamDetail,
 } from '../src/modules/ai/service.js';
 
 describe('Agent provider fallback policy', () => {
+  it('charges ten server-side credits for each Agent request', () => {
+    expect(getAgentRequestCredits()).toBe(10n);
+  });
+
   it('uses the configured channel model for default model sentinels', () => {
     expect(isDefaultAgentModelSentinel(undefined)).toBe(true);
     expect(isDefaultAgentModelSentinel('unmind-agent')).toBe(true);

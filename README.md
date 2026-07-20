@@ -105,7 +105,7 @@ npm run build
 
 Agent 与灵感分析使用 PostgreSQL 持久化异步任务。`POST /v1/ai/tasks` 接受 `type`、`requestId` 和 `payload`，立即返回 HTTP 202 与 `taskId`；`GET /v1/ai/tasks/:taskId` 查询进度和最终结果，`DELETE /v1/ai/tasks/:taskId` 取消任务。相同用户、类型和 `requestId` 会返回原任务，桌面端断线或重启后可以继续查询。兼容入口 `POST /v1/ai/chat/completions` 和 `POST /v1/ai/inspirations/analyze` 也只负责入队，不再等待模型完成。
 
-独立 `worker` 进程从数据库安全领取任务，持续更新心跳、阶段和进度。上游仍使用 `stream: true`，但由 worker 按分片增量解析 SSE 并聚合最终 JSON；桌面端每 2 秒轮询任务，成功后继续使用旧版 `content/toolCalls/finishReason` 处理逻辑。Agent 请求按 `AGENT_REQUEST_CREDITS` 预扣，成功后结算，失败或取消后释放。画布工具仍在桌面端执行，服务器不会执行或重放有副作用的工具调用。
+独立 `worker` 进程从数据库安全领取任务，持续更新心跳、阶段和进度。上游仍使用 `stream: true`，但由 worker 按分片增量解析 SSE 并聚合最终 JSON；桌面端每 2 秒轮询任务，成功后继续使用旧版 `content/toolCalls/finishReason` 处理逻辑。每次 Agent 请求由服务端按 `AGENT_REQUEST_CREDITS=10` 预扣，成功后结算，失败或取消后释放；客户端不提交也不能覆盖扣费额度。画布工具仍在桌面端执行，服务器不会执行或重放有副作用的工具调用。
 
 生产必须同时启动 API 和 worker：
 
