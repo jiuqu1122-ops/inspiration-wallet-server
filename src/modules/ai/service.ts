@@ -1,4 +1,4 @@
-import type { PrismaClient } from '@prisma/client';
+import type { AiProviderChannel, PrismaClient } from '@prisma/client';
 import { env } from '../../config/env.js';
 import { decryptProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
@@ -16,11 +16,15 @@ export class CloudAiError extends Error {
   }
 }
 
-async function selectProvider(prisma: PrismaClient) {
-  const provider = await prisma.aiProviderChannel.findFirst({
+async function listProviders(prisma: PrismaClient) {
+  return prisma.aiProviderChannel.findMany({
     where: { status: 'ACTIVE', capabilities: { has: 'LLM' } },
     orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }],
   });
+}
+
+async function selectProvider(prisma: PrismaClient) {
+  const provider = (await listProviders(prisma))[0];
   if (!provider) {
     throw new CloudAiError('provider_unavailable', '当前没有可用的 Agent 渠道', 503);
   }
@@ -114,6 +118,169 @@ async function discoverModel(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+const DEFAULT_AGENT_MODEL_SENTINELS = new Set([
+  'unmind-agent',
+  'auto',
+  'default',
+  'recommended',
+]);
+
+export function isDefaultAgentModelSentinel(value?: string | null) {
+  const normalized = value?.trim().toLowerCase() ?? '';
+  return !normalized || DEFAULT_AGENT_MODEL_SENTINELS.has(normalized);
+}
+
+const AGENT_PROTOCOL_FALLBACK_STATUSES = new Set([400, 401, 403, 404, 405, 422, 429]);
+
+export function isAgentProtocolFallbackStatus(status: number) {
+  return AGENT_PROTOCOL_FALLBACK_STATUSES.has(status);
+}
+
+export function isAgentProviderFallbackStatus(status: number) {
+  return status >= 500 || isAgentProtocolFallbackStatus(status);
+}
+
+export function sanitizeAgentUpstreamDetail(value: string) {
+  return value
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED]')
+    .replace(/((?:api[_ -]?key|token|authorization|secret)\s*[:=]\s*)[^\s,;"']+/gi, '$1[REDACTED]')
+    .replace(/([?&](?:api[_-]?key|token|access_token|key)=)[^&#\s]+/gi, '$1[REDACTED]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 600);
+}
+
+function scalarString(value: unknown) {
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number') return String(value);
+  return '';
+}
+
+function upstreamErrorDetail(status: number, text: string) {
+  let message = '';
+  let code = '';
+  try {
+    const value: unknown = JSON.parse(text);
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      const error = record.error && typeof record.error === 'object'
+        ? record.error as Record<string, unknown>
+        : null;
+      message = scalarString(error?.message) || scalarString(record.message)
+        || (typeof record.error === 'string' ? record.error.trim() : '');
+      code = scalarString(error?.code) || scalarString(error?.type) || scalarString(record.code);
+    }
+  } catch {
+    message = text;
+  }
+  const safeMessage = sanitizeAgentUpstreamDetail(message);
+  const safeCode = code.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 100);
+  return [
+    `HTTP ${status}`,
+    safeCode ? `[${safeCode}]` : '',
+    safeMessage ? `：${safeMessage}` : '',
+  ].filter(Boolean).join('');
+}
+
+class AgentUpstreamHttpError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly detail: string,
+  ) {
+    super(detail);
+    this.name = 'AgentUpstreamHttpError';
+  }
+}
+
+function agentProviderFailureDetail(error: unknown) {
+  if (error instanceof AgentUpstreamHttpError) return error.detail;
+  if (error instanceof CloudAiError) return sanitizeAgentUpstreamDetail(error.message) || error.code;
+  if (error instanceof Error) {
+    if (error.name === 'AbortError') return '上游 Agent 请求超时';
+    return sanitizeAgentUpstreamDetail(error.message) || error.name;
+  }
+  return typeof error === 'string'
+    ? sanitizeAgentUpstreamDetail(error)
+    : '未知通道错误';
+}
+
+function canFallbackToNextAgentProvider(error: unknown) {
+  if (error instanceof AgentUpstreamHttpError) {
+    return isAgentProviderFallbackStatus(error.status);
+  }
+  if (error instanceof CloudAiError) {
+    return [
+      'provider_model_missing',
+      'provider_request_failed',
+      'provider_invalid_response',
+    ].includes(error.code);
+  }
+  return error instanceof Error;
+}
+
+async function requestAgentCompletionFromProvider(
+  provider: AiProviderChannel,
+  input: {
+    messages: unknown[];
+    tools?: unknown[] | undefined;
+    model?: string | undefined;
+  },
+) {
+  await assertPublicProviderUrl(provider.baseUrl);
+  const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+  const preferredModel = isDefaultAgentModelSentinel(input.model) ? undefined : input.model;
+  const model = await discoverModel(
+    provider,
+    secrets.apiKey,
+    secrets.headers,
+    preferredModel,
+  );
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4 * 60_000);
+  let response: Response;
+  try {
+    response = await fetch(providerEndpoint(provider.baseUrl, '/v1/chat/completions'), {
+      method: 'POST',
+      headers: upstreamHeaders(secrets.apiKey, secrets.headers),
+      body: JSON.stringify({
+        model,
+        messages: input.messages,
+        stream: false,
+        ...(input.tools?.length ? { tools: input.tools, tool_choice: 'auto' } : {}),
+      }),
+      redirect: 'error',
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+  const text = await response.text();
+  if (!response.ok) {
+    throw new AgentUpstreamHttpError(
+      response.status,
+      upstreamErrorDetail(response.status, text),
+    );
+  }
+  let result: unknown;
+  try {
+    result = JSON.parse(text);
+  } catch {
+    throw new CloudAiError('provider_invalid_response', 'Agent 渠道返回格式无效', 502);
+  }
+  const providerFailure = providerFailureMessage(result);
+  if (providerFailure) {
+    throw new CloudAiError(
+      'provider_request_failed',
+      `Agent upstream failed: ${sanitizeAgentUpstreamDetail(providerFailure)}`,
+      502,
+    );
+  }
+  return result;
 }
 
 async function readProviderModels(
@@ -264,45 +431,33 @@ export async function executeWalletAgentChat(
 ) {
   const requestId = await reserveCredits(prisma, input);
   try {
-    const provider = await selectProvider(prisma);
-    const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-    const model = await discoverModel(provider, secrets.apiKey, secrets.headers, input.model);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4 * 60_000);
-    let response: Response;
-    try {
-      response = await fetch(providerEndpoint(provider.baseUrl, '/v1/chat/completions'), {
-        method: 'POST',
-        headers: upstreamHeaders(secrets.apiKey, secrets.headers),
-        body: JSON.stringify({
-          model,
-          messages: input.messages,
-          stream: false,
-          ...(input.tools?.length ? { tools: input.tools, tool_choice: 'auto' } : {}),
-        }),
-        redirect: 'error',
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timeout);
+    const providers = await listProviders(prisma);
+    if (providers.length === 0) {
+      throw new CloudAiError('provider_unavailable', '当前没有可用的 Agent 渠道', 503);
     }
-    const text = await response.text();
-    if (!response.ok) {
-      throw new CloudAiError(
-        'provider_request_failed',
-        `Agent 渠道请求失败（HTTP ${response.status}）`,
-        502,
-      );
-    }
+    const failures: string[] = [];
     let result: unknown;
-    try {
-      result = JSON.parse(text);
-    } catch {
-      throw new CloudAiError('provider_invalid_response', 'Agent 渠道返回格式无效', 502);
+    for (const [index, provider] of providers.entries()) {
+      try {
+        result = await requestAgentCompletionFromProvider(provider, input);
+        break;
+      } catch (error) {
+        failures.push(agentProviderFailureDetail(error));
+        const hasNextProvider = index + 1 < providers.length;
+        if (!hasNextProvider || !canFallbackToNextAgentProvider(error)) {
+          const lastFailure = failures[failures.length - 1] || '未知通道错误';
+          throw new CloudAiError(
+            'provider_request_failed',
+            providers.length > 1
+              ? `全部 Agent 渠道请求失败（已尝试 ${failures.length} 个）；末次错误：${lastFailure}`
+              : `Agent 渠道请求失败：${lastFailure}`,
+            502,
+          );
+        }
+      }
     }
-    const providerFailure = providerFailureMessage(result);
-    if (providerFailure) {
-      throw new CloudAiError('provider_request_failed', `Agent upstream failed: ${providerFailure}`, 502);
+    if (result === undefined) {
+      throw new CloudAiError('provider_request_failed', '全部 Agent 渠道请求失败', 502);
     }
     await settleCredits(prisma, input.userId, requestId);
     return result;
@@ -370,7 +525,11 @@ Existing profile: ${JSON.stringify(input.existingProfile ?? null)}`;
   const raw = typeof content === 'string'
     ? content
     : Array.isArray(content)
-      ? content.map((part) => (part && typeof part === 'object' && 'text' in part ? String(part.text) : '')).join('')
+      ? content.map((part: unknown) => {
+        if (!part || typeof part !== 'object' || !('text' in part)) return '';
+        const text = (part as Record<string, unknown>).text;
+        return typeof text === 'string' ? text : '';
+      }).join('')
       : '';
   const jsonText = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
   try { return { profile: JSON.parse(jsonText) as unknown }; } catch {
