@@ -77,9 +77,14 @@ async function discoverModel(
   apiKey: string,
   customHeaders: Record<string, string>,
   preferredModel?: string,
+  preferProviderDefault = false,
 ) {
-  if (preferredModel?.trim()) return preferredModel.trim();
-  if (provider.defaultModel?.trim()) return provider.defaultModel.trim();
+  const configuredModel = resolveConfiguredAgentModel(
+    provider,
+    preferredModel,
+    preferProviderDefault,
+  );
+  if (configuredModel) return configuredModel;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15_000);
   try {
@@ -130,6 +135,20 @@ const DEFAULT_AGENT_MODEL_SENTINELS = new Set([
 export function isDefaultAgentModelSentinel(value?: string | null) {
   const normalized = value?.trim().toLowerCase() ?? '';
   return !normalized || DEFAULT_AGENT_MODEL_SENTINELS.has(normalized);
+}
+
+export function resolveConfiguredAgentModel(
+  provider: { defaultModel: string | null },
+  requestedModel?: string | null,
+  preferProviderDefault = false,
+) {
+  const requested = isDefaultAgentModelSentinel(requestedModel)
+    ? ''
+    : requestedModel?.trim() ?? '';
+  const configured = provider.defaultModel?.trim() ?? '';
+  return preferProviderDefault
+    ? configured || requested || null
+    : requested || configured || null;
 }
 
 const AGENT_PROTOCOL_FALLBACK_STATUSES = new Set([400, 401, 403, 404, 405, 422, 429]);
@@ -230,6 +249,7 @@ async function requestAgentCompletionFromProvider(
     tools?: unknown[] | undefined;
     model?: string | undefined;
   },
+  preferProviderDefault = false,
 ) {
   await assertPublicProviderUrl(provider.baseUrl);
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
@@ -239,6 +259,7 @@ async function requestAgentCompletionFromProvider(
     secrets.apiKey,
     secrets.headers,
     preferredModel,
+    preferProviderDefault,
   );
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4 * 60_000);
@@ -439,7 +460,7 @@ export async function executeWalletAgentChat(
     let result: unknown;
     for (const [index, provider] of providers.entries()) {
       try {
-        result = await requestAgentCompletionFromProvider(provider, input);
+        result = await requestAgentCompletionFromProvider(provider, input, index > 0);
         break;
       } catch (error) {
         failures.push(agentProviderFailureDetail(error));

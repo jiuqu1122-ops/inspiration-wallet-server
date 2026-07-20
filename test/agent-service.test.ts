@@ -3,6 +3,7 @@ import {
   isAgentProtocolFallbackStatus,
   isAgentProviderFallbackStatus,
   isDefaultAgentModelSentinel,
+  resolveConfiguredAgentModel,
   sanitizeAgentUpstreamDetail,
 } from '../src/modules/ai/service.js';
 
@@ -12,6 +13,15 @@ describe('Agent provider fallback policy', () => {
     expect(isDefaultAgentModelSentinel('unmind-agent')).toBe(true);
     expect(isDefaultAgentModelSentinel('recommended')).toBe(true);
     expect(isDefaultAgentModelSentinel('gpt-5.6-sol')).toBe(false);
+  });
+
+  it('keeps the selected model on the primary channel and uses fallback channel defaults', () => {
+    const primary = { defaultModel: 'primary-default' };
+    const fallback = { defaultModel: 'fallback-default' };
+
+    expect(resolveConfiguredAgentModel(primary, 'selected-model')).toBe('selected-model');
+    expect(resolveConfiguredAgentModel(fallback, 'selected-model', true)).toBe('fallback-default');
+    expect(resolveConfiguredAgentModel({ defaultModel: null }, 'selected-model', true)).toBe('selected-model');
   });
 
   it('falls back for gateway failures and protocol-specific channel errors', () => {
