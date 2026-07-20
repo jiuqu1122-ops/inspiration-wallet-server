@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildAgentModelCandidates,
+  buildSingleProviderAgentRetryModels,
   isAgentProtocolFallbackStatus,
   isAgentProviderFallbackStatus,
   isAgentProviderRetryStatus,
@@ -59,6 +60,16 @@ describe('Agent provider fallback policy', () => {
       'claude-sonnet-4-5',
       'gemini-2.5-flash',
     ]);
+  });
+
+  it('retries a transient model before trying multiple same-channel alternatives', () => {
+    expect(buildSingleProviderAgentRetryModels(
+      { defaultModel: 'gpt-5.6-sol' },
+      'unmind-agent',
+      ['gpt-5.6-sol', 'gpt-5.4', 'gemini-2.5-pro', 'gpt-image-2'],
+      'gpt-5.6-sol',
+      true,
+    )).toEqual(['gpt-5.6-sol', 'gpt-5.4', 'gemini-2.5-pro']);
   });
 
   it('filters non-Agent models discovered on a mixed-capability channel', () => {

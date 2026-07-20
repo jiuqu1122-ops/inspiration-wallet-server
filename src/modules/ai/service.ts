@@ -177,6 +177,26 @@ export function buildAgentModelCandidates(
   ].filter(Boolean)));
 }
 
+const MAX_SINGLE_PROVIDER_AGENT_RETRIES = 3;
+
+export function buildSingleProviderAgentRetryModels(
+  provider: { defaultModel: string | null },
+  requestedModel: string | null | undefined,
+  discoveredModels: string[],
+  failedModel: string,
+  retryFailedModel: boolean,
+) {
+  const alternatives = buildAgentModelCandidates(
+    provider,
+    requestedModel,
+    discoveredModels,
+  ).filter(model => model !== failedModel);
+  return Array.from(new Set([
+    ...(retryFailedModel && failedModel ? [failedModel] : []),
+    ...alternatives,
+  ])).slice(0, MAX_SINGLE_PROVIDER_AGENT_RETRIES);
+}
+
 const AGENT_PROTOCOL_FALLBACK_STATUSES = new Set([400, 401, 403, 404, 405, 422, 429]);
 
 export function isAgentProtocolFallbackStatus(status: number) {
@@ -695,35 +715,50 @@ export async function executeWalletAgentChat(
         break;
       } catch (error) {
         let finalError = error;
-        let fallbackModel = '';
-        if (providers.length === 1 && canTryAlternativeAgentModel(error)) {
+        const retriedModels: string[] = [];
+        if (providers.length === 1
+          && (canTryAlternativeAgentModel(error) || canRetrySingleAgentProvider(error))) {
+          const failedModel = resolveConfiguredAgentModel(provider, input.model, index > 0) || '';
+          let discoveredModels: string[] = [];
           try {
             const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-            const models = await readProviderModels(provider, secrets.apiKey, secrets.headers);
-            const failedModel = resolveConfiguredAgentModel(provider, input.model, index > 0) || models[0] || '';
-            fallbackModel = buildAgentModelCandidates(
-              provider,
-              input.model,
-              models,
-              index > 0,
-            ).find(model => model !== failedModel) || '';
+            discoveredModels = await readProviderModels(provider, secrets.apiKey, secrets.headers);
           } catch {
-            fallbackModel = '';
+            discoveredModels = [];
           }
-        }
-        if (providers.length === 1 && (fallbackModel || canRetrySingleAgentProvider(error))) {
-          await waitForAgentProviderRetry();
-          try {
-            result = await requestAgentCompletionFromProvider(
-              provider,
-              fallbackModel ? { ...input, model: fallbackModel } : input,
-            );
-            break;
-          } catch (retryError) {
-            finalError = retryError;
+
+          const retryModels = buildSingleProviderAgentRetryModels(
+            provider,
+            input.model,
+            discoveredModels,
+            failedModel || discoveredModels[0] || '',
+            canRetrySingleAgentProvider(error),
+          );
+          const attempts: Array<string | null> = retryModels.length > 0
+            ? retryModels
+            : canRetrySingleAgentProvider(error) ? [null] : [];
+          for (const retryModel of attempts) {
+            await waitForAgentProviderRetry();
+            try {
+              result = await requestAgentCompletionFromProvider(
+                provider,
+                retryModel ? { ...input, model: retryModel } : input,
+              );
+              break;
+            } catch (retryError) {
+              finalError = retryError;
+              retriedModels.push(retryModel || failedModel || 'default');
+              if (!canTryAlternativeAgentModel(retryError)
+                && !canRetrySingleAgentProvider(retryError)) {
+                break;
+              }
+            }
           }
+          if (result !== undefined) break;
         }
-        const modelDetail = fallbackModel ? `（已自动改用模型 ${fallbackModel}）` : '';
+        const modelDetail = retriedModels.length > 0
+          ? `（同渠道已重试模型 ${retriedModels.join(' → ')}）`
+          : '';
         failures.push(`${provider.name}${modelDetail}：${agentProviderFailureDetail(finalError)}`);
         const hasNextProvider = index + 1 < providers.length;
         if (!hasNextProvider || !canFallbackToNextAgentProvider(finalError)) {
