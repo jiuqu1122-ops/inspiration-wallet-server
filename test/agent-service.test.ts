@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   isAgentProtocolFallbackStatus,
   isAgentProviderFallbackStatus,
+  isAgentProviderRetryStatus,
   isDefaultAgentModelSentinel,
   resolveConfiguredAgentModel,
   sanitizeAgentUpstreamDetail,
@@ -30,6 +31,14 @@ describe('Agent provider fallback policy', () => {
     expect(isAgentProviderFallbackStatus(429)).toBe(true);
     expect(isAgentProtocolFallbackStatus(404)).toBe(true);
     expect(isAgentProviderFallbackStatus(409)).toBe(false);
+  });
+
+  it('retries transient gateway errors without retrying protocol failures', () => {
+    expect(isAgentProviderRetryStatus(504)).toBe(true);
+    expect(isAgentProviderRetryStatus(524)).toBe(true);
+    expect(isAgentProviderRetryStatus(503)).toBe(true);
+    expect(isAgentProviderRetryStatus(429)).toBe(false);
+    expect(isAgentProviderRetryStatus(400)).toBe(false);
   });
 
   it('redacts credentials from upstream error details', () => {

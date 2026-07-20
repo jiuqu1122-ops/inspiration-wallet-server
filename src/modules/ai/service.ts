@@ -161,6 +161,12 @@ export function isAgentProviderFallbackStatus(status: number) {
   return status >= 500 || isAgentProtocolFallbackStatus(status);
 }
 
+const AGENT_PROVIDER_RETRY_STATUSES = new Set([502, 503, 504, 520, 521, 522, 523, 524]);
+
+export function isAgentProviderRetryStatus(status: number) {
+  return AGENT_PROVIDER_RETRY_STATUSES.has(status);
+}
+
 export function sanitizeAgentUpstreamDetail(value: string) {
   return value
     .replace(/<[^>]*>/g, ' ')
@@ -241,6 +247,15 @@ function canFallbackToNextAgentProvider(error: unknown) {
   }
   return error instanceof Error;
 }
+
+function canRetrySingleAgentProvider(error: unknown) {
+  if (error instanceof AgentUpstreamHttpError) {
+    return isAgentProviderRetryStatus(error.status);
+  }
+  return error instanceof Error && (error.name === 'AbortError' || error.name === 'TypeError');
+}
+
+const waitForAgentProviderRetry = () => new Promise(resolve => setTimeout(resolve, 800));
 
 async function requestAgentCompletionFromProvider(
   provider: AiProviderChannel,
@@ -463,9 +478,19 @@ export async function executeWalletAgentChat(
         result = await requestAgentCompletionFromProvider(provider, input, index > 0);
         break;
       } catch (error) {
-        failures.push(agentProviderFailureDetail(error));
+        let finalError = error;
+        if (providers.length === 1 && canRetrySingleAgentProvider(error)) {
+          await waitForAgentProviderRetry();
+          try {
+            result = await requestAgentCompletionFromProvider(provider, input);
+            break;
+          } catch (retryError) {
+            finalError = retryError;
+          }
+        }
+        failures.push(`${provider.name}：${agentProviderFailureDetail(finalError)}`);
         const hasNextProvider = index + 1 < providers.length;
-        if (!hasNextProvider || !canFallbackToNextAgentProvider(error)) {
+        if (!hasNextProvider || !canFallbackToNextAgentProvider(finalError)) {
           const lastFailure = failures[failures.length - 1] || '未知通道错误';
           throw new CloudAiError(
             'provider_request_failed',
