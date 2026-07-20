@@ -15,6 +15,7 @@ import {
   resolveNewApiImageModel,
   resolveXaisModel,
   resolveXaisWorkerRatio,
+  shouldFallbackNewApiImageProtocol,
   sizeFromRatio,
   uniqueImages,
 } from '../src/modules/ai/image-service.js';
@@ -166,6 +167,16 @@ describe('wallet image provider normalization', () => {
     expect(isGeminiNativeImageModel('gemini-3-pro-image')).toBe(true);
     expect(isGeminiNativeImageModel('Nano Banana 2')).toBe(true);
     expect(isGeminiNativeImageModel('gpt-image-2')).toBe(false);
+  });
+
+  it('falls back within a Gemini channel for temporary artifact path failures', () => {
+    expect(shouldFallbackNewApiImageProtocol(
+      'gemini-3-pro-image',
+      new Error('status_code=500, operation copy failed: source path does not exist: output.text'),
+    )).toBe(true);
+    expect(shouldFallbackNewApiImageProtocol('gemini-3-pro-image', new Error('HTTP 404 route not found'))).toBe(true);
+    expect(shouldFallbackNewApiImageProtocol('gpt-image-2', new Error('source path does not exist'))).toBe(false);
+    expect(shouldFallbackNewApiImageProtocol('gemini-3-pro-image', new Error('HTTP 504 gateway timeout'))).toBe(false);
   });
 
   it('builds Gemini native inline image parts without file paths or remote URLs', () => {

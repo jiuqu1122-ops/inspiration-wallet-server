@@ -445,6 +445,18 @@ export function isGeminiNativeImageModel(model: string) {
   return token.includes('gemini') || token.includes('nanobanana');
 }
 
+export function shouldFallbackNewApiImageProtocol(model: string, error: unknown) {
+  if (!isGeminiNativeImageModel(model)) return false;
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string' ? error : JSON.stringify(error ?? '');
+  const status = error instanceof UpstreamImageError
+    ? error.status
+    : Number(message.match(/(?:HTTP|status[_ ]?code)\D{0,12}(\d{3})/i)?.[1] || 0);
+  return [400, 404, 405, 415, 422, 501].includes(status)
+    || /(?:operation copy failed|copy operation failed|source path does not exist|provided image is not valid|bad request to gemini|unsupported (?:endpoint|model)|\.text\b)/i.test(message);
+}
+
 export function buildGeminiNativeImageBody(input: ImageInput, inputImages = input.inputImages) {
   const imageParts = inputImages.map((source) => {
     const { bytes, mime } = dataUrlImageBytes(source);
@@ -735,42 +747,56 @@ async function generateNewApiImages(
     && input.inputImages.every((source) => /^https?:\/\//i.test(source.trim()));
   if (directPublicReferences) {
     for (const source of input.inputImages) await assertPublicProviderUrl(source);
-    const value = await providerRequest(
-      provider,
-      secrets,
-      '/v1/chat/completions',
-      buildNewApiChatImageBody(input, input.inputImages),
-      IMAGE_GENERATION_TIMEOUT_MS,
-    );
-    const images = uniqueImages(value, input.inputImages, input.count);
-    if (images.length) return images;
-    throw new Error('NewAPI did not return image data');
+    try {
+      const value = await providerRequest(
+        provider,
+        secrets,
+        '/v1/chat/completions',
+        buildNewApiChatImageBody(input, input.inputImages),
+        IMAGE_GENERATION_TIMEOUT_MS,
+      );
+      const images = uniqueImages(value, input.inputImages, input.count);
+      if (images.length) return images;
+      throw new Error('NewAPI did not return image data');
+    } catch (error) {
+      if (!shouldFallbackNewApiImageProtocol(input.model, error)) throw error;
+    }
   }
 
   const materializedInputImages = await materializeNewApiReferenceImages(input.inputImages);
   if (materializedInputImages.length > 0) {
-    const value = await providerMultipartRequest(
-      provider,
-      secrets,
-      '/v1/images/edits',
-      buildNewApiImageEditForm(input, materializedInputImages),
-      IMAGE_GENERATION_TIMEOUT_MS,
-    );
-    const images = uniqueImages(value, input.inputImages, input.count);
-    if (images.length) return images;
-    throw new Error('NewAPI did not return image data');
+    try {
+      const value = await providerMultipartRequest(
+        provider,
+        secrets,
+        '/v1/images/edits',
+        buildNewApiImageEditForm(input, materializedInputImages),
+        IMAGE_GENERATION_TIMEOUT_MS,
+      );
+      const images = uniqueImages(value, input.inputImages, input.count);
+      if (images.length) return images;
+      throw new Error('NewAPI did not return image data');
+    } catch (error) {
+      if (!shouldFallbackNewApiImageProtocol(input.model, error)) throw error;
+    }
   }
 
   if (isGeminiNativeImageModel(input.model)) {
-    const value = await generateGeminiNativeImages(
-      provider,
-      secrets,
-      input,
-      materializedInputImages,
-    );
-    const images = uniqueImages(value, input.inputImages, input.count);
-    if (images.length) return images;
-    throw new Error('渠道没有返回图片数据');
+    try {
+      const value = await generateGeminiNativeImages(
+        provider,
+        secrets,
+        input,
+        materializedInputImages,
+      );
+      const images = uniqueImages(value, input.inputImages, input.count);
+      if (images.length) return images;
+      throw new Error('渠道没有返回图片数据');
+    } catch (error) {
+      if (input.inputImages.length > 0 || !shouldFallbackNewApiImageProtocol(input.model, error)) {
+        throw error;
+      }
+    }
   }
   const preparedInputImages = materializedInputImages.map((source, index) => {
     try {

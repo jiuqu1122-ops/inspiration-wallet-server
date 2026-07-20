@@ -415,13 +415,21 @@ export class AgentCompletionSseParser {
     if (this.done || !chunk) return;
     this.buffer += chunk;
     let boundary = this.buffer.search(/\r?\n\r?\n/);
-    while (boundary >= 0) {
+    while (boundary >= 0 && !this.done) {
       const event = this.buffer.slice(0, boundary);
       const separator = this.buffer.slice(boundary).match(/^\r?\n\r?\n/)?.[0] ?? '\n\n';
       this.buffer = this.buffer.slice(boundary + separator.length);
       this.consumeEvent(event);
       boundary = this.buffer.search(/\r?\n\r?\n/);
     }
+    if (!this.done && /^\s*data\s*:\s*\[DONE\]\s*$/i.test(this.buffer)) {
+      this.consumeEvent(this.buffer);
+      this.buffer = '';
+    }
+  }
+
+  isDone() {
+    return this.done;
   }
 
   finish() {
@@ -468,6 +476,48 @@ export class AgentCompletionSseParser {
     if (Array.isArray(record.choices)) {
       record.choices.forEach((choice, index) => mergeStreamedChoice(this.choices, choice, index));
     }
+  }
+}
+
+export function looksLikeAgentSsePayload(value: string) {
+  const firstLine = value
+    .replace(/^\uFEFF/, '')
+    .split(/\r?\n/)
+    .find(line => line.trim().length > 0);
+  return !!firstLine && /^\s*(?::|(?:data|event|id|retry)\s*:)/i.test(firstLine);
+}
+
+export class AgentCompletionResponseAccumulator {
+  private parser: AgentCompletionSseParser | null;
+  private buffered = '';
+
+  constructor(contentType = '') {
+    this.parser = contentType.toLowerCase().includes('text/event-stream')
+      ? new AgentCompletionSseParser()
+      : null;
+  }
+
+  push(chunk: string) {
+    if (!chunk || this.parser?.isDone()) return;
+    if (this.parser) {
+      this.parser.push(chunk);
+      return;
+    }
+    this.buffered += chunk;
+    if (!looksLikeAgentSsePayload(this.buffered)) return;
+    this.parser = new AgentCompletionSseParser();
+    this.parser.push(this.buffered);
+    this.buffered = '';
+  }
+
+  isDone() {
+    return this.parser?.isDone() ?? false;
+  }
+
+  finish() {
+    return this.parser
+      ? this.parser.finish()
+      : parseAgentCompletionResponseText(this.buffered);
   }
 }
 
@@ -661,11 +711,9 @@ async function requestStreamingCompletion(
   }
 
   const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
-  const isSse = contentType.includes('text/event-stream');
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  const parser = isSse ? new AgentCompletionSseParser() : null;
-  let buffered = '';
+  const accumulator = new AgentCompletionResponseAccumulator(contentType);
   let firstChunkMs: number | undefined;
   let lastProgressAt = 0;
   let byteCount = 0;
@@ -675,8 +723,7 @@ async function requestStreamingCompletion(
     if (!chunk.value?.byteLength) continue;
     byteCount += chunk.value.byteLength;
     const decoded = decoder.decode(chunk.value, { stream: true });
-    if (parser) parser.push(decoded);
-    else buffered += decoded;
+    accumulator.push(decoded);
     const now = Date.now();
     if (firstChunkMs === undefined) {
       firstChunkMs = now - startedAt;
@@ -703,11 +750,14 @@ async function requestStreamingCompletion(
       });
       lastProgressAt = now;
     }
+    if (accumulator.isDone()) {
+      await reader.cancel().catch(() => undefined);
+      break;
+    }
   }
   const tail = decoder.decode();
-  if (parser) parser.push(tail);
-  else buffered += tail;
-  const result = parser ? parser.finish() : parseAgentCompletionResponseText(buffered);
+  accumulator.push(tail);
+  const result = accumulator.finish();
   await emitAgentProgress(options, {
     stage: 'aggregating',
     progress: 90,

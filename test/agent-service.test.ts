@@ -2,12 +2,14 @@ import { describe, expect, it } from 'vitest';
 import {
   buildAgentModelCandidates,
   buildSingleProviderAgentRetryModels,
+  AgentCompletionResponseAccumulator,
   AgentCompletionSseParser,
   isAgentProtocolFallbackStatus,
   isAgentProviderFallbackStatus,
   isAgentProviderRetryStatus,
   isDefaultAgentModelSentinel,
   isLikelyAgentTextModel,
+  looksLikeAgentSsePayload,
   getAgentRequestCredits,
   parseAgentCompletionResponseText,
   resolveConfiguredAgentModel,
@@ -167,6 +169,29 @@ describe('Agent provider fallback policy', () => {
     });
   });
 
+  it('marks a stream complete as soon as DONE arrives without a trailing separator', () => {
+    const parser = new AgentCompletionSseParser();
+    parser.push('data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]');
+    expect(parser.isDone()).toBe(true);
+    expect(parser.finish()).toMatchObject({
+      choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+    });
+  });
+
+  it('detects SSE payloads when an upstream sends the wrong content type', () => {
+    expect(looksLikeAgentSsePayload('data: {"choices":[]}\n\n')).toBe(true);
+    expect(looksLikeAgentSsePayload(': keep-alive\n\n')).toBe(true);
+    expect(looksLikeAgentSsePayload('{"data":{"value":"ok"}}')).toBe(false);
+
+    const accumulator = new AgentCompletionResponseAccumulator('application/json');
+    accumulator.push('data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n');
+    accumulator.push('data: [DONE]');
+    expect(accumulator.isDone()).toBe(true);
+    expect(accumulator.finish()).toMatchObject({
+      choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+    });
+  });
+
   it('does not parse tool arguments until all SSE fragments are aggregated', () => {
     const parser = new AgentCompletionSseParser();
     parser.push('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"canvas_","arguments":"{\\"x\\":"}}]},"finish_reason":null}]}\n\n');
@@ -188,5 +213,11 @@ describe('Agent provider fallback policy', () => {
   it('keeps non-streaming JSON responses compatible', () => {
     const value = { choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] };
     expect(parseAgentCompletionResponseText(JSON.stringify(value))).toEqual(value);
+
+    const accumulator = new AgentCompletionResponseAccumulator('application/json');
+    accumulator.push('{"choices":[{"message":{"content":');
+    accumulator.push('"ok"},"finish_reason":"stop"}]}');
+    expect(accumulator.isDone()).toBe(false);
+    expect(accumulator.finish()).toEqual(value);
   });
 });
