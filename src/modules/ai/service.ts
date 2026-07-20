@@ -275,6 +275,22 @@ type AgentChoiceAccumulator = {
   logprobs?: unknown;
 };
 
+export type AgentExecutionProgress = {
+  stage: string;
+  progress: number;
+  provider?: string;
+  model?: string;
+  attempt?: number;
+  durationMs?: number;
+  firstChunkMs?: number;
+  upstreamStatus?: number;
+};
+
+export type AgentExecutionOptions = {
+  signal?: AbortSignal;
+  onProgress?: (progress: AgentExecutionProgress) => void | Promise<void>;
+};
+
 function objectValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -349,48 +365,11 @@ function mergeStreamedChoice(
   choices.set(index, accumulator);
 }
 
-export function parseAgentCompletionResponseText(text: string): unknown {
-  const trimmed = text.trim();
-  if (!trimmed) {
-    throw new CloudAiError('provider_invalid_response', 'Agent channel returned an empty response', 502);
-  }
-  const eventPayloads = trimmed
-    .split(/\r?\n/)
-    .map(line => line.trim())
-    .filter(line => line.startsWith('data:'))
-    .map(line => line.slice(5).trim())
-    .filter(Boolean);
-  if (eventPayloads.length === 0) {
-    try {
-      return JSON.parse(trimmed) as unknown;
-    } catch {
-      throw new CloudAiError('provider_invalid_response', 'Agent channel returned invalid JSON', 502);
-    }
-  }
-
-  const metadata: Record<string, unknown> = {};
-  const choices = new Map<number, AgentChoiceAccumulator>();
-  let lastPayload: unknown;
-  for (const payload of eventPayloads) {
-    if (payload === '[DONE]') break;
-    let value: unknown;
-    try {
-      value = JSON.parse(payload) as unknown;
-    } catch {
-      throw new CloudAiError('provider_invalid_response', 'Agent channel returned an invalid stream event', 502);
-    }
-    lastPayload = value;
-    const record = objectValue(value);
-    if (!record) continue;
-    for (const key of ['id', 'created', 'model', 'system_fingerprint', 'service_tier']) {
-      if (record[key] !== undefined && record[key] !== null) metadata[key] = record[key];
-    }
-    if (record.usage !== undefined && record.usage !== null) metadata.usage = record.usage;
-    if (Array.isArray(record.choices)) {
-      record.choices.forEach((choice, index) => mergeStreamedChoice(choices, choice, index));
-    }
-  }
-
+function buildAgentCompletionResult(
+  metadata: Record<string, unknown>,
+  choices: Map<number, AgentChoiceAccumulator>,
+  lastPayload: unknown,
+) {
   if (choices.size === 0) {
     if (lastPayload !== undefined) return lastPayload;
     throw new CloudAiError('provider_invalid_response', 'Agent channel stream did not contain a result', 502);
@@ -420,6 +399,91 @@ export function parseAgentCompletionResponseText(text: string): unknown {
         ...(choice.logprobs !== undefined ? { logprobs: choice.logprobs } : {}),
       })),
   };
+}
+
+export class AgentCompletionSseParser {
+  private buffer = '';
+  private readonly metadata: Record<string, unknown> = {};
+  private readonly choices = new Map<number, AgentChoiceAccumulator>();
+  private lastPayload: unknown;
+  private sawEvent = false;
+  private done = false;
+
+  push(chunk: string) {
+    if (this.done || !chunk) return;
+    this.buffer += chunk;
+    let boundary = this.buffer.search(/\r?\n\r?\n/);
+    while (boundary >= 0) {
+      const event = this.buffer.slice(0, boundary);
+      const separator = this.buffer.slice(boundary).match(/^\r?\n\r?\n/)?.[0] ?? '\n\n';
+      this.buffer = this.buffer.slice(boundary + separator.length);
+      this.consumeEvent(event);
+      boundary = this.buffer.search(/\r?\n\r?\n/);
+    }
+  }
+
+  finish() {
+    if (this.buffer.trim()) this.consumeEvent(this.buffer);
+    this.buffer = '';
+    if (!this.sawEvent) {
+      throw new CloudAiError('provider_invalid_response', 'Agent channel stream did not contain an event', 502);
+    }
+    const hasFinishReason = Array.from(this.choices.values())
+      .some(choice => choice.finishReason !== null && choice.finishReason !== undefined);
+    if (!this.done && this.choices.size > 0 && !hasFinishReason) {
+      throw new CloudAiError('provider_stream_interrupted', 'Agent channel stream ended unexpectedly', 502);
+    }
+    return buildAgentCompletionResult(this.metadata, this.choices, this.lastPayload);
+  }
+
+  private consumeEvent(event: string) {
+    const data = event
+      .split(/\r?\n/)
+      .filter(line => !line.startsWith(':'))
+      .filter(line => /^data(?::|$)/.test(line))
+      .map(line => line.startsWith('data:') ? line.slice(5).trimStart() : '')
+      .join('\n')
+      .trim();
+    if (!data) return;
+    this.sawEvent = true;
+    if (data === '[DONE]') {
+      this.done = true;
+      return;
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(data) as unknown;
+    } catch {
+      throw new CloudAiError('provider_invalid_response', 'Agent channel returned an invalid stream event', 502);
+    }
+    this.lastPayload = value;
+    const record = objectValue(value);
+    if (!record) return;
+    for (const key of ['id', 'created', 'model', 'system_fingerprint', 'service_tier']) {
+      if (record[key] !== undefined && record[key] !== null) this.metadata[key] = record[key];
+    }
+    if (record.usage !== undefined && record.usage !== null) this.metadata.usage = record.usage;
+    if (Array.isArray(record.choices)) {
+      record.choices.forEach((choice, index) => mergeStreamedChoice(this.choices, choice, index));
+    }
+  }
+}
+
+export function parseAgentCompletionResponseText(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    throw new CloudAiError('provider_invalid_response', 'Agent channel returned an empty response', 502);
+  }
+  if (!/^\s*(?:data(?::|$)|:)/m.test(text)) {
+    try {
+      return JSON.parse(trimmed) as unknown;
+    } catch {
+      throw new CloudAiError('provider_invalid_response', 'Agent channel returned invalid JSON', 502);
+    }
+  }
+  const parser = new AgentCompletionSseParser();
+  parser.push(text);
+  return parser.finish();
 }
 
 class AgentUpstreamHttpError extends Error {
@@ -453,6 +517,7 @@ function canFallbackToNextAgentProvider(error: unknown) {
       'provider_model_missing',
       'provider_request_failed',
       'provider_invalid_response',
+      'provider_stream_interrupted',
     ].includes(error.code);
   }
   return error instanceof Error;
@@ -462,22 +527,197 @@ function canRetrySingleAgentProvider(error: unknown) {
   if (error instanceof AgentUpstreamHttpError) {
     return isAgentProviderRetryStatus(error.status);
   }
-  return error instanceof Error && (error.name === 'AbortError' || error.name === 'TypeError');
+  if (error instanceof CloudAiError) return error.code === 'provider_stream_interrupted';
+  return error instanceof Error && (
+    error.name === 'AbortError'
+    || error.name === 'TypeError'
+    || 'code' in error && ['UPSTREAM_IDLE_TIMEOUT', 'ECONNRESET'].includes(String(error.code))
+  );
 }
 
 function canTryAlternativeAgentModel(error: unknown) {
   if (error instanceof AgentUpstreamHttpError) {
     return error.status !== 401
       && error.status !== 403
-      && (isAgentProviderRetryStatus(error.status) || [400, 404, 405, 422, 429].includes(error.status));
+      && (isAgentProviderRetryStatus(error.status) || [404, 405, 429].includes(error.status));
   }
   if (error instanceof CloudAiError) {
-    return ['provider_model_missing', 'provider_request_failed', 'provider_invalid_response'].includes(error.code);
+    return [
+      'provider_model_missing',
+      'provider_request_failed',
+      'provider_invalid_response',
+      'provider_stream_interrupted',
+    ].includes(error.code);
   }
   return error instanceof Error;
 }
 
-const waitForAgentProviderRetry = () => new Promise(resolve => setTimeout(resolve, 800));
+function waitForAgentProviderRetry(attempt: number, signal?: AbortSignal) {
+  const base = [1_000, 2_500, 5_500][Math.min(attempt, 2)] ?? 5_500;
+  const delay = base + Math.round(Math.random() * Math.max(250, base * 0.2));
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, delay);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason instanceof Error ? signal.reason : new Error('Task cancelled'));
+    };
+    if (signal?.aborted) abort();
+    else signal?.addEventListener('abort', abort, { once: true });
+  });
+}
+
+async function emitAgentProgress(
+  options: AgentExecutionOptions | undefined,
+  progress: AgentExecutionProgress,
+) {
+  await options?.onProgress?.(progress);
+}
+
+function linkedAbortController(signal?: AbortSignal) {
+  const controller = new AbortController();
+  if (signal?.aborted) controller.abort(signal.reason);
+  else signal?.addEventListener('abort', () => controller.abort(signal.reason), { once: true });
+  return controller;
+}
+
+async function readChunkWithIdleTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  controller: AbortController,
+) {
+  return new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const error = Object.assign(new Error('上游 Agent 流长时间没有返回数据'), {
+        name: 'AbortError',
+        code: 'UPSTREAM_IDLE_TIMEOUT',
+      });
+      controller.abort(error);
+      reject(error);
+    }, env.AI_UPSTREAM_IDLE_TIMEOUT_MS);
+    reader.read().then(resolve, reject).finally(() => clearTimeout(timer));
+  });
+}
+
+async function requestStreamingCompletion(
+  provider: AiProviderChannel,
+  model: string,
+  body: Record<string, unknown>,
+  options: AgentExecutionOptions | undefined,
+  attempt: number,
+) {
+  const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+  const controller = linkedAbortController(options?.signal);
+  const startedAt = Date.now();
+  const connectTimeout = setTimeout(() => {
+    controller.abort(Object.assign(new Error('上游 Agent 连接超时'), { name: 'AbortError' }));
+  }, env.AI_UPSTREAM_CONNECT_TIMEOUT_MS);
+  let response: Response;
+  try {
+    await emitAgentProgress(options, {
+      stage: 'connecting',
+      progress: 12,
+      provider: provider.name,
+      model,
+      attempt,
+    });
+    response = await fetch(providerEndpoint(provider.baseUrl, '/v1/chat/completions'), {
+      method: 'POST',
+      headers: upstreamHeaders(secrets.apiKey, secrets.headers),
+      body: JSON.stringify({ ...body, model, stream: true }),
+      redirect: 'error',
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(connectTimeout);
+  }
+
+  if (!response.ok) {
+    const errorBodyTimeout = setTimeout(() => {
+      controller.abort(Object.assign(new Error('读取上游错误响应超时'), { name: 'AbortError' }));
+    }, Math.min(10_000, env.AI_UPSTREAM_IDLE_TIMEOUT_MS));
+    let text: string;
+    try {
+      text = await response.text();
+    } finally {
+      clearTimeout(errorBodyTimeout);
+    }
+    await emitAgentProgress(options, {
+      stage: 'upstream_error',
+      progress: 10,
+      provider: provider.name,
+      model,
+      attempt,
+      durationMs: Date.now() - startedAt,
+      upstreamStatus: response.status,
+    });
+    throw new AgentUpstreamHttpError(
+      response.status,
+      upstreamErrorDetail(response.status, text),
+    );
+  }
+  if (!response.body) {
+    throw new CloudAiError('provider_invalid_response', 'Agent channel returned an empty body', 502);
+  }
+
+  const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
+  const isSse = contentType.includes('text/event-stream');
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const parser = isSse ? new AgentCompletionSseParser() : null;
+  let buffered = '';
+  let firstChunkMs: number | undefined;
+  let lastProgressAt = 0;
+  let byteCount = 0;
+  while (true) {
+    const chunk = await readChunkWithIdleTimeout(reader, controller);
+    if (chunk.done) break;
+    if (!chunk.value?.byteLength) continue;
+    byteCount += chunk.value.byteLength;
+    const decoded = decoder.decode(chunk.value, { stream: true });
+    if (parser) parser.push(decoded);
+    else buffered += decoded;
+    const now = Date.now();
+    if (firstChunkMs === undefined) {
+      firstChunkMs = now - startedAt;
+      await emitAgentProgress(options, {
+        stage: 'generating',
+        progress: 25,
+        provider: provider.name,
+        model,
+        attempt,
+        firstChunkMs,
+        upstreamStatus: response.status,
+      });
+      lastProgressAt = now;
+    } else if (now - lastProgressAt >= 5_000) {
+      await emitAgentProgress(options, {
+        stage: 'generating',
+        progress: Math.min(85, 25 + Math.floor((now - startedAt) / 5_000) * 3),
+        provider: provider.name,
+        model,
+        attempt,
+        durationMs: now - startedAt,
+        firstChunkMs,
+        upstreamStatus: response.status,
+      });
+      lastProgressAt = now;
+    }
+  }
+  const tail = decoder.decode();
+  if (parser) parser.push(tail);
+  else buffered += tail;
+  const result = parser ? parser.finish() : parseAgentCompletionResponseText(buffered);
+  await emitAgentProgress(options, {
+    stage: 'aggregating',
+    progress: 90,
+    provider: provider.name,
+    model,
+    attempt,
+    durationMs: Date.now() - startedAt,
+    ...(firstChunkMs !== undefined ? { firstChunkMs } : {}),
+    upstreamStatus: response.status,
+  });
+  return { result, model, byteCount };
+}
 
 async function requestAgentCompletionFromProvider(
   provider: AiProviderChannel,
@@ -487,6 +727,8 @@ async function requestAgentCompletionFromProvider(
     model?: string | undefined;
   },
   preferProviderDefault = false,
+  options?: AgentExecutionOptions,
+  attempt = 1,
 ) {
   await assertPublicProviderUrl(provider.baseUrl);
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
@@ -498,39 +740,10 @@ async function requestAgentCompletionFromProvider(
     preferredModel,
     preferProviderDefault,
   );
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 4 * 60_000);
-  let response: Response;
-  let text: string;
-  try {
-    response = await fetch(providerEndpoint(provider.baseUrl, '/v1/chat/completions'), {
-      method: 'POST',
-      headers: upstreamHeaders(secrets.apiKey, secrets.headers),
-      body: JSON.stringify({
-        model,
-        messages: input.messages,
-        stream: true,
-        ...(input.tools?.length ? { tools: input.tools, tool_choice: 'auto' } : {}),
-      }),
-      redirect: 'error',
-      signal: controller.signal,
-    });
-    text = await response.text();
-  } finally {
-    clearTimeout(timeout);
-  }
-  if (!response.ok) {
-    throw new AgentUpstreamHttpError(
-      response.status,
-      upstreamErrorDetail(response.status, text),
-    );
-  }
-  let result: unknown;
-  try {
-    result = parseAgentCompletionResponseText(text);
-  } catch {
-    throw new CloudAiError('provider_invalid_response', 'Agent 渠道返回格式无效', 502);
-  }
+  const { result } = await requestStreamingCompletion(provider, model, {
+    messages: input.messages,
+    ...(input.tools?.length ? { tools: input.tools, tool_choice: 'auto' } : {}),
+  }, options, attempt);
   const providerFailure = providerFailureMessage(result);
   if (providerFailure) {
     throw new CloudAiError(
@@ -635,19 +848,20 @@ async function reserveCredits(
 
 async function settleCredits(prisma: PrismaClient, userId: string, requestId: string) {
   await prisma.$transaction(async (transaction) => {
+    const claimed = await transaction.aiRequest.updateMany({
+      where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
+      data: {
+        status: 'SUCCEEDED',
+        chargedCredits: REQUEST_CREDITS,
+        completedAt: new Date(),
+      },
+    });
+    if (claimed.count !== 1) return;
     const wallet = await transaction.wallet.update({
       where: { userId },
       data: {
         reservedCredits: { decrement: REQUEST_CREDITS },
         lifetimeConsumed: { increment: REQUEST_CREDITS },
-      },
-    });
-    await transaction.aiRequest.update({
-      where: { id: requestId },
-      data: {
-        status: 'SUCCEEDED',
-        chargedCredits: REQUEST_CREDITS,
-        completedAt: new Date(),
       },
     });
     await transaction.walletLedger.create({
@@ -667,16 +881,17 @@ async function releaseCredits(prisma: PrismaClient, userId: string, requestId: s
   await prisma.$transaction(async (transaction) => {
     const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
     if (!request || request.userId !== userId || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
+    const claimed = await transaction.aiRequest.updateMany({
+      where: { id: requestId, status: { in: ['RESERVED', 'PROCESSING'] } },
+      data: { status: 'FAILED', completedAt: new Date() },
+    });
+    if (claimed.count !== 1) return;
     const wallet = await transaction.wallet.update({
       where: { userId },
       data: {
         availableCredits: { increment: REQUEST_CREDITS },
         reservedCredits: { decrement: REQUEST_CREDITS },
       },
-    });
-    await transaction.aiRequest.update({
-      where: { id: requestId },
-      data: { status: 'FAILED', completedAt: new Date() },
     });
     await transaction.walletLedger.create({
       data: {
@@ -691,6 +906,18 @@ async function releaseCredits(prisma: PrismaClient, userId: string, requestId: s
   });
 }
 
+export async function releaseAgentCreditsForClientRequest(
+  prisma: PrismaClient,
+  userId: string,
+  clientRequestId: string,
+) {
+  const request = await prisma.aiRequest.findUnique({
+    where: { userId_clientRequestId: { userId, clientRequestId } },
+    select: { id: true },
+  });
+  if (request) await releaseCredits(prisma, userId, request.id);
+}
+
 export async function executeWalletAgentChat(
   prisma: PrismaClient,
   input: {
@@ -700,6 +927,7 @@ export async function executeWalletAgentChat(
     tools?: unknown[] | undefined;
     model?: string | undefined;
   },
+  options?: AgentExecutionOptions,
 ) {
   const requestId = await reserveCredits(prisma, input);
   try {
@@ -709,11 +937,24 @@ export async function executeWalletAgentChat(
     }
     const failures: string[] = [];
     let result: unknown;
+    let requestAttempt = 0;
     for (const [index, provider] of providers.entries()) {
       try {
-        result = await requestAgentCompletionFromProvider(provider, input, index > 0);
+        requestAttempt += 1;
+        result = await requestAgentCompletionFromProvider(
+          provider,
+          input,
+          index > 0,
+          options,
+          requestAttempt,
+        );
         break;
       } catch (error) {
+        if (options?.signal?.aborted) {
+          throw options.signal.reason instanceof Error
+            ? options.signal.reason
+            : new Error('Task cancelled');
+        }
         let finalError = error;
         const retriedModels: string[] = [];
         if (providers.length === 1
@@ -738,14 +979,30 @@ export async function executeWalletAgentChat(
             ? retryModels
             : canRetrySingleAgentProvider(error) ? [null] : [];
           for (const retryModel of attempts) {
-            await waitForAgentProviderRetry();
+            await emitAgentProgress(options, {
+              stage: 'retrying',
+              progress: 10,
+              provider: provider.name,
+              model: retryModel ?? failedModel,
+              attempt: requestAttempt + 1,
+            });
+            await waitForAgentProviderRetry(retriedModels.length, options?.signal);
             try {
+              requestAttempt += 1;
               result = await requestAgentCompletionFromProvider(
                 provider,
                 retryModel ? { ...input, model: retryModel } : input,
+                false,
+                options,
+                requestAttempt,
               );
               break;
             } catch (retryError) {
+              if (options?.signal?.aborted) {
+                throw options.signal.reason instanceof Error
+                  ? options.signal.reason
+                  : new Error('Task cancelled');
+              }
               finalError = retryError;
               retriedModels.push(retryModel || failedModel || 'default');
               if (!canTryAlternativeAgentModel(retryError)
@@ -794,49 +1051,76 @@ export async function executeFreeInspirationAnalysis(
     existingProfile?: unknown;
     model?: string | undefined;
   },
+  options?: AgentExecutionOptions,
 ) {
-  const provider = await selectProvider(prisma);
-  const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-  const model = await discoverModel(provider, secrets.apiKey, secrets.headers, input.model);
   const prompt = `Analyze this saved design inspiration image. Return JSON only with this exact shape:
 {"itemId":"${input.itemId}","summary":"","objects":[],"category":"","form":{"silhouette":[],"geometry":[],"proportion":[]},"cmf":{"colors":[],"materials":[],"finishes":[]},"style":[],"interaction":[],"scene":[],"mood":[],"userTags":[],"userNotes":[]}
 Explain what it is useful as a design reference for. Keep fields concise. Preserve supplied user tags and notes.
 User tags: ${JSON.stringify(input.userTags ?? [])}
 User notes: ${JSON.stringify(input.userNotes ?? '')}
 Existing profile: ${JSON.stringify(input.existingProfile ?? null)}`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 4 * 60_000);
-  let response: Response;
-  let text: string;
-  try {
-    response = await fetch(providerEndpoint(provider.baseUrl, '/v1/chat/completions'), {
-      method: 'POST',
-      headers: upstreamHeaders(secrets.apiKey, secrets.headers),
-      body: JSON.stringify({
-        model,
-        stream: true,
-        response_format: { type: 'json_object' },
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'text', text: prompt },
-            { type: 'image_url', image_url: { url: input.imageSource, detail: 'low' } },
-          ],
-        }],
-      }),
-      redirect: 'error',
-      signal: controller.signal,
-    });
-    text = await response.text();
-  } finally {
-    clearTimeout(timeout);
-  }
-  if (!response.ok) {
-    throw new CloudAiError('provider_request_failed', `灵感自动分析渠道请求失败（HTTP ${response.status}）`, 502);
+  const providers = await listProviders(prisma);
+  if (providers.length === 0) {
+    throw new CloudAiError('provider_unavailable', '当前没有可用的灵感分析渠道', 503);
   }
   let value: unknown;
-  try { value = parseAgentCompletionResponseText(text); } catch {
-    throw new CloudAiError('provider_invalid_response', '灵感自动分析渠道返回格式无效', 502);
+  let requestAttempt = 0;
+  const failures: string[] = [];
+  for (const [providerIndex, provider] of providers.entries()) {
+    const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+    const model = await discoverModel(
+      provider,
+      secrets.apiKey,
+      secrets.headers,
+      input.model,
+      providerIndex > 0,
+    );
+    let finalError: unknown;
+    for (let retry = 0; retry < 3; retry += 1) {
+      if (retry > 0) {
+        await emitAgentProgress(options, {
+          stage: 'retrying',
+          progress: 10,
+          provider: provider.name,
+          model,
+          attempt: requestAttempt + 1,
+        });
+        await waitForAgentProviderRetry(retry - 1, options?.signal);
+      }
+      requestAttempt += 1;
+      try {
+        const completion = await requestStreamingCompletion(provider, model, {
+          response_format: { type: 'json_object' },
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'text', text: prompt },
+              { type: 'image_url', image_url: { url: input.imageSource, detail: 'low' } },
+            ],
+          }],
+        }, options, requestAttempt);
+        value = completion.result;
+        break;
+      } catch (error) {
+        if (options?.signal?.aborted) {
+          throw options.signal.reason instanceof Error
+            ? options.signal.reason
+            : new Error('Task cancelled');
+        }
+        finalError = error;
+        if (retry >= 2 || !canRetrySingleAgentProvider(error)) break;
+      }
+    }
+    if (value !== undefined) break;
+    failures.push(`${provider.name}：${agentProviderFailureDetail(finalError)}`);
+    if (!canFallbackToNextAgentProvider(finalError)) break;
+  }
+  if (value === undefined) {
+    throw new CloudAiError(
+      'provider_request_failed',
+      `灵感自动分析渠道请求失败：${failures.at(-1) ?? '未知通道错误'}`,
+      502,
+    );
   }
   const content = (value as { choices?: Array<{ message?: { content?: unknown } }> })
     ?.choices?.[0]?.message?.content;

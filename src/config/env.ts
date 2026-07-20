@@ -67,6 +67,15 @@ const envSchema = z
       .or(z.literal(''))
       .default(''),
     CORS_ALLOWED_ORIGINS: z.string().default(''),
+    AI_WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(2),
+    AI_TASK_POLL_INTERVAL_MS: z.coerce.number().int().min(250).max(30_000).default(1_000),
+    AI_TASK_HEARTBEAT_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).default(10_000),
+    AI_TASK_STALE_AFTER_MS: z.coerce.number().int().min(30_000).max(3_600_000).default(120_000),
+    AI_TASK_MAX_RUNTIME_MS: z.coerce.number().int().min(60_000).max(3_600_000).default(10 * 60_000),
+    AI_TASK_RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(14),
+    AI_UPSTREAM_CONNECT_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(30_000),
+    AI_UPSTREAM_IDLE_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(300_000).default(75_000),
+    WORKER_HEALTH_FILE: z.string().min(1).default('/tmp/inspiration-worker-health'),
   })
   .superRefine((value, context) => {
     if (value.JWT_ACCESS_SECRET === value.JWT_REFRESH_SECRET) {

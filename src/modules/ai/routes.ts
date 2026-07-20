@@ -1,9 +1,17 @@
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { z } from 'zod';
-import { CloudAiError, executeFreeInspirationAnalysis, executeWalletAgentChat, listWalletAgentModels } from './service.js';
+import { CloudAiError, listWalletAgentModels } from './service.js';
 import { executeWalletImageGeneration, listWalletImageModels } from './image-service.js';
 import { executeWalletVideoGeneration, executeWalletVideoStatus } from './image-service.js';
 import { getImageReference } from './reference-store.js';
+import { createAiTaskSchema } from './task-schema.js';
+import {
+  cancelUserAiTask,
+  createAiTask,
+  findUserAiTask,
+  publicTaskStatus,
+  serializeAiTask,
+} from './task-service.js';
 
 const chatSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
@@ -13,12 +21,19 @@ const chatSchema = z.object({
 }).strict();
 
 const inspirationAnalysisSchema = z.object({
+  clientRequestId: z.string().trim().min(8).max(128).optional(),
   itemId: z.string().trim().min(1).max(256),
   imageSource: z.string().min(1).max(12_000_000),
   userTags: z.array(z.string().trim().min(1).max(100)).max(50).optional(),
   userNotes: z.array(z.string().trim().min(1).max(2_000)).max(50).optional(),
   existingProfile: z.unknown().optional(),
   model: z.string().trim().min(1).max(200).optional(),
+}).strict();
+
+const taskParamsSchema = z.object({ taskId: z.string().trim().min(1).max(128) }).strict();
+const taskRequestParamsSchema = z.object({
+  type: z.enum(['agent_chat', 'inspiration_analysis']),
+  requestId: z.string().trim().min(8).max(128),
 }).strict();
 
 const optionalString = (max: number) => z.string().trim().max(max).nullish()
@@ -82,6 +97,70 @@ function knownError(reply: FastifyReply, error: unknown) {
 }
 
 export const aiRoutes: FastifyPluginAsync = async (app) => {
+  app.post(
+    '/tasks',
+    {
+      preHandler: app.authenticateAccessToken,
+      config: { rateLimit: { max: 40, timeWindow: '1 minute' } },
+    },
+    async (request, reply) => {
+      const parsed = createAiTaskSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'invalid_request', message: '异步任务请求格式无效' });
+      }
+      const { task } = await createAiTask(app.prisma, request.user.sub, parsed.data);
+      return reply.code(202).send({ taskId: task.id, status: publicTaskStatus(task.status) });
+    },
+  );
+
+  app.get(
+    '/tasks/by-request/:type/:requestId',
+    { preHandler: app.authenticateAccessToken },
+    async (request, reply) => {
+      const parsed = taskRequestParamsSchema.safeParse(request.params);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'invalid_request', message: '任务查询参数无效' });
+      }
+      const task = await app.prisma.aiTask.findFirst({
+        where: {
+          userId: request.user.sub,
+          requestId: parsed.data.requestId,
+          type: parsed.data.type === 'agent_chat' ? 'AGENT_CHAT' : 'INSPIRATION_ANALYSIS',
+        },
+      });
+      if (!task) return reply.code(404).send({ error: 'not_found', message: '任务不存在或已过期' });
+      return serializeAiTask(task);
+    },
+  );
+
+  app.get(
+    '/tasks/:taskId',
+    { preHandler: app.authenticateAccessToken },
+    async (request, reply) => {
+      const parsed = taskParamsSchema.safeParse(request.params);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'invalid_request', message: '任务 ID 无效' });
+      }
+      const task = await findUserAiTask(app.prisma, request.user.sub, parsed.data.taskId);
+      if (!task) return reply.code(404).send({ error: 'not_found', message: '任务不存在或已过期' });
+      return serializeAiTask(task);
+    },
+  );
+
+  app.delete(
+    '/tasks/:taskId',
+    { preHandler: app.authenticateAccessToken },
+    async (request, reply) => {
+      const parsed = taskParamsSchema.safeParse(request.params);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'invalid_request', message: '任务 ID 无效' });
+      }
+      const task = await cancelUserAiTask(app.prisma, request.user.sub, parsed.data.taskId);
+      if (!task) return reply.code(404).send({ error: 'not_found', message: '任务不存在或已过期' });
+      return serializeAiTask(task);
+    },
+  );
+
   app.get(
     '/models',
     {
@@ -149,11 +228,13 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       if (!parsed.success) {
         return reply.code(400).send({ error: 'invalid_request', message: '灵感自动分析请求格式无效' });
       }
-      try {
-        return await executeFreeInspirationAnalysis(app.prisma, parsed.data);
-      } catch (error) {
-        return knownError(reply, error);
-      }
+      const { clientRequestId, ...payload } = parsed.data;
+      const { task } = await createAiTask(app.prisma, request.user.sub, {
+        type: 'inspiration_analysis',
+        requestId: clientRequestId ?? `inspiration-${request.id}`,
+        payload,
+      });
+      return reply.code(202).send({ taskId: task.id, status: publicTaskStatus(task.status) });
     },
   );
 
@@ -168,14 +249,13 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       if (!parsed.success) {
         return reply.code(400).send({ error: 'invalid_request', message: 'Agent 请求格式无效' });
       }
-      try {
-        return await executeWalletAgentChat(app.prisma, {
-          userId: request.user.sub,
-          ...parsed.data,
-        });
-      } catch (error) {
-        return knownError(reply, error);
-      }
+      const { clientRequestId, ...payload } = parsed.data;
+      const { task } = await createAiTask(app.prisma, request.user.sub, {
+        type: 'agent_chat',
+        requestId: clientRequestId,
+        payload,
+      });
+      return reply.code(202).send({ taskId: task.id, status: publicTaskStatus(task.status) });
     },
   );
 

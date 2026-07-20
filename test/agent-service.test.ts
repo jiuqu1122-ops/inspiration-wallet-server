@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildAgentModelCandidates,
   buildSingleProviderAgentRetryModels,
+  AgentCompletionSseParser,
   isAgentProtocolFallbackStatus,
   isAgentProviderFallbackStatus,
   isAgentProviderRetryStatus,
@@ -43,6 +44,7 @@ describe('Agent provider fallback policy', () => {
     expect(isAgentProviderRetryStatus(503)).toBe(true);
     expect(isAgentProviderRetryStatus(429)).toBe(false);
     expect(isAgentProviderRetryStatus(400)).toBe(false);
+    expect(isAgentProviderRetryStatus(401)).toBe(false);
   });
 
   it('selects another text model from the same channel after a model failure', () => {
@@ -132,6 +134,50 @@ describe('Agent provider fallback policy', () => {
       },
       finish_reason: 'tool_calls',
     });
+  });
+
+  it('parses SSE events split across arbitrary network chunks', () => {
+    const parser = new AgentCompletionSseParser();
+    parser.push('data: {"choices":[{"index":0,"delta":{"content":"hel');
+    parser.push('lo "},"finish_reason":null}]}\n\ndata: {"choices":[{"index":0,');
+    parser.push('"delta":{"content":"world"},"finish_reason":"stop"}]}\n\n');
+    parser.push('data: [DONE]\n\n');
+    expect(parser.finish()).toMatchObject({
+      choices: [{ message: { content: 'hello world' }, finish_reason: 'stop' }],
+    });
+  });
+
+  it('parses multiple SSE events delivered in one network chunk', () => {
+    const parser = new AgentCompletionSseParser();
+    parser.push([
+      'data: {"choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}]}',
+      '',
+      'data: {"choices":[{"index":0,"delta":{"content":"b"},"finish_reason":"stop"}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n'));
+    expect(parser.finish()).toMatchObject({
+      choices: [{ message: { content: 'ab' }, finish_reason: 'stop' }],
+    });
+  });
+
+  it('does not parse tool arguments until all SSE fragments are aggregated', () => {
+    const parser = new AgentCompletionSseParser();
+    parser.push('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"canvas_","arguments":"{\\"x\\":"}}]},"finish_reason":null}]}\n\n');
+    parser.push('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"add","arguments":"1}"}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n');
+    const result = parser.finish() as { choices: Array<{ message: { tool_calls: unknown[] } }> };
+    expect(result.choices[0]?.message.tool_calls).toEqual([{
+      id: 'call_a',
+      type: 'function',
+      function: { name: 'canvas_add', arguments: '{"x":1}' },
+    }]);
+  });
+
+  it('rejects an interrupted stream without DONE or a finish reason', () => {
+    const parser = new AgentCompletionSseParser();
+    parser.push('data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n');
+    expect(() => parser.finish()).toThrow('ended unexpectedly');
   });
 
   it('keeps non-streaming JSON responses compatible', () => {

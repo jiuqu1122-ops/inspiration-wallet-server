@@ -23,6 +23,7 @@ services:
       - no-new-privileges:true
 
   api:
+    image: inspiration-wallet-server:local
     build:
       context: .
       dockerfile: Dockerfile
@@ -46,6 +47,32 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+      start_period: 30s
+    networks:
+      - inspiration_backend
+    security_opt:
+      - no-new-privileges:true
+
+  worker:
+    image: inspiration-wallet-server:local
+    restart: unless-stopped
+    init: true
+    command: ["node", "dist/worker.js"]
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      PROVIDER_SECRETS_ENCRYPTION_KEY: ${PROVIDER_SECRETS_ENCRYPTION_KEY:-}
+      WORKER_HEALTH_FILE: /tmp/inspiration-worker-health
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "const fs=require('node:fs');const p=process.env.WORKER_HEALTH_FILE;const age=Date.now()-fs.statSync(p).mtimeMs;if(age>60000)process.exit(1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
       start_period: 30s
     networks:
       - inspiration_backend

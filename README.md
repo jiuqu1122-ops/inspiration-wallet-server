@@ -30,6 +30,8 @@ cp .env.example .env
 # 编辑 .env，替换所有 CHANGE_ME，并配置本地 DATABASE_URL
 npm run prisma:migrate:dev
 npm run dev
+# 另开一个终端
+npm run dev:worker
 ```
 
 常用检查：
@@ -101,7 +103,16 @@ npm run build
 
 ### Agent 钱包模式
 
-`POST /v1/ai/chat/completions` 需要 Access Token，接受 `clientRequestId`、`messages` 和可选 `tools`，服务器从已启用的 LLM 渠道中选择一个上游，按 `AGENT_REQUEST_CREDITS` 预扣 额度，成功后结算，失败自动释放。渠道可以在私有工作台中设置默认 Agent 模型；留空时服务器会从上游 `/v1/models` 自动选择首个模型。上游 API Key 永远不会返回给客户端。
+Agent 与灵感分析使用 PostgreSQL 持久化异步任务。`POST /v1/ai/tasks` 接受 `type`、`requestId` 和 `payload`，立即返回 HTTP 202 与 `taskId`；`GET /v1/ai/tasks/:taskId` 查询进度和最终结果，`DELETE /v1/ai/tasks/:taskId` 取消任务。相同用户、类型和 `requestId` 会返回原任务，桌面端断线或重启后可以继续查询。兼容入口 `POST /v1/ai/chat/completions` 和 `POST /v1/ai/inspirations/analyze` 也只负责入队，不再等待模型完成。
+
+独立 `worker` 进程从数据库安全领取任务，持续更新心跳、阶段和进度。上游仍使用 `stream: true`，但由 worker 按分片增量解析 SSE 并聚合最终 JSON；桌面端每 2 秒轮询任务，成功后继续使用旧版 `content/toolCalls/finishReason` 处理逻辑。Agent 请求按 `AGENT_REQUEST_CREDITS` 预扣，成功后结算，失败或取消后释放。画布工具仍在桌面端执行，服务器不会执行或重放有副作用的工具调用。
+
+生产必须同时启动 API 和 worker：
+
+```bash
+npm run start
+npm run start:worker
+```
 
 `POST /v1/ai/images/generations` 需要 Access Token，接受客户端幂等 ID、渠道类型、模型、提示词、参考图、比例、分辨率、格式和数量。服务器只会选择已启用、声明 `IMAGE` 能力且未同时声明 `LLM` 能力的同类 NewAPI/XAIS 生图渠道；具体模型优先使用客户端节点本次选择的模型，管理器中的渠道默认模型只在客户端未指定时兜底。服务端会把主程序的 Nano Banana Pro、Nano Banana 2、GPT Image 2 显示名或旧别名归一化为标准 NewAPI 模型 ID，其他自定义模型保持原样。NewAPI 生图固定调用 `/v1/chat/completions`。生图按模型族与清晰度定价：Nano Banana Pro 2K/4K 为 18/20，Nano Banana 2 2K/4K 为 15/18，GPT Image 2 1K/2K/4K 为 10/15/18，GPT Image 2 H 2K/4K 为 30/35；未列入价格表的模型使用 `IMAGE_REQUEST_CREDITS`。服务按单价乘请求数量预扣，成功后按实际返回图片数结算，少返回的部分自动退回，失败则释放全部预扣额度。上游 API Key 只在服务器解密和使用。
 

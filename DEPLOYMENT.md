@@ -1,6 +1,6 @@
 # inspiration-wallet-server 生产部署手册
 
-本文用于在 Ubuntu 24.04 LTS 上部署 `https://api.unmind.art`。生产服务由 `api`、`postgres`、`caddy` 三个容器组成。PostgreSQL 和 API 没有宿主机端口映射，公网只开放 SSH、HTTP 和 HTTPS。
+本文用于在 Ubuntu 24.04 LTS 上部署 `https://api.unmind.art`。生产服务由 `api`、`worker`、`postgres`、`caddy` 四个容器组成。PostgreSQL、API 和 worker 没有宿主机端口映射，公网只开放 SSH、HTTP 和 HTTPS。
 
 本文不会修改 `www.unmind.art`。DNS 正确也不代表 HTTPS 已生效；Caddy 运行且公网 80/443 可达后，才会自动申请证书。
 
@@ -111,6 +111,12 @@ nano .env
 - `AGENT_REQUEST_CREDITS`：每次钱包 Agent 请求的预扣额度，必须是正整数；测试环境可从 `1` 开始，后续按实际计费策略调整。
 - `IMAGE_REQUEST_CREDITS`：未列入内置价格表的模型所使用的每张默认额度，必须是正整数；Nano Banana Pro、Nano Banana 2、GPT Image 2 和 GPT Image 2 H 按代码中的模型与清晰度价格表计费。
 - `VIDEO_REQUEST_CREDITS`：每个钱包视频任务的预扣与结算额度，必须是正整数；默认测试值为 `500`，请求数量大于 1 时按数量倍增。
+- `AI_WORKER_CONCURRENCY`：单个 worker 同时执行的任务数，默认 2；可横向增加 worker 容器，数据库条件更新会防止重复领取。
+- `AI_TASK_POLL_INTERVAL_MS`、`AI_TASK_HEARTBEAT_INTERVAL_MS`：worker 取任务与心跳间隔。
+- `AI_TASK_STALE_AFTER_MS`、`AI_TASK_MAX_RUNTIME_MS`：失联 worker 判定和单任务总时限。前者必须明显大于心跳间隔。
+- `AI_TASK_RETENTION_DAYS`：完成、失败和取消任务的保留天数。
+- `AI_UPSTREAM_CONNECT_TIMEOUT_MS`、`AI_UPSTREAM_IDLE_TIMEOUT_MS`：上游连接建立与流读取空闲超时。
+- `WORKER_HEALTH_FILE`：容器内 liveness 文件路径，通常保持默认值。
 - `ADMIN_API_KEY_HASH`：私有运营工作台管理员密钥的 SHA-256 哈希；原始管理员密钥只放密码管理器。
 - `PROVIDER_SECRETS_ENCRYPTION_KEY`：Base64 编码的 32 字节随机主密钥，用于 AES-256-GCM 加密上游渠道凭据。必须长期备份且不能随意轮换。
 - `CORS_ALLOWED_ORIGINS`：逗号分隔的精确来源。未确认 Tauri 实际 Origin 前保持为空，浏览器跨域请求将被拒绝；原生无 Origin 请求仍可访问。
@@ -125,7 +131,7 @@ git status --short
 
 ## 6. 首次部署
 
-先验证配置和镜像构建，再单独启动数据库、执行一次迁移，最后启动 API/Caddy：
+先验证配置和镜像构建，再单独启动数据库、执行一次迁移，最后启动 API、worker 和 Caddy：
 
 ```bash
 cd /opt/inspiration-wallet-server
@@ -135,7 +141,7 @@ docker compose up -d postgres
 docker compose ps
 
 docker compose run --rm --no-deps api npm run prisma:migrate:deploy
-docker compose up -d api caddy
+docker compose up -d api worker caddy
 docker compose ps
 ```
 
@@ -181,9 +187,10 @@ docker compose run --rm --no-deps api sh -c \
 
 ```bash
 docker compose logs -f --tail=200 api
+docker compose logs -f --tail=200 worker
 docker compose logs -f --tail=200 postgres
 docker compose logs -f --tail=200 caddy
-docker compose logs --since=30m api caddy
+docker compose logs --since=30m api worker caddy
 ```
 
 应用会脱敏 Authorization、Cookie、密码、Token、License、API Key 和数据库连接等字段；生产错误响应不返回堆栈。上线后仍需抽查日志，确认没有 JWT Secret、数据库密码、上游 Key、Authorization Header 或用户私密大请求体。
@@ -210,7 +217,7 @@ git pull --ff-only
 docker compose build api
 docker compose up -d postgres
 docker compose run --rm --no-deps api npm run prisma:migrate:deploy
-docker compose up -d api caddy
+docker compose up -d api worker caddy
 docker compose ps
 curl --fail --show-error https://api.unmind.art/health
 ```
@@ -228,7 +235,7 @@ git log --oneline --decorate -20
 git status --short
 git switch --detach <稳定提交哈希>
 docker compose build api
-docker compose up -d api
+docker compose up -d api worker
 docker compose ps
 curl --fail --show-error https://api.unmind.art/health
 ```
@@ -275,7 +282,7 @@ gunzip -c backups/<需要恢复的备份>.sql.gz \
   | docker compose exec -T postgres sh -c \
       'psql -v ON_ERROR_STOP=1 --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"'
 
-docker compose up -d api caddy
+docker compose up -d api worker caddy
 curl --fail --show-error https://api.unmind.art/health
 ```
 
@@ -287,7 +294,7 @@ curl --fail --show-error https://api.unmind.art/health
 - 为 `/health` 和真实业务探针配置外部监控告警，但不要把健康响应扩展为内部配置泄露。
 - 定期在测试环境升级 Node 22 patch、PostgreSQL 17 patch、Caddy 2.10 patch 和 npm 依赖，再部署生产。
 - 每次结构变更提交 Prisma migration，生产只运行 `prisma migrate deploy`。
-- Redis/BullMQ/Worker 后续加入同一专用网络；Worker 单独迁移和扩容，不能让每个副本自动执行 migration。
+- 当前任务队列使用 PostgreSQL 并由独立 worker 执行；worker 可以单独扩容，但不能让任一副本自动执行 migration。任务吞吐量显著增长后再评估 Redis/BullMQ。
 - 数据库凭据或 JWT Secret 泄露时立即轮换。轮换 JWT Secret 会使对应现有 Token 失效，应安排兼容窗口。
 
 ## 14. 邮箱账户升级与人工加额度
@@ -301,7 +308,7 @@ git pull --ff-only
 docker compose build api
 docker compose up -d postgres
 docker compose run --rm --no-deps api npm run prisma:migrate:deploy
-docker compose up -d api caddy
+docker compose up -d api worker caddy
 docker compose ps
 curl --fail --show-error https://api.unmind.art/health
 ```

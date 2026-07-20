@@ -49,6 +49,19 @@ enum AiRequestStatus {
   REFUNDED
 }
 
+enum AiTaskType {
+  AGENT_CHAT
+  INSPIRATION_ANALYSIS
+}
+
+enum AiTaskStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
 enum AdminOperationType {
   PROVISION_LICENSE
   GRANT_CREDITS
@@ -87,12 +100,39 @@ model User {
   wallet               Wallet?
   ledger               WalletLedger[]
   aiRequests           AiRequest[]
+  aiTasks              AiTask[]
   sessions             AuthSession[]
   adminOperations      AdminOperation[]
   emailChallenges      EmailVerificationChallenge[]
   creditRedemptions    CreditRedemption[]
 
   @@index([status])
+}
+
+model AiTask {
+  id          String       @id @default(cuid())
+  userId      String
+  type        AiTaskType
+  status      AiTaskStatus @default(QUEUED)
+  progress    Int          @default(0)
+  stage       String       @default("queued")
+  payload     Json
+  result      Json?
+  error       Json?
+  requestId   String
+  retryCount  Int          @default(0)
+  workerId    String?
+  heartbeatAt DateTime?
+  createdAt   DateTime     @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+  updatedAt   DateTime     @updatedAt
+  user        User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, type, requestId])
+  @@index([status, createdAt])
+  @@index([status, heartbeatAt])
+  @@index([userId, updatedAt])
 }
 
 model EmailVerificationChallenge {

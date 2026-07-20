@@ -36,7 +36,7 @@ fi
 log 'Validating Docker Compose configuration...'
 docker compose config --quiet
 
-log 'Building the API image...'
+log 'Building the shared API/worker image...'
 docker compose build api
 
 log 'Starting PostgreSQL...'
@@ -62,8 +62,8 @@ if ! docker compose run --rm --no-deps api npm run prisma:migrate:deploy; then
   fail 'Prisma migration failed. API and Caddy were not updated; database data and volumes were preserved.'
 fi
 
-log 'Starting or updating API and Caddy...'
-docker compose up -d api caddy
+log 'Starting or updating API, worker, and Caddy...'
+docker compose up -d api worker caddy
 
 log 'Reloading Caddy configuration...'
 docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
@@ -74,7 +74,7 @@ docker compose ps
 log "Checking $HEALTH_URL ..."
 if ! curl --fail --silent --show-error --retry 8 --retry-delay 3 --retry-all-errors "$HEALTH_URL"; then
   printf '\n' >&2
-  docker compose logs --tail=150 api caddy >&2 || true
+  docker compose logs --tail=150 api worker caddy >&2 || true
   fail 'Public health check failed. Inspect the logs above; no data or volume was deleted.'
 fi
 printf '\n'
