@@ -1,12 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildNewApiChatImageBody,
-  buildNewApiImageEditForm,
-  buildGeminiNativeImageBody,
   chooseProviderForCapability,
   collectProviderModelIds,
   imageUnitCredits,
-  isGeminiNativeImageModel,
+  isNewApiParamOverrideCopyError,
+  isPublicNewApiImageReference,
   isRetryableXaisPollError,
   materializeNewApiReferenceImage,
   newApiImageRequestParams,
@@ -15,7 +14,6 @@ import {
   resolveNewApiImageModel,
   resolveXaisModel,
   resolveXaisWorkerRatio,
-  shouldFallbackNewApiImageProtocol,
   sizeFromRatio,
   uniqueImages,
 } from '../src/modules/ai/image-service.js';
@@ -163,43 +161,17 @@ describe('wallet image provider normalization', () => {
     });
   });
 
-  it('identifies Gemini image models that must use the native endpoint', () => {
-    expect(isGeminiNativeImageModel('gemini-3-pro-image')).toBe(true);
-    expect(isGeminiNativeImageModel('Nano Banana 2')).toBe(true);
-    expect(isGeminiNativeImageModel('gpt-image-2')).toBe(false);
+  it('keeps NewAPI image references on the public URL path', () => {
+    expect(isPublicNewApiImageReference('https://assets.example.test/reference.png')).toBe(true);
+    expect(isPublicNewApiImageReference('data:image/png;base64,aGVsbG8=')).toBe(false);
+    expect(isPublicNewApiImageReference('C:\\cache\\reference.png')).toBe(false);
   });
 
-  it('falls back within a Gemini channel for temporary artifact path failures', () => {
-    expect(shouldFallbackNewApiImageProtocol(
-      'gemini-3-pro-image',
-      new Error('status_code=500, operation copy failed: source path does not exist: output.text'),
+  it('recognizes a broken NewAPI channel parameter override', () => {
+    expect(isNewApiParamOverrideCopyError(
+      new Error('status_code=500, operation copy failed: source path does not exist: input.0.content.0.text'),
     )).toBe(true);
-    expect(shouldFallbackNewApiImageProtocol('gemini-3-pro-image', new Error('HTTP 404 route not found'))).toBe(true);
-    expect(shouldFallbackNewApiImageProtocol('gpt-image-2', new Error('source path does not exist'))).toBe(false);
-    expect(shouldFallbackNewApiImageProtocol('gemini-3-pro-image', new Error('HTTP 504 gateway timeout'))).toBe(false);
-  });
-
-  it('builds Gemini native inline image parts without file paths or remote URLs', () => {
-    const body = buildGeminiNativeImageBody({
-      userId: 'user-1',
-      clientRequestId: 'request-1',
-      model: 'gemini-3-pro-image',
-      prompt: 'render the projector',
-      inputImages: ['data:image/png;base64,aGVsbG8='],
-      aspectRatio: '16:9',
-      resolution: '4K',
-      outputFormat: 'jpg',
-      count: 1,
-    });
-
-    expect(body.contents[0]?.parts).toEqual([
-      { text: expect.stringContaining('render the projector') },
-      { inlineData: { mimeType: 'image/png', data: 'aGVsbG8=' } },
-    ]);
-    expect(body.generationConfig).toEqual({
-      responseModalities: ['IMAGE'],
-      imageConfig: { aspectRatio: '16:9', imageSize: '4K' },
-    });
+    expect(isNewApiParamOverrideCopyError(new Error('reference image HTTP 404'))).toBe(false);
   });
 
   it('keeps public Cloudflare references as URLs for the proven NewAPI chat protocol', () => {
@@ -229,27 +201,4 @@ describe('wallet image provider normalization', () => {
     });
   });
 
-  it('matches the main app multipart image edit field names', () => {
-    const form = buildNewApiImageEditForm({
-      userId: 'user-1',
-      clientRequestId: 'request-1',
-      model: 'gemini-3-pro-image',
-      prompt: 'render the projector',
-      inputImages: [],
-      aspectRatio: '4:3',
-      resolution: '4K',
-      outputFormat: 'png',
-      count: 1,
-    }, [
-      'data:image/png;base64,aGVsbG8=',
-      'data:image/jpeg;base64,aGVsbG8=',
-    ]);
-
-    expect(form.get('model')).toBe('gemini-3-pro-image');
-    expect(form.get('size')).toBe('3200x2400');
-    expect(form.get('quality')).toBe('high');
-    expect(form.get('response_format')).toBe('b64_json');
-    expect((form.get('image') as File).name).toBe('input-1.png');
-    expect((form.get('image[]') as File).name).toBe('input-2.jpg');
-  });
 });

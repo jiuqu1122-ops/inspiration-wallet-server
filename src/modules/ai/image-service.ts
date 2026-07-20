@@ -3,7 +3,6 @@ import { env } from '../../config/env.js';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
 import { CloudAiError } from './service.js';
-import { createImageReference } from './reference-store.js';
 
 const DEFAULT_IMAGE_UNIT_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
 const IMAGE_GENERATION_TIMEOUT_MS = 10 * 60_000;
@@ -440,145 +439,15 @@ export function buildNewApiChatImageBody(input: ImageInput, inputImages = input.
   };
 }
 
-export function isGeminiNativeImageModel(model: string) {
-  const token = imageModelToken(model);
-  return token.includes('gemini') || token.includes('nanobanana');
-}
-
-export function shouldFallbackNewApiImageProtocol(model: string, error: unknown) {
-  if (!isGeminiNativeImageModel(model)) return false;
+export function isNewApiParamOverrideCopyError(error: unknown) {
   const message = error instanceof Error
     ? error.message
     : typeof error === 'string' ? error : JSON.stringify(error ?? '');
-  const status = error instanceof UpstreamImageError
-    ? error.status
-    : Number(message.match(/(?:HTTP|status[_ ]?code)\D{0,12}(\d{3})/i)?.[1] || 0);
-  return [400, 404, 405, 415, 422, 501].includes(status)
-    || /(?:operation copy failed|copy operation failed|source path does not exist|provided image is not valid|bad request to gemini|unsupported (?:endpoint|model)|\.text\b)/i.test(message);
+  return /operation copy failed\s*:\s*source path does not exist\s*:/i.test(message);
 }
 
-export function buildGeminiNativeImageBody(input: ImageInput, inputImages = input.inputImages) {
-  const imageParts = inputImages.map((source) => {
-    const { bytes, mime } = dataUrlImageBytes(source);
-    return {
-      inlineData: {
-        mimeType: mime,
-        data: bytes.toString('base64'),
-      },
-    };
-  });
-  const imageSize = pricedImageResolution(input.model, input.resolution).toUpperCase();
-  return {
-    contents: [{
-      role: 'user',
-      parts: [
-        {
-          text: input.negativePrompt
-            ? `${promptWithConstraints(input)}\n\nAvoid: ${input.negativePrompt.trim()}`
-            : promptWithConstraints(input),
-        },
-        ...imageParts,
-      ],
-    }],
-    generationConfig: {
-      // Some NewAPI Gemini adapters try to copy the optional text artifact
-      // into a temporary `.text` path and fail the whole image request when
-      // that artifact is absent. This endpoint only needs the image result.
-      responseModalities: ['IMAGE'],
-      imageConfig: {
-        aspectRatio: input.aspectRatio,
-        imageSize,
-      },
-    },
-  };
-}
-
-function geminiNativeModelName(model: string) {
-  return model.trim().replace(/^models\//i, '');
-}
-
-function referenceSourceLabel(source: string) {
-  try {
-    return new URL(source).hostname.toLowerCase();
-  } catch {
-    return 'inline-reference';
-  }
-}
-
-async function materializeNewApiReferenceImages(inputImages: string[]) {
-  return Promise.all(inputImages.map(async (source) => {
-    try {
-      const materialized = await materializeNewApiReferenceImage(source);
-      if (!/^data:image\//i.test(materialized)) {
-        throw new Error('reference is not an HTTP image or supported data URL');
-      }
-      return materialized;
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      throw new UpstreamImageError(
-        502,
-        `Reference image download failed (${referenceSourceLabel(source)}): ${detail}`,
-      );
-    }
-  }));
-}
-
-function imageMimeExtension(mime: string) {
-  if (mime === 'image/jpeg') return 'jpg';
-  if (mime === 'image/webp') return 'webp';
-  if (mime === 'image/gif') return 'gif';
-  return 'png';
-}
-
-export function buildNewApiImageEditForm(input: ImageInput, inputImages: string[]) {
-  const imageParams = newApiImageRequestParams(
-    input.model,
-    input.count,
-    input.aspectRatio,
-    input.resolution,
-  );
-  const form = new FormData();
-  form.set('model', input.model);
-  form.set(
-    'prompt',
-    input.negativePrompt
-      ? `${promptWithConstraints(input)}\n\nAvoid: ${input.negativePrompt.trim()}`
-      : promptWithConstraints(input),
-  );
-  form.set('n', String(imageParams.n));
-  form.set('size', imageParams.size);
-  if ('quality' in imageParams && imageParams.quality) form.set('quality', imageParams.quality);
-  form.set('response_format', 'b64_json');
-  inputImages.slice(0, 8).forEach((source, index) => {
-    const { bytes, mime } = dataUrlImageBytes(source);
-    const data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-    form.append(
-      index === 0 ? 'image' : 'image[]',
-      new Blob([data], { type: mime }),
-      `input-${index + 1}.${imageMimeExtension(mime)}`,
-    );
-  });
-  return form;
-}
-
-async function generateGeminiNativeImages(
-  provider: AiProviderChannel,
-  secrets: ProviderSecrets,
-  input: ImageInput,
-  materializedInputImages: string[],
-) {
-  const nativeBody = buildGeminiNativeImageBody(input, materializedInputImages);
-  const nativeValues: unknown[] = [];
-  for (let index = 0; index < input.count; index += 1) {
-    nativeValues.push(await providerRequest(
-      provider,
-      secrets,
-      `/v1beta/models/${encodeURIComponent(geminiNativeModelName(input.model))}:generateContent`,
-      nativeBody,
-      IMAGE_GENERATION_TIMEOUT_MS,
-    ));
-  }
-  return nativeValues;
+export function isPublicNewApiImageReference(source: string) {
+  return /^https?:\/\//i.test(source.trim());
 }
 
 function imageMimeFromBytes(bytes: Uint8Array) {
@@ -673,46 +542,9 @@ async function fetchPublicImageReference(source: string) {
   }
 }
 
-async function providerMultipartRequest(
-  provider: AiProviderChannel,
-  secrets: ProviderSecrets,
-  path: string,
-  body: FormData,
-  timeoutOverrideMs?: number,
-) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutOverrideMs ?? 4 * 60_000);
-  try {
-    const headers = upstreamHeaders(secrets);
-    // fetch must generate the multipart boundary itself.
-    headers.delete('content-type');
-    headers.delete('content-length');
-    const response = await fetch(providerEndpoint(provider.baseUrl, path), {
-      method: 'POST',
-      headers,
-      body,
-      redirect: 'error',
-      signal: controller.signal,
-    });
-    const text = await response.text();
-    if (!response.ok) {
-      throw new UpstreamImageError(response.status, upstreamErrorMessage(response.status, text));
-    }
-    return parseProviderValue(text);
-  } catch (error) {
-    if (error instanceof UpstreamImageError) throw error;
-    throw new UpstreamImageError(0, error instanceof Error ? error.message : String(error));
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 /**
- * NewAPI-compatible image endpoints handle data URLs more consistently than
- * temporary public URLs. Materialize public references in memory only. A
- * short-lived cache lets sequential provider failover reuse the bytes even if
- * a temporary tunnel disappears between attempts; nothing is persisted or
- * logged.
+ * XAIS attachment uploads require image bytes. NewAPI generation does not use
+ * this path; its references remain public URLs end to end.
  */
 export async function materializeNewApiReferenceImage(source: string) {
   const trimmed = source.trim();
@@ -739,97 +571,19 @@ async function generateNewApiImages(
   secrets: ProviderSecrets,
   input: ImageInput,
 ) {
-  // Preserve the already-proven main-app protocol: temporary Cloudflare
-  // references remain HTTP URLs and are submitted through chat/completions.
-  // Converting these references to Gemini inlineData made some NewAPI
-  // deployments try to copy a non-existent temporary `.text` artifact.
-  const directPublicReferences = input.inputImages.length > 0
-    && input.inputImages.every((source) => /^https?:\/\//i.test(source.trim()));
-  if (directPublicReferences) {
-    for (const source of input.inputImages) await assertPublicProviderUrl(source);
-    try {
-      const value = await providerRequest(
-        provider,
-        secrets,
-        '/v1/chat/completions',
-        buildNewApiChatImageBody(input, input.inputImages),
-        IMAGE_GENERATION_TIMEOUT_MS,
-      );
-      const images = uniqueImages(value, input.inputImages, input.count);
-      if (images.length) return images;
-      throw new Error('NewAPI did not return image data');
-    } catch (error) {
-      if (!shouldFallbackNewApiImageProtocol(input.model, error)) throw error;
-    }
+  if (input.inputImages.some(source => !isPublicNewApiImageReference(source))) {
+    throw new CloudAiError(
+      'invalid_image_reference',
+      'NewAPI 生图参考图必须使用公网 HTTP URL，服务器不会下载或转存参考图',
+      400,
+    );
   }
-
-  const materializedInputImages = await materializeNewApiReferenceImages(input.inputImages);
-  if (materializedInputImages.length > 0) {
-    try {
-      const value = await providerMultipartRequest(
-        provider,
-        secrets,
-        '/v1/images/edits',
-        buildNewApiImageEditForm(input, materializedInputImages),
-        IMAGE_GENERATION_TIMEOUT_MS,
-      );
-      const images = uniqueImages(value, input.inputImages, input.count);
-      if (images.length) return images;
-      throw new Error('NewAPI did not return image data');
-    } catch (error) {
-      if (!shouldFallbackNewApiImageProtocol(input.model, error)) throw error;
-    }
-  }
-
-  if (isGeminiNativeImageModel(input.model)) {
-    try {
-      const value = await generateGeminiNativeImages(
-        provider,
-        secrets,
-        input,
-        materializedInputImages,
-      );
-      const images = uniqueImages(value, input.inputImages, input.count);
-      if (images.length) return images;
-      throw new Error('渠道没有返回图片数据');
-    } catch (error) {
-      if (input.inputImages.length > 0 || !shouldFallbackNewApiImageProtocol(input.model, error)) {
-        throw error;
-      }
-    }
-  }
-  const preparedInputImages = materializedInputImages.map((source, index) => {
-    try {
-      const dataUrl = source;
-      if (!/^data:image\//i.test(dataUrl)) return dataUrl;
-      const { bytes, mime } = dataUrlImageBytes(dataUrl);
-      return createImageReference(bytes, mime);
-    } catch {
-      // Keep the public URL as a compatibility fallback when a remote host
-      // cannot be fetched by the wallet server.
-      return input.inputImages[index] ?? source;
-    }
-  });
-  const imageParams = newApiImageRequestParams(
-    input.model,
-    input.count,
-    input.aspectRatio,
-    input.resolution,
-  );
-  const body = {
-    model: input.model,
-    ...imageParams,
-    ...(input.negativePrompt ? { negative_prompt: input.negativePrompt } : {}),
-    messages: [{ role: 'user', content: chatContent(input, preparedInputImages) }],
-    modalities: ['image'],
-    stream: false,
-    max_tokens: 8192,
-  };
+  for (const source of input.inputImages) await assertPublicProviderUrl(source);
   const value = await providerRequest(
     provider,
     secrets,
     '/v1/chat/completions',
-    body,
+    buildNewApiChatImageBody(input, input.inputImages),
     IMAGE_GENERATION_TIMEOUT_MS,
   );
   const images = uniqueImages(value, input.inputImages, input.count);
@@ -1379,6 +1133,13 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     await releaseImageCredits(prisma, effectiveInput, reservation.requestId, reservation.estimated);
     if (error instanceof CloudAiError) throw error;
     if (error instanceof UpstreamImageError) {
+      if (provider.kind === 'NEW_API' && isNewApiParamOverrideCopyError(error)) {
+        throw new CloudAiError(
+          'provider_param_override_invalid',
+          'NewAPI 生图渠道的参数覆盖配置错误：copy.from 指向 chat/completions 请求中不存在的字段，请检查该渠道的 ParamOverride operations',
+          502,
+        );
+      }
       throw new CloudAiError(
         error.status === 401 ? 'provider_auth_failed' : 'provider_request_failed',
         error.status === 401
