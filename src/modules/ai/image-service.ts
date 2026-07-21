@@ -10,6 +10,7 @@ const IMAGE_REFERENCE_FETCH_TIMEOUT_MS = 30_000;
 const MAX_IMAGE_REFERENCE_BYTES = 16 * 1024 * 1024;
 const IMAGE_REFERENCE_CACHE_TTL_MS = 10 * 60_000;
 const IMAGE_REFERENCE_CACHE_MAX_ENTRIES = 32;
+const XAIS_ATTACHMENT_REGISTRATION_ATTEMPTS = 4;
 const imageReferenceCache = new Map<string, { dataUrl: string; expiresAt: number }>();
 const pendingImageReferenceFetches = new Map<string, Promise<string>>();
 const XAIS_MODEL_MAP: Record<string, string> = {
@@ -790,17 +791,7 @@ async function uploadXaisReferenceImage(
   } finally {
     clearTimeout(timeout);
   }
-  try {
-    await providerRequest(
-      provider,
-      secrets,
-      `/xais/attUrls?att=${encodeURIComponent(upload.name)}`,
-      undefined,
-      30_000,
-    );
-  } catch {
-    // XAIS currently treats this registration call as best-effort.
-  }
+  await confirmXaisReferenceAttachment(provider, secrets, upload.name);
   return upload.name;
 }
 
@@ -876,6 +867,43 @@ function collectAttachmentIds(value: unknown, output: string[] = [], trusted = f
 
 const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+export function xaisAttachmentRegistrationUrls(value: unknown) {
+  return uniqueImages(value, [], 8).filter((url) => /^https?:\/\//i.test(url));
+}
+
+export async function confirmXaisReferenceAttachment(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  attachmentName: string,
+  wait: (milliseconds: number) => Promise<unknown> = delay,
+) {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < XAIS_ATTACHMENT_REGISTRATION_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) await wait(600 * attempt);
+    try {
+      const registered = await providerRequest(
+        provider,
+        secrets,
+        `/xais/attUrls?att=${encodeURIComponent(attachmentName)}`,
+        undefined,
+        30_000,
+      );
+      const failure = getFailure(registered);
+      if (failure) throw new Error(failure);
+      if (xaisAttachmentRegistrationUrls(registered).length === 0) {
+        throw new Error('XAIS attachment registration did not resolve an image URL');
+      }
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  const detail = lastError instanceof Error
+    ? lastError.message
+    : typeof lastError === 'string' ? lastError : JSON.stringify(lastError ?? 'unknown error');
+  throw new Error(`XAIS reference attachment registration failed: ${detail}`);
+}
+
 async function startXaisWorkerTaskWithRetry(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
@@ -900,7 +928,7 @@ async function startXaisWorkerTaskWithRetry(
     : new Error(typeof lastError === 'string' ? lastError : JSON.stringify(lastError ?? 'XAIS worker task failed'));
 }
 
-async function runXaisWorkerTask(
+export async function runXaisWorkerTask(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   input: ImageInput,

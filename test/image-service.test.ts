@@ -4,6 +4,7 @@ import {
   buildNewApiResponsesImageBody,
   chooseProviderForCapability,
   collectProviderModelIds,
+  confirmXaisReferenceAttachment,
   generateNewApiImages,
   imageUnitCredits,
   isNewApiParamOverrideCopyError,
@@ -16,9 +17,11 @@ import {
   resolveNewApiImageModel,
   resolveXaisModel,
   resolveXaisWorkerRatio,
+  runXaisWorkerTask,
   shouldRetryNewApiImageViaResponses,
   sizeFromRatio,
   uniqueImages,
+  xaisAttachmentRegistrationUrls,
 } from '../src/modules/ai/image-service.js';
 
 afterEach(() => {
@@ -172,6 +175,75 @@ describe('wallet image provider normalization', () => {
     expect(isPublicNewApiImageReference('https://assets.example.test/reference.png')).toBe(true);
     expect(isPublicNewApiImageReference('data:image/png;base64,aGVsbG8=')).toBe(false);
     expect(isPublicNewApiImageReference('C:\\cache\\reference.png')).toBe(false);
+  });
+
+  it('only accepts XAIS attachment registrations that resolve an image URL', () => {
+    expect(xaisAttachmentRegistrationUrls({ data: { url: 'https://xais.example.test/reference.png' } }))
+      .toEqual(['https://xais.example.test/reference.png']);
+    expect(xaisAttachmentRegistrationUrls({ success: true, data: {} })).toEqual([]);
+  });
+
+  it('retries XAIS attachment registration and rejects an unresolved attachment', async () => {
+    const provider = { baseUrl: 'https://provider.example' } as Parameters<typeof confirmXaisReferenceAttachment>[0];
+    const secrets = { apiKey: 'test-key', headers: {} };
+    const noWait = async () => {};
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('temporary unavailable', { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: { url: 'https://xais.example.test/reference.png' },
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(confirmXaisReferenceAttachment(provider, secrets, 'h2/reference.png', noWait))
+      .resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ success: true, data: {} }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+    await expect(confirmXaisReferenceAttachment(provider, secrets, 'h2/missing.png', noWait))
+      .rejects.toThrow('XAIS reference attachment registration failed');
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('starts an XAIS task with the confirmed attachment name in ref', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        url: 'https://1.1.1.1/upload',
+        name: 'h2/reference.png',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response('', { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        url: 'https://xais.example.test/reference.png',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        url: 'https://xais.example.test/output.png',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(runXaisWorkerTask(
+      { baseUrl: 'https://provider.example' } as Parameters<typeof runXaisWorkerTask>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-1',
+        clientRequestId: 'request-1',
+        model: 'Xais Nano Pro_2K',
+        prompt: 'keep the reference product shape',
+        inputImages: ['data:image/png;base64,aGVsbG8='],
+        aspectRatio: '1:1',
+        resolution: '2K',
+        outputFormat: 'png',
+        count: 1,
+      },
+    )).resolves.toBe('https://xais.example.test/output.png');
+
+    const taskStartCall = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/xais/workerTaskStart'));
+    expect(taskStartCall).toBeDefined();
+    expect(JSON.parse(String(taskStartCall?.[1]?.body))).toMatchObject({
+      ref: ['h2/reference.png'],
+    });
   });
 
   it('recognizes a broken NewAPI channel parameter override', () => {
