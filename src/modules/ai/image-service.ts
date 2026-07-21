@@ -103,7 +103,7 @@ export function resolveNewApiImageModel(model: string) {
   return trimmed;
 }
 
-type ImageInput = {
+export type ImageInput = {
   userId: string;
   clientRequestId: string;
   provider?: 'new-api' | 'xais-chat' | 'openai-compatible' | 'custom' | undefined;
@@ -439,11 +439,36 @@ export function buildNewApiChatImageBody(input: ImageInput, inputImages = input.
   };
 }
 
+export function buildNewApiResponsesImageBody(input: ImageInput, inputImages = input.inputImages) {
+  const prompt = input.negativePrompt
+    ? `${promptWithConstraints(input)}\n\nAvoid: ${input.negativePrompt.trim()}`
+    : promptWithConstraints(input);
+  return {
+    model: input.model,
+    input: [{
+      role: 'user',
+      content: [
+        { type: 'input_text', text: prompt },
+        ...inputImages.map((imageUrl) => ({ type: 'input_image', image_url: imageUrl })),
+      ],
+    }],
+    stream: false,
+    max_output_tokens: 8192,
+  };
+}
+
 export function isNewApiParamOverrideCopyError(error: unknown) {
   const message = error instanceof Error
     ? error.message
     : typeof error === 'string' ? error : JSON.stringify(error ?? '');
   return /operation copy failed\s*:\s*source path does not exist\s*:/i.test(message);
+}
+
+export function shouldRetryNewApiImageViaResponses(error: unknown) {
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string' ? error : JSON.stringify(error ?? '');
+  return /operation copy failed\s*:\s*source path does not exist\s*:\s*input(?:\.|\b)/i.test(message);
 }
 
 export function isPublicNewApiImageReference(source: string) {
@@ -566,7 +591,7 @@ export async function materializeNewApiReferenceImage(source: string) {
   }
 }
 
-async function generateNewApiImages(
+export async function generateNewApiImages(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   input: ImageInput,
@@ -579,14 +604,38 @@ async function generateNewApiImages(
     );
   }
   for (const source of input.inputImages) await assertPublicProviderUrl(source);
-  const value = await providerRequest(
-    provider,
-    secrets,
-    '/v1/chat/completions',
-    buildNewApiChatImageBody(input, input.inputImages),
-    IMAGE_GENERATION_TIMEOUT_MS,
-  );
-  const images = uniqueImages(value, input.inputImages, input.count);
+  try {
+    const value = await providerRequest(
+      provider,
+      secrets,
+      '/v1/chat/completions',
+      buildNewApiChatImageBody(input, input.inputImages),
+      IMAGE_GENERATION_TIMEOUT_MS,
+    );
+    const images = uniqueImages(value, input.inputImages, input.count);
+    if (images.length) return images;
+    throw new Error('渠道没有返回图片数据');
+  } catch (error) {
+    if (!shouldRetryNewApiImageViaResponses(error)) throw error;
+  }
+
+  // Some NewAPI channels apply Responses-style ParamOverride rules even when
+  // called through chat/completions. Retry with URL-only input_image parts.
+  const images: string[] = [];
+  for (let attempt = 0; attempt < input.count && images.length < input.count; attempt += 1) {
+    const value = await providerRequest(
+      provider,
+      secrets,
+      '/v1/responses',
+      buildNewApiResponsesImageBody(input, input.inputImages),
+      IMAGE_GENERATION_TIMEOUT_MS,
+    );
+    images.push(...uniqueImages(
+      value,
+      [...input.inputImages, ...images],
+      input.count - images.length,
+    ));
+  }
   if (images.length) return images;
   throw new Error('渠道没有返回图片数据');
 }

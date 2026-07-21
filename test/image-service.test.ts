@@ -1,8 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   buildNewApiChatImageBody,
+  buildNewApiResponsesImageBody,
   chooseProviderForCapability,
   collectProviderModelIds,
+  generateNewApiImages,
   imageUnitCredits,
   isNewApiParamOverrideCopyError,
   isPublicNewApiImageReference,
@@ -14,9 +16,14 @@ import {
   resolveNewApiImageModel,
   resolveXaisModel,
   resolveXaisWorkerRatio,
+  shouldRetryNewApiImageViaResponses,
   sizeFromRatio,
   uniqueImages,
 } from '../src/modules/ai/image-service.js';
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe('wallet image provider normalization', () => {
   it('extracts the image channel model IDs returned by /v1/models', () => {
@@ -172,6 +179,12 @@ describe('wallet image provider normalization', () => {
       new Error('status_code=500, operation copy failed: source path does not exist: input.0.content.0.text'),
     )).toBe(true);
     expect(isNewApiParamOverrideCopyError(new Error('reference image HTTP 404'))).toBe(false);
+    expect(shouldRetryNewApiImageViaResponses(
+      new Error('status_code=500, operation copy failed: source path does not exist: input.0.content.0.text'),
+    )).toBe(true);
+    expect(shouldRetryNewApiImageViaResponses(
+      new Error('status_code=500, operation copy failed: source path does not exist: messages.0.content.0.text'),
+    )).toBe(false);
   });
 
   it('keeps public Cloudflare references as URLs for the proven NewAPI chat protocol', () => {
@@ -198,6 +211,68 @@ describe('wallet image provider normalization', () => {
       aspect_ratio: '16:9',
       quality: 'standard',
       modalities: ['image'],
+    });
+  });
+
+  it('uses public URLs for the Responses fallback without materializing image bytes', () => {
+    const reference = 'https://example.trycloudflare.com/reference.png';
+    const body = buildNewApiResponsesImageBody({
+      userId: 'user-1',
+      clientRequestId: 'request-1',
+      model: 'gemini-3-pro-image',
+      prompt: 'render the projector',
+      negativePrompt: 'text artifacts',
+      inputImages: [reference],
+      aspectRatio: '16:9',
+      resolution: '2K',
+      outputFormat: 'jpg',
+      count: 1,
+    }, [reference]);
+
+    expect(body.input[0]?.content).toEqual([
+      { type: 'input_text', text: expect.stringContaining('Avoid: text artifacts') },
+      { type: 'input_image', image_url: reference },
+    ]);
+    expect(JSON.stringify(body)).not.toContain('data:image/');
+    expect(body).toMatchObject({ model: 'gemini-3-pro-image', stream: false });
+  });
+
+  it('retries the same NewAPI channel through Responses after an input-path copy error', async () => {
+    const rawPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: {
+          message: 'status_code=500, operation copy failed: source path does not exist: input.0.content.0.text',
+        },
+      }), { status: 500, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        output: [{ result: rawPng }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateNewApiImages(
+      { baseUrl: 'https://provider.example' } as Parameters<typeof generateNewApiImages>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-1',
+        clientRequestId: 'request-1',
+        model: 'gemini-3-pro-image',
+        prompt: 'render the projector',
+        inputImages: [],
+        aspectRatio: '16:9',
+        resolution: '2K',
+        outputFormat: 'jpg',
+        count: 1,
+      },
+    )).resolves.toEqual([`data:image/png;base64,${rawPng}`]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://provider.example/v1/chat/completions');
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://provider.example/v1/responses');
+    const responsesBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
+    expect(responsesBody.input[0].content[0]).toEqual({
+      type: 'input_text',
+      text: expect.stringContaining('render the projector'),
     });
   });
 
