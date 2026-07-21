@@ -37,6 +37,8 @@ enum WalletLedgerType {
 enum AiCapability {
   LLM
   IMAGE
+  IMAGE_NANO_BANANA
+  IMAGE_GPT
   VIDEO
 }
 

@@ -1,18 +1,24 @@
 import type { AiCapability, AiProviderChannel, PrismaClient } from '@prisma/client';
+import { createHash } from 'node:crypto';
 import { env } from '../../config/env.js';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
 import { CloudAiError } from './service.js';
 
 const DEFAULT_IMAGE_UNIT_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
-const IMAGE_GENERATION_TIMEOUT_MS = 10 * 60_000;
+const IMAGE_GENERATION_TIMEOUT_MS = 6 * 60_000;
 const IMAGE_REFERENCE_FETCH_TIMEOUT_MS = 30_000;
 const MAX_IMAGE_REFERENCE_BYTES = 16 * 1024 * 1024;
 const IMAGE_REFERENCE_CACHE_TTL_MS = 10 * 60_000;
 const IMAGE_REFERENCE_CACHE_MAX_ENTRIES = 32;
 const XAIS_ATTACHMENT_REGISTRATION_ATTEMPTS = 4;
+const XAIS_ATTACHMENT_CACHE_TTL_MS = 10 * 60_000;
+const XAIS_ATTACHMENT_CACHE_MAX_ENTRIES = 64;
+const XAIS_ATTACHMENT_UPLOAD_CONCURRENCY = 2;
 const imageReferenceCache = new Map<string, { dataUrl: string; expiresAt: number }>();
 const pendingImageReferenceFetches = new Map<string, Promise<string>>();
+const xaisAttachmentCache = new Map<string, { name: string; expiresAt: number }>();
+const pendingXaisAttachmentUploads = new Map<string, Promise<string>>();
 const XAIS_MODEL_MAP: Record<string, string> = {
   'Xais Nano Pro_2K': 'Nano_Banana_Pro_2K_0',
   'Xais Nano Pro_4K': 'Nano_Banana_Pro_4K_0',
@@ -52,12 +58,12 @@ const imageModelToken = (model: string) => model
 type PricedImageResolution = '1k' | '2k' | '4k';
 
 const pricedImageResolution = (model: string, resolution?: string): PricedImageResolution => {
+  const requested = resolution?.trim().toLowerCase();
+  if (requested === '1k' || requested === '2k' || requested === '4k') return requested;
   const token = imageModelToken(model);
   if (token.includes('4k')) return '4k';
   if (token.includes('2k')) return '2k';
   if (token.includes('1k')) return '1k';
-  const requested = resolution?.trim().toLowerCase();
-  if (requested === '1k' || requested === '4k') return requested;
   return '2k';
 };
 
@@ -104,6 +110,44 @@ export function resolveNewApiImageModel(model: string) {
   return trimmed;
 }
 
+const IMAGE_PROVIDER_CAPABILITIES: AiCapability[] = [
+  'IMAGE',
+  'IMAGE_NANO_BANANA',
+  'IMAGE_GPT',
+];
+
+export function imageCapabilityForModel(model: string): AiCapability {
+  const token = imageModelToken(model);
+  if (token.includes('gptimage') || token.includes('image2') || token.includes('img2')) {
+    return 'IMAGE_GPT';
+  }
+  if (
+    token.includes('nanobanana')
+    || (token.includes('gemini') && token.includes('image'))
+    || token.includes('xaisnano')
+    || token.includes('nanopro')
+    || token.includes('nano2')
+  ) {
+    return 'IMAGE_NANO_BANANA';
+  }
+  return 'IMAGE';
+}
+
+export function providerSupportsImageModel(
+  provider: { capabilities: readonly AiCapability[] },
+  model: string,
+) {
+  if (provider.capabilities.includes('IMAGE')) return true;
+  return provider.capabilities.includes(imageCapabilityForModel(model));
+}
+
+export function filterProviderImageModels(
+  provider: { capabilities: readonly AiCapability[] },
+  models: string[],
+) {
+  return models.filter((model) => providerSupportsImageModel(provider, model));
+}
+
 export type ImageInput = {
   userId: string;
   clientRequestId: string;
@@ -147,24 +191,41 @@ function upstreamErrorMessage(status: number, text: string) {
 }
 
 async function listImageProviders(prisma: PrismaClient) {
-  const common = { status: 'ACTIVE' as const, capabilities: { has: 'IMAGE' as const } };
   const providers = await prisma.aiProviderChannel.findMany({
-    where: common,
+    where: {
+      status: 'ACTIVE',
+      capabilities: { hasSome: IMAGE_PROVIDER_CAPABILITIES },
+    },
     orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }],
   });
   return providers.filter((provider) => !provider.capabilities.includes('LLM'));
 }
 
-async function selectImageProvider(prisma: PrismaClient, providerChannelId?: string) {
+async function selectImageProvider(
+  prisma: PrismaClient,
+  providerChannelId: string | undefined,
+  requestedModel: string,
+) {
   const providers = await listImageProviders(prisma);
   const provider = providerChannelId
     ? providers.find((candidate) => candidate.id === providerChannelId)
-    : chooseProviderForCapability(providers, 'IMAGE');
+    : providers.find((candidate) => {
+      const model = requestedModel.trim() || candidate.defaultModel?.trim() || '';
+      return model ? providerSupportsImageModel(candidate, model) : candidate.capabilities.includes('IMAGE');
+    });
   if (!provider) {
     throw new CloudAiError(
       'provider_unavailable',
       providerChannelId ? '所选生图渠道不可用或已被停用' : '当前没有可用的生图渠道',
       503,
+    );
+  }
+  const effectiveModel = requestedModel.trim() || provider.defaultModel?.trim() || '';
+  if (effectiveModel && !providerSupportsImageModel(provider, effectiveModel)) {
+    throw new CloudAiError(
+      'provider_model_family_mismatch',
+      '所选生图模型与该渠道启用的模型家族不匹配',
+      400,
     );
   }
   await assertPublicProviderUrl(provider.baseUrl);
@@ -327,12 +388,17 @@ export async function listWalletImageModels(
       await assertPublicProviderUrl(provider.baseUrl);
       const secrets = decryptProviderSecrets(provider.encryptedSecrets);
       const value = await providerRequest(provider, secrets, '/v1/models', undefined, 15_000);
+      const models = filterProviderImageModels(provider, collectProviderModelIds(value));
+      const defaultModel = provider.defaultModel
+        && providerSupportsImageModel(provider, provider.defaultModel)
+        ? provider.defaultModel
+        : null;
       return {
         id: provider.id,
         name: provider.name,
         provider: provider.kind,
-        defaultModel: provider.defaultModel,
-        models: collectProviderModelIds(value),
+        defaultModel,
+        models,
         error: null,
       };
     } catch (error) {
@@ -469,7 +535,15 @@ export function shouldRetryNewApiImageViaResponses(error: unknown) {
   const message = error instanceof Error
     ? error.message
     : typeof error === 'string' ? error : JSON.stringify(error ?? '');
-  return /operation copy failed\s*:\s*source path does not exist\s*:\s*input(?:\.|\b)/i.test(message);
+  return /operation copy failed\s*:\s*source path does not exist\s*:\s*(?:input(?:\.|\b)|[^\r\n]*\.text\b)/i.test(message);
+}
+
+export function isNewApiGeminiImageDecodeError(model: string, error: unknown) {
+  if (imageCapabilityForModel(model) !== 'IMAGE_NANO_BANANA') return false;
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string' ? error : JSON.stringify(error ?? '');
+  return /(?:failed to decode image data|provided image is not valid|image data is not valid|please make sure the image is valid|bad request to gemini)/i.test(message);
 }
 
 export function isPublicNewApiImageReference(source: string) {
@@ -487,7 +561,7 @@ function imageMimeFromBytes(bytes: Uint8Array) {
   return '';
 }
 
-async function readLimitedImageBody(response: Response) {
+async function readLimitedImageBytes(response: Response) {
   const declaredLength = Number(response.headers.get('content-length') || '0');
   if (Number.isFinite(declaredLength) && declaredLength > MAX_IMAGE_REFERENCE_BYTES) {
     throw new Error('reference image is too large');
@@ -507,10 +581,13 @@ async function readLimitedImageBody(response: Response) {
     chunks.push(value);
   }
   const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
-  const headerMime = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() || '';
   const detectedMime = imageMimeFromBytes(bytes);
-  const mime = headerMime.startsWith('image/') ? headerMime : detectedMime;
-  if (!mime) throw new Error('reference URL did not return an image');
+  if (!detectedMime) throw new Error('reference URL did not return valid image bytes');
+  return { bytes, mime: detectedMime };
+}
+
+async function readLimitedImageBody(response: Response) {
+  const { bytes, mime } = await readLimitedImageBytes(response);
   return `data:${mime};base64,${bytes.toString('base64')}`;
 }
 
@@ -569,8 +646,9 @@ async function fetchPublicImageReference(source: string) {
 }
 
 /**
- * XAIS attachment uploads require image bytes. NewAPI generation does not use
- * this path; its references remain public URLs end to end.
+ * Public URLs remain the normal NewAPI path. Gemini references are materialized
+ * only after the upstream explicitly reports invalid image data. XAIS also uses
+ * the same verified bytes for attachment uploads.
  */
 export async function materializeNewApiReferenceImage(source: string) {
   const trimmed = source.trim();
@@ -605,40 +683,101 @@ export async function generateNewApiImages(
     );
   }
   for (const source of input.inputImages) await assertPublicProviderUrl(source);
+  let preparedInputImages = input.inputImages;
   try {
     const value = await providerRequest(
       provider,
       secrets,
       '/v1/chat/completions',
-      buildNewApiChatImageBody(input, input.inputImages),
+      buildNewApiChatImageBody(input, preparedInputImages),
       IMAGE_GENERATION_TIMEOUT_MS,
     );
-    const images = uniqueImages(value, input.inputImages, input.count);
+    const images = uniqueImages(value, preparedInputImages, input.count);
     if (images.length) return images;
     throw new Error('渠道没有返回图片数据');
   } catch (error) {
-    if (!shouldRetryNewApiImageViaResponses(error)) throw error;
+    if (input.inputImages.length > 0 && isNewApiGeminiImageDecodeError(input.model, error)) {
+      preparedInputImages = await materializeNewApiReferenceImages(input.inputImages);
+      try {
+        const value = await providerRequest(
+          provider,
+          secrets,
+          '/v1/chat/completions',
+          buildNewApiChatImageBody(input, preparedInputImages),
+          IMAGE_GENERATION_TIMEOUT_MS,
+        );
+        const images = uniqueImages(value, preparedInputImages, input.count);
+        if (images.length) return images;
+        throw new Error('NewAPI did not return image data');
+      } catch (inlineError) {
+        if (
+          !shouldRetryNewApiImageViaResponses(inlineError)
+          && !isNewApiGeminiImageDecodeError(input.model, inlineError)
+        ) throw inlineError;
+      }
+    } else if (!shouldRetryNewApiImageViaResponses(error)) {
+      throw error;
+    }
   }
 
   // Some NewAPI channels apply Responses-style ParamOverride rules even when
-  // called through chat/completions. Retry with URL-only input_image parts.
+  // called through chat/completions. Preserve URLs normally, but retain verified
+  // inline data when the Gemini adapter already rejected the public reference.
   const images: string[] = [];
   for (let attempt = 0; attempt < input.count && images.length < input.count; attempt += 1) {
     const value = await providerRequest(
       provider,
       secrets,
       '/v1/responses',
-      buildNewApiResponsesImageBody(input, input.inputImages),
+      buildNewApiResponsesImageBody(input, preparedInputImages),
       IMAGE_GENERATION_TIMEOUT_MS,
     );
     images.push(...uniqueImages(
       value,
-      [...input.inputImages, ...images],
+      [...input.inputImages, ...preparedInputImages, ...images],
       input.count - images.length,
     ));
   }
   if (images.length) return images;
   throw new Error('渠道没有返回图片数据');
+}
+
+async function fetchPublicImageReferenceBytes(source: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), IMAGE_REFERENCE_FETCH_TIMEOUT_MS);
+  try {
+    let current = new URL(source);
+    for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
+      await assertPublicProviderUrl(current.toString());
+      const response = await fetch(current, {
+        method: 'GET',
+        headers: { accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.1' },
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get('location');
+        if (!location || redirectCount >= 3) throw new Error('reference image redirect is invalid');
+        current = new URL(location, current);
+        continue;
+      }
+      if (!response.ok) throw new Error(`reference image HTTP ${response.status}`);
+      return await readLimitedImageBytes(response);
+    }
+    throw new Error('reference image redirect limit exceeded');
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function materializeNewApiReferenceImages(sources: string[]) {
+  return Promise.all(sources.map(async (source) => {
+    const materialized = await materializeNewApiReferenceImage(source);
+    if (!/^data:image\/[a-zA-Z0-9.+-]+;base64,/i.test(materialized)) {
+      throw new Error('reference image could not be converted to verified image data');
+    }
+    return materialized;
+  }));
 }
 
 export function resolveXaisModel(model: string) {
@@ -753,17 +892,37 @@ function dataUrlImageBytes(source: string) {
   return { bytes, mime };
 }
 
-async function uploadXaisReferenceImage(
+function xaisAttachmentCacheKey(provider: AiProviderChannel, source: string) {
+  return `${provider.id}:${createHash('sha256').update(source).digest('hex')}`;
+}
+
+function readCachedXaisAttachment(key: string) {
+  const cached = xaisAttachmentCache.get(key);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    xaisAttachmentCache.delete(key);
+    return null;
+  }
+  return cached.name;
+}
+
+function cacheXaisAttachment(key: string, name: string) {
+  xaisAttachmentCache.set(key, { name, expiresAt: Date.now() + XAIS_ATTACHMENT_CACHE_TTL_MS });
+  while (xaisAttachmentCache.size > XAIS_ATTACHMENT_CACHE_MAX_ENTRIES) {
+    const oldest = xaisAttachmentCache.keys().next().value;
+    if (typeof oldest !== 'string') break;
+    xaisAttachmentCache.delete(oldest);
+  }
+}
+
+async function performXaisReferenceUpload(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
-  source: string,
+  trimmed: string,
 ) {
-  const trimmed = source.trim();
-  if (!/^(?:https?:|data:image\/)/i.test(trimmed)) return trimmed;
-  const dataUrl = /^data:image\//i.test(trimmed)
-    ? trimmed
-    : await materializeNewApiReferenceImage(trimmed);
-  const { bytes, mime } = dataUrlImageBytes(dataUrl);
+  const { bytes, mime } = /^data:image\//i.test(trimmed)
+    ? dataUrlImageBytes(trimmed)
+    : await fetchPublicImageReferenceBytes(trimmed);
   const extension = mime.includes('png') ? 'png'
     : mime.includes('webp') ? 'webp'
       : mime.includes('gif') ? 'gif' : 'jpg';
@@ -793,6 +952,45 @@ async function uploadXaisReferenceImage(
   }
   await confirmXaisReferenceAttachment(provider, secrets, upload.name);
   return upload.name;
+}
+
+async function uploadXaisReferenceImage(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  source: string,
+) {
+  const trimmed = source.trim();
+  if (!/^(?:https?:|data:image\/)/i.test(trimmed)) return trimmed;
+  const cacheKey = xaisAttachmentCacheKey(provider, trimmed);
+  const cached = readCachedXaisAttachment(cacheKey);
+  if (cached) return cached;
+  const pending = pendingXaisAttachmentUploads.get(cacheKey);
+  if (pending) return pending;
+
+  const upload = performXaisReferenceUpload(provider, secrets, trimmed)
+    .then((name) => {
+      cacheXaisAttachment(cacheKey, name);
+      return name;
+    })
+    .finally(() => pendingXaisAttachmentUploads.delete(cacheKey));
+  pendingXaisAttachmentUploads.set(cacheKey, upload);
+  return upload;
+}
+
+async function uploadXaisReferenceImages(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  sources: string[],
+) {
+  const output: string[] = [];
+  for (let index = 0; index < sources.length; index += XAIS_ATTACHMENT_UPLOAD_CONCURRENCY) {
+    output.push(...await Promise.all(
+      sources
+        .slice(index, index + XAIS_ATTACHMENT_UPLOAD_CONCURRENCY)
+        .map((source) => uploadXaisReferenceImage(provider, secrets, source)),
+    ));
+  }
+  return output;
 }
 
 function getTaskId(value: unknown): string {
@@ -936,10 +1134,11 @@ export async function runXaisWorkerTask(
   const model = resolveXaisModel(input.model);
   const isNanoModel = /(?:Nano_Banana|Xais_Nano)/i.test(model);
   const isNanoLiteModel = /Lite/i.test(model);
-  const referenceInputs: string[] = [];
-  for (const source of input.inputImages) {
-    referenceInputs.push(await uploadXaisReferenceImage(provider, secrets, source));
-  }
+  const referenceInputs = await uploadXaisReferenceImages(
+    provider,
+    secrets,
+    input.inputImages,
+  );
   const started = await startXaisWorkerTaskWithRetry(provider, secrets, {
     prompt: input.prompt,
     model,
@@ -1182,7 +1381,7 @@ async function releaseImageCredits(
 }
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
-  const provider = await selectImageProvider(prisma, input.providerChannelId);
+  const provider = await selectImageProvider(prisma, input.providerChannelId, input.model);
   const effectiveInput = { ...input, model: resolveImageModel(provider, input.model) };
   const reservation = await reserveImageCredits(prisma, effectiveInput);
   try {

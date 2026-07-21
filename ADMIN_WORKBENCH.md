@@ -75,7 +75,7 @@ curl --fail --show-error https://api.unmind.art/health
 - 工作台固定访问 `https://api.unmind.art`，不会接受用户指定的任意 URL。
 - 上游 Base URL 默认只允许公网 HTTPS。确实只有 HTTP 的中转可在单条渠道上显式开启“不安全 HTTP”；保存与测试仍会拒绝 localhost、私网、链路本地地址和危险 Header。
 - 上游 API Key 与自定义 Header 使用 AES-256-GCM 加密，管理接口只返回密钥末四位，永不返回明文。
-- 渠道能力按用途隔离：Agent 渠道只勾选 `LLM`，生图渠道只勾选 `IMAGE`，视频渠道只勾选 `VIDEO`；生图和视频请求使用各自渠道在管理器中填写的默认模型，不复用 LLM 模型。
+- 渠道能力按用途和模型家族隔离：Agent 渠道只勾选 `LLM`，Nano Banana / Gemini 生图渠道勾选 `IMAGE_NANO_BANANA`，GPT Image / Image2 生图渠道勾选 `IMAGE_GPT`，视频渠道只勾选 `VIDEO`。旧 `IMAGE` 渠道仍兼容两类生图模型，并会在新版管理器中映射为两个独立能力。
 
 ## 4. 当前管理接口
 

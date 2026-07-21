@@ -5,14 +5,18 @@ import {
   chooseProviderForCapability,
   collectProviderModelIds,
   confirmXaisReferenceAttachment,
+  filterProviderImageModels,
   generateNewApiImages,
+  imageCapabilityForModel,
   imageUnitCredits,
+  isNewApiGeminiImageDecodeError,
   isNewApiParamOverrideCopyError,
   isPublicNewApiImageReference,
   isRetryableXaisPollError,
   materializeNewApiReferenceImage,
   newApiImageRequestParams,
   parseXaisTaskId,
+  providerSupportsImageModel,
   resolveImageModel,
   resolveNewApiImageModel,
   resolveXaisModel,
@@ -52,6 +56,25 @@ describe('wallet image provider normalization', () => {
     const newApi = { name: 'newapi-image', capabilities: ['IMAGE'] as const };
     expect(chooseProviderForCapability([newApi, xais], 'IMAGE')).toBe(newApi);
     expect(chooseProviderForCapability([xais, newApi], 'IMAGE')).toBe(xais);
+  });
+
+  it('separates Nano Banana and GPT Image provider capabilities', () => {
+    const nano = { capabilities: ['IMAGE_NANO_BANANA'] as const };
+    const gpt = { capabilities: ['IMAGE_GPT'] as const };
+    const legacy = { capabilities: ['IMAGE'] as const };
+
+    expect(imageCapabilityForModel('gemini-3-pro-image')).toBe('IMAGE_NANO_BANANA');
+    expect(imageCapabilityForModel('Xais Nano Pro_2K')).toBe('IMAGE_NANO_BANANA');
+    expect(imageCapabilityForModel('gpt-image-2')).toBe('IMAGE_GPT');
+    expect(imageCapabilityForModel('Image2_4K')).toBe('IMAGE_GPT');
+    expect(providerSupportsImageModel(nano, 'gpt-image-2')).toBe(false);
+    expect(providerSupportsImageModel(gpt, 'gemini-3.1-flash-image')).toBe(false);
+    expect(providerSupportsImageModel(legacy, 'custom-image-model')).toBe(true);
+    expect(filterProviderImageModels(nano, [
+      'gemini-3-pro-image',
+      'gemini-2.5-pro',
+      'gpt-image-2',
+    ])).toEqual(['gemini-3-pro-image']);
   });
 
   it('uses the client-selected image model and keeps the manager model as fallback', () => {
@@ -117,14 +140,14 @@ describe('wallet image provider normalization', () => {
 
   it('prices unified image families by clarity without depending on the provider', () => {
     expect(imageUnitCredits('gemini-3-pro-image', '2K')).toBe(18n);
-    expect(imageUnitCredits('Xais Nano Pro_4K', '2K')).toBe(20n);
+    expect(imageUnitCredits('Xais Nano Pro_4K', '2K')).toBe(18n);
     expect(imageUnitCredits('gemini-3.1-flash-image', '2K')).toBe(15n);
-    expect(imageUnitCredits('Xais Nano2_4K', '2K')).toBe(18n);
+    expect(imageUnitCredits('Xais Nano2_4K', '2K')).toBe(15n);
     expect(imageUnitCredits('gpt-image-2', '1K')).toBe(10n);
-    expect(imageUnitCredits('Image2_2K', '4K')).toBe(15n);
-    expect(imageUnitCredits('Xais Img2_4K', '2K')).toBe(18n);
-    expect(imageUnitCredits('Xais Img2_2K(高画质)', '4K')).toBe(30n);
-    expect(imageUnitCredits('Xais_Img2_4K_H', '2K')).toBe(35n);
+    expect(imageUnitCredits('Image2_2K', '4K')).toBe(18n);
+    expect(imageUnitCredits('Xais Img2_4K', '2K')).toBe(15n);
+    expect(imageUnitCredits('Xais Img2_2K(高画质)', '4K')).toBe(35n);
+    expect(imageUnitCredits('Xais_Img2_4K_H', '2K')).toBe(30n);
   });
 
   it('extracts Gemini inline_data image results', () => {
@@ -256,6 +279,17 @@ describe('wallet image provider normalization', () => {
     )).toBe(true);
     expect(shouldRetryNewApiImageViaResponses(
       new Error('status_code=500, operation copy failed: source path does not exist: messages.0.content.0.text'),
+    )).toBe(true);
+    expect(shouldRetryNewApiImageViaResponses(
+      new Error('status_code=500, operation copy failed: source path does not exist: request.image'),
+    )).toBe(false);
+    expect(isNewApiGeminiImageDecodeError(
+      'gemini-3.1-flash-image',
+      new Error('Bad request to gemini-flash: Failed to decode image data. Please make sure the image is valid.'),
+    )).toBe(true);
+    expect(isNewApiGeminiImageDecodeError(
+      'gpt-image-2',
+      new Error('Failed to decode image data'),
     )).toBe(false);
   });
 
@@ -346,6 +380,51 @@ describe('wallet image provider normalization', () => {
       type: 'input_text',
       text: expect.stringContaining('render the projector'),
     });
+  });
+
+  it('retries Gemini with verified inline bytes after the channel rejects a public reference', async () => {
+    const referencePng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
+    const outputPng = Buffer.concat([
+      Buffer.from(referencePng, 'base64'),
+      Buffer.from([0]),
+    ]).toString('base64');
+    const reference = 'https://1.1.1.1/reference.png';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: {
+          message: 'Bad request to gemini-flash: Failed to decode image data. Please make sure the image is valid.',
+        },
+      }), { status: 400, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(Buffer.from(referencePng, 'base64'), {
+        status: 200,
+        headers: { 'content-type': 'image/png' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        output: [{ result: outputPng }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateNewApiImages(
+      { baseUrl: 'https://provider.example' } as Parameters<typeof generateNewApiImages>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-1',
+        clientRequestId: 'request-gemini-inline-retry',
+        model: 'gemini-3.1-flash-image',
+        prompt: 'render the projector',
+        inputImages: [reference],
+        aspectRatio: '16:9',
+        resolution: '2K',
+        outputFormat: 'jpg',
+        count: 1,
+      },
+    )).resolves.toEqual([`data:image/png;base64,${outputPng}`]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(String(fetchMock.mock.calls[1]?.[0])).toBe(reference);
+    const retryBody = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body));
+    expect(retryBody.messages[0].content[1].image_url.url)
+      .toBe(`data:image/png;base64,${referencePng}`);
   });
 
 });

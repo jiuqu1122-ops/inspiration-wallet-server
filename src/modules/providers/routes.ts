@@ -13,7 +13,13 @@ import {
 const providerIdSchema = z.object({ providerId: z.string().min(1).max(64) });
 const operationKeySchema = z.string().min(16).max(128).regex(/^[a-zA-Z0-9_-]+$/);
 const kindSchema = z.enum(['NEW_API', 'XAIS']);
-const capabilitySchema = z.enum(['LLM', 'IMAGE', 'VIDEO']);
+const capabilitySchema = z.enum([
+  'LLM',
+  'IMAGE',
+  'IMAGE_NANO_BANANA',
+  'IMAGE_GPT',
+  'VIDEO',
+]);
 const prioritySchema = z.number().int().min(0).max(9_999);
 const headersSchema = z.record(z.string().max(100), z.string().max(2_000)).refine(
   (headers) => Object.keys(headers).length <= 20,
@@ -28,7 +34,7 @@ const createSchema = z.object({
   apiKey: z.string().trim().min(8).max(2_000),
   headers: headersSchema.default({}),
   allowInsecureHttp: z.boolean().default(false),
-  capabilities: z.array(capabilitySchema).min(1).max(3).optional(),
+  capabilities: z.array(capabilitySchema).min(1).max(5).optional(),
   enabled: z.boolean().default(true),
   idempotencyKey: operationKeySchema,
 }).strict();
@@ -40,7 +46,7 @@ const updateSchema = z.object({
   apiKey: z.string().trim().min(8).max(2_000).optional(),
   headers: headersSchema.optional(),
   allowInsecureHttp: z.boolean().optional(),
-  capabilities: z.array(capabilitySchema).min(1).max(3).optional(),
+  capabilities: z.array(capabilitySchema).min(1).max(5).optional(),
   enabled: z.boolean().optional(),
   idempotencyKey: operationKeySchema,
 }).strict().refine(
