@@ -235,12 +235,14 @@ describe('wallet image provider normalization', () => {
   it('matches the upstream NewAPI image request parameters', () => {
     expect(newApiImageRequestParams('gemini-3-pro-image', 1, '16:9', '2K')).toEqual({
       n: 1,
+      size: '2048x1152',
       aspect_ratio: '16:9',
       output_resolution: '2K',
       image_size: '2K',
     });
     expect(newApiImageRequestParams('gemini-3.1-flash-image', 2, '9:16', '4K')).toEqual({
       n: 2,
+      size: '2160x3840',
       aspect_ratio: '9:16',
       output_resolution: '4K',
       image_size: '4K',
@@ -395,7 +397,7 @@ describe('wallet image provider normalization', () => {
     )).toBe(false);
   });
 
-  it('keeps public Cloudflare references in the NewAPI image generations request', () => {
+  it('builds NewAPI image fields with reference and exact aspect-ratio size', () => {
     const reference = 'https://example.trycloudflare.com/reference.png';
     const body = buildNewApiImageGenerationBody({
       userId: 'user-1',
@@ -413,6 +415,7 @@ describe('wallet image provider normalization', () => {
       model: 'gemini-3-pro-image',
       prompt: expect.stringContaining('render the projector'),
       image: reference,
+      size: '2048x1152',
       aspect_ratio: '16:9',
       output_resolution: '2K',
       image_size: '2K',
@@ -421,12 +424,16 @@ describe('wallet image provider normalization', () => {
     });
   });
 
-  it('accepts inline references from newer wallet clients on the generations endpoint', async () => {
+  it('uploads inline references through the NewAPI multipart edits endpoint', async () => {
     const reference = 'data:image/png;base64,aGVsbG8=';
     const outputPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      output: [{ result: outputPng }],
-    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    let multipartBody = '';
+    const fetchMock = vi.fn().mockImplementation(async (_url, init) => {
+      multipartBody = Buffer.from(await new Response(init?.body as BodyInit).arrayBuffer()).toString('utf8');
+      return new Response(JSON.stringify({
+        output: [{ result: outputPng }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
     vi.stubGlobal('fetch', fetchMock);
 
     await expect(generateNewApiImages(
@@ -446,17 +453,33 @@ describe('wallet image provider normalization', () => {
     )).resolves.toEqual([`data:image/png;base64,${outputPng}`]);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://provider.example/v1/images/generations');
-    const requestBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
-    expect(requestBody.image).toBe(reference);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://provider.example/v1/images/edits');
+    expect(String(fetchMock.mock.calls[0]?.[1]?.headers.get('content-type')))
+      .toContain('multipart/form-data; boundary=');
+    expect(multipartBody).toContain('name="image"; filename="reference-1.png"');
+    expect(multipartBody).toContain('name="aspect_ratio"\r\n\r\n16:9');
+    expect(multipartBody).toContain('name="size"\r\n\r\n2048x1152');
   });
 
-  it('keeps legacy public references on the NewAPI request without downloading them', async () => {
+  it('streams legacy public references through disk to the NewAPI edits endpoint', async () => {
     const reference = 'https://1.1.1.1/legacy-reference.png';
+    const referenceBytes = Buffer.from('legacy-reference-image-bytes');
     const outputPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      output: [{ result: outputPng }],
-    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    let multipartBytes = Buffer.alloc(0);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(referenceBytes, {
+        status: 200,
+        headers: {
+          'content-type': 'image/png',
+          'content-length': String(referenceBytes.byteLength),
+        },
+      }))
+      .mockImplementationOnce(async (_url, init) => {
+        multipartBytes = Buffer.from(await new Response(init?.body as BodyInit).arrayBuffer());
+        return new Response(JSON.stringify({
+          output: [{ result: outputPng }],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      });
     vi.stubGlobal('fetch', fetchMock);
 
     await expect(generateNewApiImages(
@@ -475,10 +498,10 @@ describe('wallet image provider normalization', () => {
       },
     )).resolves.toEqual([`data:image/png;base64,${outputPng}`]);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://provider.example/v1/images/generations');
-    const requestBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
-    expect(requestBody.image).toBe(reference);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(reference);
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://provider.example/v1/images/edits');
+    expect(multipartBytes.includes(referenceBytes)).toBe(true);
   });
 
   it('enables async image tasks for 4K and multiple references', () => {
@@ -497,7 +520,13 @@ describe('wallet image provider normalization', () => {
       outputFormat: 'jpg',
       count: 1,
     }, references);
-    expect(body).toMatchObject({ images: references, async: true, stream: false });
+    expect(body).toMatchObject({
+      images: references,
+      size: '3840x2160',
+      aspect_ratio: '16:9',
+      async: true,
+      stream: false,
+    });
   });
 
   it('uses the NewAPI images/generations endpoint', async () => {
@@ -527,7 +556,13 @@ describe('wallet image provider normalization', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[0]).toBe('https://provider.example/v1/images/generations');
     const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
-    expect(body).toMatchObject({ model: 'gemini-3-pro-image', response_format: 'url', stream: false });
+    expect(body).toMatchObject({
+      model: 'gemini-3-pro-image',
+      size: '2048x1152',
+      aspect_ratio: '16:9',
+      response_format: 'url',
+      stream: false,
+    });
   });
 
   it('polls an async NewAPI image task and downloads binary content when needed', async () => {

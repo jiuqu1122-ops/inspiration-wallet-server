@@ -1,5 +1,5 @@
 import type { AiCapability, AiProviderChannel, PrismaClient } from '@prisma/client';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdtemp, open, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -13,6 +13,8 @@ import { CloudAiError } from './service.js';
 const DEFAULT_IMAGE_UNIT_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
 const IMAGE_GENERATION_TIMEOUT_MS = 6 * 60_000;
 const NEW_API_IMAGE_TASK_POLL_INTERVAL_MS = 3_000;
+const NEW_API_REFERENCE_DOWNLOAD_ATTEMPTS = 3;
+const NEW_API_REFERENCE_DOWNLOAD_RETRY_DELAYS_MS = [500, 1_500];
 const IMAGE_REFERENCE_FETCH_TIMEOUT_MS = 30_000;
 const MAX_IMAGE_REFERENCE_BYTES = 16 * 1024 * 1024;
 const IMAGE_REFERENCE_CACHE_TTL_MS = 10 * 60_000;
@@ -500,7 +502,7 @@ function normalizedImageResolution(resolution?: string): PricedImageResolution {
   return '2k';
 }
 
-function gptImage2Size(
+function newApiExactImageSize(
   ratio: ImageInput['aspectRatio'],
   resolution?: string,
 ) {
@@ -541,13 +543,14 @@ export function newApiImageRequestParams(
     const resolutionLabel = normalizedImageResolution(resolution).toUpperCase();
     return {
       n: count,
+      size: newApiExactImageSize(ratio, resolution),
       aspect_ratio: ratio,
       output_resolution: resolutionLabel,
       image_size: resolutionLabel,
     };
   }
   const size = family === 'gpt-image-2'
-    ? gptImage2Size(ratio, resolution)
+    ? newApiExactImageSize(ratio, resolution)
     : sizeFromRatio(ratio);
   return {
     n: count,
@@ -828,6 +831,174 @@ export async function resolveNewApiImageResponse(
   throw new Error(failure || `NewAPI 图片任务等待超时：${taskId}${pollDetail}`);
 }
 
+type StagedNewApiEditImage = {
+  filename: string;
+  mime: string;
+  size: number;
+  bytes?: Buffer;
+  path?: string;
+  cleanup: () => Promise<void>;
+};
+
+function newApiImageExtension(mime: string) {
+  if (mime.includes('png')) return 'png';
+  if (mime.includes('webp')) return 'webp';
+  if (mime.includes('gif')) return 'gif';
+  return 'jpg';
+}
+
+function retryableNewApiReferenceDownloadError(error: unknown) {
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string' ? error : JSON.stringify(error ?? '') ?? '';
+  const statusMatch = message.match(/reference image HTTP (\d{3})/i);
+  if (statusMatch) {
+    const status = Number(statusMatch[1]);
+    return status === 408 || status === 425 || status === 429 || status >= 500;
+  }
+  return /(?:abort|timed?\s*out|timeout|fetch failed|terminated|socket|connection|incomplete\s*read|ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR|empty image bytes|valid image bytes|content-length mismatch)/i.test(message);
+}
+
+async function stageNewApiEditImage(
+  source: string,
+  index: number,
+  wait: (milliseconds: number) => Promise<unknown> = (
+    milliseconds,
+  ) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+): Promise<StagedNewApiEditImage> {
+  if (/^data:image\//i.test(source)) {
+    const inline = dataUrlImageBytes(source);
+    return {
+      filename: `reference-${index + 1}.${newApiImageExtension(inline.mime)}`,
+      mime: inline.mime,
+      size: inline.bytes.byteLength,
+      bytes: inline.bytes,
+      cleanup: async () => {},
+    };
+  }
+
+  const directory = await mkdtemp(join(tmpdir(), 'inspiration-newapi-ref-'));
+  const path = join(directory, 'reference.bin');
+  let lastError: unknown = null;
+  try {
+    for (let attempt = 0; attempt < NEW_API_REFERENCE_DOWNLOAD_ATTEMPTS; attempt += 1) {
+      if (attempt > 0) await wait(NEW_API_REFERENCE_DOWNLOAD_RETRY_DELAYS_MS[attempt - 1] ?? 1_500);
+      try {
+        const staged = await downloadPublicImageReferenceToFile(source, path);
+        const fileSize = (await stat(path)).size;
+        if (fileSize !== staged.size) {
+          throw new Error(`reference image temporary file size mismatch: expected ${staged.size}, received ${fileSize}`);
+        }
+        return {
+          filename: `reference-${index + 1}.${newApiImageExtension(staged.mime)}`,
+          path,
+          mime: staged.mime,
+          size: staged.size,
+          cleanup: () => rm(directory, { recursive: true, force: true }),
+        };
+      } catch (error) {
+        lastError = error;
+        await rm(path, { force: true }).catch(() => {});
+        if (!retryableNewApiReferenceDownloadError(error)
+          || attempt >= NEW_API_REFERENCE_DOWNLOAD_ATTEMPTS - 1) throw error;
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('NewAPI reference image download failed');
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+function newApiMultipartTextPart(boundary: string, name: string, value: string) {
+  return Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`,
+    'utf8',
+  );
+}
+
+function newApiMultipartFileHeader(boundary: string, image: StagedNewApiEditImage) {
+  return Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="image"; filename="${image.filename}"\r\nContent-Type: ${image.mime}\r\n\r\n`,
+    'utf8',
+  );
+}
+
+function newApiEditFields(input: ImageInput) {
+  const body = buildNewApiImageGenerationBody(input) as Record<string, unknown>;
+  delete body.image;
+  delete body.images;
+  return Object.entries(body)
+    .filter((entry): entry is [string, string | number | boolean] => (
+      typeof entry[1] === 'string'
+      || typeof entry[1] === 'number'
+      || typeof entry[1] === 'boolean'
+    ))
+    .map(([name, value]) => [name, String(value)] as const);
+}
+
+async function providerNewApiImageEditRequest(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  input: ImageInput,
+  images: StagedNewApiEditImage[],
+) {
+  const boundary = `inspiration-${randomUUID().replace(/-/g, '')}`;
+  const textParts = newApiEditFields(input).map(([name, value]) => (
+    newApiMultipartTextPart(boundary, name, value)
+  ));
+  const fileHeaders = images.map((image) => newApiMultipartFileHeader(boundary, image));
+  const fileFooters = images.map(() => Buffer.from('\r\n', 'utf8'));
+  const closing = Buffer.from(`--${boundary}--\r\n`, 'utf8');
+  const contentLength = textParts.reduce((total, part) => total + part.byteLength, 0)
+    + images.reduce((total, image, index) => (
+      total + fileHeaders[index]!.byteLength + image.size + fileFooters[index]!.byteLength
+    ), 0)
+    + closing.byteLength;
+  const bodyStream = Readable.from((async function* multipartBody() {
+    for (const part of textParts) yield part;
+    for (let index = 0; index < images.length; index += 1) {
+      const image = images[index]!;
+      yield fileHeaders[index]!;
+      if (image.path) {
+        for await (const chunk of createReadStream(image.path)) yield chunk;
+      } else if (image.bytes) {
+        yield image.bytes;
+      }
+      yield fileFooters[index]!;
+    }
+    yield closing;
+  })());
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), IMAGE_GENERATION_TIMEOUT_MS);
+  try {
+    const headers = upstreamHeaders(secrets);
+    headers.set('content-type', `multipart/form-data; boundary=${boundary}`);
+    headers.set('content-length', String(contentLength));
+    const request: RequestInit & { duplex?: 'half' } = {
+      method: 'POST',
+      headers,
+      body: Readable.toWeb(bodyStream) as unknown as BodyInit,
+      redirect: 'error',
+      signal: controller.signal,
+      duplex: 'half',
+    };
+    const response = await fetch(providerEndpoint(provider.baseUrl, '/v1/images/edits'), request);
+    const text = await response.text();
+    if (!response.ok) {
+      throw new UpstreamImageError(response.status, upstreamErrorMessage(response.status, text));
+    }
+    return parseProviderValue(text);
+  } catch (error) {
+    if (error instanceof UpstreamImageError) throw error;
+    throw new UpstreamImageError(0, error instanceof Error ? error.message : String(error));
+  } finally {
+    clearTimeout(timeout);
+    bodyStream.destroy();
+  }
+}
+
 export async function generateNewApiImages(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
@@ -843,13 +1014,26 @@ export async function generateNewApiImages(
   for (const source of input.inputImages.filter(isPublicNewApiImageReference)) {
     await assertPublicProviderUrl(source);
   }
-  const started = await providerRequest(
-    provider,
-    secrets,
-    '/v1/images/generations',
-    buildNewApiImageGenerationBody(input),
-    IMAGE_GENERATION_TIMEOUT_MS,
-  );
+  const stagedImages: StagedNewApiEditImage[] = [];
+  let started: unknown;
+  try {
+    if (input.inputImages.length > 0) {
+      for (let index = 0; index < input.inputImages.length; index += 1) {
+        stagedImages.push(await stageNewApiEditImage(input.inputImages[index]!, index));
+      }
+      started = await providerNewApiImageEditRequest(provider, secrets, input, stagedImages);
+    } else {
+      started = await providerRequest(
+        provider,
+        secrets,
+        '/v1/images/generations',
+        buildNewApiImageGenerationBody(input),
+        IMAGE_GENERATION_TIMEOUT_MS,
+      );
+    }
+  } finally {
+    await Promise.all(stagedImages.map((image) => image.cleanup().catch(() => {})));
+  }
   return resolveNewApiImageResponse(
     provider,
     secrets,
@@ -1652,7 +1836,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       if (provider.kind === 'NEW_API' && isNewApiParamOverrideCopyError(error)) {
         throw new CloudAiError(
           'provider_param_override_invalid',
-          'NewAPI 生图渠道的参数覆盖配置错误：copy.from 指向 images/generations 请求中不存在的字段，请检查该渠道的 ParamOverride operations',
+          'NewAPI 生图渠道的参数覆盖配置错误：copy.from 指向 images/generations 或 images/edits 请求中不存在的字段，请检查该渠道的 ParamOverride operations',
           502,
         );
       }
