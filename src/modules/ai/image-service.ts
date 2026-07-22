@@ -550,6 +550,14 @@ export function isPublicNewApiImageReference(source: string) {
   return /^https?:\/\//i.test(source.trim());
 }
 
+function isInlineNewApiImageReference(source: string) {
+  return /^data:image\/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=\s]+$/i.test(source.trim());
+}
+
+function isSupportedNewApiImageReference(source: string) {
+  return isPublicNewApiImageReference(source) || isInlineNewApiImageReference(source);
+}
+
 function imageMimeFromBytes(bytes: Uint8Array) {
   if (bytes.length >= 8
     && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
@@ -581,9 +589,12 @@ async function readLimitedImageBytes(response: Response) {
     chunks.push(value);
   }
   const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+  if (!bytes.length) throw new Error('reference URL returned empty image bytes');
+  const headerMime = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() || '';
   const detectedMime = imageMimeFromBytes(bytes);
-  if (!detectedMime) throw new Error('reference URL did not return valid image bytes');
-  return { bytes, mime: detectedMime };
+  const mime = detectedMime || (headerMime.startsWith('image/') ? headerMime : '');
+  if (!mime) throw new Error('reference URL did not return valid image bytes');
+  return { bytes, mime };
 }
 
 async function readLimitedImageBody(response: Response) {
@@ -675,14 +686,16 @@ export async function generateNewApiImages(
   secrets: ProviderSecrets,
   input: ImageInput,
 ) {
-  if (input.inputImages.some(source => !isPublicNewApiImageReference(source))) {
+  if (input.inputImages.some(source => !isSupportedNewApiImageReference(source))) {
     throw new CloudAiError(
       'invalid_image_reference',
-      'NewAPI 生图参考图必须使用公网 HTTP URL，服务器不会下载或转存参考图',
+      'NewAPI 生图参考图必须使用公网 HTTP URL 或图片 data URI',
       400,
     );
   }
-  for (const source of input.inputImages) await assertPublicProviderUrl(source);
+  for (const source of input.inputImages.filter(isPublicNewApiImageReference)) {
+    await assertPublicProviderUrl(source);
+  }
   let preparedInputImages = input.inputImages;
   try {
     const value = await providerRequest(
@@ -1382,6 +1395,9 @@ async function releaseImageCredits(
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
   const provider = await selectImageProvider(prisma, input.providerChannelId, input.model);
+  if (provider.kind === 'XAIS' && input.inputImages.length > 8) {
+    throw new CloudAiError('invalid_request', 'XAIS 生图最多支持 8 张参考图', 400);
+  }
   const effectiveInput = { ...input, model: resolveImageModel(provider, input.model) };
   const reservation = await reserveImageCredits(prisma, effectiveInput);
   try {

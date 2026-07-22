@@ -132,6 +132,19 @@ describe('wallet image provider normalization', () => {
     await expect(materializeNewApiReferenceImage(source)).resolves.toBe(source);
   });
 
+  it('keeps compatibility with image content types outside the legacy magic-byte list', async () => {
+    const source = 'https://1.1.1.1/reference-compatible.svg';
+    const bytes = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(bytes, {
+      status: 200,
+      headers: { 'content-type': 'image/svg+xml; charset=utf-8' },
+    })));
+
+    await expect(materializeNewApiReferenceImage(source)).resolves.toBe(
+      `data:image/svg+xml;base64,${bytes.toString('base64')}`,
+    );
+  });
+
   it('uses stable OpenAI-compatible dimensions for supported ratios', () => {
     expect(sizeFromRatio('1:1')).toBe('1024x1024');
     expect(sizeFromRatio('16:9')).toBe('1792x1024');
@@ -269,6 +282,49 @@ describe('wallet image provider normalization', () => {
     });
   });
 
+  it('keeps legacy public image references working through the XAIS attachment flow', async () => {
+    const reference = 'https://1.1.1.1/legacy-reference.svg';
+    const referenceBytes = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>');
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(referenceBytes, {
+        status: 200,
+        headers: { 'content-type': 'image/svg+xml' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        url: 'https://1.1.1.1/upload',
+        name: 'legacy/reference.jpg',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response('', { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        url: 'https://xais.example.test/reference.jpg',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        url: 'https://xais.example.test/output.png',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(runXaisWorkerTask(
+      { baseUrl: 'https://provider.example' } as Parameters<typeof runXaisWorkerTask>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-legacy',
+        clientRequestId: 'request-legacy-public-reference',
+        model: 'Xais Nano Pro_2K',
+        prompt: 'keep the reference product shape',
+        inputImages: [reference],
+        aspectRatio: '1:1',
+        resolution: '2K',
+        outputFormat: 'png',
+        count: 1,
+      },
+    )).resolves.toBe('https://xais.example.test/output.png');
+
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(reference);
+    expect(Buffer.from(await new Response(fetchMock.mock.calls[2]?.[1]?.body as BodyInit).arrayBuffer()))
+      .toEqual(referenceBytes);
+  });
+
   it('recognizes a broken NewAPI channel parameter override', () => {
     expect(isNewApiParamOverrideCopyError(
       new Error('status_code=500, operation copy failed: source path does not exist: input.0.content.0.text'),
@@ -318,6 +374,64 @@ describe('wallet image provider normalization', () => {
       quality: 'standard',
       modalities: ['image'],
     });
+  });
+
+  it('accepts inline references from newer wallet clients without changing the chat protocol', async () => {
+    const reference = 'data:image/png;base64,aGVsbG8=';
+    const outputPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      output: [{ result: outputPng }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateNewApiImages(
+      { baseUrl: 'https://provider.example' } as Parameters<typeof generateNewApiImages>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-1',
+        clientRequestId: 'request-inline-reference',
+        model: 'gemini-3-pro-image',
+        prompt: 'redesign the handle',
+        inputImages: [reference],
+        aspectRatio: '16:9',
+        resolution: '2K',
+        outputFormat: 'jpg',
+        count: 1,
+      },
+    )).resolves.toEqual([`data:image/png;base64,${outputPng}`]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const requestBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(requestBody.messages[0].content[1].image_url.url).toBe(reference);
+  });
+
+  it('keeps legacy public references on the NewAPI request without downloading them after success', async () => {
+    const reference = 'https://1.1.1.1/legacy-reference.png';
+    const outputPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      output: [{ result: outputPng }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateNewApiImages(
+      { baseUrl: 'https://provider.example' } as Parameters<typeof generateNewApiImages>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-legacy',
+        clientRequestId: 'request-legacy-newapi-reference',
+        model: 'gemini-3-pro-image',
+        prompt: 'redesign the handle',
+        inputImages: [reference],
+        aspectRatio: '16:9',
+        resolution: '2K',
+        outputFormat: 'jpg',
+        count: 1,
+      },
+    )).resolves.toEqual([`data:image/png;base64,${outputPng}`]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const requestBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(requestBody.messages[0].content[1].image_url.url).toBe(reference);
   });
 
   it('uses public URLs for the Responses fallback without materializing image bytes', () => {

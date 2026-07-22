@@ -21,6 +21,19 @@ describe('wallet AI request compatibility', () => {
     });
   });
 
+  it('accepts the NewAPI maximum of nine image references', () => {
+    expect(normalizeImageRequestBody({
+      clientRequestId: 'canvas-image-request-nine',
+      provider: 'new-api',
+      model: 'gemini-3-pro-image',
+      prompt: 'combine the references',
+      inputImages: Array.from({ length: 9 }, (_, index) => `data:image/png;base64,aGVsbG8${index}=`),
+      aspectRatio: '1:1',
+      outputFormat: 'png',
+      count: 1,
+    }).inputImages).toHaveLength(9);
+  });
+
   it('accepts null optional video fields sent by older desktop clients', () => {
     expect(normalizeVideoRequestBody({
       clientRequestId: 'canvas-video-request-1',
