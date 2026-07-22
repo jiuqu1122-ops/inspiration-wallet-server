@@ -39,6 +39,9 @@ services:
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?JWT_ACCESS_SECRET is required}
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required}
       PROVIDER_SECRETS_ENCRYPTION_KEY: ${PROVIDER_SECRETS_ENCRYPTION_KEY:-}
+      IMAGE_RESULT_STORE_DIR: /var/lib/inspiration/image-results
+    volumes:
+      - image_result_data:/var/lib/inspiration/image-results
     depends_on:
       postgres:
         condition: service_healthy
@@ -112,3 +115,5 @@ volumes:
     name: inspiration_wallet_caddy_data
   caddy_config:
     name: inspiration_wallet_caddy_config
+  image_result_data:
+    name: inspiration_wallet_image_result_data

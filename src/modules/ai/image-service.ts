@@ -9,6 +9,11 @@ import { env } from '../../config/env.js';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
 import { CloudAiError } from './service.js';
+import {
+  createImageResultFromFile,
+  createImageResultFromResponse,
+  isStoredImageResultUrl,
+} from './image-result-store.js';
 
 const DEFAULT_IMAGE_UNIT_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
 const IMAGE_GENERATION_TIMEOUT_MS = 6 * 60_000;
@@ -461,6 +466,13 @@ function newApiImageFamily(model: string) {
   return 'legacy';
 }
 
+function shouldUseNewApiAsyncImageTask(input: ImageInput) {
+  return newApiImageFamily(input.model) === 'nano-banana'
+    || normalizedImageResolution(input.resolution) === '4k'
+    || input.inputImages.length > 1
+    || input.count > 1;
+}
+
 async function providerImageContentRequest(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
@@ -486,8 +498,7 @@ async function providerImageContentRequest(
     if (contentType.includes('json') || contentType.startsWith('text/')) {
       return parseProviderValue(await response.text());
     }
-    const { bytes, mime } = await readLimitedImageBytes(response);
-    return `data:${mime};base64,${bytes.toString('base64')}`;
+    return await createImageResultFromResponse(response);
   } catch (error) {
     if (error instanceof UpstreamImageError) throw error;
     throw new UpstreamImageError(0, error instanceof Error ? error.message : String(error));
@@ -578,6 +589,7 @@ function chatContent(input: ImageInput, inputImages = input.inputImages) {
 export function buildNewApiImageGenerationBody(
   input: ImageInput,
   inputImages = input.inputImages,
+  asyncOverride?: boolean,
 ) {
   const imageParams = newApiImageRequestParams(
     input.model,
@@ -593,13 +605,7 @@ export function buildNewApiImageGenerationBody(
     ...(inputImages.length === 1 ? { image: inputImages[0] } : {}),
     ...(inputImages.length > 1 ? { images: inputImages } : {}),
     response_format: 'url',
-    ...(
-      normalizedImageResolution(input.resolution) === '4k'
-      || inputImages.length > 1
-      || input.count > 1
-        ? { async: true }
-        : {}
-    ),
+    ...((asyncOverride ?? shouldUseNewApiAsyncImageTask({ ...input, inputImages })) ? { async: true } : {}),
     stream: false,
   };
 }
@@ -924,8 +930,8 @@ function newApiMultipartFileHeader(boundary: string, image: StagedNewApiEditImag
   );
 }
 
-function newApiEditFields(input: ImageInput) {
-  const body = buildNewApiImageGenerationBody(input) as Record<string, unknown>;
+function newApiEditFields(input: ImageInput, asyncOverride?: boolean) {
+  const body = buildNewApiImageGenerationBody(input, input.inputImages, asyncOverride) as Record<string, unknown>;
   delete body.image;
   delete body.images;
   return Object.entries(body)
@@ -937,14 +943,20 @@ function newApiEditFields(input: ImageInput) {
     .map(([name, value]) => [name, String(value)] as const);
 }
 
+function isUnsupportedNewApiAsyncParameter(error: unknown) {
+  if (!(error instanceof UpstreamImageError) || ![400, 404, 405, 422].includes(error.status)) return false;
+  return /(?:async|task).*(?:unsupported|unknown|invalid|not\s+allowed|not\s+support)|(?:unsupported|unknown|invalid).*(?:async|task)/i.test(error.message);
+}
+
 async function providerNewApiImageEditRequest(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   input: ImageInput,
   images: StagedNewApiEditImage[],
+  asyncOverride?: boolean,
 ) {
   const boundary = `inspiration-${randomUUID().replace(/-/g, '')}`;
-  const textParts = newApiEditFields(input).map(([name, value]) => (
+  const textParts = newApiEditFields(input, asyncOverride).map(([name, value]) => (
     newApiMultipartTextPart(boundary, name, value)
   ));
   const fileHeaders = images.map((image) => newApiMultipartFileHeader(boundary, image));
@@ -1016,31 +1028,60 @@ export async function generateNewApiImages(
   }
   const stagedImages: StagedNewApiEditImage[] = [];
   let started: unknown;
+  const preferAsync = shouldUseNewApiAsyncImageTask(input);
   try {
     if (input.inputImages.length > 0) {
       for (let index = 0; index < input.inputImages.length; index += 1) {
         stagedImages.push(await stageNewApiEditImage(input.inputImages[index]!, index));
       }
-      started = await providerNewApiImageEditRequest(provider, secrets, input, stagedImages);
+      try {
+        started = await providerNewApiImageEditRequest(provider, secrets, input, stagedImages, preferAsync);
+      } catch (error) {
+        if (!preferAsync || !isUnsupportedNewApiAsyncParameter(error)) throw error;
+        started = await providerNewApiImageEditRequest(provider, secrets, input, stagedImages, false);
+      }
     } else {
-      started = await providerRequest(
+      const startGeneration = (asyncOverride: boolean) => providerRequest(
         provider,
         secrets,
         '/v1/images/generations',
-        buildNewApiImageGenerationBody(input),
+        buildNewApiImageGenerationBody(input, input.inputImages, asyncOverride),
         IMAGE_GENERATION_TIMEOUT_MS,
       );
+      try {
+        started = await startGeneration(preferAsync);
+      } catch (error) {
+        if (!preferAsync || !isUnsupportedNewApiAsyncParameter(error)) throw error;
+        started = await startGeneration(false);
+      }
     }
   } finally {
     await Promise.all(stagedImages.map((image) => image.cleanup().catch(() => {})));
   }
-  return resolveNewApiImageResponse(
+  const images = await resolveNewApiImageResponse(
     provider,
     secrets,
     started,
     input.inputImages,
     input.count,
   );
+  return Promise.all(images.map(async (source, index) => {
+    if (!isPublicNewApiImageReference(source) || isStoredImageResultUrl(source)) return source;
+    let staged: StagedNewApiEditImage | null = null;
+    try {
+      staged = await stageNewApiEditImage(source, index);
+      return await createImageResultFromFile(staged.path!, staged.mime);
+    } catch (error) {
+      console.warn('[newapi_image_result_mirror_failed]', {
+        provider: provider.name,
+        index,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return source;
+    } finally {
+      if (staged) await staged.cleanup().catch(() => {});
+    }
+  }));
 }
 
 type StagedXaisReference = {

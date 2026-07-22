@@ -1,8 +1,14 @@
+import { createReadStream } from 'node:fs';
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { CloudAiError, listWalletAgentModels } from './service.js';
-import { executeWalletImageGeneration, listWalletImageModels } from './image-service.js';
-import { executeWalletVideoGeneration, executeWalletVideoStatus } from './image-service.js';
+import {
+  executeWalletImageGeneration,
+  executeWalletVideoGeneration,
+  executeWalletVideoStatus,
+  listWalletImageModels,
+} from './image-service.js';
+import { getImageResult } from './image-result-store.js';
 import { getImageReference } from './reference-store.js';
 import { createAiTaskSchema } from './task-schema.js';
 import {
@@ -173,6 +179,26 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       } catch (error) {
         return knownError(reply, error);
       }
+    },
+  );
+
+  app.get(
+    '/image-results/:key',
+    { config: { rateLimit: { max: 600, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const rawKey = (request.params as { key?: unknown }).key;
+      const key = typeof rawKey === 'string' ? rawKey.trim() : '';
+      const result = await getImageResult(key);
+      if (!result) {
+        return reply.code(404).send({ error: 'not_found', message: 'Image result not found or expired' });
+      }
+      return reply
+        .header('content-type', result.mime)
+        .header('content-length', String(result.size))
+        .header('cache-control', 'public, max-age=21600, immutable')
+        .header('content-disposition', 'inline')
+        .header('x-content-type-options', 'nosniff')
+        .send(createReadStream(result.path));
     },
   );
 

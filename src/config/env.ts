@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const defaultLicenseSigningPublicKey = 'AAS4rzI5dxFefYmQCNp1wYpYgKwMXp5+wG1WgF/UoRQ=';
 
@@ -76,6 +78,9 @@ const envSchema = z
     AI_UPSTREAM_CONNECT_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(30_000),
     AI_UPSTREAM_IDLE_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(300_000).default(75_000),
     WORKER_HEALTH_FILE: z.string().min(1).default('/tmp/inspiration-worker-health'),
+    IMAGE_RESULT_STORE_DIR: z.string().min(1).default(join(tmpdir(), 'inspiration-image-results')),
+    IMAGE_RESULT_TTL_MINUTES: z.coerce.number().int().min(30).max(10_080).default(1_440),
+    IMAGE_RESULT_STORE_MAX_MB: z.coerce.number().int().min(128).max(32_768).default(4_096),
   })
   .superRefine((value, context) => {
     if (value.JWT_ACCESS_SECRET === value.JWT_REFRESH_SECRET) {

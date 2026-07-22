@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { access, readFile } from 'node:fs/promises';
+import { access, readFile, rm } from 'node:fs/promises';
 import {
   buildNewApiImageGenerationBody,
   chooseProviderForCapability,
@@ -28,6 +28,7 @@ import {
   uniqueImages,
   xaisAttachmentRegistrationUrls,
 } from '../src/modules/ai/image-service.js';
+import { getImageResult } from '../src/modules/ai/image-result-store.js';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -459,6 +460,7 @@ describe('wallet image provider normalization', () => {
     expect(multipartBody).toContain('name="image"; filename="reference-1.png"');
     expect(multipartBody).toContain('name="aspect_ratio"\r\n\r\n16:9');
     expect(multipartBody).toContain('name="size"\r\n\r\n2048x1152');
+    expect(multipartBody).toContain('name="async"\r\n\r\ntrue');
   });
 
   it('streams legacy public references through disk to the NewAPI edits endpoint', async () => {
@@ -561,8 +563,87 @@ describe('wallet image provider normalization', () => {
       size: '2048x1152',
       aspect_ratio: '16:9',
       response_format: 'url',
+      async: true,
       stream: false,
     });
+  });
+
+  it('falls back to synchronous NewAPI requests when a channel rejects the async field', async () => {
+    const rawPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn().mockImplementation(async (_url, init) => {
+      requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      if (requestBodies.length === 1) {
+        return new Response(JSON.stringify({ error: { message: 'unknown field async' } }), {
+          status: 400,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ output: [{ result: rawPng }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateNewApiImages(
+      { baseUrl: 'https://provider.example' } as Parameters<typeof generateNewApiImages>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-1',
+        clientRequestId: 'request-async-fallback',
+        model: 'gemini-3-pro-image',
+        prompt: 'render the projector',
+        inputImages: [],
+        aspectRatio: '16:9',
+        resolution: '2K',
+        outputFormat: 'jpg',
+        count: 1,
+      },
+    )).resolves.toEqual([`data:image/png;base64,${rawPng}`]);
+
+    expect(requestBodies[0]?.async).toBe(true);
+    expect(requestBodies[1]).not.toHaveProperty('async');
+  });
+
+  it('streams remote NewAPI results into the stable disk-backed result store', async () => {
+    const outputUrl = 'https://1.1.1.1/generated.png';
+    const outputPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=', 'base64');
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ url: outputUrl }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(outputPng, {
+        status: 200,
+        headers: {
+          'content-type': 'image/png',
+          'content-length': String(outputPng.byteLength),
+        },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const images = await generateNewApiImages(
+      { baseUrl: 'https://provider.example', name: 'NewAPI test' } as Parameters<typeof generateNewApiImages>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-1',
+        clientRequestId: 'request-stable-result',
+        model: 'gemini-3-pro-image',
+        prompt: 'render the projector',
+        inputImages: [],
+        aspectRatio: '16:9',
+        resolution: '2K',
+        outputFormat: 'jpg',
+        count: 1,
+      },
+    );
+
+    expect(images[0]).toMatch(/^https:\/\/api\.example\.test\/v1\/ai\/image-results\/[a-f0-9]{64}\.png$/);
+    const key = new URL(images[0]!).pathname.split('/').pop()!;
+    const stored = await getImageResult(key);
+    expect(await readFile(stored!.path)).toEqual(outputPng);
+    await rm(stored!.path, { force: true });
   });
 
   it('polls an async NewAPI image task and downloads binary content when needed', async () => {
@@ -587,7 +668,13 @@ describe('wallet image provider normalization', () => {
       async () => {},
     );
 
-    expect(images).toEqual([`data:image/png;base64,${outputPng}`]);
+    expect(images).toHaveLength(1);
+    expect(images[0]).toMatch(/^https:\/\/api\.example\.test\/v1\/ai\/image-results\/[a-f0-9]{64}\.png$/);
+    const key = new URL(images[0]!).pathname.split('/').pop()!;
+    const stored = await getImageResult(key);
+    expect(stored).not.toBeNull();
+    expect(await readFile(stored!.path)).toEqual(Buffer.from(outputPng, 'base64'));
+    await rm(stored!.path, { force: true });
     expect(fetchMock.mock.calls[0]?.[0])
       .toBe('https://provider.example/v1/images/generations/task-123');
     expect(fetchMock.mock.calls[1]?.[0])
