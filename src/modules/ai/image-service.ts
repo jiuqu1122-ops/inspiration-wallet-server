@@ -1,5 +1,10 @@
 import type { AiCapability, AiProviderChannel, PrismaClient } from '@prisma/client';
 import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { mkdtemp, open, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { env } from '../../config/env.js';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
@@ -15,6 +20,8 @@ const XAIS_ATTACHMENT_REGISTRATION_ATTEMPTS = 4;
 const XAIS_ATTACHMENT_CACHE_TTL_MS = 10 * 60_000;
 const XAIS_ATTACHMENT_CACHE_MAX_ENTRIES = 64;
 const XAIS_ATTACHMENT_UPLOAD_CONCURRENCY = 2;
+const XAIS_REFERENCE_DOWNLOAD_ATTEMPTS = 3;
+const XAIS_REFERENCE_DOWNLOAD_RETRY_DELAYS_MS = [500, 1_500];
 const imageReferenceCache = new Map<string, { dataUrl: string; expiresAt: number }>();
 const pendingImageReferenceFetches = new Map<string, Promise<string>>();
 const xaisAttachmentCache = new Map<string, { name: string; expiresAt: number }>();
@@ -755,7 +762,81 @@ export async function generateNewApiImages(
   throw new Error('渠道没有返回图片数据');
 }
 
-async function fetchPublicImageReferenceBytes(source: string) {
+type StagedXaisReference = {
+  path: string;
+  mime: string;
+  size: number;
+  cleanup: () => Promise<void>;
+};
+
+function retryableXaisReferenceDownloadError(error: unknown) {
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string' ? error : JSON.stringify(error ?? '') ?? '';
+  const statusMatch = message.match(/reference image HTTP (\d{3})/i);
+  if (statusMatch) {
+    const status = Number(statusMatch[1]);
+    return status === 408 || status === 425 || status === 429 || status >= 500;
+  }
+  return /(?:abort|timed?\s*out|timeout|fetch failed|terminated|socket|connection|incomplete\s*read|ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR|empty image bytes|valid image bytes|content-length mismatch)/i.test(message);
+}
+
+async function writeResponseBodyToFile(response: Response, path: string) {
+  if (!response.body) throw new Error('reference image response has no body');
+  const declaredLength = Number(response.headers.get('content-length') || '0');
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_IMAGE_REFERENCE_BYTES) {
+    throw new Error('reference image is too large');
+  }
+
+  const file = await open(path, 'w');
+  const reader = response.body.getReader();
+  const prefixChunks: Buffer[] = [];
+  let prefixLength = 0;
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_IMAGE_REFERENCE_BYTES) {
+        await reader.cancel();
+        throw new Error('reference image is too large');
+      }
+      if (prefixLength < 512) {
+        const prefix = Buffer.from(value.buffer, value.byteOffset, Math.min(value.byteLength, 512 - prefixLength));
+        prefixChunks.push(Buffer.from(prefix));
+        prefixLength += prefix.byteLength;
+      }
+      let offset = 0;
+      while (offset < value.byteLength) {
+        const chunk = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+        const { bytesWritten } = await file.write(chunk, offset, chunk.byteLength - offset);
+        if (bytesWritten <= 0) throw new Error('reference image temporary file write failed');
+        offset += bytesWritten;
+      }
+    }
+  } finally {
+    await file.close();
+  }
+
+  if (!total) throw new Error('reference URL returned empty image bytes');
+  const contentEncoding = response.headers.get('content-encoding')?.trim().toLowerCase() || '';
+  if (
+    Number.isFinite(declaredLength)
+    && declaredLength > 0
+    && (!contentEncoding || contentEncoding === 'identity')
+    && total !== declaredLength
+  ) {
+    throw new Error(`reference image content-length mismatch: expected ${declaredLength}, received ${total}`);
+  }
+  const headerMime = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() || '';
+  const detectedMime = imageMimeFromBytes(Buffer.concat(prefixChunks));
+  const mime = detectedMime || (headerMime.startsWith('image/') ? headerMime : '');
+  if (!mime) throw new Error('reference URL did not return valid image bytes');
+  return { mime, size: total };
+}
+
+async function downloadPublicImageReferenceToFile(source: string, path: string) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), IMAGE_REFERENCE_FETCH_TIMEOUT_MS);
   try {
@@ -775,11 +856,52 @@ async function fetchPublicImageReferenceBytes(source: string) {
         continue;
       }
       if (!response.ok) throw new Error(`reference image HTTP ${response.status}`);
-      return await readLimitedImageBytes(response);
+      return await writeResponseBodyToFile(response, path);
     }
     throw new Error('reference image redirect limit exceeded');
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+export async function stageXaisPublicReference(
+  source: string,
+  wait: (milliseconds: number) => Promise<unknown> = delay,
+): Promise<StagedXaisReference> {
+  const directory = await mkdtemp(join(tmpdir(), 'inspiration-xais-ref-'));
+  const path = join(directory, 'reference.bin');
+  let lastError: unknown = null;
+  try {
+    for (let attempt = 0; attempt < XAIS_REFERENCE_DOWNLOAD_ATTEMPTS; attempt += 1) {
+      if (attempt > 0) await wait(XAIS_REFERENCE_DOWNLOAD_RETRY_DELAYS_MS[attempt - 1] ?? 1_500);
+      try {
+        const staged = await downloadPublicImageReferenceToFile(source, path);
+        const fileSize = (await stat(path)).size;
+        if (fileSize !== staged.size) {
+          throw new Error(`reference image temporary file size mismatch: expected ${staged.size}, received ${fileSize}`);
+        }
+        return {
+          path,
+          mime: staged.mime,
+          size: staged.size,
+          cleanup: () => rm(directory, { recursive: true, force: true }),
+        };
+      } catch (error) {
+        lastError = error;
+        await rm(path, { force: true }).catch(() => {});
+        if (!retryableXaisReferenceDownloadError(error) || attempt >= XAIS_REFERENCE_DOWNLOAD_ATTEMPTS - 1) {
+          throw error;
+        }
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(typeof lastError === 'string'
+        ? lastError
+        : JSON.stringify(lastError ?? 'reference image download failed') ?? 'reference image download failed');
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true }).catch(() => {});
+    throw error;
   }
 }
 
@@ -933,38 +1055,53 @@ async function performXaisReferenceUpload(
   secrets: ProviderSecrets,
   trimmed: string,
 ) {
-  const { bytes, mime } = /^data:image\//i.test(trimmed)
-    ? dataUrlImageBytes(trimmed)
-    : await fetchPublicImageReferenceBytes(trimmed);
+  const inline = /^data:image\//i.test(trimmed) ? dataUrlImageBytes(trimmed) : null;
+  const staged = inline ? null : await stageXaisPublicReference(trimmed);
+  const mime = inline?.mime ?? staged!.mime;
+  const size = inline?.bytes.byteLength ?? staged!.size;
   const extension = mime.includes('png') ? 'png'
     : mime.includes('webp') ? 'webp'
       : mime.includes('gif') ? 'gif' : 'jpg';
-  const uploadValue = await providerRequest(
-    provider,
-    secrets,
-    `/xais/fileAttachmentUploadUrl?ext=${encodeURIComponent(extension)}`,
-    undefined,
-    30_000,
-  );
-  const upload = findXaisUploadTarget(uploadValue);
-  if (!upload) throw new Error('XAIS reference upload URL response is missing url/name');
-  await assertPublicProviderUrl(upload.url);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 90_000);
   try {
-    const response = await fetch(upload.url, {
-      method: 'PUT',
-      headers: { 'content-type': 'application/octet-stream' },
-      body: bytes,
-      redirect: 'error',
-      signal: controller.signal,
-    });
-    if (!response.ok) throw new Error(`XAIS reference upload failed with HTTP ${response.status}`);
+    const uploadValue = await providerRequest(
+      provider,
+      secrets,
+      `/xais/fileAttachmentUploadUrl?ext=${encodeURIComponent(extension)}`,
+      undefined,
+      30_000,
+    );
+    const upload = findXaisUploadTarget(uploadValue);
+    if (!upload) throw new Error('XAIS reference upload URL response is missing url/name');
+    await assertPublicProviderUrl(upload.url);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 90_000);
+    const fileStream = staged ? createReadStream(staged.path) : null;
+    try {
+      const body: BodyInit = fileStream
+        ? Readable.toWeb(fileStream) as unknown as BodyInit
+        : inline!.bytes;
+      const request: RequestInit & { duplex?: 'half' } = {
+        method: 'PUT',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': String(size),
+        },
+        body,
+        redirect: 'error',
+        signal: controller.signal,
+        ...(fileStream ? { duplex: 'half' as const } : {}),
+      };
+      const response = await fetch(upload.url, request);
+      if (!response.ok) throw new Error(`XAIS reference upload failed with HTTP ${response.status}`);
+    } finally {
+      clearTimeout(timeout);
+      fileStream?.destroy();
+    }
+    await confirmXaisReferenceAttachment(provider, secrets, upload.name);
+    return upload.name;
   } finally {
-    clearTimeout(timeout);
+    await staged?.cleanup().catch(() => {});
   }
-  await confirmXaisReferenceAttachment(provider, secrets, upload.name);
-  return upload.name;
 }
 
 async function uploadXaisReferenceImage(

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { access, readFile } from 'node:fs/promises';
 import {
   buildNewApiChatImageBody,
   buildNewApiResponsesImageBody,
@@ -24,6 +25,7 @@ import {
   runXaisWorkerTask,
   shouldRetryNewApiImageViaResponses,
   sizeFromRatio,
+  stageXaisPublicReference,
   uniqueImages,
   xaisAttachmentRegistrationUrls,
 } from '../src/modules/ai/image-service.js';
@@ -143,6 +145,47 @@ describe('wallet image provider normalization', () => {
     await expect(materializeNewApiReferenceImage(source)).resolves.toBe(
       `data:image/svg+xml;base64,${bytes.toString('base64')}`,
     );
+  });
+
+  it('retries transient non-image Cloudflare responses and cleans the staged file', async () => {
+    const source = 'https://1.1.1.1/reference-retry.png';
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('<html>cloudflare tunnel not ready</html>', {
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+      }))
+      .mockResolvedValueOnce(new Response(png, {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const staged = await stageXaisPublicReference(source, async () => {});
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(staged.mime).toBe('image/png');
+    expect(staged.size).toBe(png.byteLength);
+    expect(await readFile(staged.path)).toEqual(png);
+
+    await staged.cleanup();
+    await expect(access(staged.path)).rejects.toThrow();
+  });
+
+  it('rejects a repeatedly truncated public reference without retaining a temp file', async () => {
+    const source = 'https://1.1.1.1/reference-truncated.png';
+    const pngPrefix = Buffer.from('89504e470d0a1a0a', 'hex');
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(new Response(pngPrefix, {
+      status: 200,
+      headers: {
+        'content-type': 'image/png',
+        'content-length': String(pngPrefix.byteLength + 1024),
+      },
+    })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(stageXaisPublicReference(source, async () => {}))
+      .rejects.toThrow('content-length mismatch');
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it('uses stable OpenAI-compatible dimensions for supported ratios', () => {
@@ -285,6 +328,7 @@ describe('wallet image provider normalization', () => {
   it('keeps legacy public image references working through the XAIS attachment flow', async () => {
     const reference = 'https://1.1.1.1/legacy-reference.svg';
     const referenceBytes = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>');
+    let uploadedBytes = Buffer.alloc(0);
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(referenceBytes, {
         status: 200,
@@ -294,7 +338,10 @@ describe('wallet image provider normalization', () => {
         url: 'https://1.1.1.1/upload',
         name: 'legacy/reference.jpg',
       }), { status: 200, headers: { 'content-type': 'application/json' } }))
-      .mockResolvedValueOnce(new Response('', { status: 200 }))
+      .mockImplementationOnce(async (_url, init) => {
+        uploadedBytes = Buffer.from(await new Response(init?.body as BodyInit).arrayBuffer());
+        return new Response('', { status: 200 });
+      })
       .mockResolvedValueOnce(new Response(JSON.stringify({
         url: 'https://xais.example.test/reference.jpg',
       }), { status: 200, headers: { 'content-type': 'application/json' } }))
@@ -321,8 +368,7 @@ describe('wallet image provider normalization', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(5);
     expect(String(fetchMock.mock.calls[0]?.[0])).toBe(reference);
-    expect(Buffer.from(await new Response(fetchMock.mock.calls[2]?.[1]?.body as BodyInit).arrayBuffer()))
-      .toEqual(referenceBytes);
+    expect(uploadedBytes).toEqual(referenceBytes);
   });
 
   it('recognizes a broken NewAPI channel parameter override', () => {
