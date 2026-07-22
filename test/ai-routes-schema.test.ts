@@ -39,4 +39,23 @@ describe('wallet AI request compatibility', () => {
       inputMode: undefined,
     });
   });
+
+  it('accepts up to nine NewAPI image references', () => {
+    const request = {
+      clientRequestId: 'canvas-image-request-9refs',
+      provider: 'new-api' as const,
+      model: 'gemini-3-pro-image',
+      prompt: 'combine the references',
+      inputImages: Array.from({ length: 9 }, (_, index) => `https://example.test/${index}.png`),
+      aspectRatio: '16:9' as const,
+      resolution: '4k',
+      outputFormat: 'jpg' as const,
+      count: 1,
+    };
+    expect(normalizeImageRequestBody(request).inputImages).toHaveLength(9);
+    expect(() => normalizeImageRequestBody({
+      ...request,
+      inputImages: [...request.inputImages, 'https://example.test/10.png'],
+    })).toThrow();
+  });
 });

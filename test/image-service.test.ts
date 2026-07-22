@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  buildNewApiChatImageBody,
-  buildNewApiResponsesImageBody,
+  buildNewApiImageGenerationBody,
   chooseProviderForCapability,
   collectProviderModelIds,
   confirmXaisReferenceAttachment,
@@ -19,10 +18,10 @@ import {
   providerSupportsImageModel,
   resolveImageModel,
   resolveNewApiImageModel,
+  resolveNewApiImageResponse,
   resolveXaisModel,
   resolveXaisWorkerRatio,
   runXaisWorkerTask,
-  shouldRetryNewApiImageViaResponses,
   sizeFromRatio,
   uniqueImages,
   xaisAttachmentRegistrationUrls,
@@ -180,17 +179,27 @@ describe('wallet image provider normalization', () => {
   it('matches the main app NewAPI image dimensions and quality', () => {
     expect(newApiImageRequestParams('gemini-3-pro-image', 1, '16:9', '2K')).toEqual({
       n: 1,
-      size: '1920x1088',
       aspect_ratio: '16:9',
-      ratio: '16:9',
-      quality: 'standard',
+      output_resolution: '2K',
+      image_size: '2K',
     });
     expect(newApiImageRequestParams('gemini-3.1-flash-image', 2, '9:16', '4K')).toEqual({
       n: 2,
-      size: '2160x3840',
       aspect_ratio: '9:16',
-      ratio: '9:16',
-      quality: 'high',
+      output_resolution: '4K',
+      image_size: '4K',
+    });
+    expect(newApiImageRequestParams('gpt-image-2', 1, '16:9', '1K')).toEqual({
+      n: 1,
+      size: '1280x720',
+      aspect_ratio: '16:9',
+      quality: 'medium',
+    });
+    expect(newApiImageRequestParams('gpt-image-2', 1, '16:9', '2K')).toEqual({
+      n: 1,
+      size: '2048x1152',
+      aspect_ratio: '16:9',
+      quality: 'medium',
     });
   });
 
@@ -274,15 +283,6 @@ describe('wallet image provider normalization', () => {
       new Error('status_code=500, operation copy failed: source path does not exist: input.0.content.0.text'),
     )).toBe(true);
     expect(isNewApiParamOverrideCopyError(new Error('reference image HTTP 404'))).toBe(false);
-    expect(shouldRetryNewApiImageViaResponses(
-      new Error('status_code=500, operation copy failed: source path does not exist: input.0.content.0.text'),
-    )).toBe(true);
-    expect(shouldRetryNewApiImageViaResponses(
-      new Error('status_code=500, operation copy failed: source path does not exist: messages.0.content.0.text'),
-    )).toBe(true);
-    expect(shouldRetryNewApiImageViaResponses(
-      new Error('status_code=500, operation copy failed: source path does not exist: request.image'),
-    )).toBe(false);
     expect(isNewApiGeminiImageDecodeError(
       'gemini-3.1-flash-image',
       new Error('Bad request to gemini-flash: Failed to decode image data. Please make sure the image is valid.'),
@@ -293,9 +293,9 @@ describe('wallet image provider normalization', () => {
     )).toBe(false);
   });
 
-  it('keeps public Cloudflare references as URLs for the proven NewAPI chat protocol', () => {
+  it('keeps public Cloudflare references in the NewAPI image generations request', () => {
     const reference = 'https://example.trycloudflare.com/reference.png';
-    const body = buildNewApiChatImageBody({
+    const body = buildNewApiImageGenerationBody({
       userId: 'user-1',
       clientRequestId: 'request-1',
       model: 'gemini-3-pro-image',
@@ -307,50 +307,40 @@ describe('wallet image provider normalization', () => {
       count: 1,
     }, [reference]);
 
-    expect(body.messages[0]?.content).toEqual([
-      { type: 'text', text: expect.stringContaining('render the projector') },
-      { type: 'image_url', image_url: { url: reference } },
-    ]);
     expect(body).toMatchObject({
       model: 'gemini-3-pro-image',
-      size: '1920x1088',
+      prompt: expect.stringContaining('render the projector'),
+      image: reference,
       aspect_ratio: '16:9',
-      quality: 'standard',
-      modalities: ['image'],
+      output_resolution: '2K',
+      image_size: '2K',
+      response_format: 'url',
+      stream: false,
     });
   });
 
-  it('uses public URLs for the Responses fallback without materializing image bytes', () => {
-    const reference = 'https://example.trycloudflare.com/reference.png';
-    const body = buildNewApiResponsesImageBody({
+  it('enables async image tasks for 4K and multiple references', () => {
+    const references = [
+      'https://example.test/reference-1.png',
+      'https://example.test/reference-2.png',
+    ];
+    const body = buildNewApiImageGenerationBody({
       userId: 'user-1',
       clientRequestId: 'request-1',
       model: 'gemini-3-pro-image',
       prompt: 'render the projector',
-      negativePrompt: 'text artifacts',
-      inputImages: [reference],
+      inputImages: references,
       aspectRatio: '16:9',
-      resolution: '2K',
+      resolution: '4K',
       outputFormat: 'jpg',
       count: 1,
-    }, [reference]);
-
-    expect(body.input[0]?.content).toEqual([
-      { type: 'input_text', text: expect.stringContaining('Avoid: text artifacts') },
-      { type: 'input_image', image_url: reference },
-    ]);
-    expect(JSON.stringify(body)).not.toContain('data:image/');
-    expect(body).toMatchObject({ model: 'gemini-3-pro-image', stream: false });
+    }, references);
+    expect(body).toMatchObject({ images: references, async: true, stream: false });
   });
 
-  it('retries the same NewAPI channel through Responses after an input-path copy error', async () => {
+  it('uses the NewAPI images/generations endpoint', async () => {
     const rawPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify({
-        error: {
-          message: 'status_code=500, operation copy failed: source path does not exist: input.0.content.0.text',
-        },
-      }), { status: 500, headers: { 'content-type': 'application/json' } }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
         output: [{ result: rawPng }],
       }), { status: 200, headers: { 'content-type': 'application/json' } }));
@@ -372,14 +362,10 @@ describe('wallet image provider normalization', () => {
       },
     )).resolves.toEqual([`data:image/png;base64,${rawPng}`]);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://provider.example/v1/chat/completions');
-    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://provider.example/v1/responses');
-    const responsesBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
-    expect(responsesBody.input[0].content[0]).toEqual({
-      type: 'input_text',
-      text: expect.stringContaining('render the projector'),
-    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://provider.example/v1/images/generations');
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(body).toMatchObject({ model: 'gemini-3-pro-image', response_format: 'url', stream: false });
   });
 
   it('retries Gemini with verified inline bytes after the channel rejects a public reference', async () => {
@@ -423,8 +409,36 @@ describe('wallet image provider normalization', () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(String(fetchMock.mock.calls[1]?.[0])).toBe(reference);
     const retryBody = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body));
-    expect(retryBody.messages[0].content[1].image_url.url)
-      .toBe(`data:image/png;base64,${referencePng}`);
+    expect(retryBody.image).toBe(`data:image/png;base64,${referencePng}`);
+  });
+
+  it('polls an async NewAPI image task and downloads binary content when needed', async () => {
+    const outputPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'completed' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(Buffer.from(outputPng, 'base64'), {
+        status: 200,
+        headers: { 'content-type': 'image/png' },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const images = await resolveNewApiImageResponse(
+      { baseUrl: 'https://provider.example' } as Parameters<typeof resolveNewApiImageResponse>[0],
+      { apiKey: 'test-key', headers: {} },
+      { task_id: 'task-123', status: 'queued' },
+      [],
+      1,
+      async () => {},
+    );
+
+    expect(images).toEqual([`data:image/png;base64,${outputPng}`]);
+    expect(fetchMock.mock.calls[0]?.[0])
+      .toBe('https://provider.example/v1/images/generations/task-123');
+    expect(fetchMock.mock.calls[1]?.[0])
+      .toBe('https://provider.example/v1/images/task-123/content');
   });
 
 });
