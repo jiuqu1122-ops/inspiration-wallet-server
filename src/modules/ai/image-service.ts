@@ -7,7 +7,6 @@ import { CloudAiError } from './service.js';
 
 const DEFAULT_IMAGE_UNIT_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
 const IMAGE_GENERATION_TIMEOUT_MS = 6 * 60_000;
-const NEW_API_IMAGE_TASK_POLL_INTERVAL_MS = 3_000;
 const IMAGE_REFERENCE_FETCH_TIMEOUT_MS = 30_000;
 const MAX_IMAGE_REFERENCE_BYTES = 16 * 1024 * 1024;
 const IMAGE_REFERENCE_CACHE_TTL_MS = 10 * 60_000;
@@ -200,11 +199,6 @@ async function listImageProviders(prisma: PrismaClient) {
     orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }],
   });
   return providers.filter((provider) => !provider.capabilities.includes('LLM'));
-}
-
-function isRetryableNewApiTaskPollError(error: unknown) {
-  return error instanceof UpstreamImageError
-    && (error.status === 0 || error.status === 429 || error.status >= 500);
 }
 
 async function selectImageProvider(
@@ -442,88 +436,13 @@ export function sizeFromRatio(ratio: ImageInput['aspectRatio']) {
   return '1024x1024';
 }
 
-function newApiImageFamily(model: string) {
+function supportsNewApiImageResolution(model: string) {
   const token = imageModelToken(model);
-  if (token.includes('gemini3proimage')
+  return token.includes('gemini3proimage')
     || token.includes('gemini31proimage')
     || token.includes('gemini31flashimage')
-    || token.includes('gemini3flashimage')) return 'nano-banana';
-  if (token.includes('gptimage2')) return 'gpt-image-2';
-  return 'legacy';
-}
-
-async function providerImageContentRequest(
-  provider: AiProviderChannel,
-  secrets: ProviderSecrets,
-  path: string,
-) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), IMAGE_GENERATION_TIMEOUT_MS);
-  try {
-    const headers = upstreamHeaders(secrets);
-    headers.delete('content-type');
-    headers.set('accept', 'image/*, application/json, */*');
-    const response = await fetch(providerEndpoint(provider.baseUrl, path), {
-      method: 'GET',
-      headers,
-      redirect: 'error',
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      throw new UpstreamImageError(response.status, upstreamErrorMessage(response.status, text));
-    }
-    const contentType = (response.headers.get('content-type') || '').toLowerCase();
-    if (contentType.includes('json') || contentType.startsWith('text/')) {
-      return parseProviderValue(await response.text());
-    }
-    const bytes = Buffer.from(await response.arrayBuffer());
-    const mime = contentType.startsWith('image/')
-      ? contentType.split(';')[0]!.trim()
-      : imageMimeFromBytes(bytes) || 'image/png';
-    return `data:${mime};base64,${bytes.toString('base64')}`;
-  } catch (error) {
-    if (error instanceof UpstreamImageError) throw error;
-    throw new UpstreamImageError(0, error instanceof Error ? error.message : String(error));
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function normalizedImageResolution(resolution?: string): PricedImageResolution {
-  const value = resolution?.trim().toLowerCase();
-  if (value === '1k' || value === '4k') return value;
-  return '2k';
-}
-
-function gptImage2Size(
-  ratio: ImageInput['aspectRatio'],
-  resolution?: string,
-) {
-  const sizes: Record<PricedImageResolution, Record<ImageInput['aspectRatio'], string>> = {
-    '1k': {
-      '1:1': '1024x1024',
-      '3:4': '768x1024',
-      '4:3': '1024x768',
-      '9:16': '720x1280',
-      '16:9': '1280x720',
-    },
-    '2k': {
-      '1:1': '2048x2048',
-      '3:4': '1536x2048',
-      '4:3': '2048x1536',
-      '9:16': '1152x2048',
-      '16:9': '2048x1152',
-    },
-    '4k': {
-      '1:1': '2880x2880',
-      '3:4': '2400x3200',
-      '4:3': '3200x2400',
-      '9:16': '2160x3840',
-      '16:9': '3840x2160',
-    },
-  };
-  return sizes[normalizedImageResolution(resolution)][ratio];
+    || token.includes('gemini3flashimage')
+    || token.includes('gptimage2');
 }
 
 export function newApiImageRequestParams(
@@ -532,24 +451,25 @@ export function newApiImageRequestParams(
   ratio: ImageInput['aspectRatio'],
   resolution?: string,
 ) {
-  const family = newApiImageFamily(model);
-  if (family === 'nano-banana') {
-    const resolutionLabel = normalizedImageResolution(resolution).toUpperCase();
-    return {
-      n: count,
-      aspect_ratio: ratio,
-      output_resolution: resolutionLabel,
-      image_size: resolutionLabel,
-    };
+  if (!supportsNewApiImageResolution(model)) {
+    return { n: count, size: sizeFromRatio(ratio), aspect_ratio: ratio, ratio };
   }
-  const size = family === 'gpt-image-2'
-    ? gptImage2Size(ratio, resolution)
-    : sizeFromRatio(ratio);
+  const highResolution = resolution?.trim().toLowerCase() === '4k';
+  const size = ratio === '9:16'
+    ? highResolution ? '2160x3840' : '1088x1920'
+    : ratio === '16:9'
+      ? highResolution ? '3840x2160' : '1920x1088'
+      : ratio === '3:4'
+        ? highResolution ? '2400x3200' : '960x1280'
+        : ratio === '4:3'
+          ? highResolution ? '3200x2400' : '1280x960'
+          : highResolution ? '2880x2880' : '1024x1024';
   return {
     n: count,
     size,
     aspect_ratio: ratio,
-    ...(family === 'gpt-image-2' ? { quality: 'medium' } : {}),
+    ratio,
+    quality: highResolution ? 'high' : 'standard',
   };
 }
 
@@ -568,10 +488,7 @@ function chatContent(input: ImageInput, inputImages = input.inputImages) {
   ];
 }
 
-export function buildNewApiImageGenerationBody(
-  input: ImageInput,
-  inputImages = input.inputImages,
-) {
+export function buildNewApiChatImageBody(input: ImageInput, inputImages = input.inputImages) {
   const imageParams = newApiImageRequestParams(
     input.model,
     input.count,
@@ -580,20 +497,30 @@ export function buildNewApiImageGenerationBody(
   );
   return {
     model: input.model,
-    prompt: promptWithConstraints(input),
     ...imageParams,
     ...(input.negativePrompt ? { negative_prompt: input.negativePrompt } : {}),
-    ...(inputImages.length === 1 ? { image: inputImages[0] } : {}),
-    ...(inputImages.length > 1 ? { images: inputImages } : {}),
-    response_format: 'url',
-    ...(
-      normalizedImageResolution(input.resolution) === '4k'
-      || inputImages.length > 1
-      || input.count > 1
-        ? { async: true }
-        : {}
-    ),
+    messages: [{ role: 'user', content: chatContent(input, inputImages) }],
+    modalities: ['image'],
     stream: false,
+    max_tokens: 8192,
+  };
+}
+
+export function buildNewApiResponsesImageBody(input: ImageInput, inputImages = input.inputImages) {
+  const prompt = input.negativePrompt
+    ? `${promptWithConstraints(input)}\n\nAvoid: ${input.negativePrompt.trim()}`
+    : promptWithConstraints(input);
+  return {
+    model: input.model,
+    input: [{
+      role: 'user',
+      content: [
+        { type: 'input_text', text: prompt },
+        ...inputImages.map((imageUrl) => ({ type: 'input_image', image_url: imageUrl })),
+      ],
+    }],
+    stream: false,
+    max_output_tokens: 8192,
   };
 }
 
@@ -602,6 +529,13 @@ export function isNewApiParamOverrideCopyError(error: unknown) {
     ? error.message
     : typeof error === 'string' ? error : JSON.stringify(error ?? '');
   return /operation copy failed\s*:\s*source path does not exist\s*:/i.test(message);
+}
+
+export function shouldRetryNewApiImageViaResponses(error: unknown) {
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string' ? error : JSON.stringify(error ?? '');
+  return /operation copy failed\s*:\s*source path does not exist\s*:\s*(?:input(?:\.|\b)|[^\r\n]*\.text\b)/i.test(message);
 }
 
 export function isNewApiGeminiImageDecodeError(model: string, error: unknown) {
@@ -614,12 +548,6 @@ export function isNewApiGeminiImageDecodeError(model: string, error: unknown) {
 
 export function isPublicNewApiImageReference(source: string) {
   return /^https?:\/\//i.test(source.trim());
-}
-
-function isSupportedNewApiImageReference(source: string) {
-  const value = source.trim();
-  return isPublicNewApiImageReference(value)
-    || /^data:image\/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=]+$/i.test(value);
 }
 
 function imageMimeFromBytes(bytes: Uint8Array) {
@@ -742,121 +670,76 @@ export async function materializeNewApiReferenceImage(source: string) {
   }
 }
 
-function newApiImageTaskState(value: unknown): string {
-  if (!value || typeof value !== 'object') return '';
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const state = newApiImageTaskState(item);
-      if (state) return state;
-    }
-    return '';
-  }
-  const record = value as Record<string, unknown>;
-  const direct = record.status ?? record.state;
-  if (typeof direct === 'string') return direct.trim().toLowerCase();
-  for (const key of ['data', 'result', 'task', 'response']) {
-    const state = newApiImageTaskState(record[key]);
-    if (state) return state;
-  }
-  return '';
-}
-
-export async function resolveNewApiImageResponse(
-  provider: AiProviderChannel,
-  secrets: ProviderSecrets,
-  started: unknown,
-  inputImages: string[],
-  count: number,
-  wait: (milliseconds: number) => Promise<unknown> = delay,
-) {
-  const immediate = uniqueImages(started, inputImages, count);
-  if (immediate.length) return immediate;
-  const taskId = getTaskId(started);
-  if (!taskId) throw new Error('NewAPI 没有返回图片数据或 task_id');
-
-  const deadline = Date.now() + IMAGE_GENERATION_TIMEOUT_MS;
-  let lastStatus: unknown = started;
-  let lastPollError: unknown = null;
-  while (Date.now() < deadline) {
-    await wait(NEW_API_IMAGE_TASK_POLL_INTERVAL_MS);
-    try {
-      lastStatus = await providerRequest(
-        provider,
-        secrets,
-        `/v1/images/generations/${encodeURIComponent(taskId)}`,
-        undefined,
-        45_000,
-      );
-      lastPollError = null;
-    } catch (error) {
-      if (!isRetryableNewApiTaskPollError(error)) throw error;
-      lastPollError = error;
-      continue;
-    }
-    const images = uniqueImages(lastStatus, inputImages, count);
-    if (images.length) return images;
-    const failure = getFailure(lastStatus);
-    if (failure) throw new Error(failure);
-    const state = newApiImageTaskState(lastStatus);
-    if (/^(?:failed|failure|error|cancelled|canceled)$/.test(state)) {
-      throw new Error(`NewAPI 图片任务失败：${taskId}`);
-    }
-    if (/^(?:completed|complete|succeeded|success|finished|done)$/.test(state)) {
-      const content = await providerImageContentRequest(
-        provider,
-        secrets,
-        `/v1/images/${encodeURIComponent(taskId)}/content`,
-      );
-      const contentImages = uniqueImages(content, inputImages, count);
-      if (contentImages.length) return contentImages;
-      throw new Error(`NewAPI 图片任务已完成但没有返回图片：${taskId}`);
-    }
-  }
-  const failure = getFailure(lastStatus);
-  const pollDetail = lastPollError instanceof Error ? `：${lastPollError.message}` : '';
-  throw new Error(failure || `NewAPI 图片任务等待超时：${taskId}${pollDetail}`);
-}
-
 export async function generateNewApiImages(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   input: ImageInput,
 ) {
-  if (input.inputImages.some(source => !isSupportedNewApiImageReference(source))) {
+  if (input.inputImages.some(source => !isPublicNewApiImageReference(source))) {
     throw new CloudAiError(
       'invalid_image_reference',
-      'NewAPI 生图参考图必须使用公网 HTTP URL 或图片 data URI',
+      'NewAPI 生图参考图必须使用公网 HTTP URL，服务器不会下载或转存参考图',
       400,
     );
   }
-  for (const source of input.inputImages.filter(isPublicNewApiImageReference)) {
-    await assertPublicProviderUrl(source);
-  }
-  const submit = async (preparedInputImages: string[]) => {
-    const started = await providerRequest(
+  for (const source of input.inputImages) await assertPublicProviderUrl(source);
+  let preparedInputImages = input.inputImages;
+  try {
+    const value = await providerRequest(
       provider,
       secrets,
-      '/v1/images/generations',
-      buildNewApiImageGenerationBody(input, preparedInputImages),
+      '/v1/chat/completions',
+      buildNewApiChatImageBody(input, preparedInputImages),
       IMAGE_GENERATION_TIMEOUT_MS,
     );
-    return resolveNewApiImageResponse(
-      provider,
-      secrets,
-      started,
-      Array.from(new Set([...input.inputImages, ...preparedInputImages])),
-      input.count,
-    );
-  };
-
-  try {
-    return await submit(input.inputImages);
+    const images = uniqueImages(value, preparedInputImages, input.count);
+    if (images.length) return images;
+    throw new Error('渠道没有返回图片数据');
   } catch (error) {
     if (input.inputImages.length > 0 && isNewApiGeminiImageDecodeError(input.model, error)) {
-      return submit(await materializeNewApiReferenceImages(input.inputImages));
+      preparedInputImages = await materializeNewApiReferenceImages(input.inputImages);
+      try {
+        const value = await providerRequest(
+          provider,
+          secrets,
+          '/v1/chat/completions',
+          buildNewApiChatImageBody(input, preparedInputImages),
+          IMAGE_GENERATION_TIMEOUT_MS,
+        );
+        const images = uniqueImages(value, preparedInputImages, input.count);
+        if (images.length) return images;
+        throw new Error('NewAPI did not return image data');
+      } catch (inlineError) {
+        if (
+          !shouldRetryNewApiImageViaResponses(inlineError)
+          && !isNewApiGeminiImageDecodeError(input.model, inlineError)
+        ) throw inlineError;
+      }
+    } else if (!shouldRetryNewApiImageViaResponses(error)) {
+      throw error;
     }
-    throw error;
   }
+
+  // Some NewAPI channels apply Responses-style ParamOverride rules even when
+  // called through chat/completions. Preserve URLs normally, but retain verified
+  // inline data when the Gemini adapter already rejected the public reference.
+  const images: string[] = [];
+  for (let attempt = 0; attempt < input.count && images.length < input.count; attempt += 1) {
+    const value = await providerRequest(
+      provider,
+      secrets,
+      '/v1/responses',
+      buildNewApiResponsesImageBody(input, preparedInputImages),
+      IMAGE_GENERATION_TIMEOUT_MS,
+    );
+    images.push(...uniqueImages(
+      value,
+      [...input.inputImages, ...preparedInputImages, ...images],
+      input.count - images.length,
+    ));
+  }
+  if (images.length) return images;
+  throw new Error('渠道没有返回图片数据');
 }
 
 async function fetchPublicImageReferenceBytes(source: string) {
@@ -1499,9 +1382,6 @@ async function releaseImageCredits(
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
   const provider = await selectImageProvider(prisma, input.providerChannelId, input.model);
-  if (provider.kind === 'XAIS' && input.inputImages.length > 8) {
-    throw new CloudAiError('invalid_request', 'XAIS 生图最多支持 8 张参考图', 400);
-  }
   const effectiveInput = { ...input, model: resolveImageModel(provider, input.model) };
   const reservation = await reserveImageCredits(prisma, effectiveInput);
   try {
@@ -1532,7 +1412,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       if (provider.kind === 'NEW_API' && isNewApiParamOverrideCopyError(error)) {
         throw new CloudAiError(
           'provider_param_override_invalid',
-          'NewAPI 生图渠道的参数覆盖配置错误：copy.from 指向 images/generations 请求中不存在的字段，请检查该渠道的 ParamOverride operations',
+          'NewAPI 生图渠道的参数覆盖配置错误：copy.from 指向 chat/completions 请求中不存在的字段，请检查该渠道的 ParamOverride operations',
           502,
         );
       }
