@@ -310,7 +310,9 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
             mime: image.mime,
           });
           names.push(name);
-          urls.push(ossUploadService.getPublicUrl(name, { mime: image.mime, filename }));
+          const url = ossUploadService.getPublicUrl(name, { mime: image.mime, filename });
+          await ossUploadService.verifyPublicImageUrl(name, url);
+          urls.push(url);
         }
         referenceShares.set(shareId, names);
         return { shareId, urls };

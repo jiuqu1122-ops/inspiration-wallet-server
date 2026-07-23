@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const ossMocks = vi.hoisted(() => ({
   constructor: vi.fn(),
@@ -29,10 +29,15 @@ describe('OSS public bridge service', () => {
   });
 
   afterAll(() => {
+    vi.unstubAllGlobals();
     delete process.env.OSS_REGION;
     delete process.env.OSS_BUCKET;
     delete process.env.OSS_ACCESS_KEY_ID;
     delete process.env.OSS_ACCESS_KEY_SECRET;
+  });
+
+  beforeEach(() => {
+    ossMocks.signatureUrl.mockClear();
   });
 
   it('uploads generated images and creates a signed URL', async () => {
@@ -81,7 +86,38 @@ describe('OSS public bridge service', () => {
     ossUploadService.getPublicUrl(name, { mime: 'image/jpeg', filename: 'share-1.jpg' });
     expect(ossMocks.signatureUrl).toHaveBeenLastCalledWith(
       'reference-images/share-1.jpg',
-      expect.objectContaining({ expires: 1_800 }),
+      { expires: 1_800 },
     );
+  });
+
+  it('verifies that a signed reference URL is directly readable as an image', async () => {
+    const fetchMock = vi.fn(async () => new Response(Buffer.from('image'), {
+      status: 206,
+      headers: { 'content-type': 'image/jpeg' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { ossUploadService } = await import('../src/modules/ai/oss-uploader.js');
+    const name = 'reference-images/share-2.jpg';
+    const url = 'https://test-bucket.oss-cn-hongkong.aliyuncs.com/reference-images/share-2.jpg?token=a%2Bb%3D';
+    await expect(ossUploadService.verifyPublicImageUrl(name, url)).resolves.toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      url,
+      expect.objectContaining({
+        method: 'GET',
+        redirect: 'error',
+        headers: expect.objectContaining({ range: 'bytes=0-63' }),
+      }),
+    );
+  });
+
+  it('reports an unreadable signed URL without exposing its query parameters', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 403 })));
+    const { ossUploadService } = await import('../src/modules/ai/oss-uploader.js');
+    const name = 'reference-images/share-3.jpg';
+    const url = 'https://test-bucket.oss-cn-hongkong.aliyuncs.com/reference-images/share-3.jpg?token=secret-signature';
+    const error = await ossUploadService.verifyPublicImageUrl(name, url).catch(value => value);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain('HTTP 403');
+    expect(error.message).not.toContain('secret-signature');
   });
 });

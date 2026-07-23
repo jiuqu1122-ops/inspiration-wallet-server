@@ -8,6 +8,8 @@ const bridgeMocks = vi.hoisted(() => ({
     'https://inspiration-drawer-prod.oss-cn-hongkong.aliyuncs.com/generated-images/result.png'
     + '?token=a%2Bb%3D'
   )),
+  verifyPublicImageUrl: vi.fn(async () => true),
+  delete: vi.fn(async () => true),
 }));
 
 vi.mock('../src/modules/ai/image-result-store.js', () => ({
@@ -39,8 +41,15 @@ describe('generated image OSS delivery route', () => {
     bridgeMocks.upload.mockClear();
     bridgeMocks.exists.mockClear();
     bridgeMocks.getPublicUrl.mockClear();
+    bridgeMocks.verifyPublicImageUrl.mockClear();
+    bridgeMocks.delete.mockClear();
     bridgeMocks.exists.mockResolvedValue(true);
-    bridgeMocks.upload.mockResolvedValue('generated-images/result.png');
+    bridgeMocks.upload.mockImplementation(async (input: { namespace: string; filename: string }) => (
+      `${input.namespace}/${input.filename}`
+    ));
+    bridgeMocks.getPublicUrl.mockImplementation((name: string) => (
+      `https://inspiration-drawer-prod.oss-cn-hongkong.aliyuncs.com/${name}?token=a%2Bb%3D`
+    ));
   });
 
   it('uses the same object key for upload, verification, and signing', async () => {
@@ -116,6 +125,66 @@ describe('generated image OSS delivery route', () => {
     expect(response.statusCode).toBe(502);
     expect(response.json().error).toBe('oss_object_missing');
     expect(bridgeMocks.getPublicUrl).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('uploads wallet reference images into the reference-images namespace', async () => {
+    const app = await makeApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/ai/reference-images',
+      payload: {
+        images: [{
+          filename: 'reference.png',
+          mime: 'image/png',
+          data: Buffer.from('image-bytes').toString('base64'),
+        }],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      shareId: expect.any(String),
+      urls: [expect.stringContaining('/reference-images/')],
+    });
+    expect(bridgeMocks.upload).toHaveBeenCalledWith(expect.objectContaining({
+      namespace: 'reference-images',
+      mime: 'image/png',
+    }));
+    expect(bridgeMocks.getPublicUrl).toHaveBeenCalledWith(
+      expect.stringMatching(/^reference-images\//),
+      expect.objectContaining({ mime: 'image/png' }),
+    );
+    expect(bridgeMocks.verifyPublicImageUrl).toHaveBeenCalledWith(
+      expect.stringMatching(/^reference-images\//),
+      expect.stringContaining('/reference-images/'),
+    );
+    await app.close();
+  });
+
+  it('rejects and cleans up an unreadable OSS reference URL before generation', async () => {
+    bridgeMocks.verifyPublicImageUrl.mockRejectedValueOnce(
+      new Error('OSS signed image URL returned HTTP 403'),
+    );
+    const app = await makeApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/ai/reference-images',
+      payload: {
+        images: [{
+          filename: 'reference.png',
+          mime: 'image/png',
+          data: Buffer.from('image-bytes').toString('base64'),
+        }],
+      },
+    });
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({
+      error: 'image_delivery_unavailable',
+      message: 'Reference image upload is temporarily unavailable',
+    });
+    expect(bridgeMocks.delete).toHaveBeenCalledWith(
+      expect.stringMatching(/^reference-images\//),
+    );
     await app.close();
   });
 });

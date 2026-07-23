@@ -97,22 +97,41 @@ export function getPublicUrl(name: string, options?: {
   if (!/^(?:reference-images|generated-images)\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$/.test(name)) {
     throw new Error('invalid OSS object name');
   }
-  const response: Record<string, string> = {};
-  const isGeneratedImage = name.startsWith('generated-images/');
-  // Generated images already have their real Content-Type stored as OSS object
-  // metadata. This Bucket rejects signed URLs that try to override it with
-  // response-content-type, causing both preview and download to return XML 400.
-  if (!isGeneratedImage && options?.mime) response['content-type'] = options.mime;
-  if (!isGeneratedImage && options?.filename) {
-    response['content-disposition'] = `${options.download ? 'attachment' : 'inline'}; filename="${basename(options.filename)}"`;
-  }
+  // Image Content-Type is stored as OSS object metadata during upload. This
+  // Bucket rejects signed URLs that override response headers, so neither
+  // generated images nor reference images may add response-content-* params.
+  void options;
   const url = requireClient().signatureUrl(name, {
     expires: name.startsWith('reference-images/')
       ? REFERENCE_URL_EXPIRES_SECONDS
       : GENERATED_URL_EXPIRES_SECONDS,
-    ...(Object.keys(response).length > 0 ? { response } : {}),
   });
-  return isGeneratedImage ? validateSignedUrl(name, url) : url;
+  return validateSignedUrl(name, url);
+}
+
+export async function verifyPublicImageUrl(name: string, url: string) {
+  const safeUrl = validateSignedUrl(name, url);
+  const response = await fetch(safeUrl, {
+    method: 'GET',
+    headers: {
+      accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.1',
+      range: 'bytes=0-63',
+    },
+    redirect: 'error',
+    signal: AbortSignal.timeout(15_000),
+  });
+  try {
+    if (!response.ok) {
+      throw new Error(`OSS signed image URL returned HTTP ${response.status}`);
+    }
+    const mime = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() || '';
+    if (!mime.startsWith('image/')) {
+      throw new Error('OSS signed image URL did not return image content');
+    }
+    return true;
+  } finally {
+    await response.body?.cancel().catch(() => {});
+  }
 }
 
 export async function deleteObject(name: string) {
@@ -132,5 +151,6 @@ export const ossUploadService = {
   upload,
   exists,
   getPublicUrl,
+  verifyPublicImageUrl,
   delete: deleteObject,
 };
