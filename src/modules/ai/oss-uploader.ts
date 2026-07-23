@@ -98,8 +98,12 @@ export function getPublicUrl(name: string, options?: {
     throw new Error('invalid OSS object name');
   }
   const response: Record<string, string> = {};
-  if (options?.mime) response['content-type'] = options.mime;
-  if (options?.filename) {
+  const isGeneratedImage = name.startsWith('generated-images/');
+  // Generated images already have their real Content-Type stored as OSS object
+  // metadata. This Bucket rejects signed URLs that try to override it with
+  // response-content-type, causing both preview and download to return XML 400.
+  if (!isGeneratedImage && options?.mime) response['content-type'] = options.mime;
+  if (!isGeneratedImage && options?.filename) {
     response['content-disposition'] = `${options.download ? 'attachment' : 'inline'}; filename="${basename(options.filename)}"`;
   }
   const url = requireClient().signatureUrl(name, {
@@ -108,7 +112,7 @@ export function getPublicUrl(name: string, options?: {
       : GENERATED_URL_EXPIRES_SECONDS,
     ...(Object.keys(response).length > 0 ? { response } : {}),
   });
-  return name.startsWith('generated-images/') ? validateSignedUrl(name, url) : url;
+  return isGeneratedImage ? validateSignedUrl(name, url) : url;
 }
 
 export async function deleteObject(name: string) {

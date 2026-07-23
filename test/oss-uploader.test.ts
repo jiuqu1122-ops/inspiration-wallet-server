@@ -57,7 +57,7 @@ describe('OSS public bridge service', () => {
     }));
     expect(ossMocks.signatureUrl).toHaveBeenCalledWith(
       'generated-images/result.png',
-      expect.objectContaining({ expires: 86_400 }),
+      { expires: 86_400 },
     );
     expect(url).toBe('https://test-bucket.oss-cn-hongkong.aliyuncs.com/generated-images/result.png?token=a%2Bb%3D');
     await expect(ossUploadService.exists(name)).resolves.toBe(true);
