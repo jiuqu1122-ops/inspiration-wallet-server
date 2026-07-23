@@ -1,4 +1,3 @@
-import { createReadStream } from 'node:fs';
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { CloudAiError, listWalletAgentModels } from './service.js';
@@ -9,6 +8,11 @@ import {
   listWalletImageModels,
 } from './image-service.js';
 import { getImageResult } from './image-result-store.js';
+import { mkdir, readdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
+import { env } from '../../config/env.js';
+import { ossUploadService } from './oss-uploader.js';
 import { getImageReference } from './reference-store.js';
 import { createAiTaskSchema } from './task-schema.js';
 import {
@@ -91,6 +95,25 @@ const imageModelsQuerySchema = z.object({
   provider: z.enum(['new-api', 'xais-chat', 'openai-compatible', 'custom']).nullish()
     .transform((value) => value ?? undefined),
 }).strict();
+
+const referenceUploadSchema = z.object({
+  images: z.array(z.object({
+    filename: z.string().trim().min(1).max(255),
+    mime: z.enum(['image/png', 'image/jpeg', 'image/webp', 'image/gif']),
+    data: z.string().min(1).max(16_000_000),
+  }).strict()).min(1).max(13),
+}).strict();
+
+const referenceShares = new Map<string, string[]>();
+
+async function pruneReferenceCache(directory: string) {
+  const expiresBefore = Date.now() - env.IMAGE_RESULT_TTL_MINUTES * 60_000;
+  for (const entry of await readdir(directory).catch(() => [] as string[])) {
+    const path = join(directory, entry);
+    const info = await stat(path).catch(() => null);
+    if (info?.isFile() && info.mtimeMs < expiresBefore) await unlink(path).catch(() => {});
+  }
+}
 
 export const normalizeImageRequestBody = (body: unknown) => imageSchema.parse(body);
 export const normalizeVideoRequestBody = (body: unknown) => videoSchema.parse(body);
@@ -192,13 +215,85 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       if (!result) {
         return reply.code(404).send({ error: 'not_found', message: 'Image result not found or expired' });
       }
-      return reply
-        .header('content-type', result.mime)
-        .header('content-length', String(result.size))
-        .header('cache-control', 'public, max-age=21600, immutable')
-        .header('content-disposition', 'inline')
-        .header('x-content-type-options', 'nosniff')
-        .send(createReadStream(result.path));
+      try {
+        const objectName = await ossUploadService.upload({
+          namespace: 'generated-images',
+          source: result.path,
+          filename: key,
+          mime: result.mime,
+        });
+        const url = ossUploadService.getPublicUrl(objectName, {
+          mime: result.mime,
+          filename: key,
+          download: true,
+        });
+        return reply.redirect(url);
+      } catch (error) {
+        request.log.error({ err: error, key }, 'temporary OSS image upload failed');
+        return reply.code(503).send({
+          error: 'image_delivery_unavailable',
+          message: 'Image result is temporarily unavailable',
+        });
+      }
+    },
+  );
+
+  app.post(
+    '/reference-images',
+    {
+      preHandler: app.authenticateAccessToken,
+      bodyLimit: 64 * 1024 * 1024,
+      config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    },
+    async (request, reply) => {
+      const parsed = referenceUploadSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'invalid_request', message: 'Reference image upload is invalid' });
+      }
+      const cacheDir = join(env.IMAGE_RESULT_STORE_DIR, 'reference-images');
+      await mkdir(cacheDir, { recursive: true });
+      void pruneReferenceCache(cacheDir);
+      const shareId = randomUUID();
+      const names: string[] = [];
+      const urls: string[] = [];
+      try {
+        for (const [index, image] of parsed.data.images.entries()) {
+          const bytes = Buffer.from(image.data, 'base64');
+          if (bytes.byteLength === 0 || bytes.byteLength > 10 * 1024 * 1024) {
+            throw new Error('reference image exceeds the size limit');
+          }
+          const extension = image.mime === 'image/jpeg' ? 'jpg' : image.mime.slice('image/'.length);
+          const filename = `${shareId}-${index}.${extension}`;
+          const localPath = join(cacheDir, filename);
+          await writeFile(localPath, bytes, { flag: 'wx' });
+          const name = await ossUploadService.upload({
+            namespace: 'reference-images',
+            filename,
+            source: localPath,
+            mime: image.mime,
+          });
+          names.push(name);
+          urls.push(ossUploadService.getPublicUrl(name, { mime: image.mime, filename }));
+        }
+        referenceShares.set(shareId, names);
+        return { shareId, urls };
+      } catch (error) {
+        await Promise.all(names.map(name => ossUploadService.delete(name).catch(() => false)));
+        request.log.error({ err: error }, 'OSS reference image upload failed');
+        return reply.code(503).send({ error: 'image_delivery_unavailable', message: 'Reference image upload is temporarily unavailable' });
+      }
+    },
+  );
+
+  app.delete(
+    '/reference-images/:shareId',
+    { preHandler: app.authenticateAccessToken },
+    async (request, reply) => {
+      const shareId = String((request.params as { shareId?: unknown }).shareId || '');
+      const names = referenceShares.get(shareId) || [];
+      referenceShares.delete(shareId);
+      await Promise.all(names.map(name => ossUploadService.delete(name).catch(() => false)));
+      return reply.code(204).send();
     },
   );
 

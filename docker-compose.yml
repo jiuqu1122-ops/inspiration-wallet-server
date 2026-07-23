@@ -40,6 +40,10 @@ services:
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required}
       PROVIDER_SECRETS_ENCRYPTION_KEY: ${PROVIDER_SECRETS_ENCRYPTION_KEY:-}
       IMAGE_RESULT_STORE_DIR: /var/lib/inspiration/image-results
+      OSS_REGION: ${OSS_REGION:?OSS_REGION is required}
+      OSS_BUCKET: ${OSS_BUCKET:?OSS_BUCKET is required}
+      OSS_ACCESS_KEY_ID: ${OSS_ACCESS_KEY_ID:?OSS_ACCESS_KEY_ID is required}
+      OSS_ACCESS_KEY_SECRET: ${OSS_ACCESS_KEY_SECRET:?OSS_ACCESS_KEY_SECRET is required}
     volumes:
       - image_result_data:/var/lib/inspiration/image-results
     depends_on:
@@ -68,6 +72,10 @@ services:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       PROVIDER_SECRETS_ENCRYPTION_KEY: ${PROVIDER_SECRETS_ENCRYPTION_KEY:-}
       WORKER_HEALTH_FILE: /tmp/inspiration-worker-health
+      OSS_REGION: ${OSS_REGION:?OSS_REGION is required}
+      OSS_BUCKET: ${OSS_BUCKET:?OSS_BUCKET is required}
+      OSS_ACCESS_KEY_ID: ${OSS_ACCESS_KEY_ID:?OSS_ACCESS_KEY_ID is required}
+      OSS_ACCESS_KEY_SECRET: ${OSS_ACCESS_KEY_SECRET:?OSS_ACCESS_KEY_SECRET is required}
     depends_on:
       postgres:
         condition: service_healthy
