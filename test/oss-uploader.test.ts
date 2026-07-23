@@ -1,14 +1,20 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 const ossMocks = vi.hoisted(() => ({
-  put: vi.fn(async () => ({ name: 'generated-images/result.png' })),
+  constructor: vi.fn(),
+  put: vi.fn(async (name: string) => ({ name })),
+  head: vi.fn(async () => ({ res: { status: 200 } })),
   delete: vi.fn(async () => ({ res: { status: 204 } })),
-  signatureUrl: vi.fn(() => 'https://oss.example.test/signed-image-url'),
+  signatureUrl: vi.fn((name: string) => `https://test-bucket.oss-cn-hongkong.aliyuncs.com/${name}?token=a%2Bb%3D`),
 }));
 
 vi.mock('ali-oss', () => ({
   default: class MockOss {
+    constructor(options: unknown) {
+      ossMocks.constructor(options);
+    }
     put = ossMocks.put;
+    head = ossMocks.head;
     delete = ossMocks.delete;
     signatureUrl = ossMocks.signatureUrl;
   },
@@ -44,11 +50,18 @@ describe('OSS public bridge service', () => {
       '/tmp/result.png',
       expect.objectContaining({ headers: expect.objectContaining({ 'Content-Type': 'image/png' }) }),
     );
+    expect(ossMocks.constructor).toHaveBeenCalledWith(expect.objectContaining({
+      region: 'oss-cn-hongkong',
+      bucket: 'test-bucket',
+      secure: true,
+    }));
     expect(ossMocks.signatureUrl).toHaveBeenCalledWith(
       'generated-images/result.png',
       expect.objectContaining({ expires: 86_400 }),
     );
-    expect(url).toBe('https://oss.example.test/signed-image-url');
+    expect(url).toBe('https://test-bucket.oss-cn-hongkong.aliyuncs.com/generated-images/result.png?token=a%2Bb%3D');
+    await expect(ossUploadService.exists(name)).resolves.toBe(true);
+    expect(ossMocks.head).toHaveBeenCalledWith('generated-images/result.png');
   });
 
   it('supports reference image deletion', async () => {

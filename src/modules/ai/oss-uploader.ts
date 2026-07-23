@@ -21,6 +21,7 @@ const client = configured
       bucket: env.OSS_BUCKET,
       accessKeyId: env.OSS_ACCESS_KEY_ID,
       accessKeySecret: env.OSS_ACCESS_KEY_SECRET,
+      secure: true,
     })
   : null;
 
@@ -51,13 +52,41 @@ export async function upload(input: {
   mime: string;
 }) {
   const name = objectName(input.namespace, input.filename);
-  await requireClient().put(name, input.source, {
+  const result = await requireClient().put(name, input.source, {
     headers: {
       'Content-Type': input.mime,
       'Cache-Control': 'private, max-age=86400, immutable',
     },
   });
+  if (input.namespace === 'generated-images' && result.name && result.name !== name) {
+    throw new Error('OSS returned an unexpected object key');
+  }
   return name;
+}
+
+function validateSignedUrl(name: string, signedUrl: string) {
+  const parsed = new URL(signedUrl);
+  const expectedHost = `${env.OSS_BUCKET}.${env.OSS_REGION}.aliyuncs.com`.toLowerCase();
+  if (parsed.protocol !== 'https:' || parsed.hostname.toLowerCase() !== expectedHost) {
+    throw new Error('OSS returned an unexpected signed URL endpoint');
+  }
+  if (decodeURIComponent(parsed.pathname.replace(/^\/+/, '')) !== name) {
+    throw new Error('OSS signed URL object key does not match the uploaded object');
+  }
+  return parsed.toString();
+}
+
+export async function exists(name: string) {
+  if (!/^(?:reference-images|generated-images)\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$/.test(name)) {
+    throw new Error('invalid OSS object name');
+  }
+  try {
+    await requireClient().head(name);
+    return true;
+  } catch (error) {
+    if (isNotFound(error)) return false;
+    throw error;
+  }
 }
 
 export function getPublicUrl(name: string, options?: {
@@ -73,12 +102,13 @@ export function getPublicUrl(name: string, options?: {
   if (options?.filename) {
     response['content-disposition'] = `${options.download ? 'attachment' : 'inline'}; filename="${basename(options.filename)}"`;
   }
-  return requireClient().signatureUrl(name, {
+  const url = requireClient().signatureUrl(name, {
     expires: name.startsWith('reference-images/')
       ? REFERENCE_URL_EXPIRES_SECONDS
       : GENERATED_URL_EXPIRES_SECONDS,
     ...(Object.keys(response).length > 0 ? { response } : {}),
   });
+  return name.startsWith('generated-images/') ? validateSignedUrl(name, url) : url;
 }
 
 export async function deleteObject(name: string) {
@@ -96,6 +126,7 @@ export async function deleteObject(name: string) {
 
 export const ossUploadService = {
   upload,
+  exists,
   getPublicUrl,
   delete: deleteObject,
 };

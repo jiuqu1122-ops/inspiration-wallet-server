@@ -96,6 +96,10 @@ const imageModelsQuerySchema = z.object({
     .transform((value) => value ?? undefined),
 }).strict();
 
+const imageResultQuerySchema = z.object({
+  redirect: z.enum(['0', '1']).optional(),
+}).passthrough();
+
 const referenceUploadSchema = z.object({
   images: z.array(z.object({
     filename: z.string().trim().min(1).max(255),
@@ -209,30 +213,63 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
     '/image-results/:key',
     { config: { rateLimit: { max: 600, timeWindow: '1 minute' } } },
     async (request, reply) => {
+      const query = imageResultQuerySchema.safeParse(request.query);
+      if (!query.success) {
+        return reply.code(400).send({ error: 'invalid_request', message: 'Invalid image result query' });
+      }
       const rawKey = (request.params as { key?: unknown }).key;
       const key = typeof rawKey === 'string' ? rawKey.trim() : '';
       const result = await getImageResult(key);
       if (!result) {
         return reply.code(404).send({ error: 'not_found', message: 'Image result not found or expired' });
       }
+      let objectName: string;
       try {
-        const objectName = await ossUploadService.upload({
+        objectName = await ossUploadService.upload({
           namespace: 'generated-images',
           source: result.path,
           filename: key,
           mime: result.mime,
         });
+      } catch (error) {
+        request.log.error({ key, errorName: error instanceof Error ? error.name : 'unknown' }, 'temporary OSS image upload failed');
+        return reply.code(503).send({
+          error: 'oss_upload_failed',
+          message: 'Generated image could not be uploaded to the temporary download bridge',
+        });
+      }
+      try {
+        if (!await ossUploadService.exists(objectName)) {
+          return reply.code(502).send({
+            error: 'oss_object_missing',
+            message: 'Generated image was uploaded but could not be verified',
+          });
+        }
+      } catch (error) {
+        request.log.error({ key, errorName: error instanceof Error ? error.name : 'unknown' }, 'temporary OSS image verification failed');
+        return reply.code(503).send({
+          error: 'oss_verification_failed',
+          message: 'Generated image upload could not be verified',
+        });
+      }
+      try {
         const url = ossUploadService.getPublicUrl(objectName, {
           mime: result.mime,
           filename: key,
-          download: true,
+          download: false,
         });
+        if (query.data.redirect === '0') {
+          return {
+            url,
+            expiresAt: Date.now() + 24 * 60 * 60 * 1_000,
+          };
+        }
         return reply.redirect(url);
       } catch (error) {
-        request.log.error({ err: error, key }, 'temporary OSS image upload failed');
+        request.log.error({ key, errorName: error instanceof Error ? error.name : 'unknown' }, 'temporary OSS image signing failed');
         return reply.code(503).send({
-          error: 'image_delivery_unavailable',
-          message: 'Image result is temporarily unavailable',
+          error: 'oss_signing_failed',
+          message: 'Generated image temporary URL could not be created',
         });
       }
     },
