@@ -12,7 +12,6 @@ export const inspirationTaskPayloadSchema = z.object({
   userTags: z.array(z.string().trim().min(1).max(100)).max(50).optional(),
   userNotes: z.array(z.string().trim().min(1).max(2_000)).max(50).optional(),
   existingProfile: z.unknown().optional(),
-  model: z.string().trim().min(1).max(200).optional(),
 }).strict();
 
 export const createAiTaskSchema = z.discriminatedUnion('type', [

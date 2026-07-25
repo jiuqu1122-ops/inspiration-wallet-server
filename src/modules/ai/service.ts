@@ -2,6 +2,7 @@ import type { AiProviderChannel, PrismaClient } from '@prisma/client';
 import { env } from '../../config/env.js';
 import { decryptProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
+import { normalizeImageTagAnalysis } from './tag-analysis.js';
 
 const REQUEST_CREDITS = BigInt(env.AGENT_REQUEST_CREDITS);
 
@@ -18,11 +19,18 @@ export class CloudAiError extends Error {
   }
 }
 
-async function listProviders(prisma: PrismaClient) {
+async function listProviders(prisma: PrismaClient, capability: 'LLM' | 'VISION' = 'LLM') {
   return prisma.aiProviderChannel.findMany({
-    where: { status: 'ACTIVE', capabilities: { has: 'LLM' } },
+    where: { status: 'ACTIVE', capabilities: { has: capability } },
     orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }],
   });
+}
+
+async function listInspirationProviders(prisma: PrismaClient) {
+  const visionProviders = await listProviders(prisma, 'VISION');
+  // Existing installations only have LLM channels. Keep them working until a
+  // dedicated visual channel is configured in the manager.
+  return visionProviders.length > 0 ? visionProviders : listProviders(prisma);
 }
 
 async function selectProvider(prisma: PrismaClient) {
@@ -1101,17 +1109,21 @@ export async function executeFreeInspirationAnalysis(
     userTags?: string[] | undefined;
     userNotes?: string[] | undefined;
     existingProfile?: unknown;
-    model?: string | undefined;
   },
   options?: AgentExecutionOptions,
 ) {
-  const prompt = `Analyze this saved design inspiration image. Return JSON only with this exact shape:
-{"itemId":"${input.itemId}","summary":"","objects":[],"category":"","form":{"silhouette":[],"geometry":[],"proportion":[]},"cmf":{"colors":[],"materials":[],"finishes":[]},"style":[],"interaction":[],"scene":[],"mood":[],"userTags":[],"userNotes":[]}
-Explain what it is useful as a design reference for. Keep fields concise. Preserve supplied user tags and notes.
+  const prompt = `You are an industrial-design, CMF, and product-visual-analysis expert.
+Analyze the attached saved inspiration image. Return one JSON object only; no markdown and no explanation.
+Use only visual evidence. Do not infer brands, hidden structures, or invisible materials. The primary result must be tags, not prose.
+Allowed tag categories are exactly: 产品类别, 设计领域, 风格, 材质, 色彩, 形态, 场景, 视角.
+Do not use generic or subjective labels such as 图片, 照片, 素材, 设计作品, 漂亮, 好看, 高级, 产品, 设计.
+Return this exact JSON shape:
+{"tags":[{"name":"","category":"产品类别","confidence":0.0}],"description":"","objects":[],"colors":[],"form":{"silhouette":[],"geometry":[],"proportion":[]},"cmf":{"colors":[],"materials":[],"finishes":[]},"style":[],"interaction":[],"scene":[]}
+Generate 4-16 concise tags. Confidence must be a number from 0 to 1. Keep uncertain fields empty.
 User tags: ${JSON.stringify(input.userTags ?? [])}
-User notes: ${JSON.stringify(input.userNotes ?? '')}
+User notes: ${JSON.stringify(input.userNotes ?? [])}
 Existing profile: ${JSON.stringify(input.existingProfile ?? null)}`;
-  const providers = await listProviders(prisma);
+  const providers = await listInspirationProviders(prisma);
   if (providers.length === 0) {
     throw new CloudAiError('provider_unavailable', '当前没有可用的灵感分析渠道', 503);
   }
@@ -1124,7 +1136,7 @@ Existing profile: ${JSON.stringify(input.existingProfile ?? null)}`;
       provider,
       secrets.apiKey,
       secrets.headers,
-      input.model,
+      undefined,
       providerIndex > 0,
     );
     let finalError: unknown;
@@ -1186,7 +1198,14 @@ Existing profile: ${JSON.stringify(input.existingProfile ?? null)}`;
       }).join('')
       : '';
   const jsonText = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
-  try { return { profile: JSON.parse(jsonText) as unknown }; } catch {
+  try {
+    const analysis = normalizeImageTagAnalysis(JSON.parse(jsonText) as unknown, input);
+    if (analysis.tags.length === 0) {
+      throw new CloudAiError('provider_invalid_response', '灵感自动分析没有返回有效标签', 502);
+    }
+    return analysis;
+  } catch (error) {
+    if (error instanceof CloudAiError) throw error;
     throw new CloudAiError('provider_invalid_response', '灵感自动分析未返回有效 JSON', 502);
   }
 }

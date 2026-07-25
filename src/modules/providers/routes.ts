@@ -15,6 +15,7 @@ const operationKeySchema = z.string().min(16).max(128).regex(/^[a-zA-Z0-9_-]+$/)
 const kindSchema = z.enum(['NEW_API', 'XAIS']);
 const capabilitySchema = z.enum([
   'LLM',
+  'VISION',
   'IMAGE',
   'IMAGE_NANO_BANANA',
   'IMAGE_GPT',
@@ -34,7 +35,7 @@ const createSchema = z.object({
   apiKey: z.string().trim().min(8).max(2_000),
   headers: headersSchema.default({}),
   allowInsecureHttp: z.boolean().default(false),
-  capabilities: z.array(capabilitySchema).min(1).max(5).optional(),
+  capabilities: z.array(capabilitySchema).min(1).max(6).optional(),
   enabled: z.boolean().default(true),
   idempotencyKey: operationKeySchema,
 }).strict();
@@ -46,7 +47,7 @@ const updateSchema = z.object({
   apiKey: z.string().trim().min(8).max(2_000).optional(),
   headers: headersSchema.optional(),
   allowInsecureHttp: z.boolean().optional(),
-  capabilities: z.array(capabilitySchema).min(1).max(5).optional(),
+  capabilities: z.array(capabilitySchema).min(1).max(6).optional(),
   enabled: z.boolean().optional(),
   idempotencyKey: operationKeySchema,
 }).strict().refine(
