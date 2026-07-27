@@ -6,6 +6,7 @@ import {
   defaultAiPricingConfig,
   defaultImageUnitCredits,
   getAiPricingConfig,
+  aiPricingModelToken,
 } from '../src/modules/ai/pricing.js';
 
 const prismaWithPricing = (pricing: {
@@ -32,6 +33,15 @@ describe('AI credit pricing', () => {
     expect(defaultImageUnitCredits('gpt-image-2', '4k')).toBe(18n);
     expect(defaultImageUnitCredits('Xais Img2_2K(高画质)', '4k')).toBe(35n);
     expect(defaultAiPricingConfig().inspirationAnalysisCredits).toBe('0');
+  });
+
+  it('keeps standard and high-quality model ids distinct', () => {
+    expect(aiPricingModelToken('Xais Img2_2K')).not.toBe(
+      aiPricingModelToken('Xais Img2_2K(高画质)'),
+    );
+    const modelTokens = defaultAiPricingConfig().imageModels
+      .map((item) => aiPricingModelToken(item.model));
+    expect(new Set(modelTokens).size).toBe(modelTokens.length);
   });
 
   it('uses exact configured model prices and configured unknown-model defaults', async () => {

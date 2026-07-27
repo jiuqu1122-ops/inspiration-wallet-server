@@ -53,6 +53,7 @@ const KNOWN_VIDEO_MODELS = [
 export const aiPricingModelToken = (model: string) => model
   .trim()
   .toLowerCase()
+  .replace(/高画质/g, 'highquality')
   .replace(/preview/g, '')
   .replace(/[^a-z0-9]+/g, '');
 

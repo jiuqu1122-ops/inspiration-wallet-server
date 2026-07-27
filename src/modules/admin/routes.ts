@@ -92,7 +92,7 @@ const pricingSchema = z.object({
       context.addIssue({
         code: 'custom',
         path: [path],
-        message: 'Model pricing contains duplicate models',
+        message: '模型积分配置包含重复模型',
       });
     }
   }
