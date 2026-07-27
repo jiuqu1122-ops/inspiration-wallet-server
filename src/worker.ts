@@ -3,9 +3,9 @@ import { writeFile } from 'node:fs/promises';
 import { AiTaskStatus, AiTaskType, PrismaClient, type AiTask } from '@prisma/client';
 import { env } from './config/env.js';
 import {
-  executeFreeInspirationAnalysis,
+  executeWalletInspirationAnalysis,
   executeWalletAgentChat,
-  releaseAgentCreditsForClientRequest,
+  releaseRequestCreditsForClientRequest,
   type AgentExecutionProgress,
 } from './modules/ai/service.js';
 import { agentTaskPayloadSchema, inspirationTaskPayloadSchema } from './modules/ai/task-schema.js';
@@ -59,9 +59,7 @@ async function recoverStaleTasks() {
     const result = await markStaleAiTaskFailed(prisma, task.id, staleBefore);
     if (result.count !== 1) continue;
     recovered += 1;
-    if (task.type === AiTaskType.AGENT_CHAT) {
-      await releaseAgentCreditsForClientRequest(prisma, task.userId, task.requestId);
-    }
+    await releaseRequestCreditsForClientRequest(prisma, task.userId, task.requestId);
   }
   if (recovered > 0) log('stale_tasks_failed', { count: recovered });
 }
@@ -137,9 +135,13 @@ async function executeTask(task: AiTask) {
       }, { signal: controller.signal, onProgress });
     } else {
       const payload = inspirationTaskPayloadSchema.parse(task.payload);
-      result = await executeFreeInspirationAnalysis(
+      result = await executeWalletInspirationAnalysis(
         prisma,
-        payload,
+        {
+          userId: task.userId,
+          clientRequestId: task.requestId,
+          ...payload,
+        },
         { signal: controller.signal, onProgress },
       );
     }
@@ -148,9 +150,7 @@ async function executeTask(task: AiTask) {
       log('task_succeeded', { ...taskLogFields(task), stage: 'completed', durationMs: Date.now() - started });
     }
   } catch (error) {
-    if (task.type === AiTaskType.AGENT_CHAT) {
-      await releaseAgentCreditsForClientRequest(prisma, task.userId, task.requestId);
-    }
+    await releaseRequestCreditsForClientRequest(prisma, task.userId, task.requestId);
     const failed = await failAiTask(prisma, task.id, workerId, error);
     if (failed.count === 1) {
       log('task_failed', {

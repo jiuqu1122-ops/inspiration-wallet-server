@@ -1,0 +1,250 @@
+import type { Prisma, PrismaClient } from '@prisma/client';
+import { env } from '../../config/env.js';
+
+export type ImageModelCreditPrice = {
+  model: string;
+  credits1k: string;
+  credits2k: string;
+  credits4k: string;
+};
+
+export type VideoModelCreditPrice = {
+  model: string;
+  credits: string;
+};
+
+export type AiPricingConfigValue = {
+  agentRequestCredits: string;
+  inspirationAnalysisCredits: string;
+  imageDefaultCredits: string;
+  videoDefaultCredits: string;
+  imageModels: ImageModelCreditPrice[];
+  videoModels: VideoModelCreditPrice[];
+  updatedAt: string | null;
+};
+
+export type AiPricingConfigInput = Omit<AiPricingConfigValue, 'updatedAt'>;
+
+const DEFAULT_AGENT_REQUEST_CREDITS = BigInt(env.AGENT_REQUEST_CREDITS);
+const DEFAULT_IMAGE_REQUEST_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
+const DEFAULT_VIDEO_REQUEST_CREDITS = BigInt(env.VIDEO_REQUEST_CREDITS);
+const DEFAULT_INSPIRATION_ANALYSIS_CREDITS = 0n;
+
+const KNOWN_IMAGE_MODELS = [
+  'gemini-3-pro-image',
+  'gemini-3.1-flash-image',
+  'gpt-image-2',
+  'Xais Nano Pro_2K',
+  'Xais Nano Pro_4K',
+  'Xais Nano2_2K',
+  'Xais Nano2_4K',
+  'Xais Nano_Lite_1K',
+  'Xais img2_1k',
+  'Xais Img2_2K',
+  'Xais Img2_4K',
+  'Xais Img2_2K(高画质)',
+  'Xais Img2_4K(高画质)',
+] as const;
+
+const KNOWN_VIDEO_MODELS = [
+  'seedance2',
+] as const;
+
+export const aiPricingModelToken = (model: string) => model
+  .trim()
+  .toLowerCase()
+  .replace(/preview/g, '')
+  .replace(/[^a-z0-9]+/g, '');
+
+export type PricedImageResolution = '1k' | '2k' | '4k';
+
+export const pricedImageResolution = (
+  model: string,
+  resolution?: string,
+): PricedImageResolution => {
+  const requested = resolution?.trim().toLowerCase();
+  if (requested === '1k' || requested === '2k' || requested === '4k') return requested;
+  const token = aiPricingModelToken(model);
+  if (token.includes('4k')) return '4k';
+  if (token.includes('2k')) return '2k';
+  if (token.includes('1k')) return '1k';
+  return '2k';
+};
+
+export function defaultImageUnitCredits(model: string, resolution?: string) {
+  const token = aiPricingModelToken(model);
+  const selectedResolution = pricedImageResolution(model, resolution);
+  const isGptImage2 = token.includes('gptimage2')
+    || token.includes('image2')
+    || token.includes('img2');
+  const isHighQuality = isGptImage2 && (
+    model.includes('高画质')
+    || token.endsWith('h')
+    || token.includes('highquality')
+  );
+
+  if (isHighQuality) return selectedResolution === '4k' ? 35n : 30n;
+  if (isGptImage2) {
+    if (selectedResolution === '1k') return 10n;
+    return selectedResolution === '4k' ? 18n : 15n;
+  }
+
+  const isNanoBananaPro = token.includes('nanobananapro')
+    || token.includes('xaisnanopro')
+    || token.includes('nanopro')
+    || token.includes('gemini3proimage')
+    || token.includes('gemini31proimage');
+  if (isNanoBananaPro) return selectedResolution === '4k' ? 20n : 18n;
+
+  const isNanoBanana2 = token.includes('nanobanana2')
+    || token.includes('xaisnano2')
+    || token.includes('nano2')
+    || token.includes('gemini31flashimage')
+    || token.includes('gemini3flashimage');
+  if (isNanoBanana2) return selectedResolution === '4k' ? 18n : 15n;
+
+  return DEFAULT_IMAGE_REQUEST_CREDITS;
+}
+
+const defaultImageModelPrices = (): ImageModelCreditPrice[] => (
+  KNOWN_IMAGE_MODELS.map((model) => ({
+    model,
+    credits1k: defaultImageUnitCredits(model, '1k').toString(),
+    credits2k: defaultImageUnitCredits(model, '2k').toString(),
+    credits4k: defaultImageUnitCredits(model, '4k').toString(),
+  }))
+);
+
+const defaultVideoModelPrices = (): VideoModelCreditPrice[] => (
+  KNOWN_VIDEO_MODELS.map((model) => ({
+    model,
+    credits: DEFAULT_VIDEO_REQUEST_CREDITS.toString(),
+  }))
+);
+
+export function defaultAiPricingConfig(): AiPricingConfigValue {
+  return {
+    agentRequestCredits: DEFAULT_AGENT_REQUEST_CREDITS.toString(),
+    inspirationAnalysisCredits: DEFAULT_INSPIRATION_ANALYSIS_CREDITS.toString(),
+    imageDefaultCredits: DEFAULT_IMAGE_REQUEST_CREDITS.toString(),
+    videoDefaultCredits: DEFAULT_VIDEO_REQUEST_CREDITS.toString(),
+    imageModels: defaultImageModelPrices(),
+    videoModels: defaultVideoModelPrices(),
+    updatedAt: null,
+  };
+}
+
+const validCreditString = (value: unknown): value is string => (
+  typeof value === 'string' && /^(?:0|[1-9]\d{0,6})$/.test(value)
+);
+
+const normalizeStoredImageModels = (value: Prisma.JsonValue): ImageModelCreditPrice[] => {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const record = item as Record<string, unknown>;
+    const model = typeof record.model === 'string' ? record.model.trim() : '';
+    if (!model
+      || !validCreditString(record.credits1k)
+      || !validCreditString(record.credits2k)
+      || !validCreditString(record.credits4k)) return [];
+    return [{
+      model,
+      credits1k: record.credits1k,
+      credits2k: record.credits2k,
+      credits4k: record.credits4k,
+    }];
+  });
+};
+
+const normalizeStoredVideoModels = (value: Prisma.JsonValue): VideoModelCreditPrice[] => {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const record = item as Record<string, unknown>;
+    const model = typeof record.model === 'string' ? record.model.trim() : '';
+    if (!model || !validCreditString(record.credits)) return [];
+    return [{ model, credits: record.credits }];
+  });
+};
+
+export async function getAiPricingConfig(prisma: PrismaClient): Promise<AiPricingConfigValue> {
+  const defaults = defaultAiPricingConfig();
+  const stored = await prisma.aiPricingConfig.findUnique({ where: { id: 'default' } });
+  if (!stored) return defaults;
+  return {
+    agentRequestCredits: stored.agentRequestCredits.toString(),
+    inspirationAnalysisCredits: stored.inspirationAnalysisCredits.toString(),
+    imageDefaultCredits: stored.imageDefaultCredits.toString(),
+    videoDefaultCredits: stored.videoDefaultCredits.toString(),
+    imageModels: normalizeStoredImageModels(stored.imageModelPrices),
+    videoModels: normalizeStoredVideoModels(stored.videoModelPrices),
+    updatedAt: stored.updatedAt.toISOString(),
+  };
+}
+
+export async function updateAiPricingConfig(
+  prisma: PrismaClient,
+  input: AiPricingConfigInput,
+): Promise<AiPricingConfigValue> {
+  await prisma.aiPricingConfig.upsert({
+    where: { id: 'default' },
+    create: {
+      id: 'default',
+      agentRequestCredits: BigInt(input.agentRequestCredits),
+      inspirationAnalysisCredits: BigInt(input.inspirationAnalysisCredits),
+      imageDefaultCredits: BigInt(input.imageDefaultCredits),
+      videoDefaultCredits: BigInt(input.videoDefaultCredits),
+      imageModelPrices: input.imageModels,
+      videoModelPrices: input.videoModels,
+    },
+    update: {
+      agentRequestCredits: BigInt(input.agentRequestCredits),
+      inspirationAnalysisCredits: BigInt(input.inspirationAnalysisCredits),
+      imageDefaultCredits: BigInt(input.imageDefaultCredits),
+      videoDefaultCredits: BigInt(input.videoDefaultCredits),
+      imageModelPrices: input.imageModels,
+      videoModelPrices: input.videoModels,
+    },
+  });
+  return getAiPricingConfig(prisma);
+}
+
+export async function configuredAgentRequestCredits(prisma: PrismaClient) {
+  return BigInt((await getAiPricingConfig(prisma)).agentRequestCredits);
+}
+
+export async function configuredInspirationAnalysisCredits(prisma: PrismaClient) {
+  return BigInt((await getAiPricingConfig(prisma)).inspirationAnalysisCredits);
+}
+
+export async function configuredImageUnitCredits(
+  prisma: PrismaClient,
+  model: string,
+  resolution?: string,
+) {
+  const pricing = await getAiPricingConfig(prisma);
+  const exact = pricing.imageModels.find(
+    (item) => aiPricingModelToken(item.model) === aiPricingModelToken(model),
+  );
+  if (!exact) {
+    const fallback = defaultImageUnitCredits(model, resolution);
+    return fallback === DEFAULT_IMAGE_REQUEST_CREDITS
+      ? BigInt(pricing.imageDefaultCredits)
+      : fallback;
+  }
+  const selectedResolution = pricedImageResolution(model, resolution);
+  return BigInt(
+    selectedResolution === '1k'
+      ? exact.credits1k
+      : selectedResolution === '4k' ? exact.credits4k : exact.credits2k,
+  );
+}
+
+export async function configuredVideoUnitCredits(prisma: PrismaClient, model: string) {
+  const pricing = await getAiPricingConfig(prisma);
+  const exact = pricing.videoModels.find(
+    (item) => aiPricingModelToken(item.model) === aiPricingModelToken(model),
+  );
+  return BigInt(exact?.credits ?? pricing.videoDefaultCredits);
+}

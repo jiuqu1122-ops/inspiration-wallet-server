@@ -1,5 +1,5 @@
 import { AiTaskStatus, AiTaskType, Prisma, type AiTask, type PrismaClient } from '@prisma/client';
-import { releaseAgentCreditsForClientRequest, sanitizeAgentUpstreamDetail } from './service.js';
+import { releaseRequestCreditsForClientRequest, sanitizeAgentUpstreamDetail } from './service.js';
 import type { CreateAiTaskInput } from './task-schema.js';
 
 export type PublicTaskError = {
@@ -90,8 +90,8 @@ export async function cancelUserAiTask(prisma: PrismaClient, userId: string, tas
       error: { code: 'CANCELLED', message: '任务已取消' },
     },
   });
-  if (cancelled.count === 1 && existing.type === AiTaskType.AGENT_CHAT) {
-    await releaseAgentCreditsForClientRequest(prisma, userId, existing.requestId);
+  if (cancelled.count === 1) {
+    await releaseRequestCreditsForClientRequest(prisma, userId, existing.requestId);
   }
   return findUserAiTask(prisma, userId, taskId);
 }

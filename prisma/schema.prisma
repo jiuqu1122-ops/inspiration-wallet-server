@@ -306,3 +306,15 @@ model AiProviderChannel {
   @@index([status, priority])
   @@index([updatedAt])
 }
+
+model AiPricingConfig {
+  id                         String   @id @default("default")
+  agentRequestCredits        BigInt
+  inspirationAnalysisCredits BigInt
+  imageDefaultCredits        BigInt
+  videoDefaultCredits        BigInt
+  imageModelPrices           Json
+  videoModelPrices           Json
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+}

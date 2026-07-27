@@ -5,17 +5,23 @@ import { mkdtemp, open, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
-import { env } from '../../config/env.js';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
 import { CloudAiError } from './service.js';
+import {
+  aiPricingModelToken as imageModelToken,
+  configuredImageUnitCredits,
+  configuredVideoUnitCredits,
+  defaultImageUnitCredits,
+  getAiPricingConfig,
+  type PricedImageResolution,
+} from './pricing.js';
 import {
   createImageResultFromFile,
   createImageResultFromResponse,
   isStoredImageResultUrl,
 } from './image-result-store.js';
 
-const DEFAULT_IMAGE_UNIT_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
 const IMAGE_GENERATION_TIMEOUT_MS = 6 * 60_000;
 const NEW_API_IMAGE_TASK_POLL_INTERVAL_MS = 3_000;
 const NEW_API_REFERENCE_DOWNLOAD_ATTEMPTS = 3;
@@ -64,57 +70,8 @@ const NEW_API_IMAGE_MODEL_MAP: Record<string, string> = {
   gptimage2: 'gpt-image-2',
 };
 
-const imageModelToken = (model: string) => model
-  .trim()
-  .toLowerCase()
-  .replace(/preview/g, '')
-  .replace(/[^a-z0-9]+/g, '');
-
-type PricedImageResolution = '1k' | '2k' | '4k';
-
-const pricedImageResolution = (model: string, resolution?: string): PricedImageResolution => {
-  const requested = resolution?.trim().toLowerCase();
-  if (requested === '1k' || requested === '2k' || requested === '4k') return requested;
-  const token = imageModelToken(model);
-  if (token.includes('4k')) return '4k';
-  if (token.includes('2k')) return '2k';
-  if (token.includes('1k')) return '1k';
-  return '2k';
-};
-
 export function imageUnitCredits(model: string, resolution?: string) {
-  const token = imageModelToken(model);
-  const selectedResolution = pricedImageResolution(model, resolution);
-  const isGptImage2 = token.includes('gptimage2')
-    || token.includes('image2')
-    || token.includes('img2');
-  const isHighQuality = isGptImage2 && (
-    model.includes('高画质')
-    || token.endsWith('h')
-    || token.includes('highquality')
-  );
-
-  if (isHighQuality) return selectedResolution === '4k' ? 35n : 30n;
-  if (isGptImage2) {
-    if (selectedResolution === '1k') return 10n;
-    return selectedResolution === '4k' ? 18n : 15n;
-  }
-
-  const isNanoBananaPro = token.includes('nanobananapro')
-    || token.includes('xaisnanopro')
-    || token.includes('nanopro')
-    || token.includes('gemini3proimage')
-    || token.includes('gemini31proimage');
-  if (isNanoBananaPro) return selectedResolution === '4k' ? 20n : 18n;
-
-  const isNanoBanana2 = token.includes('nanobanana2')
-    || token.includes('xaisnano2')
-    || token.includes('nano2')
-    || token.includes('gemini31flashimage')
-    || token.includes('gemini3flashimage');
-  if (isNanoBanana2) return selectedResolution === '4k' ? 18n : 15n;
-
-  return DEFAULT_IMAGE_UNIT_CREDITS;
+  return defaultImageUnitCredits(model, resolution);
 }
 
 export function resolveNewApiImageModel(model: string) {
@@ -399,7 +356,10 @@ export function collectProviderModelIds(value: unknown) {
 export async function listWalletImageModels(
   prisma: PrismaClient,
 ) {
-  const providers = await listImageProviders(prisma);
+  const [providers, pricing] = await Promise.all([
+    listImageProviders(prisma),
+    getAiPricingConfig(prisma),
+  ]);
   if (!providers.length) {
     throw new CloudAiError('provider_unavailable', '当前没有可用的生图渠道', 503);
   }
@@ -438,6 +398,7 @@ export async function listWalletImageModels(
     defaultModel: firstAvailable.defaultModel,
     models: Array.from(new Set(channels.flatMap((channel) => channel.models))),
     channels,
+    pricing,
   };
 }
 
@@ -1706,7 +1667,8 @@ async function generateXaisImages(
 }
 
 async function reserveImageCredits(prisma: PrismaClient, input: ImageInput) {
-  const estimated = imageUnitCredits(input.model, input.resolution) * BigInt(input.count);
+  const unitCredits = await configuredImageUnitCredits(prisma, input.model, input.resolution);
+  const estimated = unitCredits * BigInt(input.count);
   const requestId = await prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({
       where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } },
@@ -1761,7 +1723,7 @@ async function reserveImageCredits(prisma: PrismaClient, input: ImageInput) {
     });
     return request.id;
   });
-  return { requestId, estimated };
+  return { requestId, estimated, unitCredits };
 }
 
 async function settleImageCredits(
@@ -1769,9 +1731,10 @@ async function settleImageCredits(
   input: ImageInput,
   requestId: string,
   estimated: bigint,
+  unitCredits: bigint,
   generatedCount: number,
 ) {
-  const charged = imageUnitCredits(input.model, input.resolution) * BigInt(generatedCount);
+  const charged = unitCredits * BigInt(generatedCount);
   const refund = estimated - charged;
   await prisma.$transaction(async (transaction) => {
     const wallet = await transaction.wallet.update({
@@ -1860,6 +1823,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       effectiveInput,
       reservation.requestId,
       reservation.estimated,
+      reservation.unitCredits,
       images.length,
     );
     return {
@@ -1912,12 +1876,6 @@ export type VideoInput = {
   count: number;
 };
 
-const VIDEO_CREDITS = BigInt(env.VIDEO_REQUEST_CREDITS);
-
-function estimatedVideoCredits(input: VideoInput) {
-  return VIDEO_CREDITS * BigInt(input.count);
-}
-
 function videoProviderKind(provider?: VideoInput['provider']) {
   if (provider === 'xais-chat') return 'XAIS' as const;
   if (provider === 'new-api') return 'NEW_API' as const;
@@ -1961,7 +1919,8 @@ function xaisVideoBody(input: VideoInput) {
 }
 
 async function reserveVideo(prisma: PrismaClient, input: VideoInput) {
-  const estimated = estimatedVideoCredits(input);
+  const unitCredits = await configuredVideoUnitCredits(prisma, input.model);
+  const estimated = unitCredits * BigInt(input.count);
   return prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({ where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } } });
     const reusableRequest = existing && (existing.status === 'FAILED' || existing.status === 'REFUNDED')

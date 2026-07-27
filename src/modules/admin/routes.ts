@@ -12,6 +12,11 @@ import {
 } from './service.js';
 import { providerAdminRoutes } from '../providers/routes.js';
 import { createRedemptionCodes, listRedemptionCodes } from '../wallets/redemption.js';
+import {
+  aiPricingModelToken,
+  getAiPricingConfig,
+  updateAiPricingConfig,
+} from '../ai/pricing.js';
 
 const listUsersSchema = z.object({
   query: z.string().trim().max(200).optional(),
@@ -57,6 +62,42 @@ const createRedemptionCodesSchema = z.object({
   note: z.string().trim().max(200).nullable().optional(),
 }).strict();
 
+const pricingCreditsSchema = z.string()
+  .regex(/^(?:0|[1-9]\d{0,6})$/)
+  .refine((value) => BigInt(value) <= 1_000_000n, 'Credits must not exceed 1000000');
+const imageModelPriceSchema = z.object({
+  model: z.string().trim().min(1).max(200),
+  credits1k: pricingCreditsSchema,
+  credits2k: pricingCreditsSchema,
+  credits4k: pricingCreditsSchema,
+}).strict();
+const videoModelPriceSchema = z.object({
+  model: z.string().trim().min(1).max(200),
+  credits: pricingCreditsSchema,
+}).strict();
+const pricingSchema = z.object({
+  agentRequestCredits: pricingCreditsSchema,
+  inspirationAnalysisCredits: pricingCreditsSchema,
+  imageDefaultCredits: pricingCreditsSchema,
+  videoDefaultCredits: pricingCreditsSchema,
+  imageModels: z.array(imageModelPriceSchema).max(100),
+  videoModels: z.array(videoModelPriceSchema).max(100),
+}).strict().superRefine((value, context) => {
+  for (const [path, models] of [
+    ['imageModels', value.imageModels],
+    ['videoModels', value.videoModels],
+  ] as const) {
+    const normalized = models.map((item) => aiPricingModelToken(item.model));
+    if (new Set(normalized).size !== normalized.length) {
+      context.addIssue({
+        code: 'custom',
+        path: [path],
+        message: 'Model pricing contains duplicate models',
+      });
+    }
+  }
+});
+
 function invalid(reply: FastifyReply, message: string) {
   return reply.code(400).send({ error: 'invalid_request', message });
 }
@@ -65,6 +106,20 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.authenticateAdmin);
 
   await app.register(providerAdminRoutes, { prefix: '/providers' });
+
+  app.get('/pricing', async () => getAiPricingConfig(app.prisma));
+
+  app.patch(
+    '/pricing',
+    { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const parsed = pricingSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return invalid(reply, parsed.error.issues[0]?.message ?? 'AI pricing is invalid');
+      }
+      return updateAiPricingConfig(app.prisma, parsed.data);
+    },
+  );
 
   app.get('/redemption-codes', async (request, reply) => {
     const parsed = z.object({ limit: z.coerce.number().int().min(1).max(500).default(100) })

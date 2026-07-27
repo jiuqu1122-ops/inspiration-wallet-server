@@ -1,8 +1,12 @@
-import type { AiProviderChannel, PrismaClient } from '@prisma/client';
+import type { AiCapability, AiProviderChannel, PrismaClient } from '@prisma/client';
 import { env } from '../../config/env.js';
 import { decryptProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
 import { normalizeImageTagAnalysis } from './tag-analysis.js';
+import {
+  configuredAgentRequestCredits,
+  configuredInspirationAnalysisCredits,
+} from './pricing.js';
 
 const REQUEST_CREDITS = BigInt(env.AGENT_REQUEST_CREDITS);
 
@@ -857,7 +861,14 @@ export async function listWalletAgentModels(prisma: PrismaClient) {
 
 async function reserveCredits(
   prisma: PrismaClient,
-  input: { userId: string; clientRequestId: string },
+  input: {
+    userId: string;
+    clientRequestId: string;
+    credits: bigint;
+    capability: AiCapability;
+    logicalModel: string;
+    description: string;
+  },
 ) {
   return prisma.$transaction(async (transaction) => {
     const existing = await transaction.aiRequest.findUnique({
@@ -872,10 +883,10 @@ async function reserveCredits(
       throw new CloudAiError('duplicate_request', '该 Agent 请求已经提交过', 409);
     }
     const updated = await transaction.wallet.updateMany({
-      where: { userId: input.userId, availableCredits: { gte: REQUEST_CREDITS } },
+      where: { userId: input.userId, availableCredits: { gte: input.credits } },
       data: {
-        availableCredits: { decrement: REQUEST_CREDITS },
-        reservedCredits: { increment: REQUEST_CREDITS },
+        availableCredits: { decrement: input.credits },
+        reservedCredits: { increment: input.credits },
       },
     });
     if (updated.count !== 1) {
@@ -886,10 +897,10 @@ async function reserveCredits(
       data: {
         userId: input.userId,
         clientRequestId: input.clientRequestId,
-        capability: 'LLM',
-        logicalModel: 'unmind-agent',
+        capability: input.capability,
+        logicalModel: input.logicalModel,
         status: 'RESERVED',
-        estimatedCredits: REQUEST_CREDITS,
+        estimatedCredits: input.credits,
       },
     });
     await transaction.walletLedger.create({
@@ -897,9 +908,9 @@ async function reserveCredits(
         userId: input.userId,
         requestId: request.id,
         type: 'RESERVE',
-        amount: -REQUEST_CREDITS,
+        amount: -input.credits,
         balanceAfter: wallet.availableCredits,
-        description: 'Agent 请求预扣',
+        description: input.description,
       },
     });
     return request.id;
@@ -908,11 +919,16 @@ async function reserveCredits(
 
 async function settleCredits(prisma: PrismaClient, userId: string, requestId: string) {
   await prisma.$transaction(async (transaction) => {
+    const request = await transaction.aiRequest.findFirst({
+      where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
+    });
+    if (!request) return;
+    const credits = request.estimatedCredits;
     const claimed = await transaction.aiRequest.updateMany({
       where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
       data: {
         status: 'SUCCEEDED',
-        chargedCredits: REQUEST_CREDITS,
+        chargedCredits: credits,
         completedAt: new Date(),
       },
     });
@@ -920,8 +936,8 @@ async function settleCredits(prisma: PrismaClient, userId: string, requestId: st
     const wallet = await transaction.wallet.update({
       where: { userId },
       data: {
-        reservedCredits: { decrement: REQUEST_CREDITS },
-        lifetimeConsumed: { increment: REQUEST_CREDITS },
+        reservedCredits: { decrement: credits },
+        lifetimeConsumed: { increment: credits },
       },
     });
     await transaction.walletLedger.create({
@@ -929,9 +945,9 @@ async function settleCredits(prisma: PrismaClient, userId: string, requestId: st
         userId,
         requestId,
         type: 'CHARGE',
-        amount: REQUEST_CREDITS,
+        amount: credits,
         balanceAfter: wallet.availableCredits,
-        description: 'Agent 请求结算',
+        description: request.capability === 'VISION' ? '图片分析结算' : 'Agent 请求结算',
       },
     });
   });
@@ -946,11 +962,12 @@ async function releaseCredits(prisma: PrismaClient, userId: string, requestId: s
       data: { status: 'FAILED', completedAt: new Date() },
     });
     if (claimed.count !== 1) return;
+    const credits = request.estimatedCredits;
     const wallet = await transaction.wallet.update({
       where: { userId },
       data: {
-        availableCredits: { increment: REQUEST_CREDITS },
-        reservedCredits: { decrement: REQUEST_CREDITS },
+        availableCredits: { increment: credits },
+        reservedCredits: { decrement: credits },
       },
     });
     await transaction.walletLedger.create({
@@ -958,15 +975,17 @@ async function releaseCredits(prisma: PrismaClient, userId: string, requestId: s
         userId,
         requestId,
         type: 'RELEASE',
-        amount: REQUEST_CREDITS,
+        amount: credits,
         balanceAfter: wallet.availableCredits,
-        description: 'Agent 请求失败，释放预扣额度',
+        description: request.capability === 'VISION'
+          ? '图片分析失败，释放预扣额度'
+          : 'Agent 请求失败，释放预扣额度',
       },
     });
   });
 }
 
-export async function releaseAgentCreditsForClientRequest(
+export async function releaseRequestCreditsForClientRequest(
   prisma: PrismaClient,
   userId: string,
   clientRequestId: string,
@@ -977,6 +996,8 @@ export async function releaseAgentCreditsForClientRequest(
   });
   if (request) await releaseCredits(prisma, userId, request.id);
 }
+
+export const releaseAgentCreditsForClientRequest = releaseRequestCreditsForClientRequest;
 
 export async function executeWalletAgentChat(
   prisma: PrismaClient,
@@ -989,7 +1010,15 @@ export async function executeWalletAgentChat(
   },
   options?: AgentExecutionOptions,
 ) {
-  const requestId = await reserveCredits(prisma, input);
+  const credits = await configuredAgentRequestCredits(prisma);
+  const requestId = await reserveCredits(prisma, {
+    userId: input.userId,
+    clientRequestId: input.clientRequestId,
+    credits,
+    capability: 'LLM',
+    logicalModel: input.model?.trim() || 'unmind-agent',
+    description: 'Agent 请求预扣',
+  });
   try {
     const providers = await listProviders(prisma);
     if (providers.length === 0) {
@@ -1207,5 +1236,37 @@ Existing profile: ${JSON.stringify(input.existingProfile ?? null)}`;
   } catch (error) {
     if (error instanceof CloudAiError) throw error;
     throw new CloudAiError('provider_invalid_response', '灵感自动分析未返回有效 JSON', 502);
+  }
+}
+
+export async function executeWalletInspirationAnalysis(
+  prisma: PrismaClient,
+  input: {
+    userId: string;
+    clientRequestId: string;
+    itemId: string;
+    imageSource: string;
+    userTags?: string[] | undefined;
+    userNotes?: string[] | undefined;
+    existingProfile?: unknown;
+  },
+  options?: AgentExecutionOptions,
+) {
+  const credits = await configuredInspirationAnalysisCredits(prisma);
+  const requestId = await reserveCredits(prisma, {
+    userId: input.userId,
+    clientRequestId: input.clientRequestId,
+    credits,
+    capability: 'VISION',
+    logicalModel: 'inspiration-analysis',
+    description: '图片分析预扣',
+  });
+  try {
+    const result = await executeFreeInspirationAnalysis(prisma, input, options);
+    await settleCredits(prisma, input.userId, requestId);
+    return result;
+  } catch (error) {
+    await releaseCredits(prisma, input.userId, requestId);
+    throw error;
   }
 }
