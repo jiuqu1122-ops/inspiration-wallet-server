@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { access, readFile, rm } from 'node:fs/promises';
 import {
+  IMAGE_GENERATION_TIMEOUT_MS,
   buildNewApiImageGenerationBody,
   chooseProviderForCapability,
   collectProviderModelIds,
   confirmXaisReferenceAttachment,
   filterProviderImageModels,
   generateNewApiImages,
+  getWalletImageGenerationByRequest,
   imageCapabilityForModel,
   imageUnitCredits,
   isNewApiGeminiImageDecodeError,
@@ -15,6 +17,7 @@ import {
   isRetryableXaisPollError,
   materializeNewApiReferenceImage,
   newApiImageRequestParams,
+  parseWalletImageGenerationResult,
   parseXaisTaskId,
   providerSupportsImageModel,
   resolveImageModel,
@@ -35,6 +38,60 @@ afterEach(() => {
 });
 
 describe('wallet image provider normalization', () => {
+  it('allows image generation jobs to run for fifteen minutes', () => {
+    expect(IMAGE_GENERATION_TIMEOUT_MS).toBe(15 * 60_000);
+  });
+
+  it('accepts only complete persisted wallet image results', () => {
+    expect(parseWalletImageGenerationResult({
+      images: ['https://api.unmind.art/v1/ai/image-results/result.png'],
+      provider: 'NEW_API',
+      providerChannelId: 'channel-1',
+      providerChannelName: 'primary',
+      model: 'gpt-image-2',
+      chargedCredits: '18',
+    })).toMatchObject({
+      images: ['https://api.unmind.art/v1/ai/image-results/result.png'],
+      chargedCredits: '18',
+    });
+    expect(parseWalletImageGenerationResult({
+      images: [],
+      provider: 'NEW_API',
+    })).toBeNull();
+  });
+
+  it('looks up a persisted image result only inside the current user account', async () => {
+    const findUnique = vi.fn(async () => ({
+      capability: 'IMAGE',
+      status: 'SUCCEEDED',
+      completedAt: new Date(1_725_000_000_000),
+      result: {
+        images: ['https://api.unmind.art/v1/ai/image-results/result.png'],
+        provider: 'NEW_API',
+        providerChannelId: 'channel-1',
+        providerChannelName: 'primary',
+        model: 'gpt-image-2',
+        chargedCredits: '18',
+      },
+    }));
+    const result = await getWalletImageGenerationByRequest({
+      aiRequest: { findUnique },
+    } as never, 'user-1', 'canvas-request-1');
+    expect(findUnique).toHaveBeenCalledWith(expect.objectContaining({
+      where: {
+        userId_clientRequestId: {
+          userId: 'user-1',
+          clientRequestId: 'canvas-request-1',
+        },
+      },
+    }));
+    expect(result).toMatchObject({
+      status: 'succeeded',
+      completedAt: 1_725_000_000_000,
+      images: ['https://api.unmind.art/v1/ai/image-results/result.png'],
+    });
+  });
+
   it('extracts the image channel model IDs returned by /v1/models', () => {
     expect(collectProviderModelIds({
       data: [

@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import type { AiCapability, AiProviderChannel, PrismaClient } from '@prisma/client';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
@@ -22,7 +23,7 @@ import {
   isStoredImageResultUrl,
 } from './image-result-store.js';
 
-const IMAGE_GENERATION_TIMEOUT_MS = 6 * 60_000;
+export const IMAGE_GENERATION_TIMEOUT_MS = 15 * 60_000;
 const NEW_API_IMAGE_TASK_POLL_INTERVAL_MS = 3_000;
 const NEW_API_REFERENCE_DOWNLOAD_ATTEMPTS = 3;
 const NEW_API_REFERENCE_DOWNLOAD_RETRY_DELAYS_MS = [500, 1_500];
@@ -38,6 +39,32 @@ const XAIS_REFERENCE_DOWNLOAD_ATTEMPTS = 3;
 const XAIS_REFERENCE_DOWNLOAD_RETRY_DELAYS_MS = [500, 1_500];
 const imageReferenceCache = new Map<string, { dataUrl: string; expiresAt: number }>();
 const pendingImageReferenceFetches = new Map<string, Promise<string>>();
+
+export type WalletImageGenerationResult = {
+  images: string[];
+  provider: string;
+  providerChannelId: string;
+  providerChannelName: string;
+  model: string;
+  chargedCredits: string;
+};
+
+const isWalletImageGenerationResult = (value: unknown): value is WalletImageGenerationResult => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const candidate = value as Partial<WalletImageGenerationResult>;
+  return Array.isArray(candidate.images)
+    && candidate.images.length > 0
+    && candidate.images.every(image => typeof image === 'string' && image.length > 0)
+    && typeof candidate.provider === 'string'
+    && typeof candidate.providerChannelId === 'string'
+    && typeof candidate.providerChannelName === 'string'
+    && typeof candidate.model === 'string'
+    && typeof candidate.chargedCredits === 'string';
+};
+
+export const parseWalletImageGenerationResult = (
+  value: Prisma.JsonValue | null | undefined,
+): WalletImageGenerationResult | null => isWalletImageGenerationResult(value) ? value : null;
 const xaisAttachmentCache = new Map<string, { name: string; expiresAt: number }>();
 const pendingXaisAttachmentUploads = new Map<string, Promise<string>>();
 const XAIS_MODEL_MAP: Record<string, string> = {
@@ -1687,7 +1714,14 @@ async function reserveImageCredits(prisma: PrismaClient, input: ImageInput) {
     if (reusableRequest) {
       const request = await transaction.aiRequest.update({
         where: { id: reusableRequest.id },
-        data: { status: 'RESERVED', logicalModel: input.model, estimatedCredits: estimated, chargedCredits: 0n, completedAt: null },
+        data: {
+          status: 'RESERVED',
+          logicalModel: input.model,
+          estimatedCredits: estimated,
+          chargedCredits: 0n,
+          result: Prisma.DbNull,
+          completedAt: null,
+        },
       });
       await transaction.walletLedger.create({
         data: {
@@ -1733,6 +1767,7 @@ async function settleImageCredits(
   estimated: bigint,
   unitCredits: bigint,
   generatedCount: number,
+  result: Omit<WalletImageGenerationResult, 'chargedCredits'>,
 ) {
   const charged = unitCredits * BigInt(generatedCount);
   const refund = estimated - charged;
@@ -1747,7 +1782,15 @@ async function settleImageCredits(
     });
     await transaction.aiRequest.update({
       where: { id: requestId },
-      data: { status: 'SUCCEEDED', chargedCredits: charged, completedAt: new Date() },
+      data: {
+        status: 'SUCCEEDED',
+        chargedCredits: charged,
+        result: {
+          ...result,
+          chargedCredits: charged.toString(),
+        } satisfies Prisma.InputJsonValue,
+        completedAt: new Date(),
+      },
     });
     await transaction.walletLedger.create({
       data: {
@@ -1790,7 +1833,7 @@ async function releaseImageCredits(
     });
     await transaction.aiRequest.update({
       where: { id: requestId },
-      data: { status: 'FAILED', completedAt: new Date() },
+      data: { status: 'FAILED', result: Prisma.DbNull, completedAt: new Date() },
     });
     await transaction.walletLedger.create({
       data: {
@@ -1825,6 +1868,13 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       reservation.estimated,
       reservation.unitCredits,
       images.length,
+      {
+        images,
+        provider: provider.kind,
+        providerChannelId: provider.id,
+        providerChannelName: provider.name,
+        model: effectiveInput.model,
+      },
     );
     return {
       images,
@@ -1859,6 +1909,34 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       502,
     );
   }
+}
+
+export async function getWalletImageGenerationByRequest(
+  prisma: PrismaClient,
+  userId: string,
+  clientRequestId: string,
+) {
+  const request = await prisma.aiRequest.findUnique({
+    where: {
+      userId_clientRequestId: {
+        userId,
+        clientRequestId,
+      },
+    },
+    select: {
+      capability: true,
+      status: true,
+      result: true,
+      completedAt: true,
+    },
+  });
+  if (!request || request.capability !== 'IMAGE') return null;
+  const result = parseWalletImageGenerationResult(request.result);
+  return {
+    status: request.status.toLowerCase(),
+    completedAt: request.completedAt?.getTime() ?? null,
+    ...(result ?? {}),
+  };
 }
 
 export type VideoInput = {

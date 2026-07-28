@@ -269,6 +269,7 @@ model AiRequest {
   status           AiRequestStatus @default(PENDING)
   estimatedCredits BigInt          @default(0)
   chargedCredits   BigInt          @default(0)
+  result           Json?
   createdAt        DateTime        @default(now())
   completedAt      DateTime?
   user             User            @relation(fields: [userId], references: [id], onDelete: Restrict)

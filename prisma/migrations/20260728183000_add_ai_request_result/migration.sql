@@ -1,0 +1,1 @@
+ALTER TABLE "AiRequest" ADD COLUMN "result" JSONB;

@@ -5,6 +5,7 @@ import {
   executeWalletImageGeneration,
   executeWalletVideoGeneration,
   executeWalletVideoStatus,
+  getWalletImageGenerationByRequest,
   listWalletImageModels,
 } from './image-service.js';
 import { getImageResult } from './image-result-store.js';
@@ -93,6 +94,10 @@ const videoStatusSchema = z.object({
 const imageModelsQuerySchema = z.object({
   provider: z.enum(['new-api', 'xais-chat', 'openai-compatible', 'custom']).nullish()
     .transform((value) => value ?? undefined),
+}).strict();
+
+const imageGenerationRequestParamsSchema = z.object({
+  clientRequestId: z.string().trim().min(8).max(128),
 }).strict();
 
 const imageResultQuerySchema = z.object({
@@ -437,6 +442,29 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       } catch (error) {
         return knownError(reply, error);
       }
+    },
+  );
+
+  app.get(
+    '/images/generations/by-request/:clientRequestId',
+    {
+      preHandler: app.authenticateAccessToken,
+      config: { rateLimit: { max: 120, timeWindow: '1 minute' } },
+    },
+    async (request, reply) => {
+      const parsed = imageGenerationRequestParamsSchema.safeParse(request.params);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'invalid_request', message: '生图请求 ID 无效' });
+      }
+      const result = await getWalletImageGenerationByRequest(
+        app.prisma,
+        request.user.sub,
+        parsed.data.clientRequestId,
+      );
+      if (!result) {
+        return reply.code(404).send({ error: 'image_request_not_found', message: '没有找到对应的生图任务' });
+      }
+      return result;
     },
   );
 
