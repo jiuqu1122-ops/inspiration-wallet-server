@@ -85,7 +85,9 @@ export const inspirationSpaceRoutes: FastifyPluginAsync = async (app) => {
     if (!parsed.success) return invalid(reply, '预览图 ID 无效');
     const url = await getInspirationPreviewRedirect(app.prisma, parsed.data.assetId);
     if (!url) return reply.code(404).send({ error: 'not_found', message: '预览图不存在' });
-    return reply.redirect(url);
+    return reply
+      .header('cross-origin-resource-policy', 'cross-origin')
+      .redirect(url);
   });
 
   app.get('/:shareId/download', async (request, reply) => {
