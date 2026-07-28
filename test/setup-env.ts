@@ -23,4 +23,4 @@ process.env.JWT_REFRESH_EXPIRES_IN = '30d';
 process.env.LICENSE_SIGNING_PUBLIC_KEY = testPublicKey.subarray(-32).toString('base64');
 process.env.LICENSE_SIGNING_PRIVATE_KEY = Buffer.alloc(32, 7).toString('base64');
 process.env.PROVIDER_SECRETS_ENCRYPTION_KEY = Buffer.alloc(32, 9).toString('base64');
-process.env.CORS_ALLOWED_ORIGINS = '';
+process.env.CORS_ALLOWED_ORIGINS = 'https://www.unmind.art';
