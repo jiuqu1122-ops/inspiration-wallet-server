@@ -10,6 +10,7 @@ import { accountRoutes } from './modules/users/routes.js';
 import { walletRoutes } from './modules/wallets/routes.js';
 import { adminRoutes } from './modules/admin/routes.js';
 import { aiRoutes } from './modules/ai/routes.js';
+import { inspirationSpaceRoutes } from './modules/inspiration-space/routes.js';
 import { adminAuthPlugin } from './plugins/admin-auth.js';
 import { jwtPlugin } from './plugins/jwt.js';
 import { prismaPlugin } from './plugins/prisma.js';
@@ -65,6 +66,7 @@ export async function buildApp() {
       await v1.register(accountRoutes);
       await v1.register(walletRoutes, { prefix: '/wallet' });
       await v1.register(aiRoutes, { prefix: '/ai' });
+      await v1.register(inspirationSpaceRoutes, { prefix: '/inspiration-space' });
       await v1.register(adminRoutes, { prefix: '/admin' });
     },
     { prefix: '/v1' },

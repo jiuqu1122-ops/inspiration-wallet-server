@@ -88,6 +88,17 @@ enum CreditRedemptionCodeStatus {
   DISABLED
 }
 
+enum InspirationShareKind {
+  NODE_PRESET
+  WORKFLOW
+}
+
+enum InspirationShareStatus {
+  PENDING
+  PUBLISHED
+  REJECTED
+}
+
 model User {
   id                   String                       @id @default(cuid())
   email                String?                      @unique
@@ -317,4 +328,39 @@ model AiPricingConfig {
   videoModelPrices           Json
   createdAt                  DateTime @default(now())
   updatedAt                  DateTime @updatedAt
+}
+
+model InspirationShare {
+  id            String                 @id
+  kind          InspirationShareKind
+  status        InspirationShareStatus @default(PENDING)
+  title         String
+  description   String?
+  authorName    String
+  tags          String[]               @default([])
+  fileName      String
+  jsonPayload   Json
+  downloadCount Int                    @default(0)
+  createdAt     DateTime               @default(now())
+  updatedAt     DateTime               @updatedAt
+  publishedAt   DateTime?
+  previews      InspirationSharePreview[]
+
+  @@index([status, createdAt])
+  @@index([kind, status, createdAt])
+}
+
+model InspirationSharePreview {
+  id         String           @id
+  shareId    String
+  objectKey  String           @unique
+  mimeType   String
+  width      Int
+  height     Int
+  sizeBytes  Int
+  sortOrder  Int
+  createdAt  DateTime         @default(now())
+  share      InspirationShare @relation(fields: [shareId], references: [id], onDelete: Cascade)
+
+  @@index([shareId, sortOrder])
 }

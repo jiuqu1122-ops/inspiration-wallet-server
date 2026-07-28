@@ -17,6 +17,7 @@ import {
   getAiPricingConfig,
   updateAiPricingConfig,
 } from '../ai/pricing.js';
+import { inspirationSpaceAdminRoutes } from '../inspiration-space/admin-routes.js';
 
 const listUsersSchema = z.object({
   query: z.string().trim().max(200).optional(),
@@ -106,6 +107,7 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.authenticateAdmin);
 
   await app.register(providerAdminRoutes, { prefix: '/providers' });
+  await app.register(inspirationSpaceAdminRoutes, { prefix: '/inspiration-space' });
 
   app.get('/pricing', async () => getAiPricingConfig(app.prisma));
 

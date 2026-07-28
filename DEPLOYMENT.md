@@ -119,7 +119,7 @@ nano .env
 - `WORKER_HEALTH_FILE`：容器内 liveness 文件路径，通常保持默认值。
 - `ADMIN_API_KEY_HASH`：私有运营工作台管理员密钥的 SHA-256 哈希；原始管理员密钥只放密码管理器。
 - `PROVIDER_SECRETS_ENCRYPTION_KEY`：Base64 编码的 32 字节随机主密钥，用于 AES-256-GCM 加密上游渠道凭据。必须长期备份且不能随意轮换。
-- `CORS_ALLOWED_ORIGINS`：逗号分隔的精确来源。未确认 Tauri 实际 Origin 前保持为空，浏览器跨域请求将被拒绝；原生无 Origin 请求仍可访问。
+- `CORS_ALLOWED_ORIGINS`：逗号分隔的精确来源。网页管理后台和灵感空间上线时至少加入 `https://www.unmind.art,https://unmind.art`；本地联调可另外加入 `http://localhost:3000`。原生无 Origin 请求仍可访问。
 - `CADDY_ACME_EMAIL`：证书申请联系邮箱。
 
 不要把 NewAPI、XAIS 的 API Key 写入 `.env`；部署完成后从私有授权工作台提交，由后端加密保存。确认 `.env` 未被 Git 跟踪：
