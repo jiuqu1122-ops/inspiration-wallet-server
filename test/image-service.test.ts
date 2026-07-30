@@ -520,6 +520,64 @@ describe('wallet image provider normalization', () => {
     expect(multipartBody).toContain('name="async"\r\n\r\ntrue');
   });
 
+  it('falls back to JSON generations when a NewAPI image channel requires referenceBlobs', async () => {
+    const reference = 'https://1.1.1.1/reference.png';
+    const referenceBytes = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    const outputPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(referenceBytes, {
+        status: 200,
+        headers: {
+          'content-type': 'image/png',
+          'content-length': String(referenceBytes.byteLength),
+        },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: {
+          message: "submit failed: 422 {'error_code':'validation_error','message':\"Unsupported field(s): ['referenceImages']. Reference media must be supplied via 'referenceBlobs', not 'referenceImages' or 'referenceVideos'.\"}",
+        },
+      }), { status: 500, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        output: [{ result: outputPng }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      await expect(generateNewApiImages(
+        { baseUrl: 'https://provider.example', name: 'Image2 channel' } as Parameters<typeof generateNewApiImages>[0],
+        { apiKey: 'test-key', headers: {} },
+        {
+          userId: 'user-1',
+          clientRequestId: 'request-reference-protocol-fallback',
+          model: 'gpt-image-2',
+          prompt: 'keep the product and redesign the handle',
+          inputImages: [reference],
+          aspectRatio: '16:9',
+          resolution: '2K',
+          outputFormat: 'jpg',
+          count: 1,
+        },
+      )).resolves.toEqual([`data:image/png;base64,${outputPng}`]);
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(reference);
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://provider.example/v1/images/edits');
+    expect(fetchMock.mock.calls[2]?.[0]).toBe('https://provider.example/v1/images/generations');
+    const fallbackBody = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body));
+    expect(fallbackBody).toMatchObject({
+      model: 'gpt-image-2',
+      image: reference,
+      size: '2048x1152',
+      aspect_ratio: '16:9',
+      response_format: 'url',
+      stream: false,
+    });
+  });
+
   it('streams legacy public references through disk to the NewAPI edits endpoint', async () => {
     const reference = 'https://1.1.1.1/legacy-reference.png';
     const referenceBytes = Buffer.from('legacy-reference-image-bytes');

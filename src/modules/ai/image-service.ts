@@ -936,6 +936,25 @@ function isUnsupportedNewApiAsyncParameter(error: unknown) {
   return /(?:async|task).*(?:unsupported|unknown|invalid|not\s+allowed|not\s+support)|(?:unsupported|unknown|invalid).*(?:async|task)/i.test(error.message);
 }
 
+export function isNewApiReferenceProtocolCompatibilityError(error: unknown) {
+  if (!(error instanceof UpstreamImageError)
+    || ![400, 404, 405, 415, 422, 500, 501].includes(error.status)) return false;
+  return /(?:referenceImages|referenceVideos).{0,320}referenceBlobs|referenceBlobs.{0,320}(?:referenceImages|referenceVideos)|unsupported field(?:\(s\))?.{0,160}(?:reference|image)|(?:images\/edits|image edits?).{0,160}(?:unsupported|not supported|unknown|invalid|not found|method not allowed)|(?:unsupported|not supported|unknown|invalid|not found|method not allowed).{0,160}(?:images\/edits|image edits?)/i
+    .test(error.message);
+}
+
+async function requestNewApiImageWithAsyncFallback(
+  preferAsync: boolean,
+  request: (asyncOverride: boolean) => Promise<unknown>,
+) {
+  try {
+    return await request(preferAsync);
+  } catch (error) {
+    if (!preferAsync || !isUnsupportedNewApiAsyncParameter(error)) throw error;
+    return request(false);
+  }
+}
+
 async function providerNewApiImageEditRequest(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
@@ -1023,10 +1042,35 @@ export async function generateNewApiImages(
         stagedImages.push(await stageNewApiEditImage(input.inputImages[index]!, index));
       }
       try {
-        started = await providerNewApiImageEditRequest(provider, secrets, input, stagedImages, preferAsync);
+        started = await requestNewApiImageWithAsyncFallback(
+          preferAsync,
+          asyncOverride => providerNewApiImageEditRequest(
+            provider,
+            secrets,
+            input,
+            stagedImages,
+            asyncOverride,
+          ),
+        );
       } catch (error) {
-        if (!preferAsync || !isUnsupportedNewApiAsyncParameter(error)) throw error;
-        started = await providerNewApiImageEditRequest(provider, secrets, input, stagedImages, false);
+        if (!isNewApiReferenceProtocolCompatibilityError(error)) throw error;
+        console.warn('[newapi_image_reference_protocol_fallback]', {
+          provider: provider.name,
+          model: input.model,
+          from: 'images/edits',
+          to: 'images/generations',
+          reason: error instanceof Error ? error.message.slice(0, 320) : String(error).slice(0, 320),
+        });
+        started = await requestNewApiImageWithAsyncFallback(
+          preferAsync,
+          asyncOverride => providerRequest(
+            provider,
+            secrets,
+            '/v1/images/generations',
+            buildNewApiImageGenerationBody(input, input.inputImages, asyncOverride),
+            IMAGE_GENERATION_TIMEOUT_MS,
+          ),
+        );
       }
     } else {
       const startGeneration = (asyncOverride: boolean) => providerRequest(
@@ -1036,12 +1080,7 @@ export async function generateNewApiImages(
         buildNewApiImageGenerationBody(input, input.inputImages, asyncOverride),
         IMAGE_GENERATION_TIMEOUT_MS,
       );
-      try {
-        started = await startGeneration(preferAsync);
-      } catch (error) {
-        if (!preferAsync || !isUnsupportedNewApiAsyncParameter(error)) throw error;
-        started = await startGeneration(false);
-      }
+      started = await requestNewApiImageWithAsyncFallback(preferAsync, startGeneration);
     }
   } finally {
     await Promise.all(stagedImages.map((image) => image.cleanup().catch(() => {})));
