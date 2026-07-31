@@ -285,6 +285,39 @@ describe('wallet image provider normalization', () => {
       .toEqual([`data:image/png;base64,${rawPng}`]);
   });
 
+  it('keeps an XAIS image when a stale unknown-error field accompanies the result', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ task_id: 'task-unknown-error' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        status: 'success',
+        error: 'unknown error',
+        result: { url: 'https://xais.example.test/output.png' },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(runXaisWorkerTask(
+      { baseUrl: 'https://provider.example' } as Parameters<typeof runXaisWorkerTask>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-unknown-error',
+        clientRequestId: 'request-unknown-error',
+        model: 'Xais Nano Pro_2K',
+        prompt: 'return the generated image',
+        inputImages: [],
+        aspectRatio: '1:1',
+        resolution: '2K',
+        outputFormat: 'jpg',
+        count: 1,
+      },
+    )).resolves.toBe('https://xais.example.test/output.png');
+  });
+
   it('accepts XAIS task IDs returned as plain text or nested results', () => {
     expect(parseXaisTaskId('task-plain-123')).toBe('task-plain-123');
     expect(parseXaisTaskId({ results: [{ taskid: 456789 }] })).toBe('456789');

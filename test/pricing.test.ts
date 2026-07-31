@@ -44,6 +44,19 @@ describe('AI credit pricing', () => {
     expect(new Set(modelTokens).size).toBe(modelTokens.length);
   });
 
+  it('removes retired XAIS 1K models and omits 1K prices for XAIS and Nano models', () => {
+    const models = defaultAiPricingConfig().imageModels;
+    expect(models.some((item) => aiPricingModelToken(item.model) === 'xaisnanolite1k')).toBe(false);
+    expect(models.some((item) => aiPricingModelToken(item.model) === 'xaisimg21k')).toBe(false);
+    expect(models.find((item) => item.model === 'Xais Nano2_2K')).toEqual(expect.objectContaining({
+      model: 'Xais Nano2_2K',
+      credits2k: '15',
+      credits4k: '18',
+    }));
+    expect(models.find((item) => item.model === 'Xais Nano2_2K')?.credits1k).toBeUndefined();
+    expect(models.find((item) => item.model === 'gpt-image-2')?.credits1k).toBeDefined();
+  });
+
   it('uses exact configured model prices and configured unknown-model defaults', async () => {
     const prisma = prismaWithPricing({
       agentRequestCredits: 8n,

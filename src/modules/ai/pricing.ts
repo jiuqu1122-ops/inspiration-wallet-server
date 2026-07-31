@@ -3,7 +3,7 @@ import { env } from '../../config/env.js';
 
 export type ImageModelCreditPrice = {
   model: string;
-  credits1k: string;
+  credits1k?: string | undefined;
   credits2k: string;
   credits4k: string;
 };
@@ -38,8 +38,6 @@ const KNOWN_IMAGE_MODELS = [
   'Xais Nano Pro_4K',
   'Xais Nano2_2K',
   'Xais Nano2_4K',
-  'Xais Nano_Lite_1K',
-  'Xais img2_1k',
   'Xais Img2_2K',
   'Xais Img2_4K',
   'Xais Img2_2K(高画质)',
@@ -56,6 +54,28 @@ export const aiPricingModelToken = (model: string) => model
   .replace(/高画质/g, 'highquality')
   .replace(/preview/g, '')
   .replace(/[^a-z0-9]+/g, '');
+
+const RETIRED_IMAGE_MODEL_TOKENS = new Set([
+  'xaisnanolite1k',
+  'xaisimg21k',
+  'xaisimage21k',
+]);
+
+const isRetiredImageModel = (model: string) => RETIRED_IMAGE_MODEL_TOKENS.has(aiPricingModelToken(model));
+
+const supportsImageOneK = (model: string) => {
+  const token = aiPricingModelToken(model);
+  return !token.startsWith('xais')
+    && !token.includes('nanobananapro')
+    && !token.includes('nanobanana2')
+    && !token.includes('nanopro')
+    && !token.includes('nano2')
+    && !token.includes('nanolite')
+    && !token.includes('gemini3proimage')
+    && !token.includes('gemini31proimage')
+    && !token.includes('gemini31flashimage')
+    && !token.includes('gemini3flashimage');
+};
 
 export type PricedImageResolution = '1k' | '2k' | '4k';
 
@@ -110,7 +130,7 @@ export function defaultImageUnitCredits(model: string, resolution?: string) {
 const defaultImageModelPrices = (): ImageModelCreditPrice[] => (
   KNOWN_IMAGE_MODELS.map((model) => ({
     model,
-    credits1k: defaultImageUnitCredits(model, '1k').toString(),
+    ...(supportsImageOneK(model) ? { credits1k: defaultImageUnitCredits(model, '1k').toString() } : {}),
     credits2k: defaultImageUnitCredits(model, '2k').toString(),
     credits4k: defaultImageUnitCredits(model, '4k').toString(),
   }))
@@ -146,12 +166,13 @@ const normalizeStoredImageModels = (value: Prisma.JsonValue): ImageModelCreditPr
     const record = item as Record<string, unknown>;
     const model = typeof record.model === 'string' ? record.model.trim() : '';
     if (!model
-      || !validCreditString(record.credits1k)
+      || isRetiredImageModel(model)
       || !validCreditString(record.credits2k)
-      || !validCreditString(record.credits4k)) return [];
+      || !validCreditString(record.credits4k)
+      || (supportsImageOneK(model) && !validCreditString(record.credits1k))) return [];
     return [{
       model,
-      credits1k: record.credits1k,
+      ...(supportsImageOneK(model) ? { credits1k: record.credits1k as string } : {}),
       credits2k: record.credits2k,
       credits4k: record.credits4k,
     }];
@@ -188,6 +209,18 @@ export async function updateAiPricingConfig(
   prisma: PrismaClient,
   input: AiPricingConfigInput,
 ): Promise<AiPricingConfigValue> {
+  const imageModels = input.imageModels.flatMap((item) => {
+    const model = item.model.trim();
+    if (!model || isRetiredImageModel(model)) return [];
+    return [{
+      model,
+      ...(supportsImageOneK(model) && item.credits1k !== undefined
+        ? { credits1k: item.credits1k }
+        : {}),
+      credits2k: item.credits2k,
+      credits4k: item.credits4k,
+    }];
+  });
   await prisma.aiPricingConfig.upsert({
     where: { id: 'default' },
     create: {
@@ -196,7 +229,7 @@ export async function updateAiPricingConfig(
       inspirationAnalysisCredits: BigInt(input.inspirationAnalysisCredits),
       imageDefaultCredits: BigInt(input.imageDefaultCredits),
       videoDefaultCredits: BigInt(input.videoDefaultCredits),
-      imageModelPrices: input.imageModels,
+      imageModelPrices: imageModels,
       videoModelPrices: input.videoModels,
     },
     update: {
@@ -204,7 +237,7 @@ export async function updateAiPricingConfig(
       inspirationAnalysisCredits: BigInt(input.inspirationAnalysisCredits),
       imageDefaultCredits: BigInt(input.imageDefaultCredits),
       videoDefaultCredits: BigInt(input.videoDefaultCredits),
-      imageModelPrices: input.imageModels,
+      imageModelPrices: imageModels,
       videoModelPrices: input.videoModels,
     },
   });
@@ -237,7 +270,7 @@ export async function configuredImageUnitCredits(
   const selectedResolution = pricedImageResolution(model, resolution);
   return BigInt(
     selectedResolution === '1k'
-      ? exact.credits1k
+      ? exact.credits1k ?? exact.credits2k
       : selectedResolution === '4k' ? exact.credits4k : exact.credits2k,
   );
 }

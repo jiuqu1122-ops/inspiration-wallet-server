@@ -68,7 +68,7 @@ const pricingCreditsSchema = z.string()
   .refine((value) => BigInt(value) <= 1_000_000n, 'Credits must not exceed 1000000');
 const imageModelPriceSchema = z.object({
   model: z.string().trim().min(1).max(200),
-  credits1k: pricingCreditsSchema,
+  credits1k: pricingCreditsSchema.optional(),
   credits2k: pricingCreditsSchema,
   credits4k: pricingCreditsSchema,
 }).strict();

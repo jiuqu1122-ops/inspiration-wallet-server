@@ -1526,6 +1526,16 @@ function getTaskId(value: unknown): string {
 
 export const parseXaisTaskId = getTaskId;
 
+function isXaisPendingMessage(value: string) {
+  return /(?:pending|queued|queue|running|processing|in[_\s-]?progress|progress|waiting|not\s+ready|not\s+finished|unfinished|no\s+result|no\s+output|empty\s+result|result\s+empty)/i.test(value);
+}
+
+function normalizeXaisFailure(value: string) {
+  const normalized = value.trim();
+  if (!normalized || /^unknown error$/i.test(normalized) || isXaisPendingMessage(normalized)) return '';
+  return normalized;
+}
+
 function getFailure(value: unknown): string {
   if (!value || typeof value !== 'object') return '';
   if (Array.isArray(value)) {
@@ -1538,11 +1548,16 @@ function getFailure(value: unknown): string {
   const record = value as Record<string, unknown>;
   for (const key of ['error', 'err', 'fail_reason', 'failure_reason']) {
     const candidate = record[key];
-    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+    if (typeof candidate === 'string') {
+      const failure = normalizeXaisFailure(candidate);
+      if (failure) return failure;
+    }
   }
   const status = typeof record.status === 'string' ? record.status.toLowerCase() : '';
   if (/^(failed|failure|error|cancelled|canceled)$/.test(status)) {
-    return typeof record.message === 'string' ? record.message : status;
+    return typeof record.message === 'string'
+      ? normalizeXaisFailure(record.message) || ''
+      : status;
   }
   for (const key of ['data', 'result', 'task', 'response']) {
     const found = getFailure(record[key]);
