@@ -2,10 +2,11 @@ import { Prisma } from '@prisma/client';
 import type { AiCapability, AiProviderChannel, PrismaClient } from '@prisma/client';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { mkdtemp, open, rm, stat } from 'node:fs/promises';
+import { mkdtemp, open, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
+import sharp from 'sharp';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
 import { CloudAiError } from './service.js';
@@ -20,6 +21,7 @@ import {
 import {
   createImageResultFromFile,
   createImageResultFromResponse,
+  getImageResult,
   isStoredImageResultUrl,
 } from './image-result-store.js';
 
@@ -37,6 +39,9 @@ const XAIS_ATTACHMENT_CACHE_MAX_ENTRIES = 64;
 const XAIS_ATTACHMENT_UPLOAD_CONCURRENCY = 2;
 const XAIS_REFERENCE_DOWNLOAD_ATTEMPTS = 3;
 const XAIS_REFERENCE_DOWNLOAD_RETRY_DELAYS_MS = [500, 1_500];
+const XAIS_IMAGE_TASK_POLL_INTERVAL_MS = 1_200;
+const XAIS_IMAGE_TASK_POLL_REQUEST_TIMEOUT_MS = 6_000;
+const GPT_IMAGE_2_CHROMA_KEY = { red: 255, green: 0, blue: 255 } as const;
 const imageReferenceCache = new Map<string, { dataUrl: string; expiresAt: number }>();
 const pendingImageReferenceFetches = new Map<string, Promise<string>>();
 
@@ -568,14 +573,31 @@ export function newApiImageRequestParams(
     size,
     aspect_ratio: ratio,
     ...(family === 'gpt-image-2' ? { quality: 'medium' } : {}),
-    ...(transparentPng ? { output_format: 'png', background: 'transparent' } : {}),
+    ...(transparentPng ? {
+      output_format: 'png',
+      // GPT Image 2 does not reliably support native alpha. Sending
+      // background=transparent makes some NewAPI channels reject the edits
+      // request and can trigger a reference-dropping generations fallback.
+      // Its result is chroma-keyed and converted to real alpha below.
+      ...(family === 'gpt-image-2' ? {} : { background: 'transparent' }),
+    } : {}),
   };
+}
+
+function requiresGptImage2AlphaPostProcessing(input: ImageInput) {
+  return newApiImageFamily(input.model) === 'gpt-image-2'
+    && (input.outputFormat === 'png' || input.background === 'transparent');
 }
 
 function promptWithConstraints(input: ImageInput) {
   const constraints = [`must output exactly ${input.aspectRatio} aspect ratio`];
   if (input.resolution) constraints.push(`target resolution ${input.resolution}`);
-  if (input.background === 'transparent') {
+  if (input.inputImages.length > 0) {
+    constraints.push('treat every supplied reference image as authoritative and preserve its subject, geometry, details, colors, and branding outside changes explicitly requested by the user');
+  }
+  if (requiresGptImage2AlphaPostProcessing(input)) {
+    constraints.push('replace only the background with one perfectly uniform solid RGB(255,0,255) chroma-key color; do not draw a transparency checkerboard, gradient, texture, reflection, or shadow in the background; do not use RGB(255,0,255) on the subject');
+  } else if (input.background === 'transparent') {
     constraints.push('use a truly transparent background with an alpha channel, not a checkerboard pattern');
   }
   return `${input.prompt.trim()}\n\nStrict image constraints: ${constraints.join(', ')}.`;
@@ -922,6 +944,116 @@ async function stageNewApiEditImage(
   }
 }
 
+function chromaKeyDistance(red: number, green: number, blue: number) {
+  return Math.sqrt(
+    (GPT_IMAGE_2_CHROMA_KEY.red - red) ** 2
+    + (GPT_IMAGE_2_CHROMA_KEY.green - green) ** 2
+    + (GPT_IMAGE_2_CHROMA_KEY.blue - blue) ** 2,
+  );
+}
+
+function clampImageByte(value: number) {
+  return Math.max(0, Math.min(255, Math.round(value)));
+}
+
+export async function convertGptImage2ChromaKeyToTransparentPng(source: Buffer) {
+  const decoded = await sharp(source)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const { width, height, channels } = decoded.info;
+  if (channels !== 4 || width <= 0 || height <= 0) {
+    throw new Error('GPT Image 2 returned an image that could not be converted to RGBA');
+  }
+
+  const pixels = width * height;
+  const raw = decoded.data;
+  let existingTransparentPixels = 0;
+  for (let offset = 3; offset < raw.length; offset += channels) {
+    if (raw[offset]! < 250) existingTransparentPixels += 1;
+  }
+  if (existingTransparentPixels >= Math.max(8, Math.floor(pixels * 0.0001))) {
+    return sharp(raw, { raw: { width, height, channels } }).png().toBuffer();
+  }
+
+  const borderBand = Math.max(1, Math.round(Math.min(width, height) * 0.02));
+  let keyPixels = 0;
+  let borderPixels = 0;
+  let borderKeyPixels = 0;
+  for (let pixel = 0; pixel < pixels; pixel += 1) {
+    const offset = pixel * channels;
+    const x = pixel % width;
+    const y = Math.floor(pixel / width);
+    const distance = chromaKeyDistance(raw[offset]!, raw[offset + 1]!, raw[offset + 2]!);
+    const isKey = distance <= 88;
+    if (isKey) keyPixels += 1;
+    if (x < borderBand || x >= width - borderBand || y < borderBand || y >= height - borderBand) {
+      borderPixels += 1;
+      if (isKey) borderKeyPixels += 1;
+    }
+  }
+  const keyRatio = keyPixels / pixels;
+  const borderKeyRatio = borderPixels > 0 ? borderKeyPixels / borderPixels : 0;
+  if (keyRatio < 0.005 && borderKeyRatio < 0.08) {
+    throw new Error('GPT Image 2 did not return a usable chroma-key background; refusing to return a fake transparent PNG');
+  }
+
+  const fullyTransparentDistance = 24;
+  const fullyOpaqueDistance = 110;
+  let transparentPixels = 0;
+  for (let pixel = 0; pixel < pixels; pixel += 1) {
+    const offset = pixel * channels;
+    const red = raw[offset]!;
+    const green = raw[offset + 1]!;
+    const blue = raw[offset + 2]!;
+    const distance = chromaKeyDistance(red, green, blue);
+    const foregroundAlpha = Math.max(0, Math.min(1,
+      (distance - fullyTransparentDistance) / (fullyOpaqueDistance - fullyTransparentDistance),
+    ));
+    if (foregroundAlpha >= 1) continue;
+    const alpha = clampImageByte(255 * foregroundAlpha);
+    raw[offset + 3] = alpha;
+    if (alpha < 250) transparentPixels += 1;
+    if (foregroundAlpha > 0.02) {
+      raw[offset] = clampImageByte((red - GPT_IMAGE_2_CHROMA_KEY.red * (1 - foregroundAlpha)) / foregroundAlpha);
+      raw[offset + 1] = clampImageByte((green - GPT_IMAGE_2_CHROMA_KEY.green * (1 - foregroundAlpha)) / foregroundAlpha);
+      raw[offset + 2] = clampImageByte((blue - GPT_IMAGE_2_CHROMA_KEY.blue * (1 - foregroundAlpha)) / foregroundAlpha);
+    }
+  }
+  if (transparentPixels < Math.max(8, Math.floor(pixels * 0.0001))) {
+    throw new Error('GPT Image 2 background conversion produced no transparent pixels');
+  }
+  return sharp(raw, { raw: { width, height, channels } }).png().toBuffer();
+}
+
+async function readNewApiResultBytes(source: string, index: number) {
+  if (isStoredImageResultUrl(source)) {
+    const key = new URL(source).pathname.split('/').filter(Boolean).pop();
+    const stored = key ? await getImageResult(key) : null;
+    if (!stored) throw new Error('stored GPT Image 2 result is no longer available');
+    return readFile(stored.path);
+  }
+  const staged = await stageNewApiEditImage(source, index);
+  try {
+    if (staged.bytes) return staged.bytes;
+    if (staged.path) return await readFile(staged.path);
+    throw new Error('GPT Image 2 result returned no readable bytes');
+  } finally {
+    await staged.cleanup().catch(() => {});
+  }
+}
+
+async function createTransparentGptImage2Result(source: string, index: number) {
+  const sourceBytes = await readNewApiResultBytes(source, index);
+  const png = await convertGptImage2ChromaKeyToTransparentPng(sourceBytes);
+  return createImageResultFromResponse(new Response(new Uint8Array(png), {
+    headers: {
+      'content-type': 'image/png',
+      'content-length': String(png.byteLength),
+    },
+  }));
+}
+
 function newApiMultipartTextPart(boundary: string, name: string, value: string) {
   return Buffer.from(
     `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`,
@@ -1072,6 +1204,13 @@ export async function generateNewApiImages(
         );
       } catch (error) {
         if (!isNewApiReferenceProtocolCompatibilityError(error)) throw error;
+        if (newApiImageFamily(input.model) === 'gpt-image-2') {
+          throw new CloudAiError(
+            'provider_reference_edit_unsupported',
+            `NewAPI 渠道 ${provider.name || provider.id} 不支持 GPT Image 2 参考图编辑，已停止该渠道，避免参考图被忽略`,
+            502,
+          );
+        }
         console.warn('[newapi_image_reference_protocol_fallback]', {
           provider: provider.name,
           model: input.model,
@@ -1110,23 +1249,33 @@ export async function generateNewApiImages(
     input.inputImages,
     input.count,
   );
-  return Promise.all(images.map(async (source, index) => {
-    if (!isPublicNewApiImageReference(source) || isStoredImageResultUrl(source)) return source;
+  const output: string[] = [];
+  for (let index = 0; index < images.length; index += 1) {
+    const source = images[index]!;
+    if (requiresGptImage2AlphaPostProcessing(input)) {
+      output.push(await createTransparentGptImage2Result(source, index));
+      continue;
+    }
+    if (!isPublicNewApiImageReference(source) || isStoredImageResultUrl(source)) {
+      output.push(source);
+      continue;
+    }
     let staged: StagedNewApiEditImage | null = null;
     try {
       staged = await stageNewApiEditImage(source, index);
-      return await createImageResultFromFile(staged.path!, staged.mime);
+      output.push(await createImageResultFromFile(staged.path!, staged.mime));
     } catch (error) {
       console.warn('[newapi_image_result_mirror_failed]', {
         provider: provider.name,
         index,
         error: error instanceof Error ? error.message : String(error),
       });
-      return source;
+      output.push(source);
     } finally {
       if (staged) await staged.cleanup().catch(() => {});
     }
-  }));
+  }
+  return output;
 }
 
 type StagedXaisReference = {
@@ -1685,28 +1834,35 @@ export async function runXaisWorkerTask(
   }
   const deadline = Date.now() + IMAGE_GENERATION_TIMEOUT_MS;
   let lastTransientError: unknown = null;
+  let pollAttempt = 0;
   while (Date.now() < deadline) {
-    await delay(2_200);
-    let waited: unknown;
+    if (pollAttempt > 0) await delay(XAIS_IMAGE_TASK_POLL_INTERVAL_MS);
+    pollAttempt += 1;
+    let waited: unknown = null;
     try {
       waited = await providerRequest(
         provider,
         secrets,
         `/xais/workerTaskWait?json=1&id=${encodeURIComponent(taskId)}`,
         undefined,
-        45_000,
+        XAIS_IMAGE_TASK_POLL_REQUEST_TIMEOUT_MS,
       );
       lastTransientError = null;
     } catch (error) {
       if (!isRetryableXaisPollError(error)) throw error;
       lastTransientError = error;
-      continue;
     }
-    const failure = getFailure(waited);
-    if (failure) throw new Error(failure);
-    const images = uniqueImages(waited, input.inputImages, 1);
-    if (images.length) return images[0]!;
-    for (const attachment of collectAttachmentIds(waited)) {
+    if (waited !== null) {
+      const failure = getFailure(waited);
+      if (failure) throw new Error(failure);
+      const images = uniqueImages(waited, input.inputImages, 1);
+      if (images.length) return images[0]!;
+    }
+    const attachments = Array.from(new Set([
+      taskId,
+      ...collectAttachmentIds(waited),
+    ]));
+    for (const attachment of attachments) {
       let resolved: unknown;
       try {
         resolved = await providerRequest(
@@ -1714,11 +1870,14 @@ export async function runXaisWorkerTask(
           secrets,
           `/xais/attUrls?att=${encodeURIComponent(attachment)}`,
           undefined,
-          45_000,
+          XAIS_IMAGE_TASK_POLL_REQUEST_TIMEOUT_MS,
         );
         lastTransientError = null;
       } catch (error) {
-        if (!isRetryableXaisPollError(error)) throw error;
+        const isTaskIdProbe = attachment === taskId;
+        const isAuthorizationFailure = error instanceof UpstreamImageError
+          && (error.status === 401 || error.status === 403);
+        if (isAuthorizationFailure || (!isTaskIdProbe && !isRetryableXaisPollError(error))) throw error;
         lastTransientError = error;
         continue;
       }

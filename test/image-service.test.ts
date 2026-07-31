@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { access, readFile, rm } from 'node:fs/promises';
+import sharp from 'sharp';
 import {
   IMAGE_GENERATION_TIMEOUT_MS,
   buildNewApiImageGenerationBody,
   chooseProviderForCapability,
   collectProviderModelIds,
   confirmXaisReferenceAttachment,
+  convertGptImage2ChromaKeyToTransparentPng,
   filterProviderImageModels,
   generateNewApiImages,
   getWalletImageGenerationByRequest,
@@ -318,6 +320,47 @@ describe('wallet image provider normalization', () => {
     )).resolves.toBe('https://xais.example.test/output.png');
   });
 
+  it('resolves a completed XAIS image directly from its task ID when the wait response is stale', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ task_id: 'task-stale-wait' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'processing' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: { url: 'https://xais.example.test/completed-from-task-id.png' },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(runXaisWorkerTask(
+      { baseUrl: 'https://provider.example' } as Parameters<typeof runXaisWorkerTask>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-stale-wait',
+        clientRequestId: 'request-stale-wait',
+        model: 'Xais Nano Pro_2K',
+        prompt: 'return the completed image without waiting for stale task state',
+        inputImages: [],
+        aspectRatio: '1:1',
+        resolution: '2K',
+        outputFormat: 'jpg',
+        count: 1,
+      },
+    )).resolves.toBe('https://xais.example.test/completed-from-task-id.png');
+
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      'https://provider.example/xais/workerTaskStart',
+      'https://provider.example/xais/workerTaskWait?json=1&id=task-stale-wait',
+      'https://provider.example/xais/attUrls?att=task-stale-wait',
+    ]);
+  });
+
   it('accepts XAIS task IDs returned as plain text or nested results', () => {
     expect(parseXaisTaskId('task-plain-123')).toBe('task-plain-123');
     expect(parseXaisTaskId({ results: [{ taskid: 456789 }] })).toBe('456789');
@@ -521,7 +564,7 @@ describe('wallet image provider normalization', () => {
     });
   });
 
-  it('passes transparent PNG output parameters to NewAPI', () => {
+  it('uses a chroma-key PNG request for GPT Image 2 instead of unsupported native alpha', () => {
     const body = buildNewApiImageGenerationBody({
       userId: 'user-1',
       clientRequestId: 'request-transparent-png',
@@ -535,10 +578,85 @@ describe('wallet image provider normalization', () => {
       count: 1,
     });
 
-    expect(body).toMatchObject({
-      output_format: 'png',
-      background: 'transparent',
+    expect(body).toMatchObject({ output_format: 'png' });
+    expect(body).not.toHaveProperty('background');
+    expect(body.prompt).toContain('RGB(255,0,255)');
+    expect(body.prompt).toContain('do not draw a transparency checkerboard');
+  });
+
+  it('converts the GPT Image 2 chroma key into real PNG alpha', async () => {
+    const source = await sharp({
+      create: {
+        width: 8,
+        height: 8,
+        channels: 4,
+        background: { r: 255, g: 0, b: 255, alpha: 1 },
+      },
+    }).composite([{
+      input: Buffer.from('<svg width="8" height="8"><rect x="2" y="2" width="4" height="4" fill="#111111"/></svg>'),
+    }]).png().toBuffer();
+
+    const converted = await convertGptImage2ChromaKeyToTransparentPng(source);
+    const { data, info } = await sharp(converted).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    const alphaAt = (x: number, y: number) => data[(y * info.width + x) * info.channels + 3];
+    expect(alphaAt(0, 0)).toBe(0);
+    expect(alphaAt(3, 3)).toBe(255);
+  });
+
+  it('keeps transparent GPT Image 2 reference requests on the multipart edits endpoint', async () => {
+    const reference = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
+    const generated = await sharp({
+      create: {
+        width: 8,
+        height: 8,
+        channels: 4,
+        background: { r: 255, g: 0, b: 255, alpha: 1 },
+      },
+    }).composite([{
+      input: Buffer.from('<svg width="8" height="8"><rect x="2" y="2" width="4" height="4" fill="#111111"/></svg>'),
+    }]).png().toBuffer();
+    let multipartBody = '';
+    const fetchMock = vi.fn().mockImplementation(async (_url, init) => {
+      multipartBody = Buffer.from(await new Response(init?.body as BodyInit).arrayBuffer()).toString('utf8');
+      return new Response(JSON.stringify({ output: [{ result: generated.toString('base64') }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
     });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const [result] = await generateNewApiImages(
+      { baseUrl: 'https://provider.example', name: 'Image2 channel' } as Parameters<typeof generateNewApiImages>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-1',
+        clientRequestId: 'request-transparent-reference',
+        model: 'gpt-image-2',
+        prompt: 'remove only the background',
+        inputImages: [reference],
+        aspectRatio: '1:1',
+        resolution: '2K',
+        outputFormat: 'png',
+        background: 'transparent',
+        count: 1,
+      },
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://provider.example/v1/images/edits');
+    expect(multipartBody).toContain('name="image"; filename="reference-1.png"');
+    expect(multipartBody).toContain('name="output_format"\r\n\r\npng');
+    expect(multipartBody).not.toContain('name="background"');
+    expect(multipartBody).toContain('treat every supplied reference image as authoritative');
+    expect(result).toContain('/v1/ai/image-results/');
+
+    const key = new URL(result!).pathname.split('/').pop()!;
+    const stored = await getImageResult(key);
+    expect(stored?.mime).toBe('image/png');
+    const { data, info } = await sharp(stored!.path).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    expect(data[3]).toBe(0);
+    expect(data[(3 * info.width + 3) * info.channels + 3]).toBe(255);
+    await rm(stored!.path, { force: true });
   });
 
   it('uploads inline references through the NewAPI multipart edits endpoint', async () => {
@@ -579,7 +697,7 @@ describe('wallet image provider normalization', () => {
     expect(multipartBody).toContain('name="async"\r\n\r\ntrue');
   });
 
-  it('falls back to JSON generations when a NewAPI image channel requires referenceBlobs', async () => {
+  it('falls back to JSON generations for compatible Nano channels that require referenceBlobs', async () => {
     const reference = 'https://1.1.1.1/reference.png';
     const referenceBytes = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
     const outputPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
@@ -609,7 +727,7 @@ describe('wallet image provider normalization', () => {
         {
           userId: 'user-1',
           clientRequestId: 'request-reference-protocol-fallback',
-          model: 'gpt-image-2',
+          model: 'gemini-3-pro-image',
           prompt: 'keep the product and redesign the handle',
           inputImages: [reference],
           aspectRatio: '16:9',
@@ -628,13 +746,56 @@ describe('wallet image provider normalization', () => {
     expect(fetchMock.mock.calls[2]?.[0]).toBe('https://provider.example/v1/images/generations');
     const fallbackBody = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body));
     expect(fallbackBody).toMatchObject({
-      model: 'gpt-image-2',
+      model: 'gemini-3-pro-image',
       image: reference,
       size: '2048x1152',
       aspect_ratio: '16:9',
+      output_resolution: '2K',
+      image_size: '2K',
       response_format: 'url',
       stream: false,
     });
+  });
+
+  it('never drops GPT Image 2 references into the generations fallback', async () => {
+    const reference = 'https://1.1.1.1/reference.png';
+    const referenceBytes = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(referenceBytes, {
+        status: 200,
+        headers: {
+          'content-type': 'image/png',
+          'content-length': String(referenceBytes.byteLength),
+        },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: {
+          message: 'images/edits is not supported by this channel',
+        },
+      }), { status: 400, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateNewApiImages(
+      { id: 'channel-1', baseUrl: 'https://provider.example', name: 'Image2 channel' } as Parameters<typeof generateNewApiImages>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-1',
+        clientRequestId: 'request-reference-no-fallback',
+        model: 'gpt-image-2',
+        prompt: 'keep the reference product unchanged',
+        inputImages: [reference],
+        aspectRatio: '16:9',
+        resolution: '2K',
+        outputFormat: 'jpg',
+        count: 1,
+      },
+    )).rejects.toMatchObject({
+      code: 'provider_reference_edit_unsupported',
+      statusCode: 502,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.some(call => String(call[0]).endsWith('/v1/images/generations'))).toBe(false);
   });
 
   it('streams legacy public references through disk to the NewAPI edits endpoint', async () => {
