@@ -53,6 +53,7 @@ export async function upload(input: {
 }) {
   const name = objectName(input.namespace, input.filename);
   const result = await requireClient().put(name, input.source, {
+    timeout: 30_000,
     headers: {
       'Content-Type': input.mime,
       'Cache-Control': 'private, max-age=86400, immutable',
@@ -81,7 +82,7 @@ export async function exists(name: string) {
     throw new Error('invalid OSS object name');
   }
   try {
-    await requireClient().head(name);
+    await requireClient().head(name, { timeout: 15_000 });
     return true;
   } catch (error) {
     if (isNotFound(error)) return false;

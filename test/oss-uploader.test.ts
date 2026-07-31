@@ -66,7 +66,10 @@ describe('OSS public bridge service', () => {
     );
     expect(url).toBe('https://test-bucket.oss-cn-hongkong.aliyuncs.com/generated-images/result.png?token=a%2Bb%3D');
     await expect(ossUploadService.exists(name)).resolves.toBe(true);
-    expect(ossMocks.head).toHaveBeenCalledWith('generated-images/result.png');
+    expect(ossMocks.head).toHaveBeenCalledWith(
+      'generated-images/result.png',
+      { timeout: 15_000 },
+    );
   });
 
   it('supports reference image deletion', async () => {

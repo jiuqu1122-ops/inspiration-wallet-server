@@ -229,16 +229,18 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       if (!result) {
         return reply.code(404).send({ error: 'not_found', message: 'Image result not found or expired' });
       }
-      let objectName: string;
+      let objectName = `generated-images/${key}`;
       try {
-        objectName = await ossUploadService.upload({
-          namespace: 'generated-images',
-          source: result.path,
-          filename: key,
-          mime: result.mime,
-        });
+        if (!await ossUploadService.exists(objectName)) {
+          objectName = await ossUploadService.upload({
+            namespace: 'generated-images',
+            source: result.path,
+            filename: key,
+            mime: result.mime,
+          });
+        }
       } catch (error) {
-        request.log.error({ key, errorName: error instanceof Error ? error.name : 'unknown' }, 'temporary OSS image upload failed');
+        request.log.error({ key, errorName: error instanceof Error ? error.name : 'unknown' }, 'temporary OSS image ensure failed');
         return reply.code(503).send({
           error: 'oss_upload_failed',
           message: 'Generated image could not be uploaded to the temporary download bridge',

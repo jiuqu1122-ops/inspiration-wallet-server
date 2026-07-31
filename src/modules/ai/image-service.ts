@@ -24,6 +24,7 @@ import {
   getImageResult,
   isStoredImageResultUrl,
 } from './image-result-store.js';
+import { ossUploadService } from './oss-uploader.js';
 
 export const IMAGE_GENERATION_TIMEOUT_MS = 15 * 60_000;
 const NEW_API_IMAGE_TASK_POLL_INTERVAL_MS = 3_000;
@@ -41,6 +42,7 @@ const XAIS_REFERENCE_DOWNLOAD_ATTEMPTS = 3;
 const XAIS_REFERENCE_DOWNLOAD_RETRY_DELAYS_MS = [500, 1_500];
 const XAIS_IMAGE_TASK_POLL_INTERVAL_MS = 1_200;
 const XAIS_IMAGE_TASK_POLL_REQUEST_TIMEOUT_MS = 6_000;
+const XAIS_RESULT_MIRROR_TIMEOUT_MS = 30_000;
 const GPT_IMAGE_2_CHROMA_KEY = { red: 255, green: 0, blue: 255 } as const;
 const imageReferenceCache = new Map<string, { dataUrl: string; expiresAt: number }>();
 const pendingImageReferenceFetches = new Map<string, Promise<string>>();
@@ -944,6 +946,78 @@ async function stageNewApiEditImage(
   }
 }
 
+async function stagePublicGeneratedImageResult(source: string, index: number) {
+  const directory = await mkdtemp(join(tmpdir(), 'inspiration-generated-result-'));
+  const path = join(directory, 'result.bin');
+  try {
+    const staged = await downloadPublicImageReferenceToFile(
+      source,
+      path,
+      XAIS_RESULT_MIRROR_TIMEOUT_MS,
+    );
+    const fileSize = (await stat(path)).size;
+    if (fileSize !== staged.size) {
+      throw new Error(`generated image temporary file size mismatch: expected ${staged.size}, received ${fileSize}`);
+    }
+    return {
+      filename: `generated-${index + 1}.${newApiImageExtension(staged.mime)}`,
+      path,
+      mime: staged.mime,
+      size: staged.size,
+      cleanup: () => rm(directory, { recursive: true, force: true }),
+    } satisfies StagedNewApiEditImage;
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function mirrorPublicGeneratedImageResultToOss(source: string, index: number) {
+  const staged = await stagePublicGeneratedImageResult(source, index);
+  try {
+    if (!staged.path) throw new Error('generated image mirror did not create a temporary file');
+    const stableUrl = await createImageResultFromFile(staged.path, staged.mime);
+    const key = new URL(stableUrl).pathname.split('/').filter(Boolean).pop();
+    const stored = key ? await getImageResult(key) : null;
+    if (!key || !stored) throw new Error('generated image mirror could not reopen the stored result');
+    const objectName = await ossUploadService.upload({
+      namespace: 'generated-images',
+      filename: key,
+      source: stored.path,
+      mime: stored.mime,
+    });
+    if (!await ossUploadService.exists(objectName)) {
+      throw new Error('generated image mirror object is missing after upload');
+    }
+    // Validate that the object key can be signed before publishing the stable
+    // API URL. Clients resolve that URL to a fresh signed Hong Kong OSS URL.
+    ossUploadService.getPublicUrl(objectName, { mime: stored.mime, filename: key });
+    return stableUrl;
+  } finally {
+    await staged.cleanup().catch(() => {});
+  }
+}
+
+export async function mirrorXaisImageResults(
+  images: string[],
+  providerName: string,
+  mirrorImage: (source: string, index: number) => Promise<string> = mirrorPublicGeneratedImageResultToOss,
+) {
+  return Promise.all(images.map(async (source, index) => {
+    if (!isPublicNewApiImageReference(source) || isStoredImageResultUrl(source)) return source;
+    try {
+      return await mirrorImage(source, index);
+    } catch (error) {
+      console.warn('[xais_image_result_mirror_failed]', {
+        provider: providerName,
+        index,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return source;
+    }
+  }));
+}
+
 function chromaKeyDistance(red: number, green: number, blue: number) {
   return Math.sqrt(
     (GPT_IMAGE_2_CHROMA_KEY.red - red) ** 2
@@ -1352,9 +1426,13 @@ async function writeResponseBodyToFile(response: Response, path: string) {
   return { mime, size: total };
 }
 
-async function downloadPublicImageReferenceToFile(source: string, path: string) {
+async function downloadPublicImageReferenceToFile(
+  source: string,
+  path: string,
+  timeoutMs = IMAGE_REFERENCE_FETCH_TIMEOUT_MS,
+) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), IMAGE_REFERENCE_FETCH_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     let current = new URL(source);
     for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
@@ -2091,9 +2169,12 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
   const reservation = await reserveImageCredits(prisma, effectiveInput);
   try {
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-    const images = provider.kind === 'XAIS'
+    const providerImages = provider.kind === 'XAIS'
       ? await generateXaisImages(provider, secrets, effectiveInput)
       : await generateNewApiImages(provider, secrets, effectiveInput);
+    const images = provider.kind === 'XAIS'
+      ? await mirrorXaisImageResults(providerImages, provider.name)
+      : providerImages;
     if (!images.length) throw new Error('渠道没有返回图片数据');
     const charged = await settleImageCredits(
       prisma,

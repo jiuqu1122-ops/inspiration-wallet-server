@@ -53,6 +53,7 @@ describe('generated image OSS delivery route', () => {
   });
 
   it('uses the same object key for upload, verification, and signing', async () => {
+    bridgeMocks.exists.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
     const app = await makeApp();
     await app.inject({ method: 'GET', url: '/v1/ai/image-results/result.png?redirect=0' });
     expect(bridgeMocks.upload).toHaveBeenCalledWith(expect.objectContaining({
@@ -64,6 +65,15 @@ describe('generated image OSS delivery route', () => {
       'generated-images/result.png',
       expect.objectContaining({ mime: 'image/png', download: false }),
     );
+    await app.close();
+  });
+
+  it('reuses a result that was already mirrored to OSS by the worker', async () => {
+    const app = await makeApp();
+    const response = await app.inject({ method: 'GET', url: '/v1/ai/image-results/result.png?redirect=0' });
+    expect(response.statusCode).toBe(200);
+    expect(bridgeMocks.exists).toHaveBeenCalledWith('generated-images/result.png');
+    expect(bridgeMocks.upload).not.toHaveBeenCalled();
     await app.close();
   });
 
@@ -93,6 +103,7 @@ describe('generated image OSS delivery route', () => {
   });
 
   it('returns an explicit error when OSS upload fails', async () => {
+    bridgeMocks.exists.mockResolvedValueOnce(false);
     bridgeMocks.upload.mockRejectedValueOnce(new Error('put failed'));
     const app = await makeApp();
     const response = await app.inject({ method: 'GET', url: '/v1/ai/image-results/result.png?redirect=0' });
@@ -119,7 +130,7 @@ describe('generated image OSS delivery route', () => {
   });
 
   it('rejects a missing uploaded object before signing', async () => {
-    bridgeMocks.exists.mockResolvedValueOnce(false);
+    bridgeMocks.exists.mockResolvedValueOnce(false).mockResolvedValueOnce(false);
     const app = await makeApp();
     const response = await app.inject({ method: 'GET', url: '/v1/ai/image-results/result.png?redirect=0' });
     expect(response.statusCode).toBe(502);

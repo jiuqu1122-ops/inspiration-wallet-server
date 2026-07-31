@@ -18,6 +18,7 @@ import {
   isPublicNewApiImageReference,
   isRetryableXaisPollError,
   materializeNewApiReferenceImage,
+  mirrorXaisImageResults,
   newApiImageRequestParams,
   parseWalletImageGenerationResult,
   parseXaisTaskId,
@@ -318,6 +319,35 @@ describe('wallet image provider normalization', () => {
         count: 1,
       },
     )).resolves.toBe('https://xais.example.test/output.png');
+  });
+
+  it('replaces XAIS result URLs with stable mirrored result URLs', async () => {
+    const mirror = vi.fn(async (_source: string, index: number) => (
+      `https://api.unmind.art/v1/ai/image-results/mirrored-${index + 1}.png`
+    ));
+
+    await expect(mirrorXaisImageResults([
+      'https://xais.example.test/one.png',
+      'https://xais.example.test/two.png',
+    ], 'xais-primary', mirror)).resolves.toEqual([
+      'https://api.unmind.art/v1/ai/image-results/mirrored-1.png',
+      'https://api.unmind.art/v1/ai/image-results/mirrored-2.png',
+    ]);
+    expect(mirror).toHaveBeenCalledTimes(2);
+  });
+
+  it('falls back to the XAIS source URL when result mirroring fails', async () => {
+    const source = 'https://xais.example.test/result.png';
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const mirror = vi.fn(async () => { throw new Error('OSS unavailable'); });
+
+    await expect(mirrorXaisImageResults([source], 'xais-primary', mirror))
+      .resolves.toEqual([source]);
+    expect(warn).toHaveBeenCalledWith(
+      '[xais_image_result_mirror_failed]',
+      expect.objectContaining({ provider: 'xais-primary', index: 0 }),
+    );
+    warn.mockRestore();
   });
 
   it('resolves a completed XAIS image directly from its task ID when the wait response is stale', async () => {
