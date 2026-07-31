@@ -119,14 +119,19 @@ describe('wallet image provider normalization', () => {
 
   it('separates Nano Banana and GPT Image provider capabilities', () => {
     const nano = { capabilities: ['IMAGE_NANO_BANANA'] as const };
+    const nano2 = { capabilities: ['IMAGE_NANO_BANANA_2'] as const };
     const gpt = { capabilities: ['IMAGE_GPT'] as const };
     const legacy = { capabilities: ['IMAGE'] as const };
 
     expect(imageCapabilityForModel('gemini-3-pro-image')).toBe('IMAGE_NANO_BANANA');
     expect(imageCapabilityForModel('Xais Nano Pro_2K')).toBe('IMAGE_NANO_BANANA');
+    expect(imageCapabilityForModel('gemini-3.1-flash-image')).toBe('IMAGE_NANO_BANANA_2');
+    expect(imageCapabilityForModel('Nano Banana 2')).toBe('IMAGE_NANO_BANANA_2');
     expect(imageCapabilityForModel('gpt-image-2')).toBe('IMAGE_GPT');
     expect(imageCapabilityForModel('Image2_4K')).toBe('IMAGE_GPT');
     expect(providerSupportsImageModel(nano, 'gpt-image-2')).toBe(false);
+    expect(providerSupportsImageModel(nano, 'Nano Banana 2')).toBe(false);
+    expect(providerSupportsImageModel(nano2, 'Nano Banana 2')).toBe(true);
     expect(providerSupportsImageModel(gpt, 'gemini-3.1-flash-image')).toBe(false);
     expect(providerSupportsImageModel(legacy, 'custom-image-model')).toBe(true);
     expect(filterProviderImageModels(nano, [
@@ -177,6 +182,7 @@ describe('wallet image provider normalization', () => {
     expect(resolveXaisModel('Xais Nano Pro_2K')).toBe('Nano_Banana_Pro_2K_0');
     expect(resolveXaisModel('Nano Banana Pro 4K')).toBe('Nano_Banana_Pro_4K_0');
     expect(resolveXaisModel('Xais Image2 2K High Quality')).toBe('Xais_Img2_2K_H');
+    expect(resolveXaisModel('Xais img2_1k')).toBe('Xais img2_1k');
     expect(resolveXaisModel('custom-model')).toBe('custom-model');
   });
 
@@ -479,6 +485,26 @@ describe('wallet image provider normalization', () => {
       image_size: '2K',
       response_format: 'url',
       stream: false,
+    });
+  });
+
+  it('passes transparent PNG output parameters to NewAPI', () => {
+    const body = buildNewApiImageGenerationBody({
+      userId: 'user-1',
+      clientRequestId: 'request-transparent-png',
+      model: 'gpt-image-2',
+      prompt: 'render a product cutout',
+      inputImages: [],
+      aspectRatio: '1:1',
+      resolution: '2K',
+      outputFormat: 'png',
+      background: 'transparent',
+      count: 1,
+    });
+
+    expect(body).toMatchObject({
+      output_format: 'png',
+      background: 'transparent',
     });
   });
 

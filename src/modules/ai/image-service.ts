@@ -75,7 +75,6 @@ const XAIS_MODEL_MAP: Record<string, string> = {
   'Xais Nano_Lite_1K': 'Xais_Nano_Lite_1K',
   'Xais Nano Pro_4K_png': 'Nano_Banana_Pro_4K_5',
   'Xais Nano2_4K_png': 'Nano_Banana_2_4K_5',
-  'Xais img2_1k': 'Image2_1K',
   'Xais Img2_2K': 'Image2_2K',
   'Xais Img2_4K': 'Image2_4K',
   'Xais Img2_2K(高画质)': 'Xais_Img2_2K_H',
@@ -112,6 +111,7 @@ export function resolveNewApiImageModel(model: string) {
 const IMAGE_PROVIDER_CAPABILITIES: AiCapability[] = [
   'IMAGE',
   'IMAGE_NANO_BANANA',
+  'IMAGE_NANO_BANANA_2',
   'IMAGE_GPT',
 ];
 
@@ -119,6 +119,13 @@ export function imageCapabilityForModel(model: string): AiCapability {
   const token = imageModelToken(model);
   if (token.includes('gptimage') || token.includes('image2') || token.includes('img2')) {
     return 'IMAGE_GPT';
+  }
+  if (token.includes('nanobanana2')
+    || token.includes('gemini31flashimage')
+    || token.includes('gemini3flashimage')
+    || token.includes('xaisnano2')
+    || token.includes('nano2')) {
+    return 'IMAGE_NANO_BANANA_2';
   }
   if (
     token.includes('nanobanana')
@@ -159,6 +166,7 @@ export type ImageInput = {
   aspectRatio: '1:1' | '3:4' | '4:3' | '9:16' | '16:9';
   resolution?: string | undefined;
   outputFormat: 'jpg' | 'jpeg' | 'png' | 'webp';
+  background?: 'transparent' | undefined;
   count: number;
 };
 
@@ -536,8 +544,11 @@ export function newApiImageRequestParams(
   count: number,
   ratio: ImageInput['aspectRatio'],
   resolution?: string,
+  outputFormat?: ImageInput['outputFormat'],
+  background?: ImageInput['background'],
 ) {
   const family = newApiImageFamily(model);
+  const transparentPng = outputFormat === 'png' || background === 'transparent';
   if (family === 'nano-banana') {
     const resolutionLabel = normalizedImageResolution(resolution).toUpperCase();
     return {
@@ -546,6 +557,7 @@ export function newApiImageRequestParams(
       aspect_ratio: ratio,
       output_resolution: resolutionLabel,
       image_size: resolutionLabel,
+      ...(transparentPng ? { output_format: 'png', background: 'transparent' } : {}),
     };
   }
   const size = family === 'gpt-image-2'
@@ -556,12 +568,16 @@ export function newApiImageRequestParams(
     size,
     aspect_ratio: ratio,
     ...(family === 'gpt-image-2' ? { quality: 'medium' } : {}),
+    ...(transparentPng ? { output_format: 'png', background: 'transparent' } : {}),
   };
 }
 
 function promptWithConstraints(input: ImageInput) {
   const constraints = [`must output exactly ${input.aspectRatio} aspect ratio`];
   if (input.resolution) constraints.push(`target resolution ${input.resolution}`);
+  if (input.background === 'transparent') {
+    constraints.push('use a truly transparent background with an alpha channel, not a checkerboard pattern');
+  }
   return `${input.prompt.trim()}\n\nStrict image constraints: ${constraints.join(', ')}.`;
 }
 
@@ -584,6 +600,8 @@ export function buildNewApiImageGenerationBody(
     input.count,
     input.aspectRatio,
     input.resolution,
+    input.outputFormat,
+    input.background,
   );
   return {
     model: input.model,
@@ -606,7 +624,7 @@ export function isNewApiParamOverrideCopyError(error: unknown) {
 }
 
 export function isNewApiGeminiImageDecodeError(model: string, error: unknown) {
-  if (imageCapabilityForModel(model) !== 'IMAGE_NANO_BANANA') return false;
+  if (!['IMAGE_NANO_BANANA', 'IMAGE_NANO_BANANA_2'].includes(imageCapabilityForModel(model))) return false;
   const message = error instanceof Error
     ? error.message
     : typeof error === 'string' ? error : JSON.stringify(error ?? '');
@@ -1263,7 +1281,6 @@ export function resolveXaisModel(model: string) {
   if (/^(?:xais)?(?:nanobanana|nano)pro4k0?$/.test(token)) return 'Nano_Banana_Pro_4K_0';
   if (/^(?:xais)?(?:nanobanana|nano)22k0?$/.test(token)) return 'Nano_Banana_2_2K_0';
   if (/^(?:xais)?(?:nanobanana|nano)24k0?$/.test(token)) return 'Nano_Banana_2_4K_0';
-  if (/^(?:xais)?(?:img2|image2)1k$/.test(token)) return 'Image2_1K';
   if (/^(?:xais)?(?:img2|image2)2k$/.test(token)) return 'Image2_2K';
   if (/^(?:xais)?(?:img2|image2)4k$/.test(token)) return 'Image2_4K';
   if (/^(?:xais)?(?:img2|image2)2k(?:h|high|highquality)$/.test(token)) return 'Xais_Img2_2K_H';
@@ -1639,6 +1656,7 @@ export async function runXaisWorkerTask(
       outputFormat: input.outputFormat === 'png'
         ? 'image/png'
         : input.outputFormat === 'webp' ? 'image/webp' : 'image/jpeg',
+      ...(input.background === 'transparent' ? { background: 'transparent' } : {}),
       ...(!isNanoModel || isNanoLiteModel ? { quality: /_H$/i.test(model) ? 'high' : 'medium' } : {}),
     },
   });
@@ -1715,6 +1733,9 @@ async function generateXaisImages(
       prompt: promptWithConstraints(input),
       n: input.count,
       size: sizeFromRatio(input.aspectRatio),
+      ...(input.outputFormat === 'png' || input.background === 'transparent'
+        ? { output_format: 'png', background: 'transparent' }
+        : {}),
       response_format: 'url',
     }, IMAGE_GENERATION_TIMEOUT_MS);
     const images = uniqueImages(value, input.inputImages, input.count);

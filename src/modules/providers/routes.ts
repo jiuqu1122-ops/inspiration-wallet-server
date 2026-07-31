@@ -18,6 +18,7 @@ const capabilitySchema = z.enum([
   'VISION',
   'IMAGE',
   'IMAGE_NANO_BANANA',
+  'IMAGE_NANO_BANANA_2',
   'IMAGE_GPT',
   'VIDEO',
 ]);

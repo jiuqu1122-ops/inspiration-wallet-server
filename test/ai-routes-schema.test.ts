@@ -13,11 +13,13 @@ describe('wallet AI request compatibility', () => {
       aspectRatio: '16:9',
       resolution: '2k',
       outputFormat: 'jpg',
+      background: 'transparent',
       count: 1,
     })).toMatchObject({
       provider: 'new-api',
       negativePrompt: undefined,
       resolution: '2k',
+      background: 'transparent',
     });
   });
 

@@ -62,6 +62,8 @@ const imageSchema = z.object({
   aspectRatio: z.enum(['1:1', '3:4', '4:3', '9:16', '16:9']).default('1:1'),
   resolution: optionalString(20),
   outputFormat: z.enum(['jpg', 'jpeg', 'png', 'webp']).default('jpg'),
+  background: z.enum(['transparent']).nullish()
+    .transform((value) => value ?? undefined),
   count: z.number().int().min(1).max(4).default(1),
 }).strict();
 
