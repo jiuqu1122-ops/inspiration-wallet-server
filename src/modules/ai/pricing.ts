@@ -46,6 +46,8 @@ const KNOWN_IMAGE_MODELS = [
 
 const KNOWN_VIDEO_MODELS = [
   'seedance2',
+  'SourceMix2.0',
+  'SourceMix2.0-fast',
   'sora-2',
   'veo-3.1',
   'veo-3.1-fast',

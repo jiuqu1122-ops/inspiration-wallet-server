@@ -174,6 +174,8 @@ describe('wallet image provider normalization', () => {
     expect(newApiVideoStatusPath('unified-video', 'task/a')).toBe('/v1/video/generations/task%2Fa');
     expect(newApiVideoProtocol('veo-3.1')).toBe('openai-videos');
     expect(newApiVideoSubmitPath('veo-3.1-fast')).toBe('/v1/videos');
+    expect(newApiVideoProtocol('SourceMix2.0')).toBe('openai-videos');
+    expect(newApiVideoSubmitPath('SourceMix2.0-fast')).toBe('/v1/videos');
     expect(newApiVideoStatusPath('openai-videos', 'task/a')).toBe('/v1/videos/task%2Fa');
   });
 
@@ -237,6 +239,27 @@ describe('wallet image provider normalization', () => {
       size: '1920x1080',
       resolution: '1080p',
       images: ['person', 'scene', 'style'],
+    });
+    expect(newApiVideoBody({
+      userId: 'user-1',
+      clientRequestId: 'canvas-video-seedance-new-api',
+      provider: 'new-api',
+      model: 'SourceMix2.0',
+      prompt: 'orbit around the product',
+      inputImages: ['product', 'scene', 'style', 'ignored'],
+      aspectRatio: '9:16',
+      resolution: '1080p',
+      duration: 6,
+      inputMode: 'REF',
+      count: 1,
+    })).toEqual({
+      model: 'SourceMix2.0',
+      prompt: 'orbit around the product',
+      duration: 6,
+      seconds: '6',
+      size: '1080x1920',
+      resolution: '1080p',
+      images: ['product', 'scene', 'style'],
     });
     const oneReferenceBody = newApiVideoBody({
       userId: 'user-1',

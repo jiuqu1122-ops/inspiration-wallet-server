@@ -35,6 +35,8 @@ describe('AI credit pricing', () => {
     expect(defaultAiPricingConfig().inspirationAnalysisCredits).toBe('0');
     expect(defaultAiPricingConfig().videoModels.map((item) => item.model)).toEqual([
       'seedance2',
+      'SourceMix2.0',
+      'SourceMix2.0-fast',
       'sora-2',
       'veo-3.1',
       'veo-3.1-fast',
@@ -84,6 +86,8 @@ describe('AI credit pricing', () => {
     expect((await getAiPricingConfig(prisma)).agentRequestCredits).toBe('8');
     expect((await getAiPricingConfig(prisma)).videoModels).toEqual(expect.arrayContaining([
       { model: 'seedance2', credits: '44' },
+      { model: 'SourceMix2.0', credits: '300' },
+      { model: 'SourceMix2.0-fast', credits: '300' },
       { model: 'sora-2', credits: '300' },
       { model: 'veo-3.1', credits: '300' },
       { model: 'veo-3.1-fast', credits: '300' },
