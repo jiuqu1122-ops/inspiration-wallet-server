@@ -15,6 +15,7 @@ import {
   imageCapabilityForModel,
   imageUnitCredits,
   isNewApiVideoRouteNotFound,
+  isSourceMixVideoModel,
   isRecoverableNewApiVideoStatusError,
   isNewApiGeminiImageDecodeError,
   isNewApiParamOverrideCopyError,
@@ -23,13 +24,16 @@ import {
   materializeNewApiReferenceImage,
   mirrorXaisImageResults,
   newApiVideoBody,
+  newApiVideoJsonBody,
   newApiVideoProtocol,
+  newApiVideoProtocolCandidates,
   newApiVideoSize,
   newApiVideoStatusPath,
   newApiVideoSubmitPath,
   newApiImageRequestParams,
   parseWalletImageGenerationResult,
   parseXaisTaskId,
+  providerNewApiVideoRequest,
   providerSupportsImageModel,
   resolveImageModel,
   resolveNewApiImageModel,
@@ -168,7 +172,7 @@ describe('wallet image provider normalization', () => {
     expect(isRecoverableNewApiVideoStatusError(new Error('HTTP 401: unauthorized'))).toBe(false);
   });
 
-  it('uses the unified NewAPI task protocol for Sora 2 only', () => {
+  it('uses the unified NewAPI task protocol for Sora 2 and keeps SourceMix compatible', () => {
     expect(newApiVideoProtocol('sora-2')).toBe('unified-video');
     expect(newApiVideoSubmitPath('Sora 2')).toBe('/v1/video/generations');
     expect(newApiVideoStatusPath('unified-video', 'task/a')).toBe('/v1/video/generations/task%2Fa');
@@ -176,6 +180,12 @@ describe('wallet image provider normalization', () => {
     expect(newApiVideoSubmitPath('veo-3.1-fast')).toBe('/v1/videos');
     expect(newApiVideoProtocol('SourceMix2.0')).toBe('openai-videos');
     expect(newApiVideoSubmitPath('SourceMix2.0-fast')).toBe('/v1/videos');
+    expect(isSourceMixVideoModel('SourceMix2.0-fast')).toBe(true);
+    expect(newApiVideoProtocolCandidates('SourceMix2.0')).toEqual([
+      'openai-videos',
+      'unified-video',
+    ]);
+    expect(newApiVideoProtocolCandidates('veo-3.1')).toEqual(['openai-videos']);
     expect(newApiVideoStatusPath('openai-videos', 'task/a')).toBe('/v1/videos/task%2Fa');
   });
 
@@ -186,6 +196,63 @@ describe('wallet image provider normalization', () => {
     expect(isNewApiVideoRouteNotFound(
       new Error('HTTP 404: {"error":{"message":"task not found"}}'),
     )).toBe(false);
+    expect(isNewApiVideoRouteNotFound(
+      new Error('HTTP 404: {"detail":"未找到"}'),
+    )).toBe(true);
+    expect(isNewApiVideoRouteNotFound(
+      new Error('status_code=404, {"detail":"未找到"}'),
+    )).toBe(true);
+  });
+
+  it('submits SourceMix as JSON and retries the compatible NewAPI route after a localized 404', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ detail: '未找到' }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ task_id: 'seedance-task-1' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const submission = await providerNewApiVideoRequest(
+        { baseUrl: 'https://provider.example', name: 'Seedance channel' } as Parameters<typeof providerNewApiVideoRequest>[0],
+        { apiKey: 'test-key', headers: {} },
+        {
+          userId: 'user-1',
+          clientRequestId: 'canvas-video-seedance-submit',
+          provider: 'new-api',
+          model: 'SourceMix2.0',
+          prompt: 'orbit around the product',
+          inputImages: [],
+          aspectRatio: '16:9',
+          resolution: '720p',
+          duration: 4,
+          inputMode: 'REF',
+          count: 1,
+        },
+      );
+      expect(submission).toEqual({
+        result: { task_id: 'seedance-task-1' },
+        protocol: 'unified-video',
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock.mock.calls[0]?.[0]).toBe('https://provider.example/v1/videos');
+      expect(fetchMock.mock.calls[1]?.[0]).toBe('https://provider.example/v1/video/generations');
+      const firstRequest = fetchMock.mock.calls[0]?.[1] as RequestInit;
+      expect(new Headers(firstRequest.headers).get('content-type')).toBe('application/json');
+      expect(JSON.parse(String(firstRequest.body))).toEqual({
+        model: 'SourceMix2.0',
+        prompt: 'orbit around the product',
+        duration: 4,
+        size: '1280x720',
+      });
+    } finally {
+      warn.mockRestore();
+      vi.unstubAllGlobals();
+    }
   });
 
   it('builds NewAPI video payloads while preserving the XAIS video path separately', () => {
@@ -260,6 +327,25 @@ describe('wallet image provider normalization', () => {
       size: '1080x1920',
       resolution: '1080p',
       images: ['product', 'scene', 'style'],
+    });
+    expect(newApiVideoJsonBody({
+      userId: 'user-1',
+      clientRequestId: 'canvas-video-seedance-json',
+      provider: 'new-api',
+      model: 'SourceMix2.0-fast',
+      prompt: 'orbit around the product',
+      inputImages: ['data:image/png;base64,one'],
+      aspectRatio: '16:9',
+      resolution: '720p',
+      duration: 4,
+      inputMode: 'REF',
+      count: 1,
+    })).toEqual({
+      model: 'SourceMix2.0-fast',
+      prompt: 'orbit around the product',
+      duration: 4,
+      size: '1280x720',
+      images: ['data:image/png;base64,one'],
     });
     const oneReferenceBody = newApiVideoBody({
       userId: 'user-1',

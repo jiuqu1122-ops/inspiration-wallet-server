@@ -2335,16 +2335,36 @@ export function isSora2VideoModel(model: string) {
   return model.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-') === 'sora-2';
 }
 
+export function isSourceMixVideoModel(model: string) {
+  const normalized = model.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  return normalized === 'sourcemix2-0' || normalized === 'sourcemix2-0-fast';
+}
+
 type NewApiVideoProtocol = 'openai-videos' | 'unified-video';
 
 export function newApiVideoProtocol(model: string): NewApiVideoProtocol {
   return isSora2VideoModel(model) ? 'unified-video' : 'openai-videos';
 }
 
-export function newApiVideoSubmitPath(model: string) {
-  return newApiVideoProtocol(model) === 'unified-video'
+export function newApiVideoProtocolCandidates(
+  model: string,
+  preferred: NewApiVideoProtocol = newApiVideoProtocol(model),
+) {
+  if (!isSourceMixVideoModel(model)) return [preferred];
+  const alternate: NewApiVideoProtocol = preferred === 'openai-videos'
+    ? 'unified-video'
+    : 'openai-videos';
+  return [preferred, alternate];
+}
+
+function newApiVideoSubmitPathForProtocol(protocol: NewApiVideoProtocol) {
+  return protocol === 'unified-video'
     ? '/v1/video/generations'
     : '/v1/videos';
+}
+
+export function newApiVideoSubmitPath(model: string) {
+  return newApiVideoSubmitPathForProtocol(newApiVideoProtocol(model));
 }
 
 export function newApiVideoStatusPath(protocol: NewApiVideoProtocol, taskId: string) {
@@ -2427,25 +2447,48 @@ export function newApiVideoBody(input: VideoInput) {
   };
 }
 
+export function newApiVideoJsonBody(input: VideoInput) {
+  const body = newApiVideoBody(input);
+  return {
+    model: body.model,
+    prompt: body.prompt,
+    duration: body.duration,
+    size: body.size,
+    ...(body.images ? { images: body.images } : {}),
+  };
+}
+
 async function stagedImageDataUrl(image: StagedNewApiEditImage) {
   const bytes = image.bytes ?? (image.path ? await readFile(image.path) : Buffer.alloc(0));
   if (!bytes.length) throw new Error('video reference image is empty');
   return `data:${image.mime};base64,${bytes.toString('base64')}`;
 }
 
-async function providerNewApiVideoRequest(
+export async function providerNewApiVideoRequest(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   input: VideoInput,
+  preferredProtocol: NewApiVideoProtocol = newApiVideoProtocol(input.model),
 ) {
   const imageLimit = isSora2VideoModel(input.model) ? 1 : 3;
   const sources = input.inputImages.filter(Boolean).slice(0, imageLimit);
   if (input.inputMode === 'FLF' && !isSora2VideoModel(input.model) && sources.length !== 2) {
     throw new CloudAiError('invalid_video_input', '首尾帧模式需要同时提供首帧和尾帧两张图片', 400);
   }
+  const protocols = newApiVideoProtocolCandidates(input.model, preferredProtocol);
   const images = await Promise.all(sources.map((source, index) => stageNewApiEditImage(source, index)));
   try {
-    const submit = async (requestModel: string) => {
+    const submitJson = async (protocol: NewApiVideoProtocol) => {
+      const imageDataUrls = await Promise.all(images.map(stagedImageDataUrl));
+      const body = newApiVideoJsonBody({ ...input, inputImages: imageDataUrls });
+      return providerRequest(
+        provider,
+        secrets,
+        newApiVideoSubmitPathForProtocol(protocol),
+        body,
+      );
+    };
+    const submitMultipart = async (requestModel: string, protocol: NewApiVideoProtocol) => {
       const body = newApiVideoBody({ ...input, inputImages: sources }) as Record<string, unknown>;
       body.model = requestModel;
       delete body.images;
@@ -2507,7 +2550,10 @@ async function providerNewApiVideoRequest(
           signal: controller.signal,
           duplex: 'half',
         };
-        const response = await fetch(providerEndpoint(provider.baseUrl, newApiVideoSubmitPath(input.model)), request);
+        const response = await fetch(
+          providerEndpoint(provider.baseUrl, newApiVideoSubmitPathForProtocol(protocol)),
+          request,
+        );
         const text = await response.text();
         if (!response.ok) {
           throw new UpstreamImageError(response.status, upstreamErrorMessage(response.status, text));
@@ -2521,7 +2567,26 @@ async function providerNewApiVideoRequest(
         bodyStream.destroy();
       }
     };
-    return submit(input.model);
+    let lastError: unknown;
+    for (let index = 0; index < protocols.length; index += 1) {
+      const protocol = protocols[index]!;
+      try {
+        const result = isSourceMixVideoModel(input.model)
+          ? await submitJson(protocol)
+          : await submitMultipart(input.model, protocol);
+        return { result, protocol };
+      } catch (error) {
+        lastError = error;
+        if (index === protocols.length - 1 || !isNewApiVideoRouteNotFound(error)) throw error;
+        console.warn('[newapi_video_submit_protocol_fallback]', {
+          provider: provider.name,
+          model: input.model,
+          from: protocol,
+          to: protocols[index + 1],
+        });
+      }
+    }
+    throw lastError;
   } finally {
     await Promise.all(images.map(image => image.cleanup().catch(() => {})));
   }
@@ -2771,12 +2836,15 @@ async function recordVideoSubmission(
   input: VideoInput,
   provider: AiProviderChannel,
   taskIds: string[],
+  apiProtocol?: NewApiVideoProtocol,
 ) {
   const state: PersistedVideoRequestState = {
     kind: 'video_tasks',
     provider: provider.kind,
     providerChannelId: provider.id,
-    ...(provider.kind === 'NEW_API' ? { apiProtocol: newApiVideoProtocol(input.model) } : {}),
+    ...(provider.kind === 'NEW_API'
+      ? { apiProtocol: apiProtocol ?? newApiVideoProtocol(input.model) }
+      : {}),
     taskIds,
     completedTaskIds: [],
     outputs: {},
@@ -2971,10 +3039,23 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
   try {
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
     const results: unknown[] = [];
+    let submittedProtocol = provider.kind === 'NEW_API'
+      ? newApiVideoProtocol(input.model)
+      : undefined;
     for (let index = 0; index < input.count; index += 1) {
-      const result = provider.kind === 'XAIS'
-        ? await providerRequest(provider, secrets, '/xais/workerTaskStart', xaisVideoBody(input))
-        : await providerNewApiVideoRequest(provider, secrets, input);
+      let result: unknown;
+      if (provider.kind === 'XAIS') {
+        result = await providerRequest(provider, secrets, '/xais/workerTaskStart', xaisVideoBody(input));
+      } else {
+        const submission = await providerNewApiVideoRequest(
+          provider,
+          secrets,
+          input,
+          submittedProtocol,
+        );
+        result = submission.result;
+        submittedProtocol = submission.protocol;
+      }
       const failure = getFailure(result);
       if (failure) throw new CloudAiError('video_generation_failed', failure, 502);
       results.push(result);
@@ -2983,7 +3064,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       .map(result => getTaskId(result))
       .filter(taskId => taskId && !/^(?:https?:|data:)/i.test(taskId))));
     if (taskIds.length > 0) {
-      await recordVideoSubmission(prisma, input, provider, taskIds);
+      await recordVideoSubmission(prisma, input, provider, taskIds, submittedProtocol);
     } else {
       const directOutputs = Array.from(new Set(collectVideoUrls(results)));
       if (directOutputs.length < input.count) {
@@ -3003,8 +3084,12 @@ export function isNewApiVideoRouteNotFound(error: unknown) {
   const message = error instanceof Error
     ? error.message
     : typeof error === 'string' ? error : JSON.stringify(error ?? '') ?? '';
-  return /HTTP 404\s*:\s*\{[^}]*"detail"\s*:\s*"Not Found"/i.test(message)
-    || /HTTP 404\s*:[^\n]*(?:Invalid URL|route not found)/i.test(message);
+  const has404 = /HTTP\s*404/i.test(message)
+    || /status[_\s-]*code["']?\s*[:=]\s*404/i.test(message);
+  return has404 && (
+    /["']detail["']\s*:\s*["'](?:Not Found|未找到)["']/i.test(message)
+    || /(?:Invalid URL|route not found)/i.test(message)
+  );
 }
 
 async function resolveNewApiVideoStatusProtocol(
