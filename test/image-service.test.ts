@@ -24,7 +24,7 @@ import {
   mirrorXaisImageResults,
   newApiVideoBody,
   newApiVideoProtocol,
-  newApiSoraFallbackModel,
+  newApiVideoRequestModel,
   newApiVideoSize,
   newApiVideoStatusPath,
   newApiVideoSubmitPath,
@@ -187,19 +187,11 @@ describe('wallet image provider normalization', () => {
     )).toBe(false);
   });
 
-  it('uses the advertised Azure Sora alias only after the VIDEO endpoint rejects sora-2', () => {
-    expect(newApiSoraFallbackModel(
-      'sora-2',
-      new Error('HTTP 422: {"message":"sora-2 is not supported for ModelModality.VIDEO endpoint. Supported models: [\'azure-sora\', \'firefly-video\']"}'),
-    )).toBe('azure-sora');
-    expect(newApiSoraFallbackModel(
-      'sora-2',
-      new Error('HTTP 422: invalid duration'),
-    )).toBe('');
-    expect(newApiSoraFallbackModel(
-      'veo-3.1',
-      new Error('HTTP 422: azure-sora'),
-    )).toBe('');
+  it('uses the Azure Sora alias as the primary upstream model', () => {
+    expect(newApiVideoRequestModel('sora-2')).toBe('azure-sora');
+    expect(newApiVideoRequestModel('Sora 2')).toBe('azure-sora');
+    expect(newApiVideoRequestModel('veo-3.1')).toBe('veo-3.1');
+    expect(newApiVideoRequestModel('veo-3.1-fast')).toBe('veo-3.1-fast');
   });
 
   it('builds NewAPI video payloads while preserving the XAIS video path separately', () => {

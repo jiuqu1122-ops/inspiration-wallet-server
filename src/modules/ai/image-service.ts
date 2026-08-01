@@ -2354,16 +2354,8 @@ export function newApiVideoStatusPath(protocol: NewApiVideoProtocol, taskId: str
     : `/v1/videos/${encodedTaskId}`;
 }
 
-export function newApiSoraFallbackModel(model: string, error: unknown) {
-  if (!isSora2VideoModel(model)) return '';
-  const status = error instanceof UpstreamImageError ? error.status : 0;
-  const message = error instanceof Error
-    ? error.message
-    : typeof error === 'string' ? error : JSON.stringify(error ?? '') ?? '';
-  if (status !== 422 && !/HTTP 422\b/i.test(message)) return '';
-  return /not supported for ModelModality\.VIDEO[\s\S]*\bazure-sora\b/i.test(message)
-    ? 'azure-sora'
-    : '';
+export function newApiVideoRequestModel(model: string) {
+  return isSora2VideoModel(model) ? 'azure-sora' : model;
 }
 
 export function isVeo31VideoModel(model: string) {
@@ -2533,18 +2525,7 @@ async function providerNewApiVideoRequest(
         bodyStream.destroy();
       }
     };
-    try {
-      return await submit(input.model);
-    } catch (error) {
-      const fallbackModel = newApiSoraFallbackModel(input.model, error);
-      if (!fallbackModel) throw error;
-      console.warn('[newapi_sora_model_fallback]', {
-        provider: provider.name,
-        from: input.model,
-        to: fallbackModel,
-      });
-      return submit(fallbackModel);
-    }
+    return submit(newApiVideoRequestModel(input.model));
   } finally {
     await Promise.all(images.map(image => image.cleanup().catch(() => {})));
   }
