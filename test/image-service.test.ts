@@ -14,6 +14,7 @@ import {
   getWalletImageGenerationByRequest,
   imageCapabilityForModel,
   imageUnitCredits,
+  isRecoverableNewApiVideoStatusError,
   isNewApiGeminiImageDecodeError,
   isNewApiParamOverrideCopyError,
   isPublicNewApiImageReference,
@@ -153,6 +154,14 @@ describe('wallet image provider normalization', () => {
     expect(videoDurationSecondsForBilling('sora-2', 12, 'NEW_API')).toBe(12);
     expect(videoDurationSecondsForBilling('seedance2', undefined, 'XAIS')).toBe(15);
     expect(calculateVideoGenerationCredits(6n, 'veo-3.1-fast', 8, 2, 'NEW_API')).toBe(96n);
+  });
+
+  it('keeps polling when a NewAPI video status adapter temporarily cannot fetch the task', () => {
+    expect(isRecoverableNewApiVideoStatusError(
+      new Error('HTTP 400: {"code":"fail_to_fetch_task","message":"invalid request body"}'),
+    )).toBe(true);
+    expect(isRecoverableNewApiVideoStatusError(new Error('HTTP 503: upstream unavailable'))).toBe(true);
+    expect(isRecoverableNewApiVideoStatusError(new Error('HTTP 401: unauthorized'))).toBe(false);
   });
 
   it('builds NewAPI /v1/videos payloads while preserving the XAIS video path separately', () => {
@@ -538,6 +547,7 @@ describe('wallet image provider normalization', () => {
     await expect(confirmXaisReferenceAttachment(provider, secrets, 'h2/reference.png', noWait))
       .resolves.toBeUndefined();
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0]?.[1]?.headers.get('content-type')).toBeNull();
 
     fetchMock.mockReset();
     fetchMock.mockResolvedValue(new Response(JSON.stringify({ success: true, data: {} }), {

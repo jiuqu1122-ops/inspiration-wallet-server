@@ -311,9 +311,11 @@ async function providerRequest(
   const timeoutMs = timeoutOverrideMs ?? (/(?:video|workerTask)/i.test(path) ? 10 * 60_000 : 4 * 60_000);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    const headers = upstreamHeaders(secrets);
+    if (body === undefined) headers.delete('content-type');
     const response = await fetch(providerEndpoint(provider.baseUrl, path), {
       method: body === undefined ? 'GET' : 'POST',
-      headers: upstreamHeaders(secrets),
+      headers,
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       redirect: 'error',
       signal: controller.signal,
@@ -587,6 +589,17 @@ export function newApiImageRequestParams(
       ...(family === 'gpt-image-2' ? {} : { background: 'transparent' }),
     } : {}),
   };
+}
+
+export function isRecoverableNewApiVideoStatusError(error: unknown) {
+  const status = error instanceof UpstreamImageError ? error.status : 0;
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string' ? error : JSON.stringify(error ?? '') ?? '';
+  if (status === 401 || status === 403 || /HTTP (?:401|403)\b/i.test(message)) return false;
+  if (status === 0 || status === 400 || status === 404 || status === 408
+    || status === 409 || status === 425 || status === 429 || status >= 500) return true;
+  return /fail_to_fetch_task|invalid request body|HTTP (?:400|404|408|409|425|429|5\d\d)\b/i.test(message);
 }
 
 function requiresGptImage2AlphaPostProcessing(input: ImageInput) {
@@ -2967,7 +2980,37 @@ export async function executeWalletVideoStatus(
   const path = provider.kind === 'XAIS'
     ? `/xais/workerTaskWait?json=1&id=${encodeURIComponent(input.taskId)}`
     : `/v1/videos/${encodeURIComponent(input.taskId)}`;
-  const waited = await providerRequest(provider, secrets, path);
+  let waited: unknown;
+  try {
+    waited = await providerRequest(provider, secrets, path);
+  } catch (error) {
+    if (provider.kind === 'XAIS' || !isRecoverableNewApiVideoStatusError(error)) throw error;
+    console.warn('[newapi_video_status_recovery]', {
+      provider: provider.name,
+      taskId: input.taskId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    try {
+      const output = await mirrorProviderVideoContent(provider, secrets, input.taskId);
+      if (output) {
+        await recordVideoTaskCompleted(
+          prisma,
+          input.userId,
+          input.clientRequestId,
+          input.taskId,
+          output,
+        );
+        return { status: 'completed', video_url: output, recovered_from_content: true };
+      }
+    } catch (contentError) {
+      console.warn('[newapi_video_status_and_content_pending]', {
+        provider: provider.name,
+        taskId: input.taskId,
+        error: contentError instanceof Error ? contentError.message : String(contentError),
+      });
+    }
+    return { status: 'processing', content_pending: true, status_retry: true };
+  }
   const failure = getFailure(waited);
   if (failure) {
     if (input.clientRequestId) {
