@@ -68,6 +68,34 @@ describe('generated image OSS delivery route', () => {
     await app.close();
   });
 
+  it('redirects a whitelisted client engine asset to a signed OSS URL', async () => {
+    const app = await makeApp();
+    const filename = 'rife-ncnn-vulkan-20221029-windows-lite.zip';
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/ai/client-assets/${filename}`,
+    });
+    expect(response.statusCode).toBe(302);
+    expect(bridgeMocks.exists).toHaveBeenCalledWith(`client-assets/${filename}`);
+    expect(bridgeMocks.getPublicUrl).toHaveBeenCalledWith(
+      `client-assets/${filename}`,
+      { filename },
+    );
+    expect(response.headers['cache-control']).toBe('public, max-age=300');
+    await app.close();
+  });
+
+  it('rejects client asset names outside the fixed manifest', async () => {
+    const app = await makeApp();
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/ai/client-assets/unapproved.zip',
+    });
+    expect(response.statusCode).toBe(404);
+    expect(bridgeMocks.exists).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it('reuses a result that was already mirrored to OSS by the worker', async () => {
     const app = await makeApp();
     const response = await app.inject({ method: 'GET', url: '/v1/ai/image-results/result.png?redirect=0' });

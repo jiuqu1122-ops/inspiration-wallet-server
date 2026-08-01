@@ -14,6 +14,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { env } from '../../config/env.js';
 import { ossUploadService } from './oss-uploader.js';
+import { getClientEngineAsset } from './client-assets.js';
 import { getImageReference } from './reference-store.js';
 import { createAiTaskSchema } from './task-schema.js';
 import {
@@ -211,6 +212,36 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
         return await listWalletAgentModels(app.prisma);
       } catch (error) {
         return knownError(reply, error);
+      }
+    },
+  );
+
+  app.get(
+    '/client-assets/:asset',
+    { config: { rateLimit: { max: 120, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const rawAsset = (request.params as { asset?: unknown }).asset;
+      const asset = getClientEngineAsset(typeof rawAsset === 'string' ? rawAsset.trim() : '');
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found', message: 'Client asset not found' });
+      }
+      try {
+        if (!await ossUploadService.exists(asset.objectName)) {
+          return reply.code(404).send({ error: 'not_found', message: 'Client asset is not available' });
+        }
+        const url = ossUploadService.getPublicUrl(asset.objectName, { filename: asset.name });
+        return reply
+          .header('Cache-Control', 'public, max-age=300')
+          .redirect(url);
+      } catch (error) {
+        request.log.error(
+          { asset: asset.name, errorName: error instanceof Error ? error.name : 'unknown' },
+          'client asset signing failed',
+        );
+        return reply.code(503).send({
+          error: 'oss_signing_failed',
+          message: 'Client asset temporary URL could not be created',
+        });
       }
     },
   );
