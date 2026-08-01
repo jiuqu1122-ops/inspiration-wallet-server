@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { PrismaClient } from '@prisma/client';
 import {
   configuredImageUnitCredits,
-  configuredVideoUnitCredits,
+  configuredVideoCreditsPerSecond,
   defaultAiPricingConfig,
   defaultImageUnitCredits,
   getAiPricingConfig,
@@ -33,6 +33,14 @@ describe('AI credit pricing', () => {
     expect(defaultImageUnitCredits('gpt-image-2', '4k')).toBe(18n);
     expect(defaultImageUnitCredits('Xais Img2_2K(高画质)', '4k')).toBe(35n);
     expect(defaultAiPricingConfig().inspirationAnalysisCredits).toBe('0');
+    expect(defaultAiPricingConfig().videoModels.map((item) => item.model)).toEqual([
+      'seedance2',
+      'SourceMix2.0',
+      'SourceMix2.0-fast',
+      'sora-2',
+      'veo-3.1',
+      'veo-3.1-fast',
+    ]);
   });
 
   it('keeps standard and high-quality model ids distinct', () => {
@@ -74,7 +82,15 @@ describe('AI credit pricing', () => {
 
     expect(await configuredImageUnitCredits(prisma, 'GPT Image 2', '4K')).toBe(7n);
     expect(await configuredImageUnitCredits(prisma, 'custom-image-model', '2K')).toBe(66n);
-    expect(await configuredVideoUnitCredits(prisma, 'Seedance 2')).toBe(44n);
+    expect(await configuredVideoCreditsPerSecond(prisma, 'Seedance 2')).toBe(44n);
     expect((await getAiPricingConfig(prisma)).agentRequestCredits).toBe('8');
+    expect((await getAiPricingConfig(prisma)).videoModels).toEqual(expect.arrayContaining([
+      { model: 'seedance2', credits: '44' },
+      { model: 'SourceMix2.0', credits: '300' },
+      { model: 'SourceMix2.0-fast', credits: '300' },
+      { model: 'sora-2', credits: '300' },
+      { model: 'veo-3.1', credits: '300' },
+      { model: 'veo-3.1-fast', credits: '300' },
+    ]));
   });
 });

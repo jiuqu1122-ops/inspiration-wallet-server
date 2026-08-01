@@ -78,6 +78,48 @@ describe('OSS public bridge service', () => {
     expect(ossMocks.delete).toHaveBeenCalledWith('reference-images/share-0.jpg');
   });
 
+  it('uploads generated videos with the longer transfer timeout', async () => {
+    const { ossUploadService } = await import('../src/modules/ai/oss-uploader.js');
+    const name = await ossUploadService.upload({
+      namespace: 'generated-videos',
+      source: '/tmp/result.mp4',
+      filename: 'result.mp4',
+      mime: 'video/mp4',
+    });
+    expect(name).toBe('generated-videos/result.mp4');
+    expect(ossMocks.put).toHaveBeenCalledWith(
+      'generated-videos/result.mp4',
+      '/tmp/result.mp4',
+      expect.objectContaining({
+        timeout: 180_000,
+        headers: expect.objectContaining({ 'Content-Type': 'video/mp4' }),
+      }),
+    );
+  });
+
+  it('supports immutable client engine archives', async () => {
+    const { ossUploadService } = await import('../src/modules/ai/oss-uploader.js');
+    const name = await ossUploadService.upload({
+      namespace: 'client-assets',
+      source: '/tmp/engine.zip',
+      filename: 'engine.zip',
+      mime: 'application/zip',
+    });
+    expect(name).toBe('client-assets/engine.zip');
+    expect(ossMocks.put).toHaveBeenCalledWith(
+      'client-assets/engine.zip',
+      '/tmp/engine.zip',
+      expect.objectContaining({
+        timeout: 600_000,
+        headers: expect.objectContaining({
+          'Content-Type': 'application/zip',
+          'Cache-Control': 'private, max-age=31536000, immutable',
+        }),
+      }),
+    );
+    expect(() => ossUploadService.getPublicUrl(name)).not.toThrow();
+  });
+
   it('limits reference image URLs to 30 minutes', async () => {
     const { ossUploadService } = await import('../src/modules/ai/oss-uploader.js');
     const name = await ossUploadService.upload({
