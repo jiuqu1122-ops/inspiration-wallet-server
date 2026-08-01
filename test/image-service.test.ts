@@ -19,6 +19,8 @@ import {
   isRetryableXaisPollError,
   materializeNewApiReferenceImage,
   mirrorXaisImageResults,
+  newApiVideoBody,
+  newApiVideoSize,
   newApiImageRequestParams,
   parseWalletImageGenerationResult,
   parseXaisTaskId,
@@ -142,6 +144,72 @@ describe('wallet image provider normalization', () => {
       'gemini-2.5-pro',
       'gpt-image-2',
     ])).toEqual(['gemini-3-pro-image']);
+  });
+
+  it('builds NewAPI /v1/videos payloads while preserving the XAIS video path separately', () => {
+    expect(newApiVideoSize('sora-2', '9:16', '1080p')).toBe('720x1280');
+    expect(newApiVideoSize('veo-3.1-fast', '16:9', '1080p')).toBe('1920x1080');
+    expect(newApiVideoBody({
+      userId: 'user-1',
+      clientRequestId: 'canvas-video-1',
+      provider: 'new-api',
+      model: 'sora-2',
+      prompt: 'slow push in',
+      inputImages: ['first', 'ignored'],
+      aspectRatio: '9:16',
+      resolution: '1080p',
+      duration: 12,
+      inputMode: 'FLF',
+      count: 1,
+    })).toEqual({
+      model: 'sora-2',
+      prompt: 'slow push in',
+      duration: 12,
+      size: '720x1280',
+      images: ['first'],
+    });
+    expect(newApiVideoBody({
+      userId: 'user-1',
+      clientRequestId: 'canvas-video-2',
+      provider: 'new-api',
+      model: 'veo-3.1',
+      prompt: 'combine the ingredients',
+      inputImages: ['person', 'scene', 'style', 'ignored'],
+      aspectRatio: '16:9',
+      resolution: '1080p',
+      duration: 8,
+      inputMode: 'REF',
+      count: 1,
+    })).toEqual({
+      model: 'veo-3.1',
+      prompt: [
+        'combine the ingredients',
+        '',
+        '参考图用途（请按编号分别使用，不要混淆）：',
+        '参考图1为主体参考：保持主体（人物、角色或产品等）的外观、结构、颜色和关键识别特征一致。',
+        '参考图2为场景/背景参考：保持环境、空间关系、构图和光线氛围。',
+        '参考图3为风格/纹理参考：保持材质、色彩、质感和整体视觉风格。',
+      ].join('\n'),
+      duration: 8,
+      size: '1920x1080',
+      images: ['person', 'scene', 'style'],
+    });
+    const oneReferenceBody = newApiVideoBody({
+      userId: 'user-1',
+      clientRequestId: 'canvas-video-3',
+      provider: 'new-api',
+      model: 'veo-3.1',
+      prompt: 'product turntable video',
+      inputImages: ['product'],
+      aspectRatio: '16:9',
+      resolution: '1080p',
+      duration: 8,
+      inputMode: 'REF',
+      count: 1,
+    });
+    expect(oneReferenceBody.images).toEqual(['product']);
+    expect(oneReferenceBody.prompt).toContain('参考图1为主体参考');
+    expect(oneReferenceBody.prompt).not.toContain('参考图2为场景/背景参考');
   });
 
   it('uses the client-selected image model and keeps the manager model as fallback', () => {

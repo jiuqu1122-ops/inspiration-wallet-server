@@ -46,6 +46,9 @@ const KNOWN_IMAGE_MODELS = [
 
 const KNOWN_VIDEO_MODELS = [
   'seedance2',
+  'sora-2',
+  'veo-3.1',
+  'veo-3.1-fast',
 ] as const;
 
 export const aiPricingModelToken = (model: string) => model
@@ -194,13 +197,21 @@ export async function getAiPricingConfig(prisma: PrismaClient): Promise<AiPricin
   const defaults = defaultAiPricingConfig();
   const stored = await prisma.aiPricingConfig.findUnique({ where: { id: 'default' } });
   if (!stored) return defaults;
+  const storedVideoModels = normalizeStoredVideoModels(stored.videoModelPrices);
+  const storedVideoTokens = new Set(storedVideoModels.map((item) => aiPricingModelToken(item.model)));
+  const videoModels = [
+    ...storedVideoModels,
+    ...KNOWN_VIDEO_MODELS
+      .filter((model) => !storedVideoTokens.has(aiPricingModelToken(model)))
+      .map((model) => ({ model, credits: stored.videoDefaultCredits.toString() })),
+  ];
   return {
     agentRequestCredits: stored.agentRequestCredits.toString(),
     inspirationAnalysisCredits: stored.inspirationAnalysisCredits.toString(),
     imageDefaultCredits: stored.imageDefaultCredits.toString(),
     videoDefaultCredits: stored.videoDefaultCredits.toString(),
     imageModels: normalizeStoredImageModels(stored.imageModelPrices),
-    videoModels: normalizeStoredVideoModels(stored.videoModelPrices),
+    videoModels,
     updatedAt: stored.updatedAt.toISOString(),
   };
 }

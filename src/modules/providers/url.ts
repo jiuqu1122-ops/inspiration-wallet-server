@@ -2,7 +2,7 @@ import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import type { AiProviderKind } from '@prisma/client';
 
-const endpointSuffix = /\/(?:v1\/(?:models|chat\/completions|responses|images\/(?:generations|edits)|video\/generations)|xais\/(?:userProfile|workerTaskStart|workerTaskWait|attUrls|fileAttachmentUploadUrl))\/?$/i;
+const endpointSuffix = /\/(?:v1\/(?:models|chat\/completions|responses|images\/(?:generations|edits)|video\/generations|videos(?:\/[^/]+)?)|xais\/(?:userProfile|workerTaskStart|workerTaskWait|attUrls|fileAttachmentUploadUrl))\/?$/i;
 
 function isPrivateIpv4(value: string) {
   const parts = value.split('.').map(Number);

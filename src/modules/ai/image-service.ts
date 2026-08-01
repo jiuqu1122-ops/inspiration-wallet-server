@@ -2311,6 +2311,58 @@ function xaisVideoBody(input: VideoInput) {
   };
 }
 
+export function isSora2VideoModel(model: string) {
+  return model.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-') === 'sora-2';
+}
+
+export function isVeo31VideoModel(model: string) {
+  const normalized = model.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  return normalized === 'veo-3-1' || normalized === 'veo-3-1-fast';
+}
+
+export function buildNewApiVideoPrompt(input: VideoInput, imageCount: number) {
+  const prompt = input.prompt.trim();
+  if (!isVeo31VideoModel(input.model) || input.inputMode === 'FLF' || imageCount <= 0) return prompt;
+  const guidance = [
+    '参考图1为主体参考：保持主体（人物、角色或产品等）的外观、结构、颜色和关键识别特征一致。',
+    '参考图2为场景/背景参考：保持环境、空间关系、构图和光线氛围。',
+    '参考图3为风格/纹理参考：保持材质、色彩、质感和整体视觉风格。',
+  ].slice(0, Math.min(3, imageCount));
+  return `${prompt}\n\n参考图用途（请按编号分别使用，不要混淆）：\n${guidance.join('\n')}`;
+}
+
+export function normalizeNewApiVideoDuration(model: string, duration?: number) {
+  const values = isSora2VideoModel(model) ? [8, 12] : [4, 5, 6, 7, 8];
+  const requested = Number(duration);
+  if (values.includes(requested)) return requested;
+  const fallback = values[0] ?? 8;
+  if (!Number.isFinite(requested)) return fallback;
+  return values.reduce((best, value) => (
+    Math.abs(value - requested) < Math.abs(best - requested) ? value : best
+  ), fallback);
+}
+
+export function newApiVideoSize(model: string, aspectRatio?: string, resolution?: string) {
+  const portrait = aspectRatio?.trim() === '9:16';
+  const normalizedResolution = !isSora2VideoModel(model) && resolution?.trim().toLowerCase() === '1080p'
+    ? '1080p'
+    : '720p';
+  if (portrait) return normalizedResolution === '1080p' ? '1080x1920' : '720x1280';
+  return normalizedResolution === '1080p' ? '1920x1080' : '1280x720';
+}
+
+export function newApiVideoBody(input: VideoInput) {
+  const imageLimit = isSora2VideoModel(input.model) ? 1 : 3;
+  const images = input.inputImages.filter(Boolean).slice(0, imageLimit);
+  return {
+    model: input.model,
+    prompt: buildNewApiVideoPrompt(input, images.length),
+    duration: normalizeNewApiVideoDuration(input.model, input.duration),
+    size: newApiVideoSize(input.model, input.aspectRatio, input.resolution),
+    ...(images.length ? { images } : {}),
+  };
+}
+
 async function reserveVideo(prisma: PrismaClient, input: VideoInput) {
   const unitCredits = await configuredVideoUnitCredits(prisma, input.model);
   const estimated = unitCredits * BigInt(input.count);
@@ -2421,16 +2473,8 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
     const results: unknown[] = [];
     for (let index = 0; index < input.count; index += 1) {
-      const path = provider.kind === 'XAIS' ? '/xais/workerTaskStart' : '/v1/video/generations';
-      const body = provider.kind === 'XAIS' ? xaisVideoBody(input) : {
-        model: input.model,
-        prompt: input.prompt,
-        n: 1,
-        ...(input.inputImages.length ? { images: input.inputImages } : {}),
-        ...(input.aspectRatio ? { aspect_ratio: input.aspectRatio, ratio: input.aspectRatio } : {}),
-        ...(input.resolution ? { resolution: input.resolution } : {}),
-        ...(input.duration ? { duration: input.duration } : {}),
-      };
+      const path = provider.kind === 'XAIS' ? '/xais/workerTaskStart' : '/v1/videos';
+      const body = provider.kind === 'XAIS' ? xaisVideoBody(input) : newApiVideoBody(input);
       const result = await providerRequest(provider, secrets, path, body);
       const failure = getFailure(result);
       if (failure) throw new CloudAiError('video_generation_failed', failure, 502);
@@ -2453,7 +2497,7 @@ export async function executeWalletVideoStatus(
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
   const path = provider.kind === 'XAIS'
     ? `/xais/workerTaskWait?json=1&id=${encodeURIComponent(input.taskId)}`
-    : `/v1/video/generations/${encodeURIComponent(input.taskId)}`;
+    : `/v1/videos/${encodeURIComponent(input.taskId)}`;
   const waited = await providerRequest(provider, secrets, path);
   const failure = getFailure(waited);
   if (failure) {
