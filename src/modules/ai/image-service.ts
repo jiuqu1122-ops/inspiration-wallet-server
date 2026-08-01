@@ -2354,10 +2354,6 @@ export function newApiVideoStatusPath(protocol: NewApiVideoProtocol, taskId: str
     : `/v1/videos/${encodedTaskId}`;
 }
 
-export function newApiVideoRequestModel(model: string) {
-  return isSora2VideoModel(model) ? 'azure-sora' : model;
-}
-
 export function isVeo31VideoModel(model: string) {
   const normalized = model.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-');
   return normalized === 'veo-3-1' || normalized === 'veo-3-1-fast';
@@ -2525,7 +2521,7 @@ async function providerNewApiVideoRequest(
         bodyStream.destroy();
       }
     };
-    return submit(newApiVideoRequestModel(input.model));
+    return submit(input.model);
   } finally {
     await Promise.all(images.map(image => image.cleanup().catch(() => {})));
   }

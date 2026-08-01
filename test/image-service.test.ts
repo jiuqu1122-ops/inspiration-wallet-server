@@ -24,7 +24,6 @@ import {
   mirrorXaisImageResults,
   newApiVideoBody,
   newApiVideoProtocol,
-  newApiVideoRequestModel,
   newApiVideoSize,
   newApiVideoStatusPath,
   newApiVideoSubmitPath,
@@ -185,13 +184,6 @@ describe('wallet image provider normalization', () => {
     expect(isNewApiVideoRouteNotFound(
       new Error('HTTP 404: {"error":{"message":"task not found"}}'),
     )).toBe(false);
-  });
-
-  it('uses the Azure Sora alias as the primary upstream model', () => {
-    expect(newApiVideoRequestModel('sora-2')).toBe('azure-sora');
-    expect(newApiVideoRequestModel('Sora 2')).toBe('azure-sora');
-    expect(newApiVideoRequestModel('veo-3.1')).toBe('veo-3.1');
-    expect(newApiVideoRequestModel('veo-3.1-fast')).toBe('veo-3.1-fast');
   });
 
   it('builds NewAPI video payloads while preserving the XAIS video path separately', () => {
