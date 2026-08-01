@@ -14,6 +14,7 @@ import {
   getWalletImageGenerationByRequest,
   imageCapabilityForModel,
   imageUnitCredits,
+  isNewApiVideoRouteNotFound,
   isRecoverableNewApiVideoStatusError,
   isNewApiGeminiImageDecodeError,
   isNewApiParamOverrideCopyError,
@@ -22,7 +23,10 @@ import {
   materializeNewApiReferenceImage,
   mirrorXaisImageResults,
   newApiVideoBody,
+  newApiVideoProtocol,
   newApiVideoSize,
+  newApiVideoStatusPath,
+  newApiVideoSubmitPath,
   newApiImageRequestParams,
   parseWalletImageGenerationResult,
   parseXaisTaskId,
@@ -164,7 +168,25 @@ describe('wallet image provider normalization', () => {
     expect(isRecoverableNewApiVideoStatusError(new Error('HTTP 401: unauthorized'))).toBe(false);
   });
 
-  it('builds NewAPI /v1/videos payloads while preserving the XAIS video path separately', () => {
+  it('uses the unified NewAPI task protocol for Sora 2 only', () => {
+    expect(newApiVideoProtocol('sora-2')).toBe('unified-video');
+    expect(newApiVideoSubmitPath('Sora 2')).toBe('/v1/video/generations');
+    expect(newApiVideoStatusPath('unified-video', 'task/a')).toBe('/v1/video/generations/task%2Fa');
+    expect(newApiVideoProtocol('veo-3.1')).toBe('openai-videos');
+    expect(newApiVideoSubmitPath('veo-3.1-fast')).toBe('/v1/videos');
+    expect(newApiVideoStatusPath('openai-videos', 'task/a')).toBe('/v1/videos/task%2Fa');
+  });
+
+  it('falls back between NewAPI video protocols only for a route-level 404', () => {
+    expect(isNewApiVideoRouteNotFound(
+      new Error('HTTP 404: {"detail":"Not Found"}'),
+    )).toBe(true);
+    expect(isNewApiVideoRouteNotFound(
+      new Error('HTTP 404: {"error":{"message":"task not found"}}'),
+    )).toBe(false);
+  });
+
+  it('builds NewAPI video payloads while preserving the XAIS video path separately', () => {
     expect(newApiVideoSize('sora-2', '9:16', '1080p')).toBe('720x1280');
     expect(newApiVideoSize('veo-3.1-fast', '16:9', '1080p')).toBe('1920x1080');
     expect(newApiVideoBody({

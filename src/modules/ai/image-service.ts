@@ -2335,6 +2335,25 @@ export function isSora2VideoModel(model: string) {
   return model.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-') === 'sora-2';
 }
 
+type NewApiVideoProtocol = 'openai-videos' | 'unified-video';
+
+export function newApiVideoProtocol(model: string): NewApiVideoProtocol {
+  return isSora2VideoModel(model) ? 'unified-video' : 'openai-videos';
+}
+
+export function newApiVideoSubmitPath(model: string) {
+  return newApiVideoProtocol(model) === 'unified-video'
+    ? '/v1/video/generations'
+    : '/v1/videos';
+}
+
+export function newApiVideoStatusPath(protocol: NewApiVideoProtocol, taskId: string) {
+  const encodedTaskId = encodeURIComponent(taskId);
+  return protocol === 'unified-video'
+    ? `/v1/video/generations/${encodedTaskId}`
+    : `/v1/videos/${encodedTaskId}`;
+}
+
 export function isVeo31VideoModel(model: string) {
   const normalized = model.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-');
   return normalized === 'veo-3-1' || normalized === 'veo-3-1-fast';
@@ -2486,7 +2505,7 @@ async function providerNewApiVideoRequest(
         signal: controller.signal,
         duplex: 'half',
       };
-      const response = await fetch(providerEndpoint(provider.baseUrl, '/v1/videos'), request);
+      const response = await fetch(providerEndpoint(provider.baseUrl, newApiVideoSubmitPath(input.model)), request);
       const text = await response.text();
       if (!response.ok) {
         throw new UpstreamImageError(response.status, upstreamErrorMessage(response.status, text));
@@ -2515,6 +2534,7 @@ type PersistedVideoRequestState = {
   kind: 'video_tasks';
   provider: string;
   providerChannelId: string;
+  apiProtocol?: NewApiVideoProtocol;
   taskIds: string[];
   completedTaskIds: string[];
   outputs: Record<string, string>;
@@ -2729,6 +2749,9 @@ function parsePersistedVideoState(value: Prisma.JsonValue | null): PersistedVide
     kind: 'video_tasks',
     provider: typeof state.provider === 'string' ? state.provider : '',
     providerChannelId: typeof state.providerChannelId === 'string' ? state.providerChannelId : '',
+    ...(state.apiProtocol === 'unified-video' || state.apiProtocol === 'openai-videos'
+      ? { apiProtocol: state.apiProtocol }
+      : {}),
     taskIds: state.taskIds.filter((item): item is string => typeof item === 'string'),
     completedTaskIds: Array.isArray(state.completedTaskIds)
       ? state.completedTaskIds.filter((item): item is string => typeof item === 'string')
@@ -2749,6 +2772,7 @@ async function recordVideoSubmission(
     kind: 'video_tasks',
     provider: provider.kind,
     providerChannelId: provider.id,
+    ...(provider.kind === 'NEW_API' ? { apiProtocol: newApiVideoProtocol(input.model) } : {}),
     taskIds,
     completedTaskIds: [],
     outputs: {},
@@ -2971,18 +2995,79 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
   }
 }
 
+export function isNewApiVideoRouteNotFound(error: unknown) {
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string' ? error : JSON.stringify(error ?? '') ?? '';
+  return /HTTP 404\s*:\s*\{[^}]*"detail"\s*:\s*"Not Found"/i.test(message)
+    || /HTTP 404\s*:[^\n]*(?:Invalid URL|route not found)/i.test(message);
+}
+
+async function resolveNewApiVideoStatusProtocol(
+  prisma: PrismaClient,
+  userId: string,
+  clientRequestId?: string,
+): Promise<NewApiVideoProtocol> {
+  if (!clientRequestId) return 'openai-videos';
+  const request = await prisma.aiRequest.findUnique({
+    where: { userId_clientRequestId: { userId, clientRequestId } },
+    select: { capability: true, logicalModel: true, result: true },
+  });
+  if (!request || request.capability !== 'VIDEO') return 'openai-videos';
+  const persisted = parsePersistedVideoState(request.result);
+  return persisted?.apiProtocol ?? newApiVideoProtocol(request.logicalModel);
+}
+
+async function providerNewApiVideoStatusRequest(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  taskId: string,
+  protocol: NewApiVideoProtocol,
+) {
+  const alternate: NewApiVideoProtocol = protocol === 'unified-video'
+    ? 'openai-videos'
+    : 'unified-video';
+  try {
+    return await providerRequest(provider, secrets, newApiVideoStatusPath(protocol, taskId));
+  } catch (error) {
+    if (!isNewApiVideoRouteNotFound(error)) throw error;
+    console.warn('[newapi_video_status_protocol_fallback]', {
+      provider: provider.name,
+      taskId,
+      from: protocol,
+      to: alternate,
+    });
+    return providerRequest(provider, secrets, newApiVideoStatusPath(alternate, taskId));
+  }
+}
+
 export async function executeWalletVideoStatus(
   prisma: PrismaClient,
   input: { userId: string; provider?: VideoInput['provider']; providerChannelId?: string | undefined; taskId: string; clientRequestId?: string | undefined },
 ) {
   const provider = await selectVideoProvider(prisma, input.provider, input.providerChannelId);
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-  const path = provider.kind === 'XAIS'
-    ? `/xais/workerTaskWait?json=1&id=${encodeURIComponent(input.taskId)}`
-    : `/v1/videos/${encodeURIComponent(input.taskId)}`;
   let waited: unknown;
   try {
-    waited = await providerRequest(provider, secrets, path);
+    if (provider.kind === 'XAIS') {
+      waited = await providerRequest(
+        provider,
+        secrets,
+        `/xais/workerTaskWait?json=1&id=${encodeURIComponent(input.taskId)}`,
+      );
+    } else {
+      const protocol = await resolveNewApiVideoStatusProtocol(
+        prisma,
+        input.userId,
+        input.clientRequestId,
+      );
+      waited = await providerNewApiVideoStatusRequest(
+        provider,
+        secrets,
+        input.taskId,
+        protocol,
+      );
+    }
   } catch (error) {
     if (provider.kind === 'XAIS' || !isRecoverableNewApiVideoStatusError(error)) throw error;
     console.warn('[newapi_video_status_recovery]', {
