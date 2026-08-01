@@ -165,7 +165,9 @@ describe('wallet image provider normalization', () => {
       model: 'sora-2',
       prompt: 'slow push in',
       duration: 12,
+      seconds: '12',
       size: '720x1280',
+      resolution: '720p',
       images: ['first'],
     });
     expect(newApiVideoBody({
@@ -191,7 +193,9 @@ describe('wallet image provider normalization', () => {
         '参考图3为风格/纹理参考：保持材质、色彩、质感和整体视觉风格。',
       ].join('\n'),
       duration: 8,
+      seconds: '8',
       size: '1920x1080',
+      resolution: '1080p',
       images: ['person', 'scene', 'style'],
     });
     const oneReferenceBody = newApiVideoBody({

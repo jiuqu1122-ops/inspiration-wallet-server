@@ -283,6 +283,39 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
+  app.get(
+    '/video-results/:key',
+    { config: { rateLimit: { max: 600, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const query = imageResultQuerySchema.safeParse(request.query);
+      if (!query.success) {
+        return reply.code(400).send({ error: 'invalid_request', message: 'Invalid video result query' });
+      }
+      const rawKey = (request.params as { key?: unknown }).key;
+      const key = typeof rawKey === 'string' ? rawKey.trim().toLowerCase() : '';
+      if (!/^[a-f0-9]{64}\.(?:mp4|webm|mov)$/.test(key)) {
+        return reply.code(404).send({ error: 'not_found', message: 'Video result not found' });
+      }
+      const objectName = `generated-videos/${key}`;
+      try {
+        if (!await ossUploadService.exists(objectName)) {
+          return reply.code(404).send({ error: 'not_found', message: 'Video result not found or expired' });
+        }
+        const url = ossUploadService.getPublicUrl(objectName, { filename: key });
+        if (query.data.redirect === '0') {
+          return { url, expiresAt: Date.now() + 24 * 60 * 60 * 1_000 };
+        }
+        return reply.redirect(url);
+      } catch (error) {
+        request.log.error({ key, errorName: error instanceof Error ? error.name : 'unknown' }, 'video result signing failed');
+        return reply.code(503).send({
+          error: 'oss_signing_failed',
+          message: 'Generated video temporary URL could not be created',
+        });
+      }
+    },
+  );
+
   app.post(
     '/reference-images',
     {
