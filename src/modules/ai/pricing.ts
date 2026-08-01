@@ -286,7 +286,7 @@ export async function configuredImageUnitCredits(
   );
 }
 
-export async function configuredVideoUnitCredits(prisma: PrismaClient, model: string) {
+export async function configuredVideoCreditsPerSecond(prisma: PrismaClient, model: string) {
   const pricing = await getAiPricingConfig(prisma);
   const exact = pricing.videoModels.find(
     (item) => aiPricingModelToken(item.model) === aiPricingModelToken(model),

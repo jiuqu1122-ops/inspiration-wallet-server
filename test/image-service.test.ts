@@ -4,6 +4,7 @@ import sharp from 'sharp';
 import {
   IMAGE_GENERATION_TIMEOUT_MS,
   buildNewApiImageGenerationBody,
+  calculateVideoGenerationCredits,
   chooseProviderForCapability,
   collectProviderModelIds,
   confirmXaisReferenceAttachment,
@@ -34,6 +35,7 @@ import {
   sizeFromRatio,
   stageXaisPublicReference,
   uniqueImages,
+  videoDurationSecondsForBilling,
   xaisAttachmentRegistrationUrls,
 } from '../src/modules/ai/image-service.js';
 import { getImageResult } from '../src/modules/ai/image-result-store.js';
@@ -144,6 +146,13 @@ describe('wallet image provider normalization', () => {
       'gemini-2.5-pro',
       'gpt-image-2',
     ])).toEqual(['gemini-3-pro-image']);
+  });
+
+  it('prices video generation by effective seconds and output count', () => {
+    expect(videoDurationSecondsForBilling('veo-3.1', 8, 'NEW_API')).toBe(8);
+    expect(videoDurationSecondsForBilling('sora-2', 12, 'NEW_API')).toBe(12);
+    expect(videoDurationSecondsForBilling('seedance2', undefined, 'XAIS')).toBe(15);
+    expect(calculateVideoGenerationCredits(6n, 'veo-3.1-fast', 8, 2, 'NEW_API')).toBe(96n);
   });
 
   it('builds NewAPI /v1/videos payloads while preserving the XAIS video path separately', () => {

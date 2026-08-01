@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { PrismaClient } from '@prisma/client';
 import {
   configuredImageUnitCredits,
-  configuredVideoUnitCredits,
+  configuredVideoCreditsPerSecond,
   defaultAiPricingConfig,
   defaultImageUnitCredits,
   getAiPricingConfig,
@@ -80,7 +80,7 @@ describe('AI credit pricing', () => {
 
     expect(await configuredImageUnitCredits(prisma, 'GPT Image 2', '4K')).toBe(7n);
     expect(await configuredImageUnitCredits(prisma, 'custom-image-model', '2K')).toBe(66n);
-    expect(await configuredVideoUnitCredits(prisma, 'Seedance 2')).toBe(44n);
+    expect(await configuredVideoCreditsPerSecond(prisma, 'Seedance 2')).toBe(44n);
     expect((await getAiPricingConfig(prisma)).agentRequestCredits).toBe('8');
     expect((await getAiPricingConfig(prisma)).videoModels).toEqual(expect.arrayContaining([
       { model: 'seedance2', credits: '44' },

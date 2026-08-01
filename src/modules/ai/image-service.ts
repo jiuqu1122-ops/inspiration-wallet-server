@@ -14,7 +14,7 @@ import { CloudAiError } from './service.js';
 import {
   aiPricingModelToken as imageModelToken,
   configuredImageUnitCredits,
-  configuredVideoUnitCredits,
+  configuredVideoCreditsPerSecond,
   defaultImageUnitCredits,
   getAiPricingConfig,
   type PricedImageResolution,
@@ -2349,6 +2349,27 @@ export function normalizeNewApiVideoDuration(model: string, duration?: number) {
   ), fallback);
 }
 
+export function videoDurationSecondsForBilling(
+  model: string,
+  duration?: number,
+  providerKind?: AiProviderChannel['kind'],
+) {
+  if (providerKind === 'NEW_API') return normalizeNewApiVideoDuration(model, duration);
+  const requested = Number(duration);
+  return Number.isFinite(requested) && requested > 0 ? Math.ceil(requested) : 15;
+}
+
+export function calculateVideoGenerationCredits(
+  creditsPerSecond: bigint,
+  model: string,
+  duration: number | undefined,
+  count: number,
+  providerKind?: AiProviderChannel['kind'],
+) {
+  const durationSeconds = videoDurationSecondsForBilling(model, duration, providerKind);
+  return creditsPerSecond * BigInt(durationSeconds) * BigInt(count);
+}
+
 export function newApiVideoSize(model: string, aspectRatio?: string, resolution?: string) {
   const portrait = aspectRatio?.trim() === '9:16';
   const normalizedResolution = !isSora2VideoModel(model) && resolution?.trim().toLowerCase() === '1080p'
@@ -2789,9 +2810,20 @@ async function recordVideoTaskCompleted(
   });
 }
 
-async function reserveVideo(prisma: PrismaClient, input: VideoInput) {
-  const unitCredits = await configuredVideoUnitCredits(prisma, input.model);
-  const estimated = unitCredits * BigInt(input.count);
+async function reserveVideo(
+  prisma: PrismaClient,
+  input: VideoInput,
+  providerKind: AiProviderChannel['kind'],
+) {
+  const creditsPerSecond = await configuredVideoCreditsPerSecond(prisma, input.model);
+  const durationSeconds = videoDurationSecondsForBilling(input.model, input.duration, providerKind);
+  const estimated = calculateVideoGenerationCredits(
+    creditsPerSecond,
+    input.model,
+    input.duration,
+    input.count,
+    providerKind,
+  );
   return prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({ where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } } });
     const reusableRequest = existing && (existing.status === 'FAILED' || existing.status === 'REFUNDED')
@@ -2808,7 +2840,7 @@ async function reserveVideo(prisma: PrismaClient, input: VideoInput) {
     const request = reusableRequest
       ? await transaction.aiRequest.update({ where: { id: reusableRequest.id }, data: { status: 'RESERVED', logicalModel: input.model, estimatedCredits: estimated, chargedCredits: 0n, completedAt: null } })
       : await transaction.aiRequest.create({ data: { userId: input.userId, clientRequestId: input.clientRequestId, capability: 'VIDEO', logicalModel: input.model, status: 'RESERVED', estimatedCredits: estimated } });
-    await transaction.walletLedger.create({ data: { userId: input.userId, requestId: request.id, type: 'RESERVE', amount: -estimated, balanceAfter: wallet.availableCredits, description: '视频请求预扣' } });
+    await transaction.walletLedger.create({ data: { userId: input.userId, requestId: request.id, type: 'RESERVE', amount: -estimated, balanceAfter: wallet.availableCredits, description: `视频请求预扣（${durationSeconds}秒 × ${input.count}条）` } });
     return { requestId: request.id, estimated };
   });
 }
@@ -2893,9 +2925,9 @@ async function refundVideoRequest(prisma: PrismaClient, userId: string, clientRe
 }
 
 export async function executeWalletVideoGeneration(prisma: PrismaClient, input: VideoInput) {
-  const reservation = await reserveVideo(prisma, input);
+  const provider = await selectVideoProvider(prisma, input.provider, input.providerChannelId);
+  const reservation = await reserveVideo(prisma, input, provider.kind);
   try {
-    const provider = await selectVideoProvider(prisma, input.provider, input.providerChannelId);
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
     const results: unknown[] = [];
     for (let index = 0; index < input.count; index += 1) {
