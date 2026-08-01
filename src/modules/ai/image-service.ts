@@ -2354,6 +2354,18 @@ export function newApiVideoStatusPath(protocol: NewApiVideoProtocol, taskId: str
     : `/v1/videos/${encodedTaskId}`;
 }
 
+export function newApiSoraFallbackModel(model: string, error: unknown) {
+  if (!isSora2VideoModel(model)) return '';
+  const status = error instanceof UpstreamImageError ? error.status : 0;
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string' ? error : JSON.stringify(error ?? '') ?? '';
+  if (status !== 422 && !/HTTP 422\b/i.test(message)) return '';
+  return /not supported for ModelModality\.VIDEO[\s\S]*\bazure-sora\b/i.test(message)
+    ? 'azure-sora'
+    : '';
+}
+
 export function isVeo31VideoModel(model: string) {
   const normalized = model.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-');
   return normalized === 'veo-3-1' || normalized === 'veo-3-1-fast';
@@ -2445,78 +2457,93 @@ async function providerNewApiVideoRequest(
   }
   const images = await Promise.all(sources.map((source, index) => stageNewApiEditImage(source, index)));
   try {
-    const body = newApiVideoBody({ ...input, inputImages: sources }) as Record<string, unknown>;
-    delete body.images;
-    delete body.input_reference;
-    delete body.image_tail;
-    const boundary = `inspiration-video-${randomUUID().replace(/-/g, '')}`;
-    const textParts = Object.entries(body)
-      .filter((entry): entry is [string, string | number | boolean] => (
-        typeof entry[1] === 'string'
-        || typeof entry[1] === 'number'
-        || typeof entry[1] === 'boolean'
-      ))
-      .map(([name, value]) => newApiMultipartTextPart(boundary, name, String(value)));
-    const fieldNames = images.map((_, index) => (
-      input.inputMode === 'FLF' && index === 1 ? 'image_tail' : 'input_reference'
-    ));
-    for (let index = 0; index < images.length; index += 1) {
-      textParts.push(newApiMultipartTextPart(
-        boundary,
-        fieldNames[index]!,
-        await stagedImageDataUrl(images[index]!),
+    const submit = async (requestModel: string) => {
+      const body = newApiVideoBody({ ...input, inputImages: sources }) as Record<string, unknown>;
+      body.model = requestModel;
+      delete body.images;
+      delete body.input_reference;
+      delete body.image_tail;
+      const boundary = `inspiration-video-${randomUUID().replace(/-/g, '')}`;
+      const textParts = Object.entries(body)
+        .filter((entry): entry is [string, string | number | boolean] => (
+          typeof entry[1] === 'string'
+          || typeof entry[1] === 'number'
+          || typeof entry[1] === 'boolean'
+        ))
+        .map(([name, value]) => newApiMultipartTextPart(boundary, name, String(value)));
+      const fieldNames = images.map((_, index) => (
+        input.inputMode === 'FLF' && index === 1 ? 'image_tail' : 'input_reference'
       ));
-    }
-    const fileHeaders = images.map((image, index) => (
-      newApiMultipartFileHeader(boundary, image, fieldNames[index])
-    ));
-    const fileFooters = images.map(() => Buffer.from('\r\n', 'utf8'));
-    const closing = Buffer.from(`--${boundary}--\r\n`, 'utf8');
-    const contentLength = textParts.reduce((total, part) => total + part.byteLength, 0)
-      + images.reduce((total, image, index) => (
-        total + fileHeaders[index]!.byteLength + image.size + fileFooters[index]!.byteLength
-      ), 0)
-      + closing.byteLength;
-    const bodyStream = Readable.from((async function* multipartBody() {
-      for (const part of textParts) yield part;
       for (let index = 0; index < images.length; index += 1) {
-        const image = images[index]!;
-        yield fileHeaders[index]!;
-        if (image.path) {
-          for await (const chunk of createReadStream(image.path)) yield chunk;
-        } else if (image.bytes) {
-          yield image.bytes;
+        textParts.push(newApiMultipartTextPart(
+          boundary,
+          fieldNames[index]!,
+          await stagedImageDataUrl(images[index]!),
+        ));
+      }
+      const fileHeaders = images.map((image, index) => (
+        newApiMultipartFileHeader(boundary, image, fieldNames[index])
+      ));
+      const fileFooters = images.map(() => Buffer.from('\r\n', 'utf8'));
+      const closing = Buffer.from(`--${boundary}--\r\n`, 'utf8');
+      const contentLength = textParts.reduce((total, part) => total + part.byteLength, 0)
+        + images.reduce((total, image, index) => (
+          total + fileHeaders[index]!.byteLength + image.size + fileFooters[index]!.byteLength
+        ), 0)
+        + closing.byteLength;
+      const bodyStream = Readable.from((async function* multipartBody() {
+        for (const part of textParts) yield part;
+        for (let index = 0; index < images.length; index += 1) {
+          const image = images[index]!;
+          yield fileHeaders[index]!;
+          if (image.path) {
+            for await (const chunk of createReadStream(image.path)) yield chunk;
+          } else if (image.bytes) {
+            yield image.bytes;
+          }
+          yield fileFooters[index]!;
         }
-        yield fileFooters[index]!;
+        yield closing;
+      })());
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10 * 60_000);
+      try {
+        const headers = upstreamHeaders(secrets);
+        headers.set('content-type', `multipart/form-data; boundary=${boundary}`);
+        headers.set('content-length', String(contentLength));
+        const request: RequestInit & { duplex?: 'half' } = {
+          method: 'POST',
+          headers,
+          body: Readable.toWeb(bodyStream) as unknown as BodyInit,
+          redirect: 'error',
+          signal: controller.signal,
+          duplex: 'half',
+        };
+        const response = await fetch(providerEndpoint(provider.baseUrl, newApiVideoSubmitPath(input.model)), request);
+        const text = await response.text();
+        if (!response.ok) {
+          throw new UpstreamImageError(response.status, upstreamErrorMessage(response.status, text));
+        }
+        return parseProviderValue(text);
+      } catch (error) {
+        if (error instanceof UpstreamImageError || error instanceof CloudAiError) throw error;
+        throw new UpstreamImageError(0, error instanceof Error ? error.message : String(error));
+      } finally {
+        clearTimeout(timeout);
+        bodyStream.destroy();
       }
-      yield closing;
-    })());
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10 * 60_000);
+    };
     try {
-      const headers = upstreamHeaders(secrets);
-      headers.set('content-type', `multipart/form-data; boundary=${boundary}`);
-      headers.set('content-length', String(contentLength));
-      const request: RequestInit & { duplex?: 'half' } = {
-        method: 'POST',
-        headers,
-        body: Readable.toWeb(bodyStream) as unknown as BodyInit,
-        redirect: 'error',
-        signal: controller.signal,
-        duplex: 'half',
-      };
-      const response = await fetch(providerEndpoint(provider.baseUrl, newApiVideoSubmitPath(input.model)), request);
-      const text = await response.text();
-      if (!response.ok) {
-        throw new UpstreamImageError(response.status, upstreamErrorMessage(response.status, text));
-      }
-      return parseProviderValue(text);
+      return await submit(input.model);
     } catch (error) {
-      if (error instanceof UpstreamImageError || error instanceof CloudAiError) throw error;
-      throw new UpstreamImageError(0, error instanceof Error ? error.message : String(error));
-    } finally {
-      clearTimeout(timeout);
-      bodyStream.destroy();
+      const fallbackModel = newApiSoraFallbackModel(input.model, error);
+      if (!fallbackModel) throw error;
+      console.warn('[newapi_sora_model_fallback]', {
+        provider: provider.name,
+        from: input.model,
+        to: fallbackModel,
+      });
+      return submit(fallbackModel);
     }
   } finally {
     await Promise.all(images.map(image => image.cleanup().catch(() => {})));
