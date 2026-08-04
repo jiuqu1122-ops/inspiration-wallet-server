@@ -40,7 +40,9 @@ enum AiCapability {
   IMAGE
   IMAGE_NANO_BANANA
   IMAGE_NANO_BANANA_2
+  IMAGE_NANO_BANANA_PRO_1K
   IMAGE_GPT
+  IMAGE_GPT_1K
   VIDEO
 }
 
@@ -77,6 +79,8 @@ enum AdminOperationType {
 enum AiProviderKind {
   NEW_API
   XAIS
+  MIKOTO
+  BIGMODEL
 }
 
 enum AiProviderStatus {

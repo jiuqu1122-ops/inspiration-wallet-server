@@ -13,7 +13,7 @@ import { CloudAiError } from './service.js';
 import {
   aiPricingModelToken as imageModelToken,
   configuredImageUnitCredits,
-  configuredVideoUnitCredits,
+  configuredVideoRequestCredits,
   defaultImageUnitCredits,
   getAiPricingConfig,
   type PricedImageResolution,
@@ -119,12 +119,16 @@ const IMAGE_PROVIDER_CAPABILITIES: AiCapability[] = [
   'IMAGE',
   'IMAGE_NANO_BANANA',
   'IMAGE_NANO_BANANA_2',
+  'IMAGE_NANO_BANANA_PRO_1K',
   'IMAGE_GPT',
+  'IMAGE_GPT_1K',
 ];
 
-export function imageCapabilityForModel(model: string): AiCapability {
+export function imageCapabilityForModel(model: string, resolution?: string): AiCapability {
   const token = imageModelToken(model);
   if (token.includes('gptimage') || token.includes('image2') || token.includes('img2')) {
+    const requestedResolution = String(resolution || '').trim().toLowerCase();
+    if (requestedResolution === '1k' || token.includes('1k')) return 'IMAGE_GPT_1K';
     return 'IMAGE_GPT';
   }
   if (token.includes('nanobanana2')
@@ -141,6 +145,11 @@ export function imageCapabilityForModel(model: string): AiCapability {
     || token.includes('nanopro')
     || token.includes('nano2')
   ) {
+    const isNanoBananaPro = isNanoBananaProModelToken(token);
+    const requestedResolution = String(resolution || '').trim().toLowerCase();
+    if (isNanoBananaPro && (requestedResolution === '1k' || token.includes('1k'))) {
+      return 'IMAGE_NANO_BANANA_PRO_1K';
+    }
     return 'IMAGE_NANO_BANANA';
   }
   return 'IMAGE';
@@ -149,9 +158,29 @@ export function imageCapabilityForModel(model: string): AiCapability {
 export function providerSupportsImageModel(
   provider: { capabilities: readonly AiCapability[] },
   model: string,
+  resolution?: string,
 ) {
   if (provider.capabilities.includes('IMAGE')) return true;
-  return provider.capabilities.includes(imageCapabilityForModel(model));
+  const capability = imageCapabilityForModel(model, resolution);
+  if (capability === 'IMAGE_NANO_BANANA'
+    && provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K')
+    && !resolution
+    && isNanoBananaProModelToken(imageModelToken(model))) {
+    // A 1K-only Banana Pro channel may still advertise the model itself;
+    // the generation path applies the 1K default before charging/requesting.
+    return true;
+  }
+  if (capability === 'IMAGE_GPT'
+    && provider.capabilities.includes('IMAGE_GPT_1K')
+    && !resolution
+    && !imageModelToken(model).includes('2k')
+    && !imageModelToken(model).includes('4k')) {
+    // A generic Image2 model can be listed for a 1K-only channel; the
+    // requested resolution is checked again when a generation is started.
+    return true;
+  }
+  return provider.capabilities.includes(capability)
+    || (capability === 'IMAGE_GPT_1K' && provider.capabilities.includes('IMAGE_GPT'));
 }
 
 export function filterProviderImageModels(
@@ -164,7 +193,7 @@ export function filterProviderImageModels(
 export type ImageInput = {
   userId: string;
   clientRequestId: string;
-  provider?: 'new-api' | 'xais-chat' | 'openai-compatible' | 'custom' | undefined;
+  provider?: 'new-api' | 'xais-chat' | 'mikoto' | 'bigmodel' | 'openai-compatible' | 'custom' | undefined;
   providerChannelId?: string | undefined;
   model: string;
   prompt: string;
@@ -178,7 +207,11 @@ export type ImageInput = {
 };
 
 class UpstreamImageError extends Error {
-  constructor(public readonly status: number, message: string) {
+  constructor(
+    public readonly status: number,
+    message: string,
+    public readonly responseValue?: unknown,
+  ) {
     super(message);
     this.name = 'UpstreamImageError';
   }
@@ -224,13 +257,16 @@ async function selectImageProvider(
   prisma: PrismaClient,
   providerChannelId: string | undefined,
   requestedModel: string,
+  requestedResolution?: string,
 ) {
   const providers = await listImageProviders(prisma);
   const provider = providerChannelId
     ? providers.find((candidate) => candidate.id === providerChannelId)
     : providers.find((candidate) => {
       const model = requestedModel.trim() || candidate.defaultModel?.trim() || '';
-      return model ? providerSupportsImageModel(candidate, model) : candidate.capabilities.includes('IMAGE');
+      return model
+        ? providerSupportsImageModel(candidate, model, requestedResolution)
+        : candidate.capabilities.includes('IMAGE');
     });
   if (!provider) {
     throw new CloudAiError(
@@ -240,7 +276,7 @@ async function selectImageProvider(
     );
   }
   const effectiveModel = requestedModel.trim() || provider.defaultModel?.trim() || '';
-  if (effectiveModel && !providerSupportsImageModel(provider, effectiveModel)) {
+  if (effectiveModel && !providerSupportsImageModel(provider, effectiveModel, requestedResolution)) {
     throw new CloudAiError(
       'provider_model_family_mismatch',
       '所选生图模型与该渠道启用的模型家族不匹配',
@@ -266,9 +302,17 @@ export function resolveImageModel(
   requestedModel: string,
 ) {
   const requested = requestedModel.trim();
-  if (requested) return provider.kind === 'NEW_API' ? resolveNewApiImageModel(requested) : requested;
+  if (requested) {
+    if (provider.kind === 'NEW_API') return resolveNewApiImageModel(requested);
+    if (provider.kind === 'BIGMODEL') return resolveBigmodelImageModel(requested);
+    return requested;
+  }
   const configured = provider.defaultModel?.trim();
-  if (configured) return provider.kind === 'NEW_API' ? resolveNewApiImageModel(configured) : configured;
+  if (configured) {
+    if (provider.kind === 'NEW_API') return resolveNewApiImageModel(configured);
+    if (provider.kind === 'BIGMODEL') return resolveBigmodelImageModel(configured);
+    return configured;
+  }
   throw new CloudAiError('provider_model_missing', '生图请求和渠道都没有配置模型', 503);
 }
 
@@ -317,7 +361,11 @@ async function providerRequest(
     });
     const text = await response.text();
     if (!response.ok) {
-      throw new UpstreamImageError(response.status, upstreamErrorMessage(response.status, text));
+      throw new UpstreamImageError(
+        response.status,
+        upstreamErrorMessage(response.status, text),
+        parseProviderValue(text),
+      );
     }
     return parseProviderValue(text);
   } catch (error) {
@@ -409,8 +457,12 @@ export async function listWalletImageModels(
     try {
       await assertPublicProviderUrl(provider.baseUrl);
       const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-      const value = await providerRequest(provider, secrets, '/v1/models', undefined, 15_000);
-      const models = filterProviderImageModels(provider, collectProviderModelIds(value));
+      const value = provider.kind === 'BIGMODEL'
+        ? undefined
+        : await providerRequest(provider, secrets, '/v1/models', undefined, 15_000);
+      const models = provider.kind === 'BIGMODEL'
+        ? bigmodelConfiguredImageModels(provider)
+        : filterProviderImageModels(provider, collectProviderModelIds(value));
       const defaultModel = provider.defaultModel
         && providerSupportsImageModel(provider, provider.defaultModel)
         ? provider.defaultModel
@@ -421,6 +473,7 @@ export async function listWalletImageModels(
         provider: provider.kind,
         defaultModel,
         models,
+        capabilities: provider.capabilities,
         error: null,
       };
     } catch (error) {
@@ -430,6 +483,7 @@ export async function listWalletImageModels(
         provider: provider.kind,
         defaultModel: provider.defaultModel,
         models: [] as string[],
+        capabilities: provider.capabilities,
         error: error instanceof Error ? error.message.slice(0, 800) : '读取模型失败',
       };
     }
@@ -442,6 +496,129 @@ export async function listWalletImageModels(
     channels,
     pricing,
   };
+}
+
+function bigmodelHeaders(secrets: ProviderSecrets) {
+  const headers = new Headers({
+    accept: 'application/json, text/plain, */*',
+    'content-type': 'application/json',
+    'user-agent': 'Inspiration-Wallet-Server/1',
+  });
+  for (const [name, value] of Object.entries(secrets.headers)) headers.set(name, value);
+  // Bigmodel's native Gemini endpoint uses the Google-style API key header.
+  headers.set('x-goog-api-key', secrets.apiKey);
+  return headers;
+}
+
+async function bigmodelRequest(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  path: string,
+  body?: unknown,
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), IMAGE_GENERATION_TIMEOUT_MS);
+  try {
+    const response = await fetch(providerEndpoint(provider.baseUrl, path), {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: bigmodelHeaders(secrets),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      redirect: 'error',
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      throw new UpstreamImageError(
+        response.status,
+        upstreamErrorMessage(response.status, text),
+        parseProviderValue(text),
+      );
+    }
+    return parseProviderValue(text);
+  } catch (error) {
+    if (error instanceof UpstreamImageError) throw error;
+    throw new UpstreamImageError(0, error instanceof Error ? error.message : String(error));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export function resolveBigmodelImageModel(model: string) {
+  const trimmed = model.trim();
+  const token = imageModelToken(trimmed);
+  if (token.includes('gptimage2') || token.includes('image2') || token.includes('img2')) {
+    return 'gpt-image-2';
+  }
+  if (isNanoBananaProModelToken(token)) {
+    return 'gemini-3-pro-image-preview';
+  }
+  return trimmed;
+}
+
+function isNanoBananaProModelToken(token: string) {
+  return token.includes('nanobananapro')
+    || token.includes('nanopro')
+    || token.includes('gemini3proimage');
+}
+
+function isBigmodelBananaModel(model: string) {
+  return imageModelToken(resolveBigmodelImageModel(model)).includes('gemini3proimage');
+}
+
+function bigmodelImageSize(resolution?: string) {
+  const value = String(resolution || '').trim().toUpperCase();
+  return value === '1K' || value === '4K' ? value : '2K';
+}
+
+function bigmodelInlineImagePart(source: string) {
+  const match = source.trim().match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([a-zA-Z0-9+/=\s]+)$/i);
+  if (!match) throw new CloudAiError('invalid_image_reference', 'Bigmodel 参考图必须是图片 data URI 或公网图片 URL', 400);
+  return { inlineData: { mimeType: match[1]!, data: match[2]!.replace(/\s+/g, '') } };
+}
+
+export async function generateBigmodelBananaImages(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  input: ImageInput,
+) {
+  const model = resolveBigmodelImageModel(input.model);
+  const materialized = await Promise.all(input.inputImages.map(materializeNewApiReferenceImage));
+  const parts = [
+    { text: promptWithConstraints(input) },
+    ...materialized.map(bigmodelInlineImagePart),
+  ];
+  const images: string[] = [];
+  for (let index = 0; index < input.count; index += 1) {
+    let value: unknown;
+    try {
+      value = await bigmodelRequest(
+        provider,
+        secrets,
+        `/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        {
+          contents: [{ role: 'user', parts }],
+          generationConfig: {
+            responseModalities: ['IMAGE'],
+            responseFormat: {
+              image: {
+                aspectRatio: input.aspectRatio,
+                imageSize: bigmodelImageSize(input.resolution),
+              },
+            },
+          },
+        },
+      );
+    } catch (error) {
+      const recovered = imagesFromUpstreamError(error, input.inputImages, 1);
+      if (!recovered.length) throw error;
+      images.push(...recovered);
+      continue;
+    }
+    images.push(...uniqueImages(value, input.inputImages, 1));
+  }
+  const unique = Array.from(new Set(images)).slice(0, input.count);
+  if (!unique.length) throw new Error('Bigmodel Banana Pro 没有返回图片数据');
+  return unique;
 }
 
 export function uniqueImages(value: unknown, inputImages: string[], count: number) {
@@ -469,6 +646,30 @@ function newApiImageFamily(model: string) {
   return 'legacy';
 }
 
+function bigmodelConfiguredImageModels(provider: Pick<AiProviderChannel, 'capabilities' | 'defaultModel'>) {
+  const models: string[] = [];
+  if (provider.capabilities.includes('IMAGE_NANO_BANANA')
+    || provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K')) {
+    models.push('gemini-3-pro-image-preview');
+  }
+  if (provider.capabilities.includes('IMAGE_GPT')
+    || provider.capabilities.includes('IMAGE_GPT_1K')) {
+    models.push('gpt-image-2');
+  }
+  if (provider.defaultModel?.trim() && !models.includes(provider.defaultModel.trim())) {
+    models.push(provider.defaultModel.trim());
+  }
+  return filterProviderImageModels(provider, models);
+}
+
+const imagesFromUpstreamError = (
+  error: unknown,
+  inputImages: string[],
+  count: number,
+) => error instanceof UpstreamImageError
+  ? uniqueImages(error.responseValue, inputImages, count)
+  : [];
+
 function shouldUseNewApiAsyncImageTask(input: ImageInput) {
   return newApiImageFamily(input.model) === 'nano-banana'
     || normalizedImageResolution(input.resolution) === '4k'
@@ -495,7 +696,11 @@ async function providerImageContentRequest(
     });
     if (!response.ok) {
       const text = await response.text();
-      throw new UpstreamImageError(response.status, upstreamErrorMessage(response.status, text));
+      throw new UpstreamImageError(
+        response.status,
+        upstreamErrorMessage(response.status, text),
+        parseProviderValue(text),
+      );
     }
     const contentType = (response.headers.get('content-type') || '').toLowerCase();
     if (contentType.includes('json') || contentType.startsWith('text/')) {
@@ -839,6 +1044,8 @@ export async function resolveNewApiImageResponse(
       );
       lastPollError = null;
     } catch (error) {
+      const errorImages = imagesFromUpstreamError(error, inputImages, count);
+      if (errorImages.length) return errorImages;
       if (!isRetryableNewApiTaskPollError(error)) throw error;
       lastPollError = error;
       continue;
@@ -852,11 +1059,18 @@ export async function resolveNewApiImageResponse(
       throw new Error(`NewAPI 图片任务失败：${taskId}`);
     }
     if (/^(?:completed|complete|succeeded|success|finished|done)$/.test(state)) {
-      const content = await providerImageContentRequest(
-        provider,
-        secrets,
-        `/v1/images/${encodeURIComponent(taskId)}/content`,
-      );
+      let content: unknown;
+      try {
+        content = await providerImageContentRequest(
+          provider,
+          secrets,
+          `/v1/images/${encodeURIComponent(taskId)}/content`,
+        );
+      } catch (error) {
+        const contentImages = imagesFromUpstreamError(error, inputImages, count);
+        if (contentImages.length) return contentImages;
+        throw error;
+      }
       const contentImages = uniqueImages(content, inputImages, count);
       if (contentImages.length) return contentImages;
       throw new Error(`NewAPI 图片任务已完成但没有返回图片：${taskId}`);
@@ -1230,7 +1444,11 @@ async function providerNewApiImageEditRequest(
     const response = await fetch(providerEndpoint(provider.baseUrl, '/v1/images/edits'), request);
     const text = await response.text();
     if (!response.ok) {
-      throw new UpstreamImageError(response.status, upstreamErrorMessage(response.status, text));
+      throw new UpstreamImageError(
+        response.status,
+        upstreamErrorMessage(response.status, text),
+        parseProviderValue(text),
+      );
     }
     return parseProviderValue(text);
   } catch (error) {
@@ -1259,6 +1477,7 @@ export async function generateNewApiImages(
   }
   const stagedImages: StagedNewApiEditImage[] = [];
   let started: unknown;
+  let startError: unknown = null;
   const preferAsync = shouldUseNewApiAsyncImageTask(input);
   try {
     if (input.inputImages.length > 0) {
@@ -1313,16 +1532,27 @@ export async function generateNewApiImages(
       );
       started = await requestNewApiImageWithAsyncFallback(preferAsync, startGeneration);
     }
+  } catch (error) {
+    startError = error;
   } finally {
     await Promise.all(stagedImages.map((image) => image.cleanup().catch(() => {})));
   }
-  const images = await resolveNewApiImageResponse(
-    provider,
-    secrets,
-    started,
-    input.inputImages,
-    input.count,
-  );
+  let images: string[];
+  if (startError) {
+    images = imagesFromUpstreamError(startError, input.inputImages, input.count);
+    if (images.length === 0) throw startError;
+  } else try {
+    images = await resolveNewApiImageResponse(
+      provider,
+      secrets,
+      started,
+      input.inputImages,
+      input.count,
+    );
+  } catch (error) {
+    images = imagesFromUpstreamError(error, input.inputImages, input.count);
+    if (images.length === 0) throw error;
+  }
   const output: string[] = [];
   for (let index = 0; index < images.length; index += 1) {
     const source = images[index]!;
@@ -2161,17 +2391,26 @@ async function releaseImageCredits(
 }
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
-  const provider = await selectImageProvider(prisma, input.providerChannelId, input.model);
+  const provider = await selectImageProvider(prisma, input.providerChannelId, input.model, input.resolution);
   if (provider.kind === 'XAIS' && input.inputImages.length > 8) {
     throw new CloudAiError('invalid_request', 'XAIS 生图最多支持 8 张参考图', 400);
   }
-  const effectiveInput = { ...input, model: resolveImageModel(provider, input.model) };
+  const isImage2OneKOnly = provider.capabilities.includes('IMAGE_GPT_1K')
+    && !provider.capabilities.includes('IMAGE_GPT')
+    && !provider.capabilities.includes('IMAGE');
+  const effectiveInput = {
+    ...input,
+    model: resolveImageModel(provider, input.model),
+    ...(isImage2OneKOnly && !input.resolution ? { resolution: '1k' } : {}),
+  };
   const reservation = await reserveImageCredits(prisma, effectiveInput);
   try {
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
     const providerImages = provider.kind === 'XAIS'
       ? await generateXaisImages(provider, secrets, effectiveInput)
-      : await generateNewApiImages(provider, secrets, effectiveInput);
+      : provider.kind === 'BIGMODEL' && isBigmodelBananaModel(effectiveInput.model)
+        ? await generateBigmodelBananaImages(provider, secrets, effectiveInput)
+        : await generateNewApiImages(provider, secrets, effectiveInput);
     const images = provider.kind === 'XAIS'
       ? await mirrorXaisImageResults(providerImages, provider.name)
       : providerImages;
@@ -2257,11 +2496,13 @@ export async function getWalletImageGenerationByRequest(
 export type VideoInput = {
   userId: string;
   clientRequestId: string;
-  provider?: 'new-api' | 'xais-chat' | undefined;
+  provider?: 'new-api' | 'xais-chat' | 'mikoto' | undefined;
   providerChannelId?: string | undefined;
   model: string;
   prompt: string;
   inputImages: string[];
+  inputVideos: string[];
+  inputAudios: string[];
   aspectRatio: string;
   resolution?: string | undefined;
   duration?: number | undefined;
@@ -2269,9 +2510,20 @@ export type VideoInput = {
   count: number;
 };
 
+const isSeedance20VideoModel = (model: string) => {
+  const token = model.trim().toLowerCase().replace(/[\s_.-]+/g, '');
+  return token === 'seedance2'
+    || token === 'seedance20'
+    || token === 'seedance2fast'
+    || token === 'seedance20fast'
+    || token === 'sourcemix20'
+    || token === 'sourcemix20fast';
+};
+
 function videoProviderKind(provider?: VideoInput['provider']) {
   if (provider === 'xais-chat') return 'XAIS' as const;
   if (provider === 'new-api') return 'NEW_API' as const;
+  if (provider === 'mikoto') return 'MIKOTO' as const;
   return undefined;
 }
 
@@ -2297,23 +2549,61 @@ async function selectVideoProvider(prisma: PrismaClient, preference?: VideoInput
 }
 
 function xaisVideoBody(input: VideoInput) {
+  const references = [...input.inputImages, ...input.inputVideos, ...input.inputAudios];
   return {
     prompt: input.prompt,
     model: input.model,
-    ref: input.inputImages,
+    ref: references,
     ...(input.aspectRatio ? { ratio: input.aspectRatio } : {}),
     custom_field: {
       res: input.resolution || '720p',
-      input: input.inputMode || 'REF',
+      input: isSeedance20VideoModel(input.model) ? 'REF' : input.inputMode || 'REF',
       duration: String(input.duration || 15),
       outputFormat: 'video/mp4',
     },
   };
 }
 
+export function resolveMikotoSeedanceModel(model: string, resolution?: string) {
+  const token = model.trim().toLowerCase().replace(/[\s_.-]+/g, '');
+  const isFast = token.includes('sourcemix20fast')
+    || token.includes('seedance2fast')
+    || token.includes('seedance20fast')
+    || token.includes('seedancefast');
+  const normalizedResolution = String(resolution || '').trim().toLowerCase();
+  if (isFast) return normalizedResolution === '480p' ? 'seedance-fast-480p' : 'seedance-fast-720p';
+  return normalizedResolution === '1080p' ? 'seedance-2.0-1080p' : 'seedance-2.0-720p';
+}
+
+function mikotoSeedanceModel(input: VideoInput) {
+  return resolveMikotoSeedanceModel(input.model, input.resolution);
+}
+
+function mikotoVideoBody(input: VideoInput) {
+  const duration = Math.max(4, Math.min(15, Math.round(Number(input.duration) || 15)));
+  const hasReferences = input.inputImages.length > 0
+    || input.inputVideos.length > 0
+    || input.inputAudios.length > 0;
+  return {
+    model: mikotoSeedanceModel(input),
+    prompt: input.prompt,
+    duration,
+    ...(input.aspectRatio ? { aspect_ratio: input.aspectRatio } : {}),
+    ...(input.inputImages.length ? { images: input.inputImages } : {}),
+    ...(input.inputVideos.length ? { referenceVideos: input.inputVideos } : {}),
+    ...(input.inputAudios.length ? { referenceAudios: input.inputAudios } : {}),
+    ...(hasReferences ? { reference_mode: input.inputMode === 'FLF' ? 'frame' : 'media' } : {}),
+  };
+}
+
 async function reserveVideo(prisma: PrismaClient, input: VideoInput) {
-  const unitCredits = await configuredVideoUnitCredits(prisma, input.model);
-  const estimated = unitCredits * BigInt(input.count);
+  const estimated = await configuredVideoRequestCredits(
+    prisma,
+    input.model,
+    input.duration,
+    input.resolution,
+    input.count,
+  );
   return prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({ where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } } });
     const reusableRequest = existing && (existing.status === 'FAILED' || existing.status === 'REFUNDED')
@@ -2415,18 +2705,29 @@ async function refundVideoRequest(prisma: PrismaClient, userId: string, clientRe
 }
 
 export async function executeWalletVideoGeneration(prisma: PrismaClient, input: VideoInput) {
+  if (isSeedance20VideoModel(input.model)
+    && (input.inputImages.length > 9 || input.inputVideos.length > 3 || input.inputAudios.length > 3)) {
+    throw new CloudAiError('invalid_request', 'Seedance 2.0 supports 9 images, 3 videos, and 3 audios at most', 400);
+  }
   const reservation = await reserveVideo(prisma, input);
   try {
     const provider = await selectVideoProvider(prisma, input.provider, input.providerChannelId);
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
     const results: unknown[] = [];
     for (let index = 0; index < input.count; index += 1) {
-      const path = provider.kind === 'XAIS' ? '/xais/workerTaskStart' : '/v1/video/generations';
-      const body = provider.kind === 'XAIS' ? xaisVideoBody(input) : {
+      const path = provider.kind === 'XAIS'
+        ? '/xais/workerTaskStart'
+        : provider.kind === 'MIKOTO' ? '/v1/videos' : '/v1/video/generations';
+      const body = provider.kind === 'XAIS' ? xaisVideoBody(input) : provider.kind === 'MIKOTO' ? mikotoVideoBody(input) : {
         model: input.model,
         prompt: input.prompt,
         n: 1,
         ...(input.inputImages.length ? { images: input.inputImages } : {}),
+        ...(input.inputVideos.length ? { videos: input.inputVideos } : {}),
+        ...(input.inputAudios.length ? { audios: input.inputAudios } : {}),
+        ...(isSeedance20VideoModel(input.model)
+          ? { ref: [...input.inputImages, ...input.inputVideos, ...input.inputAudios] }
+          : {}),
         ...(input.aspectRatio ? { aspect_ratio: input.aspectRatio, ratio: input.aspectRatio } : {}),
         ...(input.resolution ? { resolution: input.resolution } : {}),
         ...(input.duration ? { duration: input.duration } : {}),
@@ -2453,7 +2754,9 @@ export async function executeWalletVideoStatus(
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
   const path = provider.kind === 'XAIS'
     ? `/xais/workerTaskWait?json=1&id=${encodeURIComponent(input.taskId)}`
-    : `/v1/video/generations/${encodeURIComponent(input.taskId)}`;
+    : provider.kind === 'MIKOTO'
+      ? `/v1/videos/${encodeURIComponent(input.taskId)}`
+      : `/v1/video/generations/${encodeURIComponent(input.taskId)}`;
   const waited = await providerRequest(provider, secrets, path);
   const failure = getFailure(waited);
   if (failure) {

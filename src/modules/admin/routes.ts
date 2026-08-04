@@ -75,6 +75,11 @@ const imageModelPriceSchema = z.object({
 const videoModelPriceSchema = z.object({
   model: z.string().trim().min(1).max(200),
   credits: pricingCreditsSchema,
+  creditsPerSecond: pricingCreditsSchema.optional(),
+  creditsPerVideo: pricingCreditsSchema.optional(),
+  creditsByDuration: z.record(z.string().trim().min(1).max(20), pricingCreditsSchema).optional(),
+  creditsByResolution: z.record(z.string().trim().min(1).max(20), pricingCreditsSchema).optional(),
+  creditsByCount: z.record(z.string().trim().min(1).max(20), pricingCreditsSchema).optional(),
 }).strict();
 const pricingSchema = z.object({
   agentRequestCredits: pricingCreditsSchema,

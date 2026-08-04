@@ -10,7 +10,16 @@ export type ImageModelCreditPrice = {
 
 export type VideoModelCreditPrice = {
   model: string;
+  /** Legacy per-second price. Kept for existing pricing records. */
   credits: string;
+  creditsPerSecond?: string | undefined;
+  creditsPerVideo?: string | undefined;
+  /** Per-video override keyed by duration in seconds. */
+  creditsByDuration?: Record<string, string> | undefined;
+  /** Per-video surcharge keyed by output resolution. */
+  creditsByResolution?: Record<string, string> | undefined;
+  /** Exact request total keyed by requested output count. */
+  creditsByCount?: Record<string, string> | undefined;
 };
 
 export type AiPricingConfigValue = {
@@ -46,6 +55,9 @@ const KNOWN_IMAGE_MODELS = [
 
 const KNOWN_VIDEO_MODELS = [
   'seedance2',
+  'seedance2fast',
+  'kling-video',
+  'kling-omni-video',
 ] as const;
 
 export const aiPricingModelToken = (model: string) => model
@@ -186,7 +198,25 @@ const normalizeStoredVideoModels = (value: Prisma.JsonValue): VideoModelCreditPr
     const record = item as Record<string, unknown>;
     const model = typeof record.model === 'string' ? record.model.trim() : '';
     if (!model || !validCreditString(record.credits)) return [];
-    return [{ model, credits: record.credits }];
+    const normalizeMap = (candidate: unknown): Record<string, string> | undefined => {
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return undefined;
+      const entries = Object.entries(candidate as Record<string, unknown>)
+        .filter(([key, credits]) => key.trim() && validCreditString(credits))
+        .map(([key, credits]) => [key.trim().toLowerCase(), credits] as const);
+      return entries.length ? Object.fromEntries(entries) as Record<string, string> : undefined;
+    };
+    const creditsByDuration = normalizeMap(record.creditsByDuration);
+    const creditsByResolution = normalizeMap(record.creditsByResolution);
+    const creditsByCount = normalizeMap(record.creditsByCount);
+    return [{
+      model,
+      credits: record.credits,
+      ...(validCreditString(record.creditsPerSecond) ? { creditsPerSecond: record.creditsPerSecond } : {}),
+      ...(validCreditString(record.creditsPerVideo) ? { creditsPerVideo: record.creditsPerVideo } : {}),
+      ...(creditsByDuration ? { creditsByDuration } : {}),
+      ...(creditsByResolution ? { creditsByResolution } : {}),
+      ...(creditsByCount ? { creditsByCount } : {}),
+    }];
   });
 };
 
@@ -280,5 +310,49 @@ export async function configuredVideoUnitCredits(prisma: PrismaClient, model: st
   const exact = pricing.videoModels.find(
     (item) => aiPricingModelToken(item.model) === aiPricingModelToken(model),
   );
-  return BigInt(exact?.credits ?? pricing.videoDefaultCredits);
+  return BigInt(exact?.creditsPerSecond ?? exact?.credits ?? pricing.videoDefaultCredits);
+}
+
+export function calculateVideoRequestCredits(
+  price: VideoModelCreditPrice | undefined,
+  fallbackPerSecond: string,
+  duration = 15,
+  resolution = '720p',
+  count = 1,
+) {
+  const safeDuration = Math.max(1, Math.ceil(Number(duration) || 15));
+  const safeCount = Math.max(1, Math.ceil(Number(count) || 1));
+  const durationKey = String(safeDuration);
+  const resolutionKey = String(resolution || '720p').trim().toLowerCase() || '720p';
+  const countKey = String(safeCount);
+  const countOverride = price?.creditsByCount?.[countKey];
+  if (countOverride !== undefined) return BigInt(countOverride);
+
+  const perSecond = BigInt(price?.creditsPerSecond ?? price?.credits ?? fallbackPerSecond);
+  const durationCredits = price?.creditsByDuration?.[durationKey] !== undefined
+    ? BigInt(price.creditsByDuration[durationKey])
+    : perSecond * BigInt(safeDuration);
+  const perVideo = BigInt(price?.creditsPerVideo ?? '0');
+  const resolutionSurcharge = BigInt(price?.creditsByResolution?.[resolutionKey] ?? '0');
+  return (durationCredits + perVideo + resolutionSurcharge) * BigInt(safeCount);
+}
+
+export async function configuredVideoRequestCredits(
+  prisma: PrismaClient,
+  model: string,
+  duration?: number,
+  resolution?: string,
+  count = 1,
+) {
+  const pricing = await getAiPricingConfig(prisma);
+  const price = pricing.videoModels.find(
+    (item) => aiPricingModelToken(item.model) === aiPricingModelToken(model),
+  );
+  return calculateVideoRequestCredits(
+    price,
+    pricing.videoDefaultCredits,
+    duration,
+    resolution,
+    count,
+  );
 }

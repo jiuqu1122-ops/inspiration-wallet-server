@@ -461,6 +461,10 @@ export async function getProviderBalance(prisma: PrismaClient, providerId: strin
 
   const candidates = provider.kind === 'XAIS'
     ? [{ name: 'XAIS /xais/userProfile', path: '/xais/userProfile' }]
+    : provider.kind === 'MIKOTO'
+      ? [{ name: 'Mikoto /v1/models', path: '/v1/models' }]
+    : provider.kind === 'BIGMODEL'
+      ? [{ name: 'Bigmodel /v1beta/models', path: '/v1beta/models', headers: { 'x-goog-api-key': secrets.apiKey } }]
     : [
       { name: 'NewAPI /api/usage/token/', path: '/api/usage/token/' },
       { name: 'NewAPI /api/user/self', path: '/api/user/self' },
@@ -474,12 +478,13 @@ export async function getProviderBalance(prisma: PrismaClient, providerId: strin
   for (const candidate of candidates) {
     try {
       const useManagementAuth = candidate.path === '/api/user/self' && managementAuth;
+      const candidateHeaders = 'headers' in candidate ? candidate.headers : undefined;
       const value = await providerGet(
         providerEndpoint(provider.baseUrl, candidate.path),
         secrets,
         useManagementAuth
-          ? { bearerToken: managementAuth.token, headers: { 'New-Api-User': managementAuth.user } }
-          : undefined,
+          ? { bearerToken: managementAuth.token, headers: { 'New-Api-User': managementAuth.user, ...(candidateHeaders ?? {}) } }
+          : candidateHeaders ? { headers: candidateHeaders } : undefined,
       );
       const result = normalizeProviderBalance(provider.kind, candidate.name, value);
       if (result.available) return result;
@@ -498,11 +503,17 @@ export async function getProviderBalance(prisma: PrismaClient, providerId: strin
 
 function modelIds(value: unknown) {
   if (!value || typeof value !== 'object') return [];
-  const data: unknown = Reflect.get(value, 'data');
+  const data: unknown = Reflect.get(value, 'data') ?? Reflect.get(value, 'models');
   if (!Array.isArray(data)) return [];
   return data
     .map((item: unknown) => (
-      item && typeof item === 'object' && 'id' in item ? Reflect.get(item, 'id') : null
+      item && typeof item === 'object'
+        ? Reflect.get(item, 'id') ?? (
+          typeof Reflect.get(item, 'name') === 'string'
+            ? String(Reflect.get(item, 'name')).replace(/^models\//, '')
+            : null
+        )
+        : null
     ))
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
     .slice(0, 50);
@@ -524,7 +535,9 @@ export async function testProvider(prisma: PrismaClient, providerId: string) {
   let message = 'Provider connection failed';
   let models: string[] = [];
   try {
-    const value = await providerGet(providerEndpoint(provider.baseUrl, '/v1/models'), secrets);
+    const path = provider.kind === 'BIGMODEL' ? '/v1beta/models' : '/v1/models';
+    const headers = provider.kind === 'BIGMODEL' ? { 'x-goog-api-key': secrets.apiKey } : undefined;
+    const value = await providerGet(providerEndpoint(provider.baseUrl, path), secrets, headers ? { headers } : undefined);
     models = modelIds(value);
     status = 'OK';
     message = models.length

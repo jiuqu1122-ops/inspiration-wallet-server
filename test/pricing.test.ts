@@ -3,6 +3,8 @@ import type { PrismaClient } from '@prisma/client';
 import {
   configuredImageUnitCredits,
   configuredVideoUnitCredits,
+  configuredVideoRequestCredits,
+  calculateVideoRequestCredits,
   defaultAiPricingConfig,
   defaultImageUnitCredits,
   getAiPricingConfig,
@@ -76,5 +78,29 @@ describe('AI credit pricing', () => {
     expect(await configuredImageUnitCredits(prisma, 'custom-image-model', '2K')).toBe(66n);
     expect(await configuredVideoUnitCredits(prisma, 'Seedance 2')).toBe(44n);
     expect((await getAiPricingConfig(prisma)).agentRequestCredits).toBe('8');
+  });
+
+  it('calculates video credits from duration, resolution, per-video, and count rules', async () => {
+    const price = {
+      model: 'kling-video',
+      credits: '2',
+      creditsPerSecond: '3',
+      creditsPerVideo: '5',
+      creditsByDuration: { '10': '40' },
+      creditsByResolution: { '1080p': '8' },
+      creditsByCount: { '3': '200' },
+    };
+    expect(calculateVideoRequestCredits(price, '1', 10, '1080p', 2)).toBe(106n);
+    expect(calculateVideoRequestCredits(price, '1', 10, '720p', 3)).toBe(200n);
+
+    const prisma = prismaWithPricing({
+      agentRequestCredits: 8n,
+      inspirationAnalysisCredits: 2n,
+      imageDefaultCredits: 66n,
+      videoDefaultCredits: 1n,
+      imageModelPrices: [],
+      videoModelPrices: [price],
+    });
+    expect(await configuredVideoRequestCredits(prisma, 'Kling Video', 10, '1080p', 2)).toBe(106n);
   });
 });

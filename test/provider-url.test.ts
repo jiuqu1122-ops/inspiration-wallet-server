@@ -11,6 +11,18 @@ describe('provider URL safety and normalization', () => {
       .toBe('https://gateway.example.com/tenant/v1/models');
   });
 
+  it('keeps the Mikoto base URL at the channel root', () => {
+    expect(normalizeProviderBaseUrl('MIKOTO', 'https://api.mikoto.vip/v1/models'))
+      .toBe('https://api.mikoto.vip');
+    expect(normalizeProviderBaseUrl('MIKOTO', 'https://api.mikoto.vip/v1/videos'))
+      .toBe('https://api.mikoto.vip');
+  });
+
+  it('normalizes a Bigmodel native Gemini endpoint to the channel root', () => {
+    expect(normalizeProviderBaseUrl('BIGMODEL', 'https://st.smart-agi.com/v1beta/models/gemini-3-pro-image-preview:generateContent'))
+      .toBe('https://st.smart-agi.com');
+  });
+
   it('rejects unsafe schemes, credentials, and local hosts', () => {
     expect(() => normalizeProviderBaseUrl('NEW_API', 'http://gateway.example.com'))
       .toThrow('HTTPS');

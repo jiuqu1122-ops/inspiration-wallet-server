@@ -9,6 +9,7 @@ import {
   confirmXaisReferenceAttachment,
   convertGptImage2ChromaKeyToTransparentPng,
   filterProviderImageModels,
+  generateBigmodelBananaImages,
   generateNewApiImages,
   getWalletImageGenerationByRequest,
   imageCapabilityForModel,
@@ -23,7 +24,9 @@ import {
   parseWalletImageGenerationResult,
   parseXaisTaskId,
   providerSupportsImageModel,
+  resolveBigmodelImageModel,
   resolveImageModel,
+  resolveMikotoSeedanceModel,
   resolveNewApiImageModel,
   resolveNewApiImageResponse,
   resolveXaisModel,
@@ -35,6 +38,15 @@ import {
   xaisAttachmentRegistrationUrls,
 } from '../src/modules/ai/image-service.js';
 import { getImageResult } from '../src/modules/ai/image-result-store.js';
+
+describe('Mikoto Seedance model mapping', () => {
+  it('maps the two client models to Mikoto resolution-specific model ids', () => {
+    expect(resolveMikotoSeedanceModel('seedance2', '1080p')).toBe('seedance-2.0-1080p');
+    expect(resolveMikotoSeedanceModel('seedance2', '720p')).toBe('seedance-2.0-720p');
+    expect(resolveMikotoSeedanceModel('seedance2fast', '480p')).toBe('seedance-fast-480p');
+    expect(resolveMikotoSeedanceModel('seedance2fast', '720p')).toBe('seedance-fast-720p');
+  });
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -132,11 +144,18 @@ describe('wallet image provider normalization', () => {
     expect(imageCapabilityForModel('Nano Banana 2')).toBe('IMAGE_NANO_BANANA_2');
     expect(imageCapabilityForModel('gpt-image-2')).toBe('IMAGE_GPT');
     expect(imageCapabilityForModel('Image2_4K')).toBe('IMAGE_GPT');
+    expect(imageCapabilityForModel('Image2_1K')).toBe('IMAGE_GPT_1K');
     expect(providerSupportsImageModel(nano, 'gpt-image-2')).toBe(false);
     expect(providerSupportsImageModel(nano, 'Nano Banana 2')).toBe(false);
     expect(providerSupportsImageModel(nano2, 'Nano Banana 2')).toBe(true);
     expect(providerSupportsImageModel(gpt, 'gemini-3.1-flash-image')).toBe(false);
+    expect(providerSupportsImageModel({ capabilities: ['IMAGE_GPT_1K'] as const }, 'Image2_1K')).toBe(true);
+    expect(providerSupportsImageModel({ capabilities: ['IMAGE_GPT_1K'] as const }, 'Image2_4K')).toBe(false);
+    expect(providerSupportsImageModel({ capabilities: ['IMAGE_GPT_1K'] as const }, 'gpt-image-2', '1k')).toBe(true);
+    expect(providerSupportsImageModel({ capabilities: ['IMAGE_GPT_1K'] as const }, 'gpt-image-2', '2k')).toBe(false);
     expect(providerSupportsImageModel(legacy, 'custom-image-model')).toBe(true);
+    expect(providerSupportsImageModel({ capabilities: ['IMAGE_NANO_BANANA_PRO_1K'] as const }, 'gemini-3-pro-image-preview')).toBe(true);
+    expect(providerSupportsImageModel({ capabilities: ['IMAGE_NANO_BANANA_PRO_1K'] as const }, 'gemini-3-pro-image-preview', '2k')).toBe(false);
     expect(filterProviderImageModels(nano, [
       'gemini-3-pro-image',
       'gemini-2.5-pro',
@@ -153,6 +172,12 @@ describe('wallet image provider normalization', () => {
       .toThrow('生图请求和渠道都没有配置模型');
   });
 
+  it('normalizes Bigmodel aliases to the native model IDs', () => {
+    expect(resolveBigmodelImageModel('Nano Banana Pro')).toBe('gemini-3-pro-image-preview');
+    expect(resolveBigmodelImageModel('GPT Image 2')).toBe('gpt-image-2');
+    expect(resolveImageModel({ kind: 'BIGMODEL', defaultModel: 'Nano Banana Pro' }, '')).toBe('gemini-3-pro-image-preview');
+  });
+
   it('maps the main app image aliases back to NewAPI model IDs', () => {
     expect(resolveNewApiImageModel('Nano Banana Pro')).toBe('gemini-3-pro-image');
     expect(resolveNewApiImageModel('google/gemini_3_pro_image_preview')).toBe('gemini-3-pro-image');
@@ -163,6 +188,32 @@ describe('wallet image provider normalization', () => {
     expect(resolveNewApiImageModel('「CS」gpt-image-2')).toBe('「CS」gpt-image-2');
     expect(resolveNewApiImageModel('「Rim」gemini-3-pro-image-preview')).toBe('「Rim」gemini-3-pro-image-preview');
     expect(resolveNewApiImageModel('custom-image-model')).toBe('custom-image-model');
+  });
+
+  it('calls Bigmodel native Gemini with the API-key header and image config', async () => {
+    const generated = 'iVBORw0KGgo' + 'a'.repeat(40);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('https://bigmodel.example/v1beta/models/gemini-3-pro-image-preview:generateContent');
+      expect(new Headers(init?.headers).get('x-goog-api-key')).toBe('sk-test');
+      const body = JSON.parse(String(init?.body));
+      expect(body.generationConfig.responseModalities).toEqual(['IMAGE']);
+      expect(body.generationConfig.responseFormat.image).toEqual({ aspectRatio: '16:9', imageSize: '1K' });
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: generated } }] } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await generateBigmodelBananaImages(
+      { baseUrl: 'https://bigmodel.example', name: 'Bigmodel', kind: 'BIGMODEL' } as never,
+      { apiKey: 'sk-test', headers: {} },
+      {
+        userId: 'user-1', clientRequestId: 'request-1', model: 'gemini-3-pro-image-preview', prompt: 'a red apple',
+        inputImages: [], aspectRatio: '16:9', resolution: '1k', outputFormat: 'png', count: 1,
+      },
+    );
+    expect(result).toEqual([`data:image/png;base64,${generated}`]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('extracts URL and Base64 image results while excluding reference inputs', () => {
@@ -1044,6 +1095,32 @@ describe('wallet image provider normalization', () => {
       .toBe('https://provider.example/v1/images/generations/task-123');
     expect(fetchMock.mock.calls[1]?.[0])
       .toBe('https://provider.example/v1/images/task-123/content');
+  });
+
+  it('keeps async task content images when the content endpoint reports a post-processing error', async () => {
+    const output = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'completed' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: 'GPT Image 2 did not return a usable chroma-key background' },
+        output,
+      }), {
+        status: 502,
+        headers: { 'content-type': 'application/json' },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(resolveNewApiImageResponse(
+      { baseUrl: 'https://provider.example' } as Parameters<typeof resolveNewApiImageResponse>[0],
+      { apiKey: 'test-key', headers: {} },
+      { task_id: 'task-content-error', status: 'queued' },
+      [],
+      1,
+      async () => {},
+    )).resolves.toEqual([output]);
   });
 
 });

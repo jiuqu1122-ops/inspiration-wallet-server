@@ -49,9 +49,19 @@ const taskRequestParamsSchema = z.object({
 const optionalString = (max: number) => z.string().trim().max(max).nullish()
   .transform((value) => value ?? undefined);
 
+const isSeedance20VideoModel = (model: string) => {
+  const token = model.trim().toLowerCase().replace(/[\s_.-]+/g, '');
+  return token === 'seedance2'
+    || token === 'seedance20'
+    || token === 'seedance2fast'
+    || token === 'seedance20fast'
+    || token === 'sourcemix20'
+    || token === 'sourcemix20fast';
+};
+
 const imageSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
-  provider: z.enum(['new-api', 'xais-chat', 'openai-compatible', 'custom']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'bigmodel', 'openai-compatible', 'custom']).nullish()
     .transform((value) => value ?? undefined),
   providerChannelId: z.string().trim().min(1).max(128).nullish()
     .transform((value) => value ?? undefined),
@@ -69,22 +79,35 @@ const imageSchema = z.object({
 
 const videoSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
-  provider: z.enum(['new-api', 'xais-chat']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'mikoto']).nullish()
     .transform((value) => value ?? undefined),
   providerChannelId: z.string().trim().min(1).max(128).nullish()
     .transform((value) => value ?? undefined),
   model: z.string().trim().min(1).max(200),
   prompt: z.string().trim().min(1).max(50_000),
   inputImages: z.array(z.string().min(1).max(12_000_000)).max(13).default([]),
+  inputVideos: z.array(z.string().min(1).max(12_000_000)).max(3).default([]),
+  inputAudios: z.array(z.string().min(1).max(12_000_000)).max(3).default([]),
   aspectRatio: z.string().trim().max(20).default('16:9'),
   resolution: optionalString(20),
   duration: z.number().positive().max(120).nullish().transform((value) => value ?? undefined),
   inputMode: z.enum(['REF', 'FLF']).nullish().transform((value) => value ?? undefined),
   count: z.number().int().min(1).max(4).default(1),
-}).strict();
+}).strict().superRefine((value, context) => {
+  if (!isSeedance20VideoModel(value.model)) return;
+  if (value.inputImages.length > 9) {
+    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 9, inclusive: true, path: ['inputImages'], message: 'Seedance 2.0 supports at most 9 reference images' });
+  }
+  if (value.inputVideos.length > 3) {
+    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 3, inclusive: true, path: ['inputVideos'], message: 'Seedance 2.0 supports at most 3 reference videos' });
+  }
+  if (value.inputAudios.length > 3) {
+    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 3, inclusive: true, path: ['inputAudios'], message: 'Seedance 2.0 supports at most 3 reference audios' });
+  }
+});
 
 const videoStatusSchema = z.object({
-  provider: z.enum(['new-api', 'xais-chat']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'mikoto']).nullish()
     .transform((value) => value ?? undefined),
   providerChannelId: z.string().trim().min(1).max(128).nullish()
     .transform((value) => value ?? undefined),
@@ -94,7 +117,7 @@ const videoStatusSchema = z.object({
 }).strict();
 
 const imageModelsQuerySchema = z.object({
-  provider: z.enum(['new-api', 'xais-chat', 'openai-compatible', 'custom']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'bigmodel', 'openai-compatible', 'custom']).nullish()
     .transform((value) => value ?? undefined),
 }).strict();
 
