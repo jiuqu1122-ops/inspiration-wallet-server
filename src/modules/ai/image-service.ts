@@ -1993,32 +1993,116 @@ function normalizeXaisFailure(value: string) {
   return normalized;
 }
 
-function getFailure(value: unknown): string {
-  if (!value || typeof value !== 'object') return '';
+const VIDEO_FAILURE_STATES = new Set([
+  'failed',
+  'failure',
+  'error',
+  'cancelled',
+  'canceled',
+  'rejected',
+  'aborted',
+  'expired',
+  'timeout',
+  'timed_out',
+]);
+
+const normalizeTaskState = (value: unknown) => (
+  typeof value === 'string'
+    ? value.trim().toLowerCase().replace(/[\s-]+/g, '_')
+    : ''
+);
+
+const isFailureTaskState = (state: string) => (
+  VIDEO_FAILURE_STATES.has(state)
+  || /(?:^|_)(?:failed|failure|error|cancelled|canceled|rejected|aborted|expired|timeout|timed_out)(?:_|$)/.test(state)
+);
+
+function getFailure(value: unknown, depth = 0): string {
+  if (!value || typeof value !== 'object' || depth > 8) return '';
   if (Array.isArray(value)) {
     for (const item of value) {
-      const found = getFailure(item);
+      const found = getFailure(item, depth + 1);
       if (found) return found;
     }
     return '';
   }
   const record = value as Record<string, unknown>;
-  for (const key of ['error', 'err', 'fail_reason', 'failure_reason']) {
+  for (const key of [
+    'error',
+    'err',
+    'fail_reason',
+    'failure_reason',
+    'failureReason',
+    'error_message',
+    'errorMessage',
+  ]) {
     const candidate = record[key];
     if (typeof candidate === 'string') {
       const failure = normalizeXaisFailure(candidate);
       if (failure) return failure;
+    } else if (candidate && typeof candidate === 'object') {
+      const candidateRecord = candidate as Record<string, unknown>;
+      for (const messageKey of ['message', 'msg', 'detail']) {
+        const message = candidateRecord[messageKey];
+        if (typeof message !== 'string') continue;
+        const failure = normalizeXaisFailure(message);
+        if (failure) return failure;
+      }
+      const found = getFailure(candidate, depth + 1);
+      if (found) return found;
     }
   }
-  const status = typeof record.status === 'string' ? record.status.toLowerCase() : '';
-  if (/^(failed|failure|error|cancelled|canceled)$/.test(status)) {
-    return typeof record.message === 'string'
-      ? normalizeXaisFailure(record.message) || ''
-      : status;
+  const state = normalizeTaskState(
+    record.status
+      ?? record.state
+      ?? record.task_status
+      ?? record.taskStatus
+      ?? record.phase,
+  );
+  if (isFailureTaskState(state)) {
+    for (const key of ['message', 'msg', 'detail']) {
+      const candidate = record[key];
+      if (typeof candidate !== 'string') continue;
+      const failure = normalizeXaisFailure(candidate);
+      if (failure) return failure;
+    }
+    return state;
   }
-  for (const key of ['data', 'result', 'task', 'response']) {
-    const found = getFailure(record[key]);
-    if (found) return found;
+  if (record.success === false || record.ok === false) {
+    for (const key of ['message', 'msg', 'detail']) {
+      const candidate = record[key];
+      if (typeof candidate !== 'string') continue;
+      const failure = normalizeXaisFailure(candidate);
+      if (failure) return failure;
+    }
+    return 'upstream request failed';
+  }
+  const numericCode = Number(record.code ?? record.statusCode ?? record.errorCode ?? record.status);
+  if (Number.isFinite(numericCode) && numericCode >= 400) {
+    for (const key of ['message', 'msg', 'detail']) {
+      const candidate = record[key];
+      if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+    }
+    return `HTTP ${numericCode}`;
+  }
+  for (const [key, nested] of Object.entries(record)) {
+    const normalizedKey = key.trim().toLowerCase().replace(/[\s-]+/g, '_');
+    if (
+      normalizedKey === 'data'
+      || normalizedKey === 'result'
+      || normalizedKey === 'results'
+      || normalizedKey === 'task'
+      || normalizedKey === 'tasks'
+      || normalizedKey === 'response'
+      || normalizedKey === 'payload'
+      || normalizedKey === 'job'
+      || normalizedKey === 'operation'
+      || normalizedKey === 'meta'
+      || (nested && typeof nested === 'object')
+    ) {
+      const found = getFailure(nested, depth + 1);
+      if (found) return found;
+    }
   }
   return '';
 }
