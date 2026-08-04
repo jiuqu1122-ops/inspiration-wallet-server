@@ -2,7 +2,7 @@ import { basename } from 'node:path';
 import OSS from 'ali-oss';
 import { env } from '../../config/env.js';
 
-export type OssImageNamespace = 'reference-images' | 'generated-images';
+export type OssMediaNamespace = 'reference-images' | 'generated-images' | 'generated-videos';
 
 const REFERENCE_URL_EXPIRES_SECONDS = 30 * 60;
 const GENERATED_URL_EXPIRES_SECONDS = 24 * 60 * 60;
@@ -30,7 +30,7 @@ function requireClient() {
   return client;
 }
 
-function objectName(namespace: OssImageNamespace, filename: string) {
+function objectName(namespace: OssMediaNamespace, filename: string) {
   const safeName = basename(filename);
   if (safeName !== filename || !SAFE_FILENAME.test(safeName)) {
     throw new Error('invalid OSS image filename');
@@ -46,20 +46,21 @@ function isNotFound(error: unknown) {
 }
 
 export async function upload(input: {
-  namespace: OssImageNamespace;
+  namespace: OssMediaNamespace;
   filename: string;
   source: string | Buffer;
   mime: string;
 }) {
   const name = objectName(input.namespace, input.filename);
   const result = await requireClient().put(name, input.source, {
-    timeout: 30_000,
+    timeout: input.namespace === 'generated-videos' ? 10 * 60_000 : 30_000,
     headers: {
       'Content-Type': input.mime,
       'Cache-Control': 'private, max-age=86400, immutable',
     },
   });
-  if (input.namespace === 'generated-images' && result.name && result.name !== name) {
+  if ((input.namespace === 'generated-images' || input.namespace === 'generated-videos')
+    && result.name && result.name !== name) {
     throw new Error('OSS returned an unexpected object key');
   }
   return name;
@@ -78,7 +79,7 @@ function validateSignedUrl(name: string, signedUrl: string) {
 }
 
 export async function exists(name: string) {
-  if (!/^(?:reference-images|generated-images)\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$/.test(name)) {
+  if (!/^(?:reference-images|generated-images|generated-videos)\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$/.test(name)) {
     throw new Error('invalid OSS object name');
   }
   try {
@@ -95,10 +96,10 @@ export function getPublicUrl(name: string, options?: {
   filename?: string;
   download?: boolean;
 }) {
-  if (!/^(?:reference-images|generated-images)\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$/.test(name)) {
+  if (!/^(?:reference-images|generated-images|generated-videos)\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$/.test(name)) {
     throw new Error('invalid OSS object name');
   }
-  // Image Content-Type is stored as OSS object metadata during upload. This
+  // Media Content-Type is stored as OSS object metadata during upload. This
   // Bucket rejects signed URLs that override response headers, so neither
   // generated images nor reference images may add response-content-* params.
   void options;
@@ -136,7 +137,7 @@ export async function verifyPublicImageUrl(name: string, url: string) {
 }
 
 export async function deleteObject(name: string) {
-  if (!/^(?:reference-images|generated-images)\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$/.test(name)) {
+  if (!/^(?:reference-images|generated-images|generated-videos)\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$/.test(name)) {
     throw new Error('invalid OSS object name');
   }
   try {

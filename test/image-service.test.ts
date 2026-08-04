@@ -5,6 +5,7 @@ import {
   IMAGE_GENERATION_TIMEOUT_MS,
   buildNewApiImageGenerationBody,
   chooseProviderForCapability,
+  collectGeneratedVideoStrings,
   collectProviderModelIds,
   confirmXaisReferenceAttachment,
   convertGptImage2ChromaKeyToTransparentPng,
@@ -19,6 +20,8 @@ import {
   isPublicNewApiImageReference,
   isRetryableXaisPollError,
   materializeNewApiReferenceImage,
+  mirrorGeneratedImageResults,
+  mirrorGeneratedVideoResponse,
   mirrorXaisImageResults,
   newApiImageRequestParams,
   parseWalletImageGenerationResult,
@@ -51,6 +54,27 @@ describe('Mikoto Seedance model mapping', () => {
   it('passes Kling model ids through to the Mikoto video endpoint', () => {
     expect(resolveMikotoVideoModel('kling-video', '1080p')).toBe('kling-video');
     expect(resolveMikotoVideoModel('kling-omni-video', '720p')).toBe('kling-omni-video');
+  });
+
+  it('extracts generated video results without treating reference media as outputs', () => {
+    expect(collectGeneratedVideoStrings({
+      data: {
+        status: 'succeeded',
+        video_url: 'https://media.example/output.mp4?token=1',
+        images: ['https://media.example/reference.png'],
+        referenceVideos: ['https://media.example/reference.mp4'],
+      },
+    })).toEqual(['https://media.example/output.mp4?token=1']);
+  });
+
+  it('places mirrored video URLs before the upstream response', async () => {
+    const upstream = { data: { status: 'succeeded', video_url: 'https://media.example/output.mp4' } };
+    const mirror = vi.fn(async () => 'https://api.unmind.art/v1/ai/video-results/stable.mp4');
+    await expect(mirrorGeneratedVideoResponse(upstream, 'Mikoto', mirror)).resolves.toEqual({
+      walletVideoResults: ['https://api.unmind.art/v1/ai/video-results/stable.mp4'],
+      upstream,
+    });
+    expect(mirror).toHaveBeenCalledWith('https://media.example/output.mp4');
   });
 });
 
@@ -405,6 +429,19 @@ describe('wallet image provider normalization', () => {
       expect.objectContaining({ provider: 'xais-primary', index: 0 }),
     );
     warn.mockRestore();
+  });
+
+  it('mirrors inline and stable image results for every non-XAIS image channel', async () => {
+    const mirror = vi.fn(async (source: string, index: number) => (
+      `https://api.unmind.art/v1/ai/image-results/mirrored-${index + 1}.png?source=${encodeURIComponent(source.slice(0, 12))}`
+    ));
+    const inline = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB';
+    const stable = 'https://api.unmind.art/v1/ai/image-results/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png';
+    const publicUrl = 'https://bigmodel.example/generated.png';
+
+    await expect(mirrorGeneratedImageResults([inline, stable, publicUrl], 'Bigmodel', mirror))
+      .resolves.toHaveLength(3);
+    expect(mirror).toHaveBeenCalledTimes(3);
   });
 
   it('resolves a completed XAIS image directly from its task ID when the wait response is stale', async () => {

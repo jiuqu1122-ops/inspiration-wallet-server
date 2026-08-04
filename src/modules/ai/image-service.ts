@@ -25,6 +25,7 @@ import {
   isStoredImageResultUrl,
 } from './image-result-store.js';
 import { ossUploadService } from './oss-uploader.js';
+import { mirrorGeneratedVideoResultToOss } from './video-result-store.js';
 
 export const IMAGE_GENERATION_TIMEOUT_MS = 15 * 60_000;
 const NEW_API_IMAGE_TASK_POLL_INTERVAL_MS = 3_000;
@@ -43,6 +44,7 @@ const XAIS_REFERENCE_DOWNLOAD_RETRY_DELAYS_MS = [500, 1_500];
 const XAIS_IMAGE_TASK_POLL_INTERVAL_MS = 1_200;
 const XAIS_IMAGE_TASK_POLL_REQUEST_TIMEOUT_MS = 6_000;
 const XAIS_RESULT_MIRROR_TIMEOUT_MS = 30_000;
+const MAX_GENERATED_IMAGE_BYTES = 64 * 1024 * 1024;
 const GPT_IMAGE_2_CHROMA_KEY = { red: 255, green: 0, blue: 255 } as const;
 const imageReferenceCache = new Map<string, { dataUrl: string; expiresAt: number }>();
 const pendingImageReferenceFetches = new Map<string, Promise<string>>();
@@ -1186,30 +1188,51 @@ async function stagePublicGeneratedImageResult(source: string, index: number) {
   }
 }
 
+async function uploadStoredImageResultToOss(stableUrl: string) {
+  const key = new URL(stableUrl).pathname.split('/').filter(Boolean).pop();
+  const stored = key ? await getImageResult(key) : null;
+  if (!key || !stored) throw new Error('generated image mirror could not reopen the stored result');
+  const objectName = await ossUploadService.upload({
+    namespace: 'generated-images',
+    filename: key,
+    source: stored.path,
+    mime: stored.mime,
+  });
+  if (!await ossUploadService.exists(objectName)) {
+    throw new Error('generated image mirror object is missing after upload');
+  }
+  // Validate that the object key can be signed before publishing the stable
+  // API URL. Clients resolve that URL to a fresh signed Hong Kong OSS URL.
+  ossUploadService.getPublicUrl(objectName, { mime: stored.mime, filename: key });
+  return stableUrl;
+}
+
 async function mirrorPublicGeneratedImageResultToOss(source: string, index: number) {
   const staged = await stagePublicGeneratedImageResult(source, index);
   try {
     if (!staged.path) throw new Error('generated image mirror did not create a temporary file');
     const stableUrl = await createImageResultFromFile(staged.path, staged.mime);
-    const key = new URL(stableUrl).pathname.split('/').filter(Boolean).pop();
-    const stored = key ? await getImageResult(key) : null;
-    if (!key || !stored) throw new Error('generated image mirror could not reopen the stored result');
-    const objectName = await ossUploadService.upload({
-      namespace: 'generated-images',
-      filename: key,
-      source: stored.path,
-      mime: stored.mime,
-    });
-    if (!await ossUploadService.exists(objectName)) {
-      throw new Error('generated image mirror object is missing after upload');
-    }
-    // Validate that the object key can be signed before publishing the stable
-    // API URL. Clients resolve that URL to a fresh signed Hong Kong OSS URL.
-    ossUploadService.getPublicUrl(objectName, { mime: stored.mime, filename: key });
-    return stableUrl;
+    return uploadStoredImageResultToOss(stableUrl);
   } finally {
     await staged.cleanup().catch(() => {});
   }
+}
+
+async function mirrorInlineGeneratedImageResultToOss(source: string) {
+  const inline = dataUrlImageBytes(source, MAX_GENERATED_IMAGE_BYTES);
+  const stableUrl = await createImageResultFromResponse(new Response(inline.bytes, {
+    headers: {
+      'content-type': inline.mime,
+      'content-length': String(inline.bytes.byteLength),
+    },
+  }));
+  return uploadStoredImageResultToOss(stableUrl);
+}
+
+async function mirrorGeneratedImageResultToOss(source: string, index: number) {
+  if (isStoredImageResultUrl(source)) return uploadStoredImageResultToOss(source);
+  if (/^data:image\//i.test(source.trim())) return mirrorInlineGeneratedImageResultToOss(source);
+  return mirrorPublicGeneratedImageResultToOss(source, index);
 }
 
 export async function mirrorXaisImageResults(
@@ -1223,6 +1246,29 @@ export async function mirrorXaisImageResults(
       return await mirrorImage(source, index);
     } catch (error) {
       console.warn('[xais_image_result_mirror_failed]', {
+        provider: providerName,
+        index,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return source;
+    }
+  }));
+}
+
+export async function mirrorGeneratedImageResults(
+  images: string[],
+  providerName: string,
+  mirrorImage: (source: string, index: number) => Promise<string> = mirrorGeneratedImageResultToOss,
+) {
+  return Promise.all(images.map(async (source, index) => {
+    const trimmed = source.trim();
+    if (!isStoredImageResultUrl(trimmed)
+      && !isPublicNewApiImageReference(trimmed)
+      && !/^data:image\//i.test(trimmed)) return source;
+    try {
+      return await mirrorImage(trimmed, index);
+    } catch (error) {
+      console.warn('[image_result_mirror_failed]', {
         provider: providerName,
         index,
         error: error instanceof Error ? error.message : String(error),
@@ -1831,12 +1877,12 @@ function findXaisUploadTarget(value: unknown): { url: string; name: string } | n
   return null;
 }
 
-function dataUrlImageBytes(source: string) {
+function dataUrlImageBytes(source: string, maximumBytes = MAX_IMAGE_REFERENCE_BYTES) {
   const match = source.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([a-zA-Z0-9+/=\s]+)$/i);
   if (!match) throw new Error('reference image is not a supported data URL');
   const mime = match[1]!.toLowerCase();
   const bytes = Buffer.from(match[2]!.replace(/\s+/g, ''), 'base64');
-  if (!bytes.length || bytes.length > MAX_IMAGE_REFERENCE_BYTES) throw new Error('reference image size is invalid');
+  if (!bytes.length || bytes.length > maximumBytes) throw new Error('reference image size is invalid');
   return { bytes, mime };
 }
 
@@ -2502,7 +2548,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         : await generateNewApiImages(provider, secrets, effectiveInput);
     const images = provider.kind === 'XAIS'
       ? await mirrorXaisImageResults(providerImages, provider.name)
-      : providerImages;
+      : await mirrorGeneratedImageResults(providerImages, provider.name);
     if (!images.length) throw new Error('渠道没有返回图片数据');
     const charged = await settleImageCredits(
       prisma,
@@ -2608,6 +2654,85 @@ const isSeedance20VideoModel = (model: string) => {
     || token === 'sourcemix20'
     || token === 'sourcemix20fast';
 };
+
+const VIDEO_RESULT_KEYS = /^(?:result|results|output|outputs|video|videos|video_url|videoUrl|url|urls|uri|uris|href|download|downloads|file|files)$/i;
+const VIDEO_REFERENCE_KEYS = /^(?:image|images|input|inputs|reference|references|referenceImages|referenceVideos|referenceAudios|audio|audios)$/i;
+
+function hasImageResultExtension(value: string) {
+  try {
+    return /\.(?:avif|bmp|gif|jpe?g|png|svg|webp)$/i.test(new URL(value).pathname);
+  } catch {
+    return false;
+  }
+}
+
+export function collectGeneratedVideoStrings(
+  value: unknown,
+  output: string[] = [],
+  trusted = false,
+  depth = 0,
+): string[] {
+  if (!value || depth > 10) return output;
+  if (typeof value === 'string') {
+    const dataUrls = value.match(/data:video\/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=\s]+/gi);
+    if (dataUrls) output.push(...dataUrls.map(item => item.replace(/\s+/g, '')));
+    const urls = value.match(/https?:\/\/[^\s"'<>)}\]]+/gi) || [];
+    for (const candidate of urls) {
+      const source = candidate.replace(/[.,;，。；]+$/g, '');
+      if (!hasImageResultExtension(source)
+        && (trusted || /\.(?:avi|m4v|mov|mp4|webm)(?:$|[?#])/i.test(source)
+          || /\/v1\/ai\/video-results\/|\/generated-videos\//i.test(source))) {
+        output.push(source);
+      }
+    }
+    return output;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectGeneratedVideoStrings(
+        item,
+        output,
+        item && typeof item === 'object' ? false : trusted,
+        depth + 1,
+      );
+    }
+    return output;
+  }
+  if (typeof value !== 'object') return output;
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    if (VIDEO_REFERENCE_KEYS.test(key) || /^(?:error|err|message|msg|detail|trace|stack|debug)$/i.test(key)) continue;
+    const nestedTrusted = VIDEO_RESULT_KEYS.test(key);
+    if (typeof nested === 'string' && /^(?:b64_json|video_base64|base64)$/i.test(key)) {
+      output.push(`data:video/mp4;base64,${nested.replace(/^data:video\/[a-zA-Z0-9.+-]+;base64,/i, '')}`);
+      continue;
+    }
+    collectGeneratedVideoStrings(nested, output, nestedTrusted, depth + 1);
+  }
+  return output;
+}
+
+export async function mirrorGeneratedVideoResponse(
+  value: unknown,
+  providerName: string,
+  mirrorVideo: (source: string) => Promise<string> = mirrorGeneratedVideoResultToOss,
+  trusted = false,
+) {
+  const sources = Array.from(new Set(collectGeneratedVideoStrings(value, [], trusted)));
+  if (!sources.length) return value;
+  const mirrored = await Promise.all(sources.map(async (source, index) => {
+    try {
+      return await mirrorVideo(source);
+    } catch (error) {
+      console.warn('[video_result_mirror_failed]', {
+        provider: providerName,
+        index,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return source;
+    }
+  }));
+  return { walletVideoResults: mirrored, upstream: value };
+}
 
 const isKlingVideoModel = (model: string) => /kling/i.test(model.trim());
 
@@ -2830,7 +2955,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       const result = await providerRequest(provider, secrets, path, body);
       const failure = getFailure(result);
       if (failure) throw new CloudAiError('video_generation_failed', failure, 502);
-      results.push(result);
+      results.push(await mirrorGeneratedVideoResponse(result, provider.name));
     }
     await settleVideo(prisma, input.userId, reservation.requestId, reservation.estimated);
     return { results, provider: provider.kind, model: input.model, chargedCredits: reservation.estimated.toString() };
@@ -2860,13 +2985,18 @@ export async function executeWalletVideoStatus(
     }
     throw new CloudAiError('video_generation_failed', failure, 502);
   }
-  if (provider.kind !== 'XAIS') return waited;
+  if (provider.kind !== 'XAIS') return mirrorGeneratedVideoResponse(waited, provider.name);
   const attachments = collectAttachmentIds(waited)
     .filter((value) => !/^(?:pending|processing|queued|completed|success|succeeded|failed|failure|error|cancelled|canceled)$/i.test(value));
-  if (!attachments.length) return waited;
+  if (!attachments.length) return mirrorGeneratedVideoResponse(waited, provider.name);
   const resolved: unknown[] = [];
   for (const attachment of Array.from(new Set(attachments))) {
     resolved.push(await providerRequest(provider, secrets, `/xais/attUrls?att=${encodeURIComponent(attachment)}`));
   }
-  return { result: waited, attachments: resolved };
+  return mirrorGeneratedVideoResponse(
+    { result: waited, attachments: resolved },
+    provider.name,
+    mirrorGeneratedVideoResultToOss,
+    true,
+  );
 }

@@ -102,6 +102,26 @@ describe('generated image OSS delivery route', () => {
     await app.close();
   });
 
+  it('returns a fresh signed OSS URL for a mirrored video result', async () => {
+    const key = `${'a'.repeat(64)}.mp4`;
+    const app = await makeApp();
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/ai/video-results/${key}?redirect=0`,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      url: expect.stringContaining(`/generated-videos/${key}`),
+      expiresAt: expect.any(Number),
+    });
+    expect(bridgeMocks.exists).toHaveBeenCalledWith(`generated-videos/${key}`);
+    expect(bridgeMocks.getPublicUrl).toHaveBeenCalledWith(
+      `generated-videos/${key}`,
+      expect.objectContaining({ filename: key, download: false }),
+    );
+    await app.close();
+  });
+
   it('returns an explicit error when OSS upload fails', async () => {
     bridgeMocks.exists.mockResolvedValueOnce(false);
     bridgeMocks.upload.mockRejectedValueOnce(new Error('put failed'));

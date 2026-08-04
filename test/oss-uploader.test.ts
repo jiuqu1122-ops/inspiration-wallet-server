@@ -72,6 +72,26 @@ describe('OSS public bridge service', () => {
     );
   });
 
+  it('uploads generated videos under the video namespace', async () => {
+    const { ossUploadService } = await import('../src/modules/ai/oss-uploader.js');
+    const name = await ossUploadService.upload({
+      namespace: 'generated-videos',
+      source: '/tmp/result.mp4',
+      filename: 'result.mp4',
+      mime: 'video/mp4',
+    });
+    expect(name).toBe('generated-videos/result.mp4');
+    expect(ossMocks.put).toHaveBeenCalledWith(
+      'generated-videos/result.mp4',
+      '/tmp/result.mp4',
+      expect.objectContaining({
+        timeout: 10 * 60_000,
+        headers: expect.objectContaining({ 'Content-Type': 'video/mp4' }),
+      }),
+    );
+    await expect(ossUploadService.exists(name)).resolves.toBe(true);
+  });
+
   it('supports reference image deletion', async () => {
     const { ossUploadService } = await import('../src/modules/ai/oss-uploader.js');
     await expect(ossUploadService.delete('reference-images/share-0.jpg')).resolves.toBe(true);
