@@ -2482,10 +2482,15 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
   const isImage2OneKOnly = provider.capabilities.includes('IMAGE_GPT_1K')
     && !provider.capabilities.includes('IMAGE_GPT')
     && !provider.capabilities.includes('IMAGE');
+  const isBananaProOneKOnly = provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K')
+    && !provider.capabilities.includes('IMAGE_NANO_BANANA')
+    && !provider.capabilities.includes('IMAGE');
   const effectiveInput = {
     ...input,
     model: resolveImageModel(provider, input.model),
-    ...(isImage2OneKOnly && !input.resolution ? { resolution: '1k' } : {}),
+    ...((isImage2OneKOnly || isBananaProOneKOnly) && !input.resolution
+      ? { resolution: '1k' }
+      : {}),
   };
   const reservation = await reserveImageCredits(prisma, effectiveInput);
   try {
@@ -2604,6 +2609,8 @@ const isSeedance20VideoModel = (model: string) => {
     || token === 'sourcemix20fast';
 };
 
+const isKlingVideoModel = (model: string) => /kling/i.test(model.trim());
+
 function videoProviderKind(provider?: VideoInput['provider']) {
   if (provider === 'xais-chat') return 'XAIS' as const;
   if (provider === 'new-api') return 'NEW_API' as const;
@@ -2659,8 +2666,12 @@ export function resolveMikotoSeedanceModel(model: string, resolution?: string) {
   return normalizedResolution === '1080p' ? 'seedance-2.0-1080p' : 'seedance-2.0-720p';
 }
 
-function mikotoSeedanceModel(input: VideoInput) {
-  return resolveMikotoSeedanceModel(input.model, input.resolution);
+export function resolveMikotoVideoModel(model: string, resolution?: string) {
+  return isKlingVideoModel(model) ? model.trim() : resolveMikotoSeedanceModel(model, resolution);
+}
+
+function mikotoVideoModel(input: VideoInput) {
+  return resolveMikotoVideoModel(input.model, input.resolution);
 }
 
 function mikotoVideoBody(input: VideoInput) {
@@ -2669,7 +2680,7 @@ function mikotoVideoBody(input: VideoInput) {
     || input.inputVideos.length > 0
     || input.inputAudios.length > 0;
   return {
-    model: mikotoSeedanceModel(input),
+    model: mikotoVideoModel(input),
     prompt: input.prompt,
     duration,
     ...(input.aspectRatio ? { aspect_ratio: input.aspectRatio } : {}),

@@ -27,6 +27,7 @@ import {
   resolveBigmodelImageModel,
   resolveImageModel,
   resolveMikotoSeedanceModel,
+  resolveMikotoVideoModel,
   resolveNewApiImageModel,
   resolveNewApiImageResponse,
   resolveXaisModel,
@@ -45,6 +46,11 @@ describe('Mikoto Seedance model mapping', () => {
     expect(resolveMikotoSeedanceModel('seedance2', '720p')).toBe('seedance-2.0-720p');
     expect(resolveMikotoSeedanceModel('seedance2fast', '480p')).toBe('seedance-fast-480p');
     expect(resolveMikotoSeedanceModel('seedance2fast', '720p')).toBe('seedance-fast-720p');
+  });
+
+  it('passes Kling model ids through to the Mikoto video endpoint', () => {
+    expect(resolveMikotoVideoModel('kling-video', '1080p')).toBe('kling-video');
+    expect(resolveMikotoVideoModel('kling-omni-video', '720p')).toBe('kling-omni-video');
   });
 });
 

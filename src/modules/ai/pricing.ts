@@ -220,6 +220,17 @@ const normalizeStoredVideoModels = (value: Prisma.JsonValue): VideoModelCreditPr
   });
 };
 
+const mergeKnownVideoModels = (
+  stored: VideoModelCreditPrice[],
+  defaults: VideoModelCreditPrice[],
+) => {
+  const knownTokens = new Set(stored.map(item => aiPricingModelToken(item.model)));
+  return [
+    ...stored,
+    ...defaults.filter(item => !knownTokens.has(aiPricingModelToken(item.model))),
+  ];
+};
+
 export async function getAiPricingConfig(prisma: PrismaClient): Promise<AiPricingConfigValue> {
   const defaults = defaultAiPricingConfig();
   const stored = await prisma.aiPricingConfig.findUnique({ where: { id: 'default' } });
@@ -230,7 +241,10 @@ export async function getAiPricingConfig(prisma: PrismaClient): Promise<AiPricin
     imageDefaultCredits: stored.imageDefaultCredits.toString(),
     videoDefaultCredits: stored.videoDefaultCredits.toString(),
     imageModels: normalizeStoredImageModels(stored.imageModelPrices),
-    videoModels: normalizeStoredVideoModels(stored.videoModelPrices),
+    videoModels: mergeKnownVideoModels(
+      normalizeStoredVideoModels(stored.videoModelPrices),
+      defaults.videoModels,
+    ),
     updatedAt: stored.updatedAt.toISOString(),
   };
 }

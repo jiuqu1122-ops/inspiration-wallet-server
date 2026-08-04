@@ -77,7 +77,14 @@ describe('AI credit pricing', () => {
     expect(await configuredImageUnitCredits(prisma, 'GPT Image 2', '4K')).toBe(7n);
     expect(await configuredImageUnitCredits(prisma, 'custom-image-model', '2K')).toBe(66n);
     expect(await configuredVideoUnitCredits(prisma, 'Seedance 2')).toBe(44n);
-    expect((await getAiPricingConfig(prisma)).agentRequestCredits).toBe('8');
+    const resolved = await getAiPricingConfig(prisma);
+    expect(resolved.agentRequestCredits).toBe('8');
+    expect(resolved.videoModels.map(item => item.model)).toEqual(expect.arrayContaining([
+      'seedance2',
+      'seedance2fast',
+      'kling-video',
+      'kling-omni-video',
+    ]));
   });
 
   it('calculates video credits from duration, resolution, per-video, and count rules', async () => {
