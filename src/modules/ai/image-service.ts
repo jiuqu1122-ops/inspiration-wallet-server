@@ -28,6 +28,7 @@ import {
 import { ossUploadService } from './oss-uploader.js';
 
 export const IMAGE_GENERATION_TIMEOUT_MS = 15 * 60_000;
+export const BIGMODEL_IMAGE_GENERATION_TIMEOUT_MS = 3 * 60_000;
 const NEW_API_IMAGE_TASK_POLL_INTERVAL_MS = 3_000;
 const NEW_API_REFERENCE_DOWNLOAD_ATTEMPTS = 3;
 const NEW_API_REFERENCE_DOWNLOAD_RETRY_DELAYS_MS = [500, 1_500];
@@ -445,6 +446,7 @@ export async function listWalletImageModels(
         provider: provider.kind,
         defaultModel,
         models,
+        capabilities: provider.capabilities,
         error: null,
       };
     } catch (error) {
@@ -454,6 +456,7 @@ export async function listWalletImageModels(
         provider: provider.kind,
         defaultModel: provider.defaultModel,
         models: [] as string[],
+        capabilities: provider.capabilities,
         error: error instanceof Error ? error.message.slice(0, 800) : '读取模型失败',
       };
     }
@@ -610,6 +613,70 @@ export function newApiImageRequestParams(
   };
 }
 
+export async function readBigmodelResponse(response: Response) {
+  if (!response.body) return parseProviderValue(await response.text());
+
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const events: unknown[] = [];
+  let buffer = '';
+  let fullText = '';
+
+  const parseEvent = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return null;
+    const payload = /^data:\s*/i.test(trimmed)
+      ? trimmed.replace(/^data:\s*/i, '').trim()
+      : trimmed;
+    if (!payload || payload === '[DONE]') return null;
+    try {
+      return JSON.parse(payload) as unknown;
+    } catch {
+      return null;
+    }
+  };
+
+  const returnIfImageReady = async () => {
+    const images = uniqueImages(events, [], 1);
+    const hasCompleteImage = images.some((image) => {
+      if (!/^data:image\//i.test(image)) return /^https?:\/\//i.test(image);
+      return (image.split(',', 2)[1] || '').replace(/\s+/g, '').length >= 64;
+    });
+    if (!hasCompleteImage) return null;
+    await reader.cancel().catch(() => {});
+    return events.length === 1 ? events[0] : events;
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    const decoded = decoder.decode(value || new Uint8Array(), { stream: !done });
+    fullText += decoded;
+    buffer += decoded;
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      // Some Gemini-compatible proxies return SSE without an explicit stream
+      // request. Return once a complete image event arrives.
+      if (!contentType.includes('event-stream') && !/^\s*(?:data:\s*)?[\[{]/.test(line)) continue;
+      const parsed = parseEvent(line);
+      if (parsed === null) continue;
+      events.push(parsed);
+      const ready = await returnIfImageReady();
+      if (ready !== null) return ready;
+    }
+    if (done) break;
+  }
+
+  const tail = buffer.trim();
+  if (tail) {
+    const parsed = parseEvent(tail);
+    if (parsed !== null) events.push(parsed);
+  }
+  if (events.length > 0) return events.length === 1 ? events[0] : events;
+  return parseProviderValue(fullText);
+}
+
 async function providerBigmodelRequest(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
@@ -617,7 +684,7 @@ async function providerBigmodelRequest(
   body: unknown,
 ) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), IMAGE_GENERATION_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), BIGMODEL_IMAGE_GENERATION_TIMEOUT_MS);
   try {
     const headers = new Headers({
       accept: 'application/json, text/plain, */*',
@@ -635,11 +702,11 @@ async function providerBigmodelRequest(
       redirect: 'error',
       signal: controller.signal,
     });
-    const text = await response.text();
     if (!response.ok) {
+      const text = await response.text();
       throw new UpstreamImageError(response.status, upstreamErrorMessage(response.status, text));
     }
-    return parseProviderValue(text);
+    return await readBigmodelResponse(response);
   } catch (error) {
     if (error instanceof UpstreamImageError) throw error;
     throw new UpstreamImageError(0, error instanceof Error ? error.message : String(error));
@@ -1082,25 +1149,43 @@ async function mirrorPublicGeneratedImageResultToOss(source: string, index: numb
   try {
     if (!staged.path) throw new Error('generated image mirror did not create a temporary file');
     const stableUrl = await createImageResultFromFile(staged.path, staged.mime);
-    const key = new URL(stableUrl).pathname.split('/').filter(Boolean).pop();
-    const stored = key ? await getImageResult(key) : null;
-    if (!key || !stored) throw new Error('generated image mirror could not reopen the stored result');
-    const objectName = await ossUploadService.upload({
-      namespace: 'generated-images',
-      filename: key,
-      source: stored.path,
-      mime: stored.mime,
-    });
-    if (!await ossUploadService.exists(objectName)) {
-      throw new Error('generated image mirror object is missing after upload');
-    }
-    // Validate that the object key can be signed before publishing the stable
-    // API URL. Clients resolve that URL to a fresh signed Hong Kong OSS URL.
-    ossUploadService.getPublicUrl(objectName, { mime: stored.mime, filename: key });
-    return stableUrl;
+    return await uploadStoredImageResultToOss(stableUrl);
   } finally {
     await staged.cleanup().catch(() => {});
   }
+}
+
+async function uploadStoredImageResultToOss(stableUrl: string) {
+  const key = new URL(stableUrl).pathname.split('/').filter(Boolean).pop();
+  const stored = key ? await getImageResult(key) : null;
+  if (!key || !stored) throw new Error('generated image mirror could not reopen the stored result');
+  const objectName = await ossUploadService.upload({
+    namespace: 'generated-images',
+    filename: key,
+    source: stored.path,
+    mime: stored.mime,
+  });
+  if (!await ossUploadService.exists(objectName)) {
+    throw new Error('generated image mirror object is missing after upload');
+  }
+  // Validate that the object key can be signed before publishing the stable
+  // API URL. Clients resolve that URL to a fresh signed Hong Kong OSS URL.
+  ossUploadService.getPublicUrl(objectName, { mime: stored.mime, filename: key });
+  return stableUrl;
+}
+
+async function mirrorInlineGeneratedImageResultToOss(source: string) {
+  const match = source.trim().match(/^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i);
+  if (!match) throw new Error('generated inline image data is invalid');
+  const bytes = Buffer.from(match[2]!.replace(/\s+/g, ''), 'base64');
+  if (!bytes.length) throw new Error('generated inline image data is empty');
+  const stableUrl = await createImageResultFromResponse(new Response(bytes, {
+    headers: {
+      'content-type': match[1]!,
+      'content-length': String(bytes.byteLength),
+    },
+  }));
+  return await uploadStoredImageResultToOss(stableUrl);
 }
 
 export async function mirrorXaisImageResults(
@@ -1109,7 +1194,20 @@ export async function mirrorXaisImageResults(
   mirrorImage: (source: string, index: number) => Promise<string> = mirrorPublicGeneratedImageResultToOss,
 ) {
   return Promise.all(images.map(async (source, index) => {
-    if (!isPublicNewApiImageReference(source) || isStoredImageResultUrl(source)) return source;
+    if (isStoredImageResultUrl(source)) return source;
+    if (/^data:image\//i.test(source)) {
+      try {
+        return await mirrorInlineGeneratedImageResultToOss(source);
+      } catch (error) {
+        console.warn('[xais_image_result_mirror_failed]', {
+          provider: providerName,
+          index,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return source;
+      }
+    }
+    if (!isPublicNewApiImageReference(source)) return source;
     try {
       return await mirrorImage(source, index);
     } catch (error) {
@@ -2279,6 +2377,17 @@ async function releaseImageCredits(
 }
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
+  // A client may retry after the upstream completed but the HTTP response was
+  // lost. Return the persisted result instead of turning that retry into a
+  // duplicate-request error with no usable image on the client.
+  const existing = await getWalletImageGenerationByRequest(
+    prisma,
+    input.userId,
+    input.clientRequestId,
+  );
+  if (existing?.status === 'succeeded' && Array.isArray(existing.images) && existing.images.length > 0 && existing.provider && existing.model && existing.chargedCredits) {
+    return existing;
+  }
   const provider = await selectImageProvider(
     prisma,
     input.providerChannelId,

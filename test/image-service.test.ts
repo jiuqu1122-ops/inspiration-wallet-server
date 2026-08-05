@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { access, readFile, rm } from 'node:fs/promises';
 import sharp from 'sharp';
 import {
+  BIGMODEL_IMAGE_GENERATION_TIMEOUT_MS,
   IMAGE_GENERATION_TIMEOUT_MS,
   buildNewApiImageGenerationBody,
   calculateVideoGenerationCredits,
@@ -35,6 +36,7 @@ import {
   parseXaisTaskId,
   providerNewApiVideoRequest,
   providerSupportsImageModel,
+  readBigmodelResponse,
   resolveImageModel,
   resolveNewApiImageModel,
   resolveNewApiImageResponse,
@@ -56,6 +58,29 @@ afterEach(() => {
 describe('wallet image provider normalization', () => {
   it('allows image generation jobs to run for fifteen minutes', () => {
     expect(IMAGE_GENERATION_TIMEOUT_MS).toBe(15 * 60_000);
+  });
+
+  it('stops reading a Bigmodel SSE response once an image event arrives', async () => {
+    const response = new Response([
+      `data: ${JSON.stringify({
+        candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: 'ZmFrZQ==' } }] } }],
+      })}`,
+      '',
+    ].join('\n'), {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+    const value = await readBigmodelResponse(response);
+    expect(uniqueImages(value, [], 1)).toEqual(['data:image/png;base64,ZmFrZQ==']);
+    expect(BIGMODEL_IMAGE_GENERATION_TIMEOUT_MS).toBe(3 * 60_000);
+  });
+
+  it('keeps parsing regular Bigmodel JSON responses, including pretty JSON', async () => {
+    const value = await readBigmodelResponse(new Response(JSON.stringify({
+      candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: 'ZmFrZQ==' } }] } }],
+    }, null, 2), {
+      headers: { 'content-type': 'application/json' },
+    }));
+    expect(uniqueImages(value, [], 1)).toEqual(['data:image/png;base64,ZmFrZQ==']);
   });
 
   it('accepts only complete persisted wallet image results', () => {
