@@ -58,4 +58,25 @@ describe('generated video OSS mirroring', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(bridgeMocks.upload).toHaveBeenCalledTimes(1);
   });
+
+  it('uses provider authorization for protected video content downloads', async () => {
+    const mp4 = Buffer.from('000000186674797069736f6d0000020069736f6d69736f32', 'hex');
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get('authorization')).toBe('Bearer sk-mikoto');
+      return new Response(mp4, {
+        status: 200,
+        headers: {
+          'content-type': 'video/mp4',
+          'content-length': String(mp4.byteLength),
+        },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(mirrorGeneratedVideoResultToOss(
+      'https://1.1.1.1/v1/videos/task-1/content',
+      { authorization: 'Bearer sk-mikoto' },
+    )).resolves.toMatch(/^https:\/\/api\.example\.test\/v1\/ai\/video-results\/[a-f0-9]{64}\.mp4$/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });

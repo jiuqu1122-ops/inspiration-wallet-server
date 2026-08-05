@@ -115,18 +115,21 @@ async function writeVideoResponseToFile(response: Response, path: string) {
   return { ...type, size: total };
 }
 
-async function stagePublicVideo(source: string) {
+async function stagePublicVideo(source: string, requestHeaders?: HeadersInit) {
   const directory = await mkdtemp(join(tmpdir(), 'inspiration-video-result-'));
   const path = join(directory, 'result.bin');
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), VIDEO_RESULT_DOWNLOAD_TIMEOUT_MS);
   try {
     let current = new URL(source);
+    const authenticatedOrigin = requestHeaders ? current.origin : null;
     for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
       await assertPublicProviderUrl(current.toString());
+      const headers = new Headers(current.origin === authenticatedOrigin ? requestHeaders : undefined);
+      headers.set('accept', 'video/mp4,video/webm,video/quicktime,video/*;q=0.9,*/*;q=0.1');
       const response = await fetch(current, {
         method: 'GET',
-        headers: { accept: 'video/mp4,video/webm,video/quicktime,video/*;q=0.9,*/*;q=0.1' },
+        headers,
         redirect: 'manual',
         signal: controller.signal,
       });
@@ -180,7 +183,7 @@ async function stageInlineVideo(source: string) {
   }
 }
 
-async function performGeneratedVideoResultMirror(source: string) {
+async function performGeneratedVideoResultMirror(source: string, requestHeaders?: HeadersInit) {
   const trimmed = source.trim();
   if (isStoredVideoResultUrl(trimmed)) {
     const key = new URL(trimmed).pathname.split('/').filter(Boolean).pop();
@@ -192,7 +195,7 @@ async function performGeneratedVideoResultMirror(source: string) {
   }
   const staged = /^data:video\//i.test(trimmed)
     ? await stageInlineVideo(trimmed)
-    : await stagePublicVideo(trimmed);
+    : await stagePublicVideo(trimmed, requestHeaders);
   try {
     const key = `${randomBytes(32).toString('hex')}.${staged.extension}`;
     const objectName = await ossUploadService.upload({
@@ -211,16 +214,22 @@ async function performGeneratedVideoResultMirror(source: string) {
   }
 }
 
-export async function mirrorGeneratedVideoResultToOss(source: string) {
+export async function mirrorGeneratedVideoResultToOss(source: string, requestHeaders?: HeadersInit) {
   const trimmed = source.trim();
-  if (isStoredVideoResultUrl(trimmed)) return performGeneratedVideoResultMirror(trimmed);
-  const cacheKey = createHash('sha256').update(trimmed).digest('hex');
+  if (isStoredVideoResultUrl(trimmed)) return performGeneratedVideoResultMirror(trimmed, requestHeaders);
+  const normalizedHeaders = requestHeaders
+    ? Array.from(new Headers(requestHeaders).entries()).sort(([left], [right]) => left.localeCompare(right))
+    : [];
+  const cacheKey = createHash('sha256')
+    .update(trimmed)
+    .update(JSON.stringify(normalizedHeaders))
+    .digest('hex');
   const cached = completedVideoMirrors.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.url;
   if (cached) completedVideoMirrors.delete(cacheKey);
   const pending = pendingVideoMirrors.get(cacheKey);
   if (pending) return pending;
-  const mirror = performGeneratedVideoResultMirror(trimmed)
+  const mirror = performGeneratedVideoResultMirror(trimmed, requestHeaders)
     .then((url) => {
       completedVideoMirrors.set(cacheKey, {
         url,

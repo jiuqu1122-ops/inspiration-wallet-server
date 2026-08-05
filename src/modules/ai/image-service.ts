@@ -2829,6 +2829,20 @@ export async function mirrorGeneratedVideoResponse(
   return { walletVideoResults: mirrored, upstream: value };
 }
 
+function providerVideoResultMirror(
+  provider: Pick<AiProviderChannel, 'baseUrl'>,
+  secrets: ProviderSecrets,
+) {
+  const providerOrigin = new URL(provider.baseUrl).origin;
+  return (source: string) => {
+    if (!/^https?:\/\//i.test(source)) return mirrorGeneratedVideoResultToOss(source);
+    const sourceOrigin = new URL(source).origin;
+    return sourceOrigin === providerOrigin
+      ? mirrorGeneratedVideoResultToOss(source, upstreamHeaders(secrets))
+      : mirrorGeneratedVideoResultToOss(source);
+  };
+}
+
 const isKlingVideoModel = (model: string) => /kling/i.test(model.trim());
 
 function videoProviderKind(provider?: VideoInput['provider']) {
@@ -2886,8 +2900,28 @@ export function resolveMikotoSeedanceModel(model: string, resolution?: string) {
   return normalizedResolution === '1080p' ? 'seedance-2.0-1080p' : 'seedance-2.0-720p';
 }
 
+function isMikotoOmniKlingModel(model: string) {
+  const token = model.trim().toLowerCase().replace(/[\s_.-]+/g, '');
+  return token.includes('omni') || token.includes('klingo1');
+}
+
+function isMikotoKlingModelForFamily(model: string, omni: boolean) {
+  const token = model.trim().toLowerCase().replace(/[\s_.-]+/g, '');
+  return token.includes('kling') && isMikotoOmniKlingModel(model) === omni;
+}
+
+export function resolveMikotoKlingModel(model: string) {
+  const trimmed = model.trim();
+  const token = trimmed.toLowerCase().replace(/[\s_.-]+/g, '');
+  if (token === 'klingomnivideo') return 'kling-o1-text-to-video';
+  if (token === 'klingvideo') return 'kling-v2.6-pro-t2v';
+  return trimmed;
+}
+
 export function resolveMikotoVideoModel(model: string, resolution?: string) {
-  return isKlingVideoModel(model) ? model.trim() : resolveMikotoSeedanceModel(model, resolution);
+  return isKlingVideoModel(model)
+    ? resolveMikotoKlingModel(model)
+    : resolveMikotoSeedanceModel(model, resolution);
 }
 
 function isMikotoFastSeedanceModel(model: string) {
@@ -2896,6 +2930,11 @@ function isMikotoFastSeedanceModel(model: string) {
     || token.includes('seedance2fast')
     || token.includes('seedance20fast')
     || token.includes('seedancefast');
+}
+
+function isMikotoSoraV3ProModel(model: string) {
+  const token = model.trim().toLowerCase().replace(/[\s_.-]+/g, '');
+  return token === 'sorav3pro';
 }
 
 function isMikotoSeedanceModelForFamily(model: string, fast: boolean) {
@@ -2912,13 +2951,44 @@ function isMikotoSeedanceModelForFamily(model: string, fast: boolean) {
  */
 export function mikotoSeedanceModelCandidates(input: VideoInput, configuredModel?: string | null) {
   const fast = isMikotoFastSeedanceModel(input.model);
+  const resolution = String(input.resolution || '720p').trim().toLowerCase();
+  const referenceCount = (input.inputImages?.length ?? 0)
+    + (input.inputVideos?.length ?? 0)
+    + (input.inputAudios?.length ?? 0);
+  const supportsSoraV3Pro = !fast && resolution === '720p' && referenceCount <= 12;
   const candidates = [
     configuredModel?.trim(),
     resolveMikotoSeedanceModel(input.model, input.resolution),
     fast ? 'seedance-2.0-fast' : 'seedance-2.0',
     fast ? 'seedance2fast' : 'seedance2',
+    ...(supportsSoraV3Pro ? ['sora-v3-pro'] : []),
   ].filter((model): model is string => (
-    !!model && isMikotoSeedanceModelForFamily(model, fast)
+    !!model && (
+      isMikotoSeedanceModelForFamily(model, fast)
+      || (supportsSoraV3Pro && isMikotoSoraV3ProModel(model))
+    )
+  ));
+  return Array.from(new Set(candidates));
+}
+
+/**
+ * The canvas uses stable public Kling names, while Mikoto exposes versioned
+ * upstream model IDs. Prefer an explicitly configured channel model, then the
+ * known Mikoto alias, followed by matching IDs reported by /v1/models.
+ */
+export function mikotoKlingModelCandidates(
+  input: VideoInput,
+  configuredModel?: string | null,
+  discoveredModels: string[] = [],
+) {
+  const omni = isMikotoOmniKlingModel(input.model);
+  const candidates = [
+    configuredModel?.trim(),
+    resolveMikotoKlingModel(input.model),
+    ...discoveredModels.map(model => model.trim()),
+    input.model.trim(),
+  ].filter((model): model is string => (
+    !!model && isMikotoKlingModelForFamily(model, omni)
   ));
   return Array.from(new Set(candidates));
 }
@@ -2927,11 +2997,37 @@ function mikotoVideoModel(input: VideoInput, modelOverride?: string) {
   return modelOverride?.trim() || resolveMikotoVideoModel(input.model, input.resolution);
 }
 
+export function mikotoSoraV3ProVideoBody(input: VideoInput, model = 'sora-v3-pro') {
+  const duration = Math.max(4, Math.min(15, Math.round(Number(input.duration) || 15)));
+  const [imageUrl, ...referenceImageUrls] = input.inputImages;
+  const referenceMode = input.inputMode === 'FLF'
+    ? input.inputImages.length >= 2 ? 'start_end' : 'start_frame'
+    : 'auto';
+  return {
+    model,
+    prompt: input.prompt,
+    seconds: String(duration),
+    aspect_ratio: input.aspectRatio || '16:9',
+    resolution: '720p',
+    ...(imageUrl ? { image_url: imageUrl } : {}),
+    ...(referenceImageUrls.length ? { reference_image_urls: referenceImageUrls } : {}),
+    ...(input.inputVideos.length === 1
+      ? { reference_video: input.inputVideos[0] }
+      : input.inputVideos.length > 1 ? { reference_videos: input.inputVideos } : {}),
+    ...(input.inputAudios.length
+      ? { audio_url: input.inputAudios.length === 1 ? input.inputAudios[0] : input.inputAudios }
+      : {}),
+    video_config: { reference_mode: referenceMode },
+  };
+}
+
 function mikotoVideoBody(input: VideoInput, modelOverride?: string) {
   const requestedDuration = Math.max(4, Math.min(15, Math.round(Number(input.duration) || 15)));
   const duration = isKlingVideoModel(input.model)
     ? ([5, 10, 15].find(value => value >= requestedDuration) ?? 15)
     : requestedDuration;
+  const model = mikotoVideoModel(input, modelOverride);
+  if (isMikotoSoraV3ProModel(model)) return mikotoSoraV3ProVideoBody(input, model);
   const hasReferences = input.inputImages.length > 0
     || input.inputVideos.length > 0
     || input.inputAudios.length > 0;
@@ -2959,7 +3055,7 @@ function mikotoVideoBody(input: VideoInput, modelOverride?: string) {
       reference_mode: isOmni ? 'element' : 'frame',
     };
     return {
-      model: mikotoVideoModel(input, modelOverride),
+      model,
       prompt: input.prompt,
       messages: [{ role: 'user', content: input.inputImages.length ? content : input.prompt }],
       seconds: String(duration),
@@ -2973,7 +3069,7 @@ function mikotoVideoBody(input: VideoInput, modelOverride?: string) {
     };
   }
   return {
-    model: mikotoVideoModel(input, modelOverride),
+    model,
     prompt: input.prompt,
     duration,
     ...(input.aspectRatio ? { aspect_ratio: input.aspectRatio } : {}),
@@ -2984,11 +3080,13 @@ function mikotoVideoBody(input: VideoInput, modelOverride?: string) {
   };
 }
 
-function shouldTryMikotoSeedanceModel(error: unknown) {
+function shouldTryMikotoVideoModel(error: unknown) {
   if (error instanceof UpstreamImageError) {
     return [400, 404, 422, 500, 502, 503, 504].includes(error.status);
   }
-  const message = error instanceof Error ? error.message : String(error || '');
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string' ? error : '';
   return /(?:503|temporarily unavailable|no available channel|model.+(?:not found|unavailable))/i.test(message);
 }
 
@@ -3119,13 +3217,29 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       }
     }
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+    let mikotoVideoModels: string[] = [];
+    if (provider.kind === 'MIKOTO' && isKlingVideoModel(input.model)) {
+      try {
+        const value = await providerRequest(provider, secrets, '/v1/models', undefined, 15_000);
+        mikotoVideoModels = collectProviderModelIds(value);
+      } catch (error) {
+        console.warn('[mikoto_video_models_discovery_failed]', {
+          provider: provider.name,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
     const results: unknown[] = [];
     for (let index = 0; index < input.count; index += 1) {
       const path = provider.kind === 'XAIS'
         ? '/xais/workerTaskStart'
         : provider.kind === 'MIKOTO' ? '/v1/videos' : '/v1/video/generations';
-      const mikotoModels = provider.kind === 'MIKOTO' && isSeedance20VideoModel(input.model)
-        ? mikotoSeedanceModelCandidates(input, provider.defaultModel)
+      const mikotoModels = provider.kind === 'MIKOTO'
+        ? isSeedance20VideoModel(input.model)
+          ? mikotoSeedanceModelCandidates(input, provider.defaultModel)
+          : isKlingVideoModel(input.model)
+            ? mikotoKlingModelCandidates(input, provider.defaultModel, mikotoVideoModels)
+            : []
         : [];
       const modelAttempts = mikotoModels.length > 0 ? mikotoModels : [undefined];
       let result: unknown = null;
@@ -3152,9 +3266,9 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
           if (failure) {
             lastError = new Error(failure);
             if (provider.kind === 'MIKOTO'
-              && isSeedance20VideoModel(input.model)
+              && (isSeedance20VideoModel(input.model) || isKlingVideoModel(input.model))
               && modelIndex < modelAttempts.length - 1
-              && shouldTryMikotoSeedanceModel(lastError)) {
+              && shouldTryMikotoVideoModel(lastError)) {
               continue;
             }
             throw new CloudAiError('video_generation_failed', failure, 502);
@@ -3164,16 +3278,23 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
         } catch (error) {
           lastError = error;
           if (provider.kind === 'MIKOTO'
-            && isSeedance20VideoModel(input.model)
+            && (isSeedance20VideoModel(input.model) || isKlingVideoModel(input.model))
             && modelIndex < modelAttempts.length - 1
-            && shouldTryMikotoSeedanceModel(error)) {
+            && shouldTryMikotoVideoModel(error)) {
             continue;
           }
           throw error;
         }
       }
-      if (lastError) throw lastError;
-      results.push(await mirrorGeneratedVideoResponse(result, provider.name));
+      if (lastError instanceof Error) throw lastError;
+      if (lastError) throw new Error('Mikoto video generation failed');
+      results.push(await mirrorGeneratedVideoResponse(
+        result,
+        provider.name,
+        provider.kind === 'MIKOTO'
+          ? providerVideoResultMirror(provider, secrets)
+          : mirrorGeneratedVideoResultToOss,
+      ));
     }
     await settleVideo(prisma, input.userId, reservation.requestId, reservation.estimated);
     return { results, provider: provider.kind, model: input.model, chargedCredits: reservation.estimated.toString() };
@@ -3203,7 +3324,13 @@ export async function executeWalletVideoStatus(
     }
     throw new CloudAiError('video_generation_failed', failure, 502);
   }
-  if (provider.kind !== 'XAIS') return mirrorGeneratedVideoResponse(waited, provider.name);
+  if (provider.kind !== 'XAIS') return mirrorGeneratedVideoResponse(
+    waited,
+    provider.name,
+    provider.kind === 'MIKOTO'
+      ? providerVideoResultMirror(provider, secrets)
+      : mirrorGeneratedVideoResultToOss,
+  );
   const attachments = collectAttachmentIds(waited)
     .filter((value) => !/^(?:pending|processing|queued|completed|success|succeeded|failed|failure|error|cancelled|canceled)$/i.test(value));
   if (!attachments.length) return mirrorGeneratedVideoResponse(waited, provider.name);

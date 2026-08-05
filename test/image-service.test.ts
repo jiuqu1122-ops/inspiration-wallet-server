@@ -31,7 +31,10 @@ import {
   resolveBigmodelImageModel,
   resolveImageModel,
   resolveMikotoImageModel,
+  mikotoKlingModelCandidates,
+  mikotoSoraV3ProVideoBody,
   mikotoSeedanceModelCandidates,
+  resolveMikotoKlingModel,
   resolveMikotoSeedanceModel,
   resolveMikotoVideoModel,
   resolveNewApiImageModel,
@@ -54,9 +57,27 @@ describe('Mikoto Seedance model mapping', () => {
     expect(resolveMikotoSeedanceModel('seedance2fast', '720p')).toBe('seedance-fast-720p');
   });
 
-  it('passes Kling model ids through to the Mikoto video endpoint', () => {
-    expect(resolveMikotoVideoModel('kling-video', '1080p')).toBe('kling-video');
-    expect(resolveMikotoVideoModel('kling-omni-video', '720p')).toBe('kling-omni-video');
+  it('maps canvas Kling names to Mikoto model ids', () => {
+    expect(resolveMikotoKlingModel('kling-video')).toBe('kling-v2.6-pro-t2v');
+    expect(resolveMikotoKlingModel('kling-omni-video')).toBe('kling-o1-text-to-video');
+    expect(resolveMikotoKlingModel('kling-o1-standard')).toBe('kling-o1-standard');
+    expect(resolveMikotoVideoModel('kling-video', '1080p')).toBe('kling-v2.6-pro-t2v');
+    expect(resolveMikotoVideoModel('kling-omni-video', '720p')).toBe('kling-o1-text-to-video');
+  });
+
+  it('prefers a configured Kling model and filters discovered models by family', () => {
+    expect(mikotoKlingModelCandidates({
+      model: 'kling-omni-video', inputImages: [],
+    } as never, 'kling-o1-image-to-video', [
+      'seedance-2.0',
+      'kling-v2.6-pro-t2v',
+      'kling-o1-standard',
+    ])).toEqual([
+      'kling-o1-image-to-video',
+      'kling-o1-text-to-video',
+      'kling-o1-standard',
+      'kling-omni-video',
+    ]);
   });
 
   it('prefers a matching channel model and keeps fallback aliases in order', () => {
@@ -66,6 +87,7 @@ describe('Mikoto Seedance model mapping', () => {
       'seedance-2.0',
       'seedance-2.0-720p',
       'seedance2',
+      'sora-v3-pro',
     ]);
     expect(mikotoSeedanceModelCandidates({
       model: 'seedance2fast', resolution: '480p',
@@ -74,6 +96,39 @@ describe('Mikoto Seedance model mapping', () => {
       'seedance-2.0-fast',
       'seedance2fast',
     ]);
+  });
+
+  it('uses a configured Mikoto Sora V3 Pro channel only for Seedance 2.0 at 720p', () => {
+    const base = {
+      model: 'seedance2', resolution: '720p',
+      inputImages: [], inputVideos: [], inputAudios: [],
+    } as never;
+    expect(mikotoSeedanceModelCandidates(base, 'sora-v3-pro')[0]).toBe('sora-v3-pro');
+    expect(mikotoSeedanceModelCandidates({ ...base, resolution: '1080p' }, 'sora-v3-pro'))
+      .not.toContain('sora-v3-pro');
+    expect(mikotoSeedanceModelCandidates({ ...base, model: 'seedance2fast' }, 'sora-v3-pro'))
+      .not.toContain('sora-v3-pro');
+  });
+
+  it('adapts Seedance references to the Mikoto Sora V3 Pro contract', () => {
+    expect(mikotoSoraV3ProVideoBody({
+      model: 'seedance2', prompt: 'product camera move', duration: 10,
+      aspectRatio: '16:9', resolution: '720p', inputMode: 'REF',
+      inputImages: ['https://media.example/main.jpg', 'https://media.example/ref.jpg'],
+      inputVideos: ['https://media.example/move.mp4'],
+      inputAudios: ['https://media.example/music.mp3'],
+    } as never)).toEqual({
+      model: 'sora-v3-pro',
+      prompt: 'product camera move',
+      seconds: '10',
+      aspect_ratio: '16:9',
+      resolution: '720p',
+      image_url: 'https://media.example/main.jpg',
+      reference_image_urls: ['https://media.example/ref.jpg'],
+      reference_video: 'https://media.example/move.mp4',
+      audio_url: 'https://media.example/music.mp3',
+      video_config: { reference_mode: 'auto' },
+    });
   });
 
   it('extracts generated video results without treating reference media as outputs', () => {
