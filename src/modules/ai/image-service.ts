@@ -250,6 +250,17 @@ async function listImageProviders(prisma: PrismaClient) {
   return providers.filter((provider) => !provider.capabilities.includes('LLM'));
 }
 
+async function listVideoProviders(prisma: PrismaClient) {
+  const providers = await prisma.aiProviderChannel.findMany({
+    where: {
+      status: 'ACTIVE',
+      capabilities: { has: 'VIDEO' },
+    },
+    orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }],
+  });
+  return providers.filter((provider) => !provider.capabilities.includes('LLM'));
+}
+
 function isRetryableNewApiTaskPollError(error: unknown) {
   return error instanceof UpstreamImageError
     && (error.status === 0 || error.status === 429 || error.status >= 500);
@@ -450,8 +461,9 @@ export function collectProviderModelIds(value: unknown) {
 export async function listWalletImageModels(
   prisma: PrismaClient,
 ) {
-  const [providers, pricing] = await Promise.all([
+  const [providers, videoProviders, pricing] = await Promise.all([
     listImageProviders(prisma),
+    listVideoProviders(prisma),
     getAiPricingConfig(prisma),
   ]);
   if (!providers.length) {
@@ -498,6 +510,17 @@ export async function listWalletImageModels(
     defaultModel: firstAvailable.defaultModel,
     models: Array.from(new Set(channels.flatMap((channel) => channel.models))),
     channels,
+    videoChannels: videoProviders.map((provider) => ({
+      id: provider.id,
+      name: provider.name,
+      provider: provider.kind,
+      defaultModel: provider.defaultModel,
+      // Video model IDs are resolved by the provider-specific request adapter;
+      // the client only needs the channel and capability to choose the route.
+      models: [],
+      capabilities: provider.capabilities,
+      error: null,
+    })),
     pricing,
   };
 }
@@ -2867,11 +2890,44 @@ export function resolveMikotoVideoModel(model: string, resolution?: string) {
   return isKlingVideoModel(model) ? model.trim() : resolveMikotoSeedanceModel(model, resolution);
 }
 
-function mikotoVideoModel(input: VideoInput) {
-  return resolveMikotoVideoModel(input.model, input.resolution);
+function isMikotoFastSeedanceModel(model: string) {
+  const token = model.trim().toLowerCase().replace(/[\s_.-]+/g, '');
+  return token.includes('sourcemix20fast')
+    || token.includes('seedance2fast')
+    || token.includes('seedance20fast')
+    || token.includes('seedancefast');
 }
 
-function mikotoVideoBody(input: VideoInput) {
+function isMikotoSeedanceModelForFamily(model: string, fast: boolean) {
+  const token = model.trim().toLowerCase().replace(/[\s_.-]+/g, '');
+  if (!token.includes('seedance') && !token.includes('sourcemix')) return false;
+  return isMikotoFastSeedanceModel(model) === fast;
+}
+
+/**
+ * Mikoto deployments do not all expose the same public model alias. Prefer
+ * the channel's configured model when it matches the requested family, then
+ * try the resolution-aware aliases used by older deployments and the two
+ * canonical Seedance aliases used by newer deployments.
+ */
+export function mikotoSeedanceModelCandidates(input: VideoInput, configuredModel?: string | null) {
+  const fast = isMikotoFastSeedanceModel(input.model);
+  const candidates = [
+    configuredModel?.trim(),
+    resolveMikotoSeedanceModel(input.model, input.resolution),
+    fast ? 'seedance-2.0-fast' : 'seedance-2.0',
+    fast ? 'seedance2fast' : 'seedance2',
+  ].filter((model): model is string => (
+    !!model && isMikotoSeedanceModelForFamily(model, fast)
+  ));
+  return Array.from(new Set(candidates));
+}
+
+function mikotoVideoModel(input: VideoInput, modelOverride?: string) {
+  return modelOverride?.trim() || resolveMikotoVideoModel(input.model, input.resolution);
+}
+
+function mikotoVideoBody(input: VideoInput, modelOverride?: string) {
   const requestedDuration = Math.max(4, Math.min(15, Math.round(Number(input.duration) || 15)));
   const duration = isKlingVideoModel(input.model)
     ? ([5, 10, 15].find(value => value >= requestedDuration) ?? 15)
@@ -2903,7 +2959,7 @@ function mikotoVideoBody(input: VideoInput) {
       reference_mode: isOmni ? 'element' : 'frame',
     };
     return {
-      model: mikotoVideoModel(input),
+      model: mikotoVideoModel(input, modelOverride),
       prompt: input.prompt,
       messages: [{ role: 'user', content: input.inputImages.length ? content : input.prompt }],
       seconds: String(duration),
@@ -2917,7 +2973,7 @@ function mikotoVideoBody(input: VideoInput) {
     };
   }
   return {
-    model: mikotoVideoModel(input),
+    model: mikotoVideoModel(input, modelOverride),
     prompt: input.prompt,
     duration,
     ...(input.aspectRatio ? { aspect_ratio: input.aspectRatio } : {}),
@@ -2926,6 +2982,14 @@ function mikotoVideoBody(input: VideoInput) {
     ...(input.inputAudios.length ? { referenceAudios: input.inputAudios } : {}),
     ...(hasReferences ? { reference_mode: input.inputMode === 'FLF' ? 'frame' : 'media' } : {}),
   };
+}
+
+function shouldTryMikotoSeedanceModel(error: unknown) {
+  if (error instanceof UpstreamImageError) {
+    return [400, 404, 422, 500, 502, 503, 504].includes(error.status);
+  }
+  const message = error instanceof Error ? error.message : String(error || '');
+  return /(?:503|temporarily unavailable|no available channel|model.+(?:not found|unavailable))/i.test(message);
 }
 
 async function reserveVideo(prisma: PrismaClient, input: VideoInput) {
@@ -3060,23 +3124,55 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       const path = provider.kind === 'XAIS'
         ? '/xais/workerTaskStart'
         : provider.kind === 'MIKOTO' ? '/v1/videos' : '/v1/video/generations';
-      const body = provider.kind === 'XAIS' ? xaisVideoBody(input) : provider.kind === 'MIKOTO' ? mikotoVideoBody(input) : {
-        model: input.model,
-        prompt: input.prompt,
-        n: 1,
-        ...(input.inputImages.length ? { images: input.inputImages } : {}),
-        ...(input.inputVideos.length ? { videos: input.inputVideos } : {}),
-        ...(input.inputAudios.length ? { audios: input.inputAudios } : {}),
-        ...(isSeedance20VideoModel(input.model)
-          ? { ref: [...input.inputImages, ...input.inputVideos, ...input.inputAudios] }
-          : {}),
-        ...(input.aspectRatio ? { aspect_ratio: input.aspectRatio, ratio: input.aspectRatio } : {}),
-        ...(input.resolution ? { resolution: input.resolution } : {}),
-        ...(input.duration ? { duration: input.duration } : {}),
-      };
-      const result = await providerRequest(provider, secrets, path, body);
-      const failure = getFailure(result);
-      if (failure) throw new CloudAiError('video_generation_failed', failure, 502);
+      const mikotoModels = provider.kind === 'MIKOTO' && isSeedance20VideoModel(input.model)
+        ? mikotoSeedanceModelCandidates(input, provider.defaultModel)
+        : [];
+      const modelAttempts = mikotoModels.length > 0 ? mikotoModels : [undefined];
+      let result: unknown = null;
+      let lastError: unknown = null;
+      for (let modelIndex = 0; modelIndex < modelAttempts.length; modelIndex += 1) {
+        const modelOverride = modelAttempts[modelIndex];
+        const body = provider.kind === 'XAIS' ? xaisVideoBody(input) : provider.kind === 'MIKOTO' ? mikotoVideoBody(input, modelOverride) : {
+          model: input.model,
+          prompt: input.prompt,
+          n: 1,
+          ...(input.inputImages.length ? { images: input.inputImages } : {}),
+          ...(input.inputVideos.length ? { videos: input.inputVideos } : {}),
+          ...(input.inputAudios.length ? { audios: input.inputAudios } : {}),
+          ...(isSeedance20VideoModel(input.model)
+            ? { ref: [...input.inputImages, ...input.inputVideos, ...input.inputAudios] }
+            : {}),
+          ...(input.aspectRatio ? { aspect_ratio: input.aspectRatio, ratio: input.aspectRatio } : {}),
+          ...(input.resolution ? { resolution: input.resolution } : {}),
+          ...(input.duration ? { duration: input.duration } : {}),
+        };
+        try {
+          result = await providerRequest(provider, secrets, path, body);
+          const failure = getFailure(result);
+          if (failure) {
+            lastError = new Error(failure);
+            if (provider.kind === 'MIKOTO'
+              && isSeedance20VideoModel(input.model)
+              && modelIndex < modelAttempts.length - 1
+              && shouldTryMikotoSeedanceModel(lastError)) {
+              continue;
+            }
+            throw new CloudAiError('video_generation_failed', failure, 502);
+          }
+          lastError = null;
+          break;
+        } catch (error) {
+          lastError = error;
+          if (provider.kind === 'MIKOTO'
+            && isSeedance20VideoModel(input.model)
+            && modelIndex < modelAttempts.length - 1
+            && shouldTryMikotoSeedanceModel(error)) {
+            continue;
+          }
+          throw error;
+        }
+      }
+      if (lastError) throw lastError;
       results.push(await mirrorGeneratedVideoResponse(result, provider.name));
     }
     await settleVideo(prisma, input.userId, reservation.requestId, reservation.estimated);

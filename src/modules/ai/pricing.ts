@@ -60,12 +60,41 @@ const KNOWN_VIDEO_MODELS = [
   'kling-omni-video',
 ] as const;
 
+const CANONICAL_IMAGE_PRICING_MODELS = [
+  'nano-banana-pro',
+  'nano-banana-2',
+  'image2',
+] as const;
+
 export const aiPricingModelToken = (model: string) => model
   .trim()
   .toLowerCase()
   .replace(/高画质/g, 'highquality')
   .replace(/preview/g, '')
   .replace(/[^a-z0-9]+/g, '');
+
+export const videoPricingModelToken = (model: string) => {
+  const token = aiPricingModelToken(model);
+  if (token === 'sourcemix20' || token === 'seedance20') return 'seedance2';
+  if (token === 'sourcemix20fast' || token === 'seedance20fast') return 'seedance2fast';
+  return token;
+};
+
+export const imagePricingModelToken = (model: string) => {
+  const token = aiPricingModelToken(model);
+  if (token.includes('nanobananapro') || token.includes('nanopro') || token.includes('gemini3proimage')) return 'nanobananapro';
+  if (token.includes('nanobanana2') || token.includes('nano2') || token.includes('gemini31flashimage')) return 'nanobanana2';
+  if (token.includes('gptimage2') || token.includes('image2') || token.includes('img2')) return 'image2';
+  return token;
+};
+
+const canonicalImagePricingModel = (model: string) => {
+  const token = imagePricingModelToken(model);
+  if (token === 'nanobananapro') return 'nano-banana-pro';
+  if (token === 'nanobanana2') return 'nano-banana-2';
+  if (token === 'image2') return 'image2';
+  return model.trim();
+};
 
 const RETIRED_IMAGE_MODEL_TOKENS = new Set([
   'xaisnanolite1k',
@@ -76,16 +105,11 @@ const RETIRED_IMAGE_MODEL_TOKENS = new Set([
 const isRetiredImageModel = (model: string) => RETIRED_IMAGE_MODEL_TOKENS.has(aiPricingModelToken(model));
 
 const supportsImageOneK = (model: string) => {
-  const token = aiPricingModelToken(model);
+  const token = imagePricingModelToken(model);
   if (token.startsWith('xais')) return false;
-  if (token.includes('nanobananapro')
-    || token.includes('nanopro')
-    || token.includes('gemini3proimage')
-    || token.includes('gemini31proimage')) return true;
-  return !token.includes('nanobanana2')
-    && !token.includes('nano2')
+  if (token === 'nanobananapro' || token === 'image2') return true;
+  return token !== 'nanobanana2'
     && !token.includes('nanolite')
-    && !token.includes('gemini31flashimage')
     && !token.includes('gemini3flashimage');
 };
 
@@ -105,15 +129,14 @@ export const pricedImageResolution = (
 };
 
 export function defaultImageUnitCredits(model: string, resolution?: string) {
-  const token = aiPricingModelToken(model);
+  const token = imagePricingModelToken(model);
+  const rawToken = aiPricingModelToken(model);
   const selectedResolution = pricedImageResolution(model, resolution);
-  const isGptImage2 = token.includes('gptimage2')
-    || token.includes('image2')
-    || token.includes('img2');
+  const isGptImage2 = token === 'image2';
   const isHighQuality = isGptImage2 && (
     model.includes('高画质')
-    || token.endsWith('h')
-    || token.includes('highquality')
+    || rawToken.endsWith('h')
+    || rawToken.includes('highquality')
   );
 
   if (isHighQuality) return selectedResolution === '4k' ? 35n : 30n;
@@ -122,25 +145,17 @@ export function defaultImageUnitCredits(model: string, resolution?: string) {
     return selectedResolution === '4k' ? 18n : 15n;
   }
 
-  const isNanoBananaPro = token.includes('nanobananapro')
-    || token.includes('xaisnanopro')
-    || token.includes('nanopro')
-    || token.includes('gemini3proimage')
-    || token.includes('gemini31proimage');
+  const isNanoBananaPro = token === 'nanobananapro';
   if (isNanoBananaPro) return selectedResolution === '4k' ? 20n : 18n;
 
-  const isNanoBanana2 = token.includes('nanobanana2')
-    || token.includes('xaisnano2')
-    || token.includes('nano2')
-    || token.includes('gemini31flashimage')
-    || token.includes('gemini3flashimage');
+  const isNanoBanana2 = token === 'nanobanana2';
   if (isNanoBanana2) return selectedResolution === '4k' ? 18n : 15n;
 
   return DEFAULT_IMAGE_REQUEST_CREDITS;
 }
 
 const defaultImageModelPrices = (): ImageModelCreditPrice[] => (
-  KNOWN_IMAGE_MODELS.map((model) => ({
+  CANONICAL_IMAGE_PRICING_MODELS.map((model) => ({
     model,
     ...(supportsImageOneK(model) ? { credits1k: defaultImageUnitCredits(model, '1k').toString() } : {}),
     credits2k: defaultImageUnitCredits(model, '2k').toString(),
@@ -173,7 +188,8 @@ const validCreditString = (value: unknown): value is string => (
 
 const normalizeStoredImageModels = (value: Prisma.JsonValue): ImageModelCreditPrice[] => {
   if (!Array.isArray(value)) return [];
-  return value.flatMap((item) => {
+  const normalized = new Map<string, ImageModelCreditPrice>();
+  value.forEach((item) => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
     const record = item as Record<string, unknown>;
     const model = typeof record.model === 'string' ? record.model.trim() : '';
@@ -181,16 +197,18 @@ const normalizeStoredImageModels = (value: Prisma.JsonValue): ImageModelCreditPr
       || isRetiredImageModel(model)
       || !validCreditString(record.credits2k)
       || !validCreditString(record.credits4k)) return [];
-    const credits1k = supportsImageOneK(model)
+    const canonicalModel = canonicalImagePricingModel(model);
+    const credits1k = supportsImageOneK(canonicalModel)
       ? validCreditString(record.credits1k) ? record.credits1k : record.credits2k
       : undefined;
-    return [{
-      model,
+    normalized.set(imagePricingModelToken(canonicalModel), {
+      model: canonicalModel,
       ...(credits1k ? { credits1k } : {}),
       credits2k: record.credits2k,
       credits4k: record.credits4k,
-    }];
+    });
   });
+  return Array.from(normalized.values());
 };
 
 const normalizeStoredVideoModels = (value: Prisma.JsonValue): VideoModelCreditPrice[] => {
@@ -222,14 +240,25 @@ const normalizeStoredVideoModels = (value: Prisma.JsonValue): VideoModelCreditPr
   });
 };
 
+const mergeKnownImageModels = (
+  stored: ImageModelCreditPrice[],
+  defaults: ImageModelCreditPrice[],
+) => {
+  const knownTokens = new Set(stored.map(item => imagePricingModelToken(item.model)));
+  return [
+    ...stored,
+    ...defaults.filter(item => !knownTokens.has(imagePricingModelToken(item.model))),
+  ];
+};
+
 const mergeKnownVideoModels = (
   stored: VideoModelCreditPrice[],
   defaults: VideoModelCreditPrice[],
 ) => {
-  const knownTokens = new Set(stored.map(item => aiPricingModelToken(item.model)));
+  const knownTokens = new Set(stored.map(item => videoPricingModelToken(item.model)));
   return [
     ...stored,
-    ...defaults.filter(item => !knownTokens.has(aiPricingModelToken(item.model))),
+    ...defaults.filter(item => !knownTokens.has(videoPricingModelToken(item.model))),
   ];
 };
 
@@ -242,7 +271,10 @@ export async function getAiPricingConfig(prisma: PrismaClient): Promise<AiPricin
     inspirationAnalysisCredits: stored.inspirationAnalysisCredits.toString(),
     imageDefaultCredits: stored.imageDefaultCredits.toString(),
     videoDefaultCredits: stored.videoDefaultCredits.toString(),
-    imageModels: normalizeStoredImageModels(stored.imageModelPrices),
+    imageModels: mergeKnownImageModels(
+      normalizeStoredImageModels(stored.imageModelPrices),
+      defaults.imageModels,
+    ),
     videoModels: mergeKnownVideoModels(
       normalizeStoredVideoModels(stored.videoModelPrices),
       defaults.videoModels,
@@ -255,18 +287,21 @@ export async function updateAiPricingConfig(
   prisma: PrismaClient,
   input: AiPricingConfigInput,
 ): Promise<AiPricingConfigValue> {
-  const imageModels = input.imageModels.flatMap((item) => {
+  const imageModelsByToken = new Map<string, ImageModelCreditPrice>();
+  input.imageModels.forEach((item) => {
     const model = item.model.trim();
-    if (!model || isRetiredImageModel(model)) return [];
-    return [{
-      model,
+    if (!model || isRetiredImageModel(model)) return;
+    const canonicalModel = canonicalImagePricingModel(model);
+    imageModelsByToken.set(imagePricingModelToken(canonicalModel), {
+      model: canonicalModel,
       ...(supportsImageOneK(model) && item.credits1k !== undefined
         ? { credits1k: item.credits1k }
         : {}),
       credits2k: item.credits2k,
       credits4k: item.credits4k,
-    }];
+    });
   });
+  const imageModels = Array.from(imageModelsByToken.values());
   await prisma.aiPricingConfig.upsert({
     where: { id: 'default' },
     create: {
@@ -305,7 +340,7 @@ export async function configuredImageUnitCredits(
 ) {
   const pricing = await getAiPricingConfig(prisma);
   const exact = pricing.imageModels.find(
-    (item) => aiPricingModelToken(item.model) === aiPricingModelToken(model),
+    (item) => imagePricingModelToken(item.model) === imagePricingModelToken(model),
   );
   if (!exact) {
     const fallback = defaultImageUnitCredits(model, resolution);
@@ -324,7 +359,7 @@ export async function configuredImageUnitCredits(
 export async function configuredVideoUnitCredits(prisma: PrismaClient, model: string) {
   const pricing = await getAiPricingConfig(prisma);
   const exact = pricing.videoModels.find(
-    (item) => aiPricingModelToken(item.model) === aiPricingModelToken(model),
+    (item) => videoPricingModelToken(item.model) === videoPricingModelToken(model),
   );
   return BigInt(exact?.creditsPerSecond ?? exact?.credits ?? pricing.videoDefaultCredits);
 }
@@ -362,7 +397,7 @@ export async function configuredVideoRequestCredits(
 ) {
   const pricing = await getAiPricingConfig(prisma);
   const price = pricing.videoModels.find(
-    (item) => aiPricingModelToken(item.model) === aiPricingModelToken(model),
+    (item) => videoPricingModelToken(item.model) === videoPricingModelToken(model),
   );
   return calculateVideoRequestCredits(
     price,

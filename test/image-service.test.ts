@@ -31,6 +31,7 @@ import {
   resolveBigmodelImageModel,
   resolveImageModel,
   resolveMikotoImageModel,
+  mikotoSeedanceModelCandidates,
   resolveMikotoSeedanceModel,
   resolveMikotoVideoModel,
   resolveNewApiImageModel,
@@ -56,6 +57,23 @@ describe('Mikoto Seedance model mapping', () => {
   it('passes Kling model ids through to the Mikoto video endpoint', () => {
     expect(resolveMikotoVideoModel('kling-video', '1080p')).toBe('kling-video');
     expect(resolveMikotoVideoModel('kling-omni-video', '720p')).toBe('kling-omni-video');
+  });
+
+  it('prefers a matching channel model and keeps fallback aliases in order', () => {
+    expect(mikotoSeedanceModelCandidates({
+      model: 'seedance2', resolution: '720p',
+    } as never, 'seedance-2.0')).toEqual([
+      'seedance-2.0',
+      'seedance-2.0-720p',
+      'seedance2',
+    ]);
+    expect(mikotoSeedanceModelCandidates({
+      model: 'seedance2fast', resolution: '480p',
+    } as never, 'seedance-2.0')).toEqual([
+      'seedance-fast-480p',
+      'seedance-2.0-fast',
+      'seedance2fast',
+    ]);
   });
 
   it('extracts generated video results without treating reference media as outputs', () => {
