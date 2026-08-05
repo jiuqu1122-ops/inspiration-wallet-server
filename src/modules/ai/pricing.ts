@@ -77,14 +77,14 @@ const isRetiredImageModel = (model: string) => RETIRED_IMAGE_MODEL_TOKENS.has(ai
 
 const supportsImageOneK = (model: string) => {
   const token = aiPricingModelToken(model);
-  return !token.startsWith('xais')
-    && !token.includes('nanobananapro')
-    && !token.includes('nanobanana2')
-    && !token.includes('nanopro')
+  if (token.startsWith('xais')) return false;
+  if (token.includes('nanobananapro')
+    || token.includes('nanopro')
+    || token.includes('gemini3proimage')
+    || token.includes('gemini31proimage')) return true;
+  return !token.includes('nanobanana2')
     && !token.includes('nano2')
     && !token.includes('nanolite')
-    && !token.includes('gemini3proimage')
-    && !token.includes('gemini31proimage')
     && !token.includes('gemini31flashimage')
     && !token.includes('gemini3flashimage');
 };
@@ -180,11 +180,13 @@ const normalizeStoredImageModels = (value: Prisma.JsonValue): ImageModelCreditPr
     if (!model
       || isRetiredImageModel(model)
       || !validCreditString(record.credits2k)
-      || !validCreditString(record.credits4k)
-      || (supportsImageOneK(model) && !validCreditString(record.credits1k))) return [];
+      || !validCreditString(record.credits4k)) return [];
+    const credits1k = supportsImageOneK(model)
+      ? validCreditString(record.credits1k) ? record.credits1k : record.credits2k
+      : undefined;
     return [{
       model,
-      ...(supportsImageOneK(model) ? { credits1k: record.credits1k as string } : {}),
+      ...(credits1k ? { credits1k } : {}),
       credits2k: record.credits2k,
       credits4k: record.credits4k,
     }];

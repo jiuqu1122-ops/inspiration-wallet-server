@@ -46,7 +46,7 @@ describe('AI credit pricing', () => {
     expect(new Set(modelTokens).size).toBe(modelTokens.length);
   });
 
-  it('removes retired XAIS 1K models and omits 1K prices for XAIS and Nano models', () => {
+  it('keeps retired XAIS models out while exposing 1K pricing for non-XAIS Banana Pro', () => {
     const models = defaultAiPricingConfig().imageModels;
     expect(models.some((item) => aiPricingModelToken(item.model) === 'xaisnanolite1k')).toBe(false);
     expect(models.some((item) => aiPricingModelToken(item.model) === 'xaisimg21k')).toBe(false);
@@ -56,6 +56,8 @@ describe('AI credit pricing', () => {
       credits4k: '18',
     }));
     expect(models.find((item) => item.model === 'Xais Nano2_2K')?.credits1k).toBeUndefined();
+    expect(models.find((item) => item.model === 'gemini-3-pro-image')?.credits1k).toBeDefined();
+    expect(models.find((item) => item.model === 'gemini-3.1-flash-image')?.credits1k).toBeUndefined();
     expect(models.find((item) => item.model === 'gpt-image-2')?.credits1k).toBeDefined();
   });
 
@@ -65,16 +67,25 @@ describe('AI credit pricing', () => {
       inspirationAnalysisCredits: 2n,
       imageDefaultCredits: 66n,
       videoDefaultCredits: 300n,
-      imageModelPrices: [{
-        model: 'gpt-image-2',
-        credits1k: '3',
-        credits2k: '5',
-        credits4k: '7',
-      }],
+      imageModelPrices: [
+        {
+          model: 'gpt-image-2',
+          credits1k: '3',
+          credits2k: '5',
+          credits4k: '7',
+        },
+        {
+          model: 'gemini-3-pro-image',
+          credits1k: '6',
+          credits2k: '8',
+          credits4k: '10',
+        },
+      ],
       videoModelPrices: [{ model: 'seedance2', credits: '44' }],
     });
 
     expect(await configuredImageUnitCredits(prisma, 'GPT Image 2', '4K')).toBe(7n);
+    expect(await configuredImageUnitCredits(prisma, 'gemini-3-pro-image-preview', '1K')).toBe(6n);
     expect(await configuredImageUnitCredits(prisma, 'custom-image-model', '2K')).toBe(66n);
     expect(await configuredVideoUnitCredits(prisma, 'Seedance 2')).toBe(44n);
     const resolved = await getAiPricingConfig(prisma);
@@ -85,6 +96,29 @@ describe('AI credit pricing', () => {
       'kling-video',
       'kling-omni-video',
     ]));
+  });
+
+  it('backfills Banana Pro 1K pricing from legacy 2K records', async () => {
+    const prisma = prismaWithPricing({
+      agentRequestCredits: 8n,
+      inspirationAnalysisCredits: 2n,
+      imageDefaultCredits: 66n,
+      videoDefaultCredits: 300n,
+      imageModelPrices: [{
+        model: 'gemini-3-pro-image',
+        credits2k: '18',
+        credits4k: '20',
+      }],
+      videoModelPrices: [],
+    });
+
+    const resolved = await getAiPricingConfig(prisma);
+    expect(resolved.imageModels[0]).toEqual({
+      model: 'gemini-3-pro-image',
+      credits1k: '18',
+      credits2k: '18',
+      credits4k: '20',
+    });
   });
 
   it('calculates video credits from duration, resolution, per-video, and count rules', async () => {
