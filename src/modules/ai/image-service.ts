@@ -121,6 +121,8 @@ const IMAGE_PROVIDER_CAPABILITIES: AiCapability[] = [
   'IMAGE',
   'IMAGE_NANO_BANANA',
   'IMAGE_NANO_BANANA_2',
+  'IMAGE_NANO_BANANA_DUAL_2K',
+  // Kept during the transition so existing database rows remain routable.
   'IMAGE_NANO_BANANA_PRO_1K',
   'IMAGE_GPT',
   'IMAGE_GPT_1K',
@@ -164,19 +166,24 @@ export function providerSupportsImageModel(
 ) {
   if (provider.capabilities.includes('IMAGE')) return true;
   const capability = imageCapabilityForModel(model, resolution);
-  if (capability === 'IMAGE_NANO_BANANA'
-    && provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K')
-    && !resolution
-    && isNanoBananaProModelToken(imageModelToken(model))) {
-    // A 1K-only Banana Pro channel may still advertise the model itself;
-    // the generation path applies the 1K default before charging/requesting.
+  const modelToken = imageModelToken(model);
+  const requestedResolution = String(resolution || '').trim().toLowerCase();
+  const modelResolution = modelToken.includes('4k')
+    ? '4k'
+    : modelToken.includes('2k') ? '2k' : modelToken.includes('1k') ? '1k' : '';
+  const hasBananaDual2K = provider.capabilities.includes('IMAGE_NANO_BANANA_DUAL_2K')
+    || provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K');
+  if (hasBananaDual2K
+    && (!requestedResolution || requestedResolution === '2k')
+    && (!modelResolution || modelResolution === '2k')
+    && (capability === 'IMAGE_NANO_BANANA' || capability === 'IMAGE_NANO_BANANA_2')) {
     return true;
   }
   if (capability === 'IMAGE_GPT'
     && provider.capabilities.includes('IMAGE_GPT_1K')
     && !resolution
-    && !imageModelToken(model).includes('2k')
-    && !imageModelToken(model).includes('4k')) {
+    && !modelToken.includes('2k')
+    && !modelToken.includes('4k')) {
     // A generic Image2 model can be listed for a 1K-only channel; the
     // requested resolution is checked again when a generation is started.
     return true;
@@ -579,6 +586,11 @@ export function resolveBigmodelImageModel(model: string) {
   if (isNanoBananaProModelToken(token)) {
     return 'gemini-3-pro-image-preview';
   }
+  if (token.includes('nanobanana2')
+    || token.includes('gemini31flashimage')
+    || token.includes('gemini3flashimage')) {
+    return 'gemini-3.1-flash-image-preview';
+  }
   return trimmed;
 }
 
@@ -605,7 +617,8 @@ function isNanoBananaProModelToken(token: string) {
 }
 
 function isBigmodelBananaModel(model: string) {
-  return imageModelToken(resolveBigmodelImageModel(model)).includes('gemini3proimage');
+  const capability = imageCapabilityForModel(resolveBigmodelImageModel(model));
+  return capability === 'IMAGE_NANO_BANANA' || capability === 'IMAGE_NANO_BANANA_2';
 }
 
 function isMikotoBananaModel(model: string) {
@@ -739,9 +752,14 @@ function newApiImageFamily(model: string) {
 
 function bigmodelConfiguredImageModels(provider: Pick<AiProviderChannel, 'capabilities' | 'defaultModel'>) {
   const models: string[] = [];
+  const hasBananaDual2K = provider.capabilities.includes('IMAGE_NANO_BANANA_DUAL_2K')
+    || provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K');
   if (provider.capabilities.includes('IMAGE_NANO_BANANA')
-    || provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K')) {
+    || hasBananaDual2K) {
     models.push('gemini-3-pro-image-preview');
+  }
+  if (provider.capabilities.includes('IMAGE_NANO_BANANA_2') || hasBananaDual2K) {
+    models.push('gemini-3.1-flash-image-preview');
   }
   if (provider.capabilities.includes('IMAGE_GPT')
     || provider.capabilities.includes('IMAGE_GPT_1K')) {
@@ -2621,15 +2639,18 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
   const isImage2OneKOnly = provider.capabilities.includes('IMAGE_GPT_1K')
     && !provider.capabilities.includes('IMAGE_GPT')
     && !provider.capabilities.includes('IMAGE');
-  const isBananaProOneKOnly = provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K')
+  const isBananaDualTwoKOnly = (
+    provider.capabilities.includes('IMAGE_NANO_BANANA_DUAL_2K')
+      || provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K')
+  )
     && !provider.capabilities.includes('IMAGE_NANO_BANANA')
+    && !provider.capabilities.includes('IMAGE_NANO_BANANA_2')
     && !provider.capabilities.includes('IMAGE');
   const effectiveInput = {
     ...input,
     model: resolveImageModel(provider, input.model),
-    ...((isImage2OneKOnly || isBananaProOneKOnly) && !input.resolution
-      ? { resolution: '1k' }
-      : {}),
+    ...(isImage2OneKOnly && !input.resolution ? { resolution: '1k' } : {}),
+    ...(isBananaDualTwoKOnly && !input.resolution ? { resolution: '2k' } : {}),
   };
   const reservation = await reserveImageCredits(prisma, effectiveInput);
   try {

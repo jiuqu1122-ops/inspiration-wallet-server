@@ -62,6 +62,11 @@ function configurationError(error: unknown): never {
 }
 
 function serializeProvider(provider: AiProviderChannel) {
+  const capabilities = Array.from(new Set(provider.capabilities.map(capability => (
+    capability === 'IMAGE_NANO_BANANA_PRO_1K'
+      ? 'IMAGE_NANO_BANANA_DUAL_2K' as AiCapability
+      : capability
+  ))));
   return {
     id: provider.id,
     name: provider.name,
@@ -73,7 +78,7 @@ function serializeProvider(provider: AiProviderChannel) {
     allowInsecureHttp: provider.allowInsecureHttp,
     apiKeyConfigured: true,
     apiKeyLast4: provider.apiKeyLast4,
-    capabilities: provider.capabilities,
+    capabilities,
     lastTestStatus: provider.lastTestStatus,
     lastTestMessage: provider.lastTestMessage,
     lastTestModelCount: provider.lastTestModelCount,

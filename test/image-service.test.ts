@@ -259,8 +259,19 @@ describe('wallet image provider normalization', () => {
     expect(providerSupportsImageModel({ capabilities: ['IMAGE_GPT_1K'] as const }, 'gpt-image-2', '1k')).toBe(true);
     expect(providerSupportsImageModel({ capabilities: ['IMAGE_GPT_1K'] as const }, 'gpt-image-2', '2k')).toBe(false);
     expect(providerSupportsImageModel(legacy, 'custom-image-model')).toBe(true);
-    expect(providerSupportsImageModel({ capabilities: ['IMAGE_NANO_BANANA_PRO_1K'] as const }, 'gemini-3-pro-image-preview')).toBe(true);
-    expect(providerSupportsImageModel({ capabilities: ['IMAGE_NANO_BANANA_PRO_1K'] as const }, 'gemini-3-pro-image-preview', '2k')).toBe(false);
+    const bananaDual2k = { capabilities: ['IMAGE_NANO_BANANA_DUAL_2K'] as const };
+    expect(providerSupportsImageModel(bananaDual2k, 'gemini-3-pro-image-preview')).toBe(true);
+    expect(providerSupportsImageModel(bananaDual2k, 'gemini-3-pro-image-preview', '2k')).toBe(true);
+    expect(providerSupportsImageModel(bananaDual2k, 'gemini-3.1-flash-image-preview', '2k')).toBe(true);
+    expect(providerSupportsImageModel(bananaDual2k, 'Xais Nano Pro_2K')).toBe(true);
+    expect(providerSupportsImageModel(bananaDual2k, 'Xais Nano2_4K')).toBe(false);
+    expect(providerSupportsImageModel(bananaDual2k, 'gemini-3-pro-image-preview', '1k')).toBe(false);
+    expect(providerSupportsImageModel(bananaDual2k, 'gemini-3.1-flash-image-preview', '4k')).toBe(false);
+    expect(providerSupportsImageModel(
+      { capabilities: ['IMAGE_NANO_BANANA_PRO_1K'] as const },
+      'gemini-3-pro-image-preview',
+      '2k',
+    )).toBe(true);
     expect(filterProviderImageModels(nano, [
       'gemini-3-pro-image',
       'gemini-2.5-pro',
@@ -279,6 +290,7 @@ describe('wallet image provider normalization', () => {
 
   it('normalizes Bigmodel aliases to the native model IDs', () => {
     expect(resolveBigmodelImageModel('Nano Banana Pro')).toBe('gemini-3-pro-image-preview');
+    expect(resolveBigmodelImageModel('Nano Banana 2')).toBe('gemini-3.1-flash-image-preview');
     expect(resolveBigmodelImageModel('GPT Image 2')).toBe('gpt-image-2');
     expect(resolveImageModel({ kind: 'BIGMODEL', defaultModel: 'Nano Banana Pro' }, '')).toBe('gemini-3-pro-image-preview');
   });
