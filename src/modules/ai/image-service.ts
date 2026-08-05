@@ -307,12 +307,14 @@ export function resolveImageModel(
   if (requested) {
     if (provider.kind === 'NEW_API') return resolveNewApiImageModel(requested);
     if (provider.kind === 'BIGMODEL') return resolveBigmodelImageModel(requested);
+    if (provider.kind === 'MIKOTO') return resolveMikotoImageModel(requested);
     return requested;
   }
   const configured = provider.defaultModel?.trim();
   if (configured) {
     if (provider.kind === 'NEW_API') return resolveNewApiImageModel(configured);
     if (provider.kind === 'BIGMODEL') return resolveBigmodelImageModel(configured);
+    if (provider.kind === 'MIKOTO') return resolveMikotoImageModel(configured);
     return configured;
   }
   throw new CloudAiError('provider_model_missing', '生图请求和渠道都没有配置模型', 503);
@@ -557,6 +559,22 @@ export function resolveBigmodelImageModel(model: string) {
   return trimmed;
 }
 
+/** Mikoto exposes Gemini image models through its native Gemini endpoint. */
+export function resolveMikotoImageModel(model: string) {
+  const trimmed = model.trim();
+  const token = imageModelToken(trimmed);
+  if (isNanoBananaProModelToken(token)) return 'gemini-3-pro-image-preview';
+  if (token.includes('nanobanana2')
+    || token.includes('gemini31flashimage')
+    || token.includes('gemini3flashimage')) {
+    return 'gemini-3.1-flash-image-preview';
+  }
+  if (token.includes('gptimage2') || token.includes('image2') || token.includes('img2')) {
+    return 'gpt-image-2';
+  }
+  return trimmed;
+}
+
 function isNanoBananaProModelToken(token: string) {
   return token.includes('nanobananapro')
     || token.includes('nanopro')
@@ -567,6 +585,11 @@ function isBigmodelBananaModel(model: string) {
   return imageModelToken(resolveBigmodelImageModel(model)).includes('gemini3proimage');
 }
 
+function isMikotoBananaModel(model: string) {
+  const capability = imageCapabilityForModel(model);
+  return capability === 'IMAGE_NANO_BANANA' || capability === 'IMAGE_NANO_BANANA_2';
+}
+
 function bigmodelImageSize(resolution?: string) {
   const value = String(resolution || '').trim().toUpperCase();
   return value === '1K' || value === '4K' ? value : '2K';
@@ -574,7 +597,7 @@ function bigmodelImageSize(resolution?: string) {
 
 function bigmodelInlineImagePart(source: string) {
   const match = source.trim().match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([a-zA-Z0-9+/=\s]+)$/i);
-  if (!match) throw new CloudAiError('invalid_image_reference', 'Bigmodel 参考图必须是图片 data URI 或公网图片 URL', 400);
+  if (!match) throw new CloudAiError('invalid_image_reference', 'Gemini 生图参考图必须是图片 data URI 或公网图片 URL', 400);
   return { inlineData: { mimeType: match[1]!, data: match[2]!.replace(/\s+/g, '') } };
 }
 
@@ -620,6 +643,49 @@ export async function generateBigmodelBananaImages(
   }
   const unique = Array.from(new Set(images)).slice(0, input.count);
   if (!unique.length) throw new Error('Bigmodel Banana Pro 没有返回图片数据');
+  return unique;
+}
+
+export async function generateMikotoBananaImages(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  input: ImageInput,
+) {
+  const model = resolveMikotoImageModel(input.model);
+  const materialized = await Promise.all(input.inputImages.map(materializeNewApiReferenceImage));
+  const parts = [
+    { text: promptWithConstraints(input) },
+    ...materialized.map(bigmodelInlineImagePart),
+  ];
+  const images: string[] = [];
+  for (let index = 0; index < input.count; index += 1) {
+    let value: unknown;
+    try {
+      value = await bigmodelRequest(
+        provider,
+        secrets,
+        `/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        {
+          contents: [{ role: 'user', parts }],
+          generationConfig: {
+            responseModalities: ['TEXT', 'IMAGE'],
+            imageConfig: {
+              imageSize: bigmodelImageSize(input.resolution),
+              aspectRatio: input.aspectRatio,
+            },
+          },
+        },
+      );
+    } catch (error) {
+      const recovered = imagesFromUpstreamError(error, input.inputImages, 1);
+      if (!recovered.length) throw error;
+      images.push(...recovered);
+      continue;
+    }
+    images.push(...uniqueImages(value, input.inputImages, 1));
+  }
+  const unique = Array.from(new Set(images)).slice(0, input.count);
+  if (!unique.length) throw new Error('Mikoto Banana 没有返回图片数据');
   return unique;
 }
 
@@ -673,6 +739,10 @@ const imagesFromUpstreamError = (
   : [];
 
 function shouldUseNewApiAsyncImageTask(input: ImageInput) {
+  // Mikoto has a separate /async contract and its synchronous OpenAI image
+  // endpoints already wait for the final URL. Keep this path synchronous so
+  // we do not send NewAPI's `async: true` flag or poll the wrong endpoint.
+  if (input.provider === 'mikoto') return false;
   return newApiImageFamily(input.model) === 'nano-banana'
     || normalizedImageResolution(input.resolution) === '4k'
     || input.inputImages.length > 1
@@ -2545,6 +2615,8 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       ? await generateXaisImages(provider, secrets, effectiveInput)
       : provider.kind === 'BIGMODEL' && isBigmodelBananaModel(effectiveInput.model)
         ? await generateBigmodelBananaImages(provider, secrets, effectiveInput)
+        : provider.kind === 'MIKOTO' && isMikotoBananaModel(effectiveInput.model)
+          ? await generateMikotoBananaImages(provider, secrets, effectiveInput)
         : await generateNewApiImages(provider, secrets, effectiveInput);
     const images = provider.kind === 'XAIS'
       ? await mirrorXaisImageResults(providerImages, provider.name)
@@ -2800,10 +2872,50 @@ function mikotoVideoModel(input: VideoInput) {
 }
 
 function mikotoVideoBody(input: VideoInput) {
-  const duration = Math.max(4, Math.min(15, Math.round(Number(input.duration) || 15)));
+  const requestedDuration = Math.max(4, Math.min(15, Math.round(Number(input.duration) || 15)));
+  const duration = isKlingVideoModel(input.model)
+    ? ([5, 10, 15].find(value => value >= requestedDuration) ?? 15)
+    : requestedDuration;
   const hasReferences = input.inputImages.length > 0
     || input.inputVideos.length > 0
     || input.inputAudios.length > 0;
+  if (isKlingVideoModel(input.model)) {
+    const isOmni = /omni/i.test(input.model);
+    const resolution = input.resolution === '1080p' ? '1080p' : '720p';
+    const vertical = input.aspectRatio === '9:16';
+    const size = resolution === '1080p'
+      ? (vertical ? '1080x1920' : '1920x1080')
+      : (vertical ? '720x1280' : '1280x720');
+    const content = [
+      { type: 'text', text: input.prompt },
+      ...input.inputImages.map(url => ({
+        type: 'image_url',
+        image_url: { url, detail: 'high' },
+      })),
+    ];
+    const extraBody = {
+      seconds: duration,
+      duration,
+      aspect_ratio: input.aspectRatio || '16:9',
+      aspectRatio: input.aspectRatio || '16:9',
+      resolution,
+      size,
+      reference_mode: isOmni ? 'element' : 'frame',
+    };
+    return {
+      model: mikotoVideoModel(input),
+      prompt: input.prompt,
+      messages: [{ role: 'user', content: input.inputImages.length ? content : input.prompt }],
+      seconds: String(duration),
+      duration,
+      aspect_ratio: input.aspectRatio || '16:9',
+      aspectRatio: input.aspectRatio || '16:9',
+      resolution,
+      size,
+      reference_mode: isOmni ? 'element' : 'frame',
+      extra_body: extraBody,
+    };
+  }
   return {
     model: mikotoVideoModel(input),
     prompt: input.prompt,
@@ -2932,6 +3044,16 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
   const reservation = await reserveVideo(prisma, input);
   try {
     const provider = await selectVideoProvider(prisma, input.provider, input.providerChannelId);
+    if (provider.kind === 'MIKOTO' && isKlingVideoModel(input.model)) {
+      const maxImages = /omni/i.test(input.model) ? 3 : 2;
+      if (input.inputImages.length > maxImages || input.inputVideos.length > 0 || input.inputAudios.length > 0) {
+        throw new CloudAiError(
+          'invalid_request',
+          `Mikoto ${/omni/i.test(input.model) ? 'Kling Omni' : 'Kling'} 最多支持 ${maxImages} 张参考图，且不支持参考视频或参考音频`,
+          400,
+        );
+      }
+    }
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
     const results: unknown[] = [];
     for (let index = 0; index < input.count; index += 1) {

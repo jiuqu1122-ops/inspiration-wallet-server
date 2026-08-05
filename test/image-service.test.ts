@@ -11,6 +11,7 @@ import {
   convertGptImage2ChromaKeyToTransparentPng,
   filterProviderImageModels,
   generateBigmodelBananaImages,
+  generateMikotoBananaImages,
   generateNewApiImages,
   getWalletImageGenerationByRequest,
   imageCapabilityForModel,
@@ -29,6 +30,7 @@ import {
   providerSupportsImageModel,
   resolveBigmodelImageModel,
   resolveImageModel,
+  resolveMikotoImageModel,
   resolveMikotoSeedanceModel,
   resolveMikotoVideoModel,
   resolveNewApiImageModel,
@@ -246,6 +248,30 @@ describe('wallet image provider normalization', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('calls Mikoto Gemini native endpoint with imageConfig', async () => {
+    const generated = 'iVBORw0KGgo' + 'b'.repeat(40);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('https://api.mikoto.example/v1beta/models/gemini-3-pro-image-preview:generateContent');
+      expect(new Headers(init?.headers).get('x-goog-api-key')).toBe('sk-mikoto');
+      const body = JSON.parse(String(init?.body));
+      expect(body.generationConfig.responseModalities).toEqual(['TEXT', 'IMAGE']);
+      expect(body.generationConfig.imageConfig).toEqual({ aspectRatio: '1:1', imageSize: '1K' });
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: generated } }] } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(generateMikotoBananaImages(
+      { baseUrl: 'https://api.mikoto.example', name: 'Mikoto', kind: 'MIKOTO' } as never,
+      { apiKey: 'sk-mikoto', headers: {} },
+      {
+        userId: 'user-1', clientRequestId: 'request-mikoto', model: 'Nano Banana Pro', prompt: 'a red apple',
+        inputImages: [], aspectRatio: '1:1', resolution: '1k', outputFormat: 'jpg', count: 1,
+      },
+    )).resolves.toEqual([`data:image/png;base64,${generated}`]);
+  });
+
   it('extracts URL and Base64 image results while excluding reference inputs', () => {
     const reference = 'https://assets.example.test/reference.png';
     const images = uniqueImages({
@@ -429,6 +455,13 @@ describe('wallet image provider normalization', () => {
       expect.objectContaining({ provider: 'xais-primary', index: 0 }),
     );
     warn.mockRestore();
+  });
+
+  it('normalizes Mikoto Gemini aliases to its native model IDs', () => {
+    expect(resolveMikotoImageModel('Nano Banana Pro')).toBe('gemini-3-pro-image-preview');
+    expect(resolveMikotoImageModel('Nano Banana 2')).toBe('gemini-3.1-flash-image-preview');
+    expect(resolveMikotoImageModel('GPT Image 2')).toBe('gpt-image-2');
+    expect(resolveImageModel({ kind: 'MIKOTO', defaultModel: 'Nano Banana Pro' }, '')).toBe('gemini-3-pro-image-preview');
   });
 
   it('mirrors inline and stable image results for every non-XAIS image channel', async () => {
