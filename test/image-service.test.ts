@@ -117,6 +117,9 @@ describe('wallet image provider normalization', () => {
         { id: '' },
       ],
     })).toEqual(['gemini-3-pro-image', 'gemini-3.1-flash-image']);
+    expect(collectProviderModelIds({
+      models: [{ name: 'models/gemini-3-pro-image-preview' }],
+    })).toEqual(['gemini-3-pro-image-preview']);
   });
 
   it('prefers the dedicated IMAGE channel over an LLM channel with legacy broad capabilities', () => {
@@ -138,6 +141,8 @@ describe('wallet image provider normalization', () => {
     const nano2 = { capabilities: ['IMAGE_NANO_BANANA_2'] as const };
     const gpt = { capabilities: ['IMAGE_GPT'] as const };
     const legacy = { capabilities: ['IMAGE'] as const };
+    const nanoOneK = { capabilities: ['IMAGE_NANO_BANANA_PRO_1K'] as const };
+    const gptOneK = { capabilities: ['IMAGE_GPT_1K'] as const };
 
     expect(imageCapabilityForModel('gemini-3-pro-image')).toBe('IMAGE_NANO_BANANA');
     expect(imageCapabilityForModel('Xais Nano Pro_2K')).toBe('IMAGE_NANO_BANANA');
@@ -150,6 +155,10 @@ describe('wallet image provider normalization', () => {
     expect(providerSupportsImageModel(nano2, 'Nano Banana 2')).toBe(true);
     expect(providerSupportsImageModel(gpt, 'gemini-3.1-flash-image')).toBe(false);
     expect(providerSupportsImageModel(legacy, 'custom-image-model')).toBe(true);
+    expect(providerSupportsImageModel(nanoOneK, 'gemini-3-pro-image', '1k')).toBe(true);
+    expect(providerSupportsImageModel(nanoOneK, 'gemini-3-pro-image', '2k')).toBe(false);
+    expect(providerSupportsImageModel(gptOneK, 'gpt-image-2', '1k')).toBe(true);
+    expect(providerSupportsImageModel(gptOneK, 'gpt-image-2', '4k')).toBe(false);
     expect(filterProviderImageModels(nano, [
       'gemini-3-pro-image',
       'gemini-2.5-pro',
@@ -326,7 +335,8 @@ describe('wallet image provider normalization', () => {
       seconds: '6',
       size: '1080x1920',
       resolution: '1080p',
-      images: ['product', 'scene', 'style'],
+      images: ['product', 'scene', 'style', 'ignored'],
+      ref: ['product', 'scene', 'style', 'ignored'],
     });
     expect(newApiVideoJsonBody({
       userId: 'user-1',
@@ -346,6 +356,31 @@ describe('wallet image provider normalization', () => {
       duration: 4,
       size: '1280x720',
       images: ['data:image/png;base64,one'],
+      ref: ['data:image/png;base64,one'],
+    });
+    expect(newApiVideoSize('seedance2fast', '16:9', '480p')).toBe('854x480');
+    expect(newApiVideoBody({
+      userId: 'user-1',
+      clientRequestId: 'canvas-video-seedance-references',
+      provider: 'new-api',
+      model: 'seedance2fast',
+      prompt: 'match the reference motion',
+      inputImages: ['image-1'],
+      inputVideos: ['video-1'],
+      inputAudios: ['audio-1'],
+      aspectRatio: '16:9',
+      resolution: '480p',
+      duration: 15,
+      inputMode: 'REF',
+      count: 1,
+    })).toMatchObject({
+      duration: 15,
+      size: '854x480',
+      resolution: '480p',
+      images: ['image-1'],
+      videos: ['video-1'],
+      audios: ['audio-1'],
+      ref: ['image-1', 'video-1', 'audio-1'],
     });
     const oneReferenceBody = newApiVideoBody({
       userId: 'user-1',

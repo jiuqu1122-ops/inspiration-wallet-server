@@ -302,7 +302,11 @@ function responsePreview(value: string, secrets: ProviderSecrets) {
 async function providerGet(
   url: string,
   secrets: ProviderSecrets,
-  options?: { bearerToken?: string | undefined; headers?: Record<string, string> | undefined },
+  options?: {
+    bearerToken?: string | undefined;
+    headers?: Record<string, string> | undefined;
+    providerKind?: AiProviderKind | undefined;
+  },
 ) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15_000);
@@ -312,6 +316,10 @@ async function providerGet(
       authorization: `Bearer ${options?.bearerToken ?? secrets.apiKey}`,
       'user-agent': 'Inspiration-Wallet-Server/1',
     });
+    if (options?.providerKind === 'BIGMODEL') {
+      headers.delete('authorization');
+      headers.set('x-goog-api-key', secrets.apiKey);
+    }
     for (const [name, value] of Object.entries(secrets.headers)) headers.set(name, value);
     for (const [name, value] of Object.entries(options?.headers ?? {})) headers.set(name, value);
     const response = await fetch(url, {
@@ -461,6 +469,8 @@ export async function getProviderBalance(prisma: PrismaClient, providerId: strin
 
   const candidates = provider.kind === 'XAIS'
     ? [{ name: 'XAIS /xais/userProfile', path: '/xais/userProfile' }]
+    : provider.kind === 'BIGMODEL'
+      ? [{ name: 'Bigmodel /v1beta/models', path: '/v1beta/models' }]
     : [
       { name: 'NewAPI /api/usage/token/', path: '/api/usage/token/' },
       { name: 'NewAPI /api/user/self', path: '/api/user/self' },
@@ -479,7 +489,7 @@ export async function getProviderBalance(prisma: PrismaClient, providerId: strin
         secrets,
         useManagementAuth
           ? { bearerToken: managementAuth.token, headers: { 'New-Api-User': managementAuth.user } }
-          : undefined,
+          : { providerKind: provider.kind },
       );
       const result = normalizeProviderBalance(provider.kind, candidate.name, value);
       if (result.available) return result;
@@ -498,13 +508,17 @@ export async function getProviderBalance(prisma: PrismaClient, providerId: strin
 
 function modelIds(value: unknown) {
   if (!value || typeof value !== 'object') return [];
-  const data: unknown = Reflect.get(value, 'data');
+  const data: unknown = Reflect.get(value, 'data') ?? Reflect.get(value, 'models');
   if (!Array.isArray(data)) return [];
   return data
-    .map((item: unknown) => (
-      item && typeof item === 'object' && 'id' in item ? Reflect.get(item, 'id') : null
-    ))
+    .map((item: unknown) => {
+      if (!item || typeof item !== 'object') return null;
+      const record = item as Record<string, unknown>;
+      const candidate = record.id ?? record.name;
+      return typeof candidate === 'string' ? candidate : null;
+    })
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
+    .map((id) => id.replace(/^models\//i, ''))
     .slice(0, 50);
 }
 
@@ -524,15 +538,25 @@ export async function testProvider(prisma: PrismaClient, providerId: string) {
   let message = 'Provider connection failed';
   let models: string[] = [];
   try {
-    const value = await providerGet(providerEndpoint(provider.baseUrl, '/v1/models'), secrets);
+    const modelPath = provider.kind === 'BIGMODEL' ? '/v1beta/models' : '/v1/models';
+    const value = await providerGet(
+      providerEndpoint(provider.baseUrl, modelPath),
+      secrets,
+      { providerKind: provider.kind },
+    );
     models = modelIds(value);
     status = 'OK';
     message = models.length
       ? `Connected successfully; ${models.length} models discovered`
       : 'Connected successfully; the provider returned no model IDs';
   } catch (modelsError) {
-    if (provider.kind !== 'XAIS') throw modelsError;
-    await providerGet(providerEndpoint(provider.baseUrl, '/xais/userProfile'), secrets);
+    if (provider.kind === 'XAIS') {
+      await providerGet(providerEndpoint(provider.baseUrl, '/xais/userProfile'), secrets, { providerKind: provider.kind });
+    } else if (provider.kind === 'BIGMODEL') {
+      throw modelsError;
+    } else {
+      throw modelsError;
+    }
     status = 'OK';
     message = 'Connected successfully through XAIS userProfile';
   }

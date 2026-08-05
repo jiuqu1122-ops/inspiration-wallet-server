@@ -122,7 +122,9 @@ const IMAGE_PROVIDER_CAPABILITIES: AiCapability[] = [
   'IMAGE',
   'IMAGE_NANO_BANANA',
   'IMAGE_NANO_BANANA_2',
+  'IMAGE_NANO_BANANA_PRO_1K',
   'IMAGE_GPT',
+  'IMAGE_GPT_1K',
 ];
 
 export function imageCapabilityForModel(model: string): AiCapability {
@@ -152,9 +154,18 @@ export function imageCapabilityForModel(model: string): AiCapability {
 export function providerSupportsImageModel(
   provider: { capabilities: readonly AiCapability[] },
   model: string,
+  resolution?: string,
 ) {
   if (provider.capabilities.includes('IMAGE')) return true;
-  return provider.capabilities.includes(imageCapabilityForModel(model));
+  const capability = imageCapabilityForModel(model);
+  if (provider.capabilities.includes(capability)) return true;
+  const normalizedResolution = resolution?.trim().toLowerCase();
+  if (normalizedResolution && normalizedResolution !== '1k') return false;
+  return capability === 'IMAGE_NANO_BANANA'
+    ? provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K')
+    : capability === 'IMAGE_GPT'
+      ? provider.capabilities.includes('IMAGE_GPT_1K')
+      : false;
 }
 
 export function filterProviderImageModels(
@@ -167,7 +178,7 @@ export function filterProviderImageModels(
 export type ImageInput = {
   userId: string;
   clientRequestId: string;
-  provider?: 'new-api' | 'xais-chat' | 'openai-compatible' | 'custom' | undefined;
+  provider?: 'new-api' | 'xais-chat' | 'openai-compatible' | 'custom' | 'mikoto' | 'bigmodel' | undefined;
   providerChannelId?: string | undefined;
   model: string;
   prompt: string;
@@ -227,13 +238,16 @@ async function selectImageProvider(
   prisma: PrismaClient,
   providerChannelId: string | undefined,
   requestedModel: string,
+  requestedResolution?: string,
 ) {
   const providers = await listImageProviders(prisma);
   const provider = providerChannelId
     ? providers.find((candidate) => candidate.id === providerChannelId)
     : providers.find((candidate) => {
       const model = requestedModel.trim() || candidate.defaultModel?.trim() || '';
-      return model ? providerSupportsImageModel(candidate, model) : candidate.capabilities.includes('IMAGE');
+      return model
+        ? providerSupportsImageModel(candidate, model, requestedResolution)
+        : candidate.capabilities.includes('IMAGE');
     });
   if (!provider) {
     throw new CloudAiError(
@@ -243,7 +257,7 @@ async function selectImageProvider(
     );
   }
   const effectiveModel = requestedModel.trim() || provider.defaultModel?.trim() || '';
-  if (effectiveModel && !providerSupportsImageModel(provider, effectiveModel)) {
+  if (effectiveModel && !providerSupportsImageModel(provider, effectiveModel, requestedResolution)) {
     throw new CloudAiError(
       'provider_model_family_mismatch',
       '所选生图模型与该渠道启用的模型家族不匹配',
@@ -391,12 +405,15 @@ function collectImageStrings(value: unknown, output: string[] = [], contextKey =
 
 export function collectProviderModelIds(value: unknown) {
   if (!value || typeof value !== 'object') return [];
-  const data: unknown = (value as Record<string, unknown>).data;
+  const record = value as Record<string, unknown>;
+  const data: unknown = record.data ?? record.models;
   if (!Array.isArray(data)) return [];
   return Array.from(new Set(data.map((item: unknown) => (
-    item && typeof item === 'object' ? (item as Record<string, unknown>).id : null
+    item && typeof item === 'object'
+      ? (item as Record<string, unknown>).id ?? (item as Record<string, unknown>).name
+      : null
   )).filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
-    .map((id) => id.trim())))
+    .map((id) => id.trim().replace(/^models\//i, ''))))
     .slice(0, 200);
 }
 
@@ -414,7 +431,9 @@ export async function listWalletImageModels(
     try {
       await assertPublicProviderUrl(provider.baseUrl);
       const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-      const value = await providerRequest(provider, secrets, '/v1/models', undefined, 15_000);
+      const value = provider.kind === 'BIGMODEL'
+        ? await providerBigmodelModels(provider, secrets)
+        : await providerRequest(provider, secrets, '/v1/models', undefined, 15_000);
       const models = filterProviderImageModels(provider, collectProviderModelIds(value));
       const defaultModel = provider.defaultModel
         && providerSupportsImageModel(provider, provider.defaultModel)
@@ -589,6 +608,76 @@ export function newApiImageRequestParams(
       ...(family === 'gpt-image-2' ? {} : { background: 'transparent' }),
     } : {}),
   };
+}
+
+async function providerBigmodelRequest(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  model: string,
+  body: unknown,
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), IMAGE_GENERATION_TIMEOUT_MS);
+  try {
+    const headers = new Headers({
+      accept: 'application/json, text/plain, */*',
+      'content-type': 'application/json',
+      'user-agent': 'Inspiration-Wallet-Server/1',
+      'x-goog-api-key': secrets.apiKey,
+    });
+    for (const [name, value] of Object.entries(secrets.headers)) headers.set(name, value);
+    const modelName = model.trim().replace(/^models\//i, '');
+    const path = `/v1beta/models/${encodeURIComponent(modelName)}:generateContent`;
+    const response = await fetch(providerEndpoint(provider.baseUrl, path), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      redirect: 'error',
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      throw new UpstreamImageError(response.status, upstreamErrorMessage(response.status, text));
+    }
+    return parseProviderValue(text);
+  } catch (error) {
+    if (error instanceof UpstreamImageError) throw error;
+    throw new UpstreamImageError(0, error instanceof Error ? error.message : String(error));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function providerBigmodelModels(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const headers = new Headers({
+      accept: 'application/json, text/plain, */*',
+      'user-agent': 'Inspiration-Wallet-Server/1',
+      'x-goog-api-key': secrets.apiKey,
+    });
+    for (const [name, value] of Object.entries(secrets.headers)) headers.set(name, value);
+    const response = await fetch(providerEndpoint(provider.baseUrl, '/v1beta/models'), {
+      method: 'GET',
+      headers,
+      redirect: 'error',
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      throw new UpstreamImageError(response.status, upstreamErrorMessage(response.status, text));
+    }
+    return parseProviderValue(text);
+  } catch (error) {
+    if (error instanceof UpstreamImageError) throw error;
+    throw new UpstreamImageError(0, error instanceof Error ? error.message : String(error));
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export function isRecoverableNewApiVideoStatusError(error: unknown) {
@@ -2190,7 +2279,12 @@ async function releaseImageCredits(
 }
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
-  const provider = await selectImageProvider(prisma, input.providerChannelId, input.model);
+  const provider = await selectImageProvider(
+    prisma,
+    input.providerChannelId,
+    input.model,
+    input.resolution,
+  );
   if (provider.kind === 'XAIS' && input.inputImages.length > 8) {
     throw new CloudAiError('invalid_request', 'XAIS 生图最多支持 8 张参考图', 400);
   }
@@ -2200,8 +2294,10 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
     const providerImages = provider.kind === 'XAIS'
       ? await generateXaisImages(provider, secrets, effectiveInput)
-      : await generateNewApiImages(provider, secrets, effectiveInput);
-    const images = provider.kind === 'XAIS'
+      : provider.kind === 'BIGMODEL'
+        ? await generateBigmodelImages(provider, secrets, effectiveInput)
+        : await generateNewApiImages(provider, secrets, effectiveInput);
+    const images = provider.kind === 'XAIS' || provider.kind === 'BIGMODEL'
       ? await mirrorXaisImageResults(providerImages, provider.name)
       : providerImages;
     if (!images.length) throw new Error('渠道没有返回图片数据');
@@ -2286,11 +2382,13 @@ export async function getWalletImageGenerationByRequest(
 export type VideoInput = {
   userId: string;
   clientRequestId: string;
-  provider?: 'new-api' | 'xais-chat' | undefined;
+  provider?: 'new-api' | 'xais-chat' | 'mikoto' | 'bigmodel' | undefined;
   providerChannelId?: string | undefined;
   model: string;
   prompt: string;
   inputImages: string[];
+  inputVideos?: string[] | undefined;
+  inputAudios?: string[] | undefined;
   aspectRatio: string;
   resolution?: string | undefined;
   duration?: number | undefined;
@@ -2301,6 +2399,8 @@ export type VideoInput = {
 function videoProviderKind(provider?: VideoInput['provider']) {
   if (provider === 'xais-chat') return 'XAIS' as const;
   if (provider === 'new-api') return 'NEW_API' as const;
+  if (provider === 'mikoto') return 'MIKOTO' as const;
+  if (provider === 'bigmodel') return 'BIGMODEL' as const;
   return undefined;
 }
 
@@ -2347,6 +2447,16 @@ export function isSora2VideoModel(model: string) {
 export function isSourceMixVideoModel(model: string) {
   const normalized = model.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-');
   return normalized === 'sourcemix2-0' || normalized === 'sourcemix2-0-fast';
+}
+
+export function isSeedance20VideoModel(model: string) {
+  const normalized = model.trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+  return normalized === 'seedance2'
+    || normalized === 'seedance20'
+    || normalized === 'seedance2fast'
+    || normalized === 'seedance20fast'
+    || normalized === 'sourcemix20'
+    || normalized === 'sourcemix20fast';
 }
 
 type NewApiVideoProtocol = 'openai-videos' | 'unified-video';
@@ -2400,7 +2510,10 @@ export function buildNewApiVideoPrompt(input: VideoInput, imageCount: number) {
 }
 
 export function normalizeNewApiVideoDuration(model: string, duration?: number) {
-  const values = isSora2VideoModel(model) ? [8, 12] : [4, 5, 6, 7, 8];
+  const values = isSora2VideoModel(model)
+    ? [8, 12]
+    : isSeedance20VideoModel(model) ? [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+      : [4, 5, 6, 7, 8];
   const requested = Number(duration);
   if (values.includes(requested)) return requested;
   const fallback = values[0] ?? 8;
@@ -2432,17 +2545,31 @@ export function calculateVideoGenerationCredits(
 }
 
 export function newApiVideoSize(model: string, aspectRatio?: string, resolution?: string) {
-  const portrait = aspectRatio?.trim() === '9:16';
-  const normalizedResolution = !isSora2VideoModel(model) && resolution?.trim().toLowerCase() === '1080p'
-    ? '1080p'
+  const normalizedRatio = aspectRatio?.trim();
+  const normalizedResolution = !isSora2VideoModel(model)
+    && (resolution?.trim().toLowerCase() === '1080p'
+      || (isSeedance20VideoModel(model) && resolution?.trim().toLowerCase() === '480p'))
+    ? resolution!.trim().toLowerCase()
     : '720p';
-  if (portrait) return normalizedResolution === '1080p' ? '1080x1920' : '720x1280';
-  return normalizedResolution === '1080p' ? '1920x1080' : '1280x720';
+  const shortEdge = normalizedResolution === '1080p' ? 1080 : normalizedResolution === '480p' ? 480 : 720;
+  if (normalizedRatio === '9:16') {
+    return `${shortEdge}x${shortEdge === 480 ? 854 : Math.round(shortEdge * 16 / 9)}`;
+  }
+  if (normalizedRatio === '3:4') return `${shortEdge}x${Math.round(shortEdge * 4 / 3)}`;
+  if (normalizedRatio === '4:3') return `${Math.round(shortEdge * 4 / 3)}x${shortEdge}`;
+  if (normalizedRatio === '1:1') return `${shortEdge}x${shortEdge}`;
+  return `${shortEdge === 480 ? 854 : Math.round(shortEdge * 16 / 9)}x${shortEdge}`;
 }
 
 export function newApiVideoBody(input: VideoInput) {
-  const imageLimit = isSora2VideoModel(input.model) ? 1 : 3;
-  const images = input.inputImages.filter(Boolean).slice(0, imageLimit);
+  const isSeedance = isSeedance20VideoModel(input.model);
+  const imageLimit = isSora2VideoModel(input.model) ? 1 : isSeedance ? 9 : 3;
+  const maxImages = isSora2VideoModel(input.model)
+    ? 1
+    : input.inputMode === 'FLF' ? 2 : imageLimit;
+  const images = input.inputImages.filter(Boolean).slice(0, maxImages);
+  const videos = isSeedance ? (input.inputVideos || []).filter(Boolean).slice(0, 3) : [];
+  const audios = isSeedance ? (input.inputAudios || []).filter(Boolean).slice(0, 3) : [];
   const duration = normalizeNewApiVideoDuration(input.model, input.duration);
   const size = newApiVideoSize(input.model, input.aspectRatio, input.resolution);
   return {
@@ -2451,8 +2578,13 @@ export function newApiVideoBody(input: VideoInput) {
     duration,
     seconds: String(duration),
     size,
-    resolution: size.includes('1080') ? '1080p' : '720p',
+    resolution: size.includes('1080') ? '1080p' : size.includes('480') ? '480p' : '720p',
     ...(images.length ? { images } : {}),
+    ...(videos.length ? { videos } : {}),
+    ...(audios.length ? { audios } : {}),
+    ...(isSeedance && images.length + videos.length + audios.length > 0
+      ? { ref: [...images, ...videos, ...audios] }
+      : {}),
   };
 }
 
@@ -2464,7 +2596,61 @@ export function newApiVideoJsonBody(input: VideoInput) {
     duration: body.duration,
     size: body.size,
     ...(body.images ? { images: body.images } : {}),
+    ...(body.videos ? { videos: body.videos } : {}),
+    ...(body.audios ? { audios: body.audios } : {}),
+    ...(body.ref ? { ref: body.ref } : {}),
   };
+}
+
+async function generateBigmodelImages(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  input: ImageInput,
+) {
+  const stagedImages = await Promise.all(input.inputImages.map((source, index) => (
+    stageNewApiEditImage(source, index)
+  )));
+  try {
+    const referenceParts = await Promise.all(stagedImages.map(async (image) => {
+      const bytes = image.bytes ?? (image.path ? await readFile(image.path) : Buffer.alloc(0));
+      if (!bytes.length) throw new Error('Bigmodel reference image is empty');
+      return {
+        inlineData: {
+          mimeType: image.mime,
+          data: bytes.toString('base64'),
+        },
+      };
+    }));
+    const resolution = input.resolution?.trim().toLowerCase();
+    const imageSize = resolution === '1k' || resolution === '4k'
+      ? resolution.toUpperCase()
+      : '2K';
+    const started = await providerBigmodelRequest(provider, secrets, input.model, {
+      contents: [{
+        role: 'user',
+        parts: [
+          { text: promptWithConstraints(input) },
+          ...referenceParts,
+        ],
+      }],
+      generationConfig: {
+        responseModalities: ['IMAGE'],
+        responseFormat: {
+          image: {
+            aspectRatio: input.aspectRatio,
+            imageSize,
+          },
+        },
+      },
+    });
+    const failure = getFailure(started);
+    if (failure) throw new Error(failure);
+    const images = uniqueImages(started, input.inputImages, input.count);
+    if (!images.length) throw new Error('Bigmodel response did not contain image data');
+    return images;
+  } finally {
+    await Promise.all(stagedImages.map(image => image.cleanup().catch(() => {})));
+  }
 }
 
 async function stagedImageDataUrl(image: StagedNewApiEditImage) {
@@ -2479,7 +2665,9 @@ export async function providerNewApiVideoRequest(
   input: VideoInput,
   preferredProtocol: NewApiVideoProtocol = newApiVideoProtocol(input.model),
 ) {
-  const imageLimit = isSora2VideoModel(input.model) ? 1 : 3;
+  const imageLimit = isSora2VideoModel(input.model)
+    ? 1
+    : isSeedance20VideoModel(input.model) ? 9 : 3;
   const sources = input.inputImages.filter(Boolean).slice(0, imageLimit);
   if (input.inputMode === 'FLF' && !isSora2VideoModel(input.model) && sources.length !== 2) {
     throw new CloudAiError('invalid_video_input', '首尾帧模式需要同时提供首帧和尾帧两张图片', 400);
@@ -2580,7 +2768,7 @@ export async function providerNewApiVideoRequest(
     for (let index = 0; index < protocols.length; index += 1) {
       const protocol = protocols[index]!;
       try {
-        const result = isSourceMixVideoModel(input.model)
+        const result = isSourceMixVideoModel(input.model) || isSeedance20VideoModel(input.model)
           ? await submitJson(protocol)
           : await submitMultipart(input.model, protocol);
         return { result, protocol };

@@ -52,7 +52,7 @@ const optionalString = (max: number) => z.string().trim().max(max).nullish()
 
 const imageSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
-  provider: z.enum(['new-api', 'xais-chat', 'openai-compatible', 'custom']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'openai-compatible', 'custom', 'mikoto', 'bigmodel']).nullish()
     .transform((value) => value ?? undefined),
   providerChannelId: z.string().trim().min(1).max(128).nullish()
     .transform((value) => value ?? undefined),
@@ -70,13 +70,15 @@ const imageSchema = z.object({
 
 const videoSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
-  provider: z.enum(['new-api', 'xais-chat']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'bigmodel']).nullish()
     .transform((value) => value ?? undefined),
   providerChannelId: z.string().trim().min(1).max(128).nullish()
     .transform((value) => value ?? undefined),
   model: z.string().trim().min(1).max(200),
   prompt: z.string().trim().min(1).max(50_000),
   inputImages: z.array(z.string().min(1).max(12_000_000)).max(13).default([]),
+  inputVideos: z.array(z.string().min(1).max(12_000_000)).max(3).default([]),
+  inputAudios: z.array(z.string().min(1).max(12_000_000)).max(3).default([]),
   aspectRatio: z.string().trim().max(20).default('16:9'),
   resolution: optionalString(20),
   duration: z.number().positive().max(120).nullish().transform((value) => value ?? undefined),
@@ -85,7 +87,7 @@ const videoSchema = z.object({
 }).strict();
 
 const videoStatusSchema = z.object({
-  provider: z.enum(['new-api', 'xais-chat']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'bigmodel']).nullish()
     .transform((value) => value ?? undefined),
   providerChannelId: z.string().trim().min(1).max(128).nullish()
     .transform((value) => value ?? undefined),
@@ -95,7 +97,7 @@ const videoStatusSchema = z.object({
 }).strict();
 
 const imageModelsQuerySchema = z.object({
-  provider: z.enum(['new-api', 'xais-chat', 'openai-compatible', 'custom']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'openai-compatible', 'custom', 'mikoto', 'bigmodel']).nullish()
     .transform((value) => value ?? undefined),
 }).strict();
 

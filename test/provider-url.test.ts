@@ -11,6 +11,13 @@ describe('provider URL safety and normalization', () => {
       .toBe('https://gateway.example.com/tenant/v1/models');
   });
 
+  it('normalizes a Bigmodel Gemini generateContent endpoint to its channel root', () => {
+    expect(normalizeProviderBaseUrl(
+      'BIGMODEL',
+      'https://st.smart-agi.com/v1beta/models/gemini-3-pro-image-preview:generateContent',
+    )).toBe('https://st.smart-agi.com');
+  });
+
   it('rejects unsafe schemes, credentials, and local hosts', () => {
     expect(() => normalizeProviderBaseUrl('NEW_API', 'http://gateway.example.com'))
       .toThrow('HTTPS');
