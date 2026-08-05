@@ -13,7 +13,8 @@ import {
 import { providerAdminRoutes } from '../providers/routes.js';
 import { createRedemptionCodes, listRedemptionCodes } from '../wallets/redemption.js';
 import {
-  aiPricingModelToken,
+  imagePricingModelToken,
+  videoPricingModelToken,
   getAiPricingConfig,
   updateAiPricingConfig,
 } from '../ai/pricing.js';
@@ -88,7 +89,11 @@ const pricingSchema = z.object({
     ['imageModels', value.imageModels],
     ['videoModels', value.videoModels],
   ] as const) {
-    const normalized = models.map((item) => aiPricingModelToken(item.model));
+    const normalized = models.map((item) => (
+      path === 'imageModels'
+        ? imagePricingModelToken(item.model)
+        : videoPricingModelToken(item.model)
+    ));
     if (new Set(normalized).size !== normalized.length) {
       context.addIssue({
         code: 'custom',

@@ -228,6 +228,61 @@ describe('generated image OSS delivery route', () => {
     await app.close();
   });
 
+  it('returns 413 for a decoded reference image over 10 MB and cleans up earlier uploads', async () => {
+    const app = await makeApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/ai/reference-images',
+      payload: {
+        images: [
+          {
+            filename: 'small.png',
+            mime: 'image/png',
+            data: Buffer.from('image-bytes').toString('base64'),
+          },
+          {
+            filename: 'large.png',
+            mime: 'image/png',
+            data: Buffer.alloc((10 * 1024 * 1024) + 1, 1).toString('base64'),
+          },
+        ],
+      },
+    });
+    expect(response.statusCode).toBe(413);
+    expect(response.json()).toEqual({
+      error: 'reference_image_too_large',
+      message: '单张参考图不能超过 10 MB',
+      maxBytes: 10 * 1024 * 1024,
+    });
+    expect(bridgeMocks.upload).toHaveBeenCalledTimes(1);
+    expect(bridgeMocks.delete).toHaveBeenCalledWith(
+      expect.stringMatching(/^reference-images\//),
+    );
+    await app.close();
+  });
+
+  it('returns 413 when the encoded reference exceeds the request schema limit', async () => {
+    const app = await makeApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/ai/reference-images',
+      payload: {
+        images: [{
+          filename: 'large.png',
+          mime: 'image/png',
+          data: 'A'.repeat(16_000_001),
+        }],
+      },
+    });
+    expect(response.statusCode).toBe(413);
+    expect(response.json()).toMatchObject({
+      error: 'reference_image_too_large',
+      maxBytes: 10 * 1024 * 1024,
+    });
+    expect(bridgeMocks.upload).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it('rejects and cleans up an unreadable OSS reference URL before generation', async () => {
     bridgeMocks.verifyPublicImageUrl.mockRejectedValueOnce(
       new Error('OSS signed image URL returned HTTP 403'),

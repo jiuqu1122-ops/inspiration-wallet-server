@@ -107,11 +107,19 @@ const imageResultQuerySchema = z.object({
   redirect: z.enum(['0', '1']).optional(),
 }).passthrough();
 
+const MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_REFERENCE_IMAGE_BASE64_LENGTH = 16_000_000;
+const REFERENCE_IMAGE_TOO_LARGE_RESPONSE = {
+  error: 'reference_image_too_large',
+  message: '单张参考图不能超过 10 MB',
+  maxBytes: MAX_REFERENCE_IMAGE_BYTES,
+} as const;
+
 const referenceUploadSchema = z.object({
   images: z.array(z.object({
     filename: z.string().trim().min(1).max(255),
     mime: z.enum(['image/png', 'image/jpeg', 'image/webp', 'image/gif']),
-    data: z.string().min(1).max(16_000_000),
+    data: z.string().min(1).max(MAX_REFERENCE_IMAGE_BASE64_LENGTH),
   }).strict()).min(1).max(13),
 }).strict();
 
@@ -357,6 +365,14 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
     async (request, reply) => {
       const parsed = referenceUploadSchema.safeParse(request.body);
       if (!parsed.success) {
+        const encodedImageTooLarge = parsed.error.issues.some(issue => (
+          issue.code === 'too_big'
+          && issue.path[0] === 'images'
+          && issue.path[issue.path.length - 1] === 'data'
+        ));
+        if (encodedImageTooLarge) {
+          return reply.code(413).send(REFERENCE_IMAGE_TOO_LARGE_RESPONSE);
+        }
         return reply.code(400).send({ error: 'invalid_request', message: 'Reference image upload is invalid' });
       }
       const cacheDir = join(env.IMAGE_RESULT_STORE_DIR, 'reference-images');
@@ -368,7 +384,10 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       try {
         for (const [index, image] of parsed.data.images.entries()) {
           const bytes = Buffer.from(image.data, 'base64');
-          if (bytes.byteLength === 0 || bytes.byteLength > 10 * 1024 * 1024) {
+          if (bytes.byteLength === 0) {
+            throw new Error('reference image is empty');
+          }
+          if (bytes.byteLength > MAX_REFERENCE_IMAGE_BYTES) {
             throw new Error('reference image exceeds the size limit');
           }
           const extension = image.mime === 'image/jpeg' ? 'jpg' : image.mime.slice('image/'.length);
@@ -390,6 +409,10 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
         return { shareId, urls };
       } catch (error) {
         await Promise.all(names.map(name => ossUploadService.delete(name).catch(() => false)));
+        if (error instanceof Error && error.message === 'reference image exceeds the size limit') {
+          request.log.warn({ err: error }, 'Reference image exceeds the upload size limit');
+          return reply.code(413).send(REFERENCE_IMAGE_TOO_LARGE_RESPONSE);
+        }
         request.log.error({ err: error }, 'OSS reference image upload failed');
         return reply.code(503).send({ error: 'image_delivery_unavailable', message: 'Reference image upload is temporarily unavailable' });
       }

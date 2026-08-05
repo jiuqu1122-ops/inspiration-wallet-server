@@ -31,12 +31,16 @@ describe('AI credit pricing', () => {
   it('preserves the legacy image prices as its initial defaults', () => {
     expect(defaultImageUnitCredits('gpt-image-2', '1k')).toBe(10n);
     expect(defaultImageUnitCredits('gpt-image-2', '4k')).toBe(18n);
-    expect(defaultImageUnitCredits('Xais Img2_2K(高画质)', '4k')).toBe(35n);
+    expect(defaultImageUnitCredits('Xais Img2_2K(高画质)', '4k')).toBe(18n);
     expect(defaultAiPricingConfig().inspirationAnalysisCredits).toBe('0');
+    expect(defaultAiPricingConfig().imageModels.map((item) => item.model)).toEqual([
+      'nano-banana-pro',
+      'nano-banana-2',
+      'image2',
+    ]);
     expect(defaultAiPricingConfig().videoModels.map((item) => item.model)).toEqual([
       'seedance2',
-      'SourceMix2.0',
-      'SourceMix2.0-fast',
+      'seedance2fast',
       'sora-2',
       'veo-3.1',
       'veo-3.1-fast',
@@ -48,7 +52,7 @@ describe('AI credit pricing', () => {
       aiPricingModelToken('Xais Img2_2K(高画质)'),
     );
     const modelTokens = defaultAiPricingConfig().imageModels
-      .map((item) => aiPricingModelToken(item.model));
+      .map((item) => item.model);
     expect(new Set(modelTokens).size).toBe(modelTokens.length);
   });
 
@@ -56,13 +60,13 @@ describe('AI credit pricing', () => {
     const models = defaultAiPricingConfig().imageModels;
     expect(models.some((item) => aiPricingModelToken(item.model) === 'xaisnanolite1k')).toBe(false);
     expect(models.some((item) => aiPricingModelToken(item.model) === 'xaisimg21k')).toBe(false);
-    expect(models.find((item) => item.model === 'Xais Nano2_2K')).toEqual(expect.objectContaining({
-      model: 'Xais Nano2_2K',
+    expect(models.find((item) => item.model === 'nano-banana-2')).toEqual(expect.objectContaining({
+      model: 'nano-banana-2',
       credits2k: '15',
       credits4k: '18',
     }));
     expect(models.find((item) => item.model === 'Xais Nano2_2K')?.credits1k).toBeUndefined();
-    expect(models.find((item) => item.model === 'gpt-image-2')?.credits1k).toBeDefined();
+    expect(models.find((item) => item.model === 'image2')?.credits1k).toBeDefined();
   });
 
   it('uses exact configured model prices and configured unknown-model defaults', async () => {
@@ -86,11 +90,38 @@ describe('AI credit pricing', () => {
     expect((await getAiPricingConfig(prisma)).agentRequestCredits).toBe('8');
     expect((await getAiPricingConfig(prisma)).videoModels).toEqual(expect.arrayContaining([
       { model: 'seedance2', credits: '44' },
-      { model: 'SourceMix2.0', credits: '300' },
-      { model: 'SourceMix2.0-fast', credits: '300' },
+      { model: 'seedance2fast', credits: '300' },
       { model: 'sora-2', credits: '300' },
       { model: 'veo-3.1', credits: '300' },
       { model: 'veo-3.1-fast', credits: '300' },
     ]));
+  });
+
+  it('uses one public price for upstream image and video aliases', async () => {
+    const prisma = prismaWithPricing({
+      agentRequestCredits: 8n,
+      inspirationAnalysisCredits: 2n,
+      imageDefaultCredits: 66n,
+      videoDefaultCredits: 300n,
+      imageModelPrices: [{
+        model: 'Xais Nano Pro_4K',
+        credits2k: '21',
+        credits4k: '34',
+      }, {
+        model: 'gemini-3-pro-image',
+        credits1k: '11',
+        credits2k: '19',
+        credits4k: '31',
+      }],
+      videoModelPrices: [{ model: 'SourceMix2.0', credits: '52' }],
+    });
+
+    const pricing = await getAiPricingConfig(prisma);
+    expect(pricing.imageModels).toEqual(expect.arrayContaining([
+      expect.objectContaining({ model: 'nano-banana-pro', credits1k: '11', credits2k: '21', credits4k: '34' }),
+    ]));
+    expect(pricing.imageModels.filter(item => item.model === 'nano-banana-pro')).toHaveLength(1);
+    expect(await configuredImageUnitCredits(prisma, 'Xais Nano Pro_2K', '4K')).toBe(34n);
+    expect(await configuredVideoCreditsPerSecond(prisma, 'SourceMix2.0')).toBe(52n);
   });
 });

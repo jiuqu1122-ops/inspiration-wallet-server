@@ -2025,8 +2025,17 @@ async function generateXaisImages(
   return uniqueImages(value, input.inputImages, input.count);
 }
 
-async function reserveImageCredits(prisma: PrismaClient, input: ImageInput) {
-  const unitCredits = await configuredImageUnitCredits(prisma, input.model, input.resolution);
+async function reserveImageCredits(
+  prisma: PrismaClient,
+  input: ImageInput,
+  providerCapabilities?: readonly string[],
+) {
+  const unitCredits = await configuredImageUnitCredits(
+    prisma,
+    input.model,
+    input.resolution,
+    providerCapabilities,
+  );
   const estimated = unitCredits * BigInt(input.count);
   const requestId = await prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({
@@ -2186,7 +2195,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     throw new CloudAiError('invalid_request', 'XAIS 生图最多支持 8 张参考图', 400);
   }
   const effectiveInput = { ...input, model: resolveImageModel(provider, input.model) };
-  const reservation = await reserveImageCredits(prisma, effectiveInput);
+  const reservation = await reserveImageCredits(prisma, effectiveInput, provider.capabilities);
   try {
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
     const providerImages = provider.kind === 'XAIS'

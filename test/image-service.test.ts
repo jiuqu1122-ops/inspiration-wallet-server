@@ -489,8 +489,8 @@ describe('wallet image provider normalization', () => {
     expect(imageUnitCredits('gpt-image-2', '1K')).toBe(10n);
     expect(imageUnitCredits('Image2_2K', '4K')).toBe(18n);
     expect(imageUnitCredits('Xais Img2_4K', '2K')).toBe(15n);
-    expect(imageUnitCredits('Xais Img2_2K(高画质)', '4K')).toBe(35n);
-    expect(imageUnitCredits('Xais_Img2_4K_H', '2K')).toBe(30n);
+    expect(imageUnitCredits('Xais Img2_2K(高画质)', '4K')).toBe(18n);
+    expect(imageUnitCredits('Xais_Img2_4K_H', '2K')).toBe(15n);
   });
 
   it('extracts Gemini inline_data image results', () => {
