@@ -17,12 +17,16 @@ import {
   imageUnitCredits,
   isNewApiVideoRouteNotFound,
   isSourceMixVideoModel,
+  isMikotoKlingVideoModel,
   isRecoverableNewApiVideoStatusError,
   isNewApiGeminiImageDecodeError,
   isNewApiParamOverrideCopyError,
   isPublicNewApiImageReference,
   isRetryableXaisPollError,
   materializeNewApiReferenceImage,
+  mikotoVideoBody,
+  mikotoVideoSize,
+  normalizeMikotoVideoDuration,
   mirrorXaisImageResults,
   newApiVideoBody,
   newApiVideoJsonBody,
@@ -287,6 +291,56 @@ describe('wallet image provider normalization', () => {
       warn.mockRestore();
       vi.unstubAllGlobals();
     }
+  });
+
+  it('builds the Mikoto Kling JSON payload required by /v1/videos', () => {
+    expect(isMikotoKlingVideoModel('kling-video')).toBe(true);
+    expect(isMikotoKlingVideoModel('kling-omni-video')).toBe(true);
+    expect(isMikotoKlingVideoModel('veo-3.1')).toBe(false);
+    expect(normalizeMikotoVideoDuration(6)).toBe(10);
+    expect(normalizeMikotoVideoDuration(15)).toBe(15);
+    expect(mikotoVideoSize('16:9', '1080p')).toBe('1920x1080');
+    expect(mikotoVideoSize('9:16', '720p')).toBe('720x1280');
+    expect(mikotoVideoBody({
+      userId: 'user-1',
+      clientRequestId: 'canvas-video-kling-json',
+      provider: 'mikoto',
+      model: 'kling-video',
+      prompt: 'orbit around the product',
+      inputImages: ['data:image/jpeg;base64,first', 'data:image/jpeg;base64,last'],
+      aspectRatio: '16:9',
+      resolution: '1080p',
+      duration: 10,
+      inputMode: 'REF',
+      count: 1,
+    })).toEqual({
+      model: 'kling-video',
+      prompt: 'orbit around the product',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'orbit around the product' },
+          { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,first', detail: 'high' } },
+          { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,last', detail: 'high' } },
+        ],
+      }],
+      seconds: '10',
+      duration: 10,
+      aspect_ratio: '16:9',
+      aspectRatio: '16:9',
+      resolution: '1080p',
+      size: '1920x1080',
+      reference_mode: 'frame',
+      extra_body: {
+        seconds: 10,
+        duration: 10,
+        aspect_ratio: '16:9',
+        aspectRatio: '16:9',
+        resolution: '1080p',
+        size: '1920x1080',
+        reference_mode: 'frame',
+      },
+    });
   });
 
   it('builds NewAPI video payloads while preserving the XAIS video path separately', () => {

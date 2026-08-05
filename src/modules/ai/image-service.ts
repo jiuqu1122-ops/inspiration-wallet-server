@@ -230,6 +230,20 @@ async function listImageProviders(prisma: PrismaClient) {
   return providers.filter((provider) => !provider.capabilities.includes('LLM'));
 }
 
+async function listVideoProviders(prisma: PrismaClient) {
+  return prisma.aiProviderChannel.findMany({
+    where: {
+      status: 'ACTIVE',
+      capabilities: { has: 'VIDEO' },
+    },
+    orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }],
+  });
+}
+
+function isLikelyVideoModel(model: string) {
+  return /(?:video|sora|veo|seedance|sourcemix|kling|hailuo|minimax|runway|luma|pixverse|vidu|jimeng|wan)/i.test(model);
+}
+
 function isRetryableNewApiTaskPollError(error: unknown) {
   return error instanceof UpstreamImageError
     && (error.status === 0 || error.status === 429 || error.status >= 500);
@@ -421,11 +435,12 @@ export function collectProviderModelIds(value: unknown) {
 export async function listWalletImageModels(
   prisma: PrismaClient,
 ) {
-  const [providers, pricing] = await Promise.all([
+  const [providers, videoProviders, pricing] = await Promise.all([
     listImageProviders(prisma),
+    listVideoProviders(prisma),
     getAiPricingConfig(prisma),
   ]);
-  if (!providers.length) {
+  if (!providers.length && !videoProviders.length) {
     throw new CloudAiError('provider_unavailable', '当前没有可用的生图渠道', 503);
   }
   const channels = await Promise.all(providers.map(async (provider) => {
@@ -461,12 +476,48 @@ export async function listWalletImageModels(
       };
     }
   }));
-  const firstAvailable = channels.find((channel) => !channel.error) ?? channels[0]!;
+  const firstAvailable = channels.find((channel) => !channel.error) ?? channels[0];
+  const videoChannels = await Promise.all(videoProviders.map(async (provider) => {
+    const configuredDefaultModel = provider.defaultModel?.trim() || '';
+    try {
+      await assertPublicProviderUrl(provider.baseUrl);
+      const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+      const value = await providerRequest(provider, secrets, '/v1/models', undefined, 15_000);
+      const models = Array.from(new Set([
+        ...collectProviderModelIds(value).filter(isLikelyVideoModel),
+        ...(configuredDefaultModel ? [configuredDefaultModel] : []),
+      ]));
+      return {
+        id: provider.id,
+        name: provider.name,
+        provider: provider.kind,
+        defaultModel: configuredDefaultModel || null,
+        models,
+        capabilities: provider.capabilities,
+        error: null,
+      };
+    } catch (error) {
+      // Some video gateways do not implement /v1/models. A configured
+      // default model is still enough for the client to route requests.
+      return {
+        id: provider.id,
+        name: provider.name,
+        provider: provider.kind,
+        defaultModel: configuredDefaultModel || null,
+        models: configuredDefaultModel ? [configuredDefaultModel] : [],
+        capabilities: provider.capabilities,
+        error: configuredDefaultModel ? null : error instanceof Error
+          ? error.message.slice(0, 800)
+          : '璇诲彇瑙嗛妯″瀷澶辫触',
+      };
+    }
+  }));
   return {
-    provider: firstAvailable.provider,
-    defaultModel: firstAvailable.defaultModel,
+    provider: firstAvailable?.provider ?? videoChannels[0]?.provider ?? 'NEW_API',
+    defaultModel: firstAvailable?.defaultModel ?? videoChannels[0]?.defaultModel ?? null,
     models: Array.from(new Set(channels.flatMap((channel) => channel.models))),
     channels,
+    videoChannels,
     pricing,
   };
 }
@@ -2711,6 +2762,90 @@ export function newApiVideoJsonBody(input: VideoInput) {
   };
 }
 
+export function isMikotoKlingVideoModel(model: string) {
+  const normalized = model.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  return normalized === 'kling-video' || normalized === 'kling-omni-video';
+}
+
+export function normalizeMikotoVideoDuration(duration?: number) {
+  const values = [5, 10, 15];
+  const requested = Number(duration);
+  if (!Number.isFinite(requested)) return 15;
+  return values.find((value) => value >= requested) ?? values[values.length - 1]!;
+}
+
+export function mikotoVideoSize(aspectRatio?: string, resolution?: string) {
+  const ratio = aspectRatio?.trim() === '9:16' ? '9:16' : '16:9';
+  const height = resolution?.trim().toLowerCase() === '1080p' ? 1080 : 720;
+  if (ratio === '9:16') return `${height === 1080 ? 1080 : 720}x${height === 1080 ? 1920 : 1280}`;
+  return `${height === 1080 ? 1920 : 1280}x${height}`;
+}
+
+export function mikotoVideoBody(input: VideoInput) {
+  const model = input.model.trim();
+  const isOmni = model.toLowerCase() === 'kling-omni-video';
+  const maxImages = input.inputMode === 'FLF' ? 2 : isOmni ? 3 : 2;
+  const images = input.inputImages.filter(Boolean).slice(0, maxImages);
+  const duration = normalizeMikotoVideoDuration(input.duration);
+  const aspectRatio = input.aspectRatio?.trim() === '9:16' ? '9:16' : '16:9';
+  const resolution = input.resolution?.trim().toLowerCase() === '1080p' ? '1080p' : '720p';
+  const size = mikotoVideoSize(aspectRatio, resolution);
+  const referenceMode = isOmni ? 'element' : 'frame';
+  const content = images.length > 0
+    ? [
+      { type: 'text', text: input.prompt.trim() },
+      ...images.map((url) => ({ type: 'image_url', image_url: { url, detail: 'high' } })),
+    ]
+    : input.prompt.trim();
+  return {
+    model,
+    prompt: input.prompt.trim(),
+    messages: [{ role: 'user', content }],
+    seconds: String(duration),
+    duration,
+    aspect_ratio: aspectRatio,
+    aspectRatio,
+    resolution,
+    size,
+    reference_mode: referenceMode,
+    extra_body: {
+      seconds: duration,
+      duration,
+      aspect_ratio: aspectRatio,
+      aspectRatio,
+      resolution,
+      size,
+      reference_mode: referenceMode,
+    },
+  };
+}
+
+export async function providerMikotoVideoRequest(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  input: VideoInput,
+) {
+  const maxImages = input.inputMode === 'FLF'
+    ? 2
+    : input.model.trim().toLowerCase() === 'kling-omni-video' ? 3 : 2;
+  const sources = input.inputImages.filter(Boolean).slice(0, maxImages);
+  if (input.inputMode === 'FLF' && sources.length !== 2) {
+    throw new CloudAiError('invalid_video_input', '棣栧熬甯фā寮忛渶瑕佸悓鏃舵彁渚涢甯у拰灏惧抚涓ゅ紶鍥剧墖', 400);
+  }
+  const images = await Promise.all(sources.map((source, index) => stageNewApiEditImage(source, index)));
+  try {
+    const imageDataUrls = await Promise.all(images.map(stagedImageDataUrl));
+    return providerRequest(
+      provider,
+      secrets,
+      '/v1/videos',
+      mikotoVideoBody({ ...input, inputImages: imageDataUrls }),
+    );
+  } finally {
+    await Promise.all(images.map((image) => image.cleanup().catch(() => {})));
+  }
+}
+
 async function generateBigmodelImages(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
@@ -3352,6 +3487,8 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       let result: unknown;
       if (provider.kind === 'XAIS') {
         result = await providerRequest(provider, secrets, '/xais/workerTaskStart', xaisVideoBody(input));
+      } else if (provider.kind === 'MIKOTO' && isMikotoKlingVideoModel(input.model)) {
+        result = await providerMikotoVideoRequest(provider, secrets, input);
       } else {
         const submission = await providerNewApiVideoRequest(
           provider,
