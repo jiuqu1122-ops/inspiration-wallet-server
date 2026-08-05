@@ -8,7 +8,6 @@ import {
   getWalletImageGenerationByRequest,
   listWalletImageModels,
 } from './image-service.js';
-import { getImageResult } from './image-result-store.js';
 import { mkdir, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
@@ -16,6 +15,7 @@ import { env } from '../../config/env.js';
 import { ossUploadService } from './oss-uploader.js';
 import { getImageReference } from './reference-store.js';
 import { isVideoResultKey } from './video-result-store.js';
+import { getImageResult, imageResultMimeForKey } from './image-result-store.js';
 import { createAiTaskSchema } from './task-schema.js';
 import {
   cancelUserAiTask,
@@ -250,17 +250,21 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       const rawKey = (request.params as { key?: unknown }).key;
       const key = typeof rawKey === 'string' ? rawKey.trim() : '';
       const result = await getImageResult(key);
-      if (!result) {
+      const resultMime = result?.mime || imageResultMimeForKey(key);
+      if (!resultMime) {
         return reply.code(404).send({ error: 'not_found', message: 'Image result not found or expired' });
       }
       let objectName = `generated-images/${key}`;
       try {
         if (!await ossUploadService.exists(objectName)) {
+          if (!result) {
+            return reply.code(404).send({ error: 'not_found', message: 'Image result not found or expired' });
+          }
           objectName = await ossUploadService.upload({
             namespace: 'generated-images',
             source: result.path,
             filename: key,
-            mime: result.mime,
+            mime: resultMime,
           });
         }
       } catch (error) {
@@ -286,7 +290,7 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       }
       try {
         const url = ossUploadService.getPublicUrl(objectName, {
-          mime: result.mime,
+          mime: resultMime,
           filename: key,
           download: false,
         });

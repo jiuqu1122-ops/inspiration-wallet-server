@@ -25,6 +25,15 @@ function mimeForExtension(extension: string) {
   return 'image/jpeg';
 }
 
+export function isImageResultKey(value: string) {
+  return RESULT_KEY_PATTERN.test(value);
+}
+
+export function imageResultMimeForKey(value: string) {
+  if (!isImageResultKey(value)) return null;
+  return mimeForExtension(value.split('.').pop()?.toLowerCase() || 'jpg');
+}
+
 function imageMimeFromPrefix(prefix: Buffer) {
   if (prefix.length >= 8
     && prefix[0] === 0x89 && prefix[1] === 0x50 && prefix[2] === 0x4e && prefix[3] === 0x47) return 'image/png';
@@ -179,7 +188,7 @@ export async function createImageResultFromFile(sourcePath: string, mime: string
 }
 
 export async function getImageResult(key: string) {
-  if (!RESULT_KEY_PATTERN.test(key)) return null;
+  if (!isImageResultKey(key)) return null;
   const path = join(env.IMAGE_RESULT_STORE_DIR, key);
   const info = await stat(path).catch(() => null);
   if (!info?.isFile()) return null;

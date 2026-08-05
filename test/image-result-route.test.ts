@@ -18,6 +18,7 @@ vi.mock('../src/modules/ai/image-result-store.js', () => ({
     mime: 'image/png',
     size: 5,
   })),
+  imageResultMimeForKey: vi.fn((key: string) => key.endsWith('.png') ? 'image/png' : null),
 }));
 
 vi.mock('../src/modules/ai/oss-uploader.js', () => ({
@@ -25,6 +26,7 @@ vi.mock('../src/modules/ai/oss-uploader.js', () => ({
 }));
 
 import { aiRoutes } from '../src/modules/ai/routes.js';
+import { getImageResult } from '../src/modules/ai/image-result-store.js';
 
 async function makeApp() {
   const app = Fastify();
@@ -50,6 +52,11 @@ describe('generated image OSS delivery route', () => {
     bridgeMocks.getPublicUrl.mockImplementation((name: string) => (
       `https://inspiration-drawer-prod.oss-cn-hongkong.aliyuncs.com/${name}?token=a%2Bb%3D`
     ));
+    vi.mocked(getImageResult).mockResolvedValue({
+      path: '/tmp/result.png',
+      mime: 'image/png',
+      size: 5,
+    });
   });
 
   it('uses the same object key for upload, verification, and signing', async () => {
@@ -99,6 +106,23 @@ describe('generated image OSS delivery route', () => {
       expiresAt: expect.any(Number),
     });
     expect(response.json().expiresAt).toBeGreaterThan(before + 23 * 60 * 60 * 1_000);
+    await app.close();
+  });
+
+  it('signs an OSS result even when the API container has no local copy', async () => {
+    vi.mocked(getImageResult).mockResolvedValue(null);
+    const key = `${'a'.repeat(64)}.png`;
+    const app = await makeApp();
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/ai/image-results/${key}?redirect=0`,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      url: expect.stringContaining(`/generated-images/${key}`),
+      expiresAt: expect.any(Number),
+    });
+    expect(bridgeMocks.upload).not.toHaveBeenCalled();
     await app.close();
   });
 
