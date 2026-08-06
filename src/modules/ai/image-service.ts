@@ -2912,6 +2912,13 @@ async function selectVideoProvider(prisma: PrismaClient, preference?: VideoInput
   const preferred = kind
     ? await prisma.aiProviderChannel.findMany({ where: { ...common, kind }, orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }] })
     : [];
+  if (kind && preferred.length === 0) {
+    throw new CloudAiError(
+      'provider_unavailable',
+      `Video provider ${preference} is unavailable or disabled`,
+      503,
+    );
+  }
   const fallback = preferred.length === 0
     ? await prisma.aiProviderChannel.findMany({ where: common, orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }] })
     : [];
