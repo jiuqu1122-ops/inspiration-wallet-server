@@ -70,7 +70,7 @@ describe('Mikoto Seedance model mapping', () => {
   });
 
   it('builds the independent MiniMax H3 multimodal video contract', () => {
-    expect(minimaxVideoBody({
+    const body = minimaxVideoBody({
       model: 'MiniMax-H3',
       prompt: 'camera orbit',
       inputImages: ['https://media.example/first.jpg', 'https://media.example/style.jpg'],
@@ -79,7 +79,8 @@ describe('Mikoto Seedance model mapping', () => {
       aspectRatio: '16:9',
       resolution: '1080p',
       duration: 5,
-    } as never)).toEqual({
+    } as never);
+    expect(body).toEqual({
       model: 'MiniMax-H3',
       content: [
         { type: 'text', text: 'camera orbit' },
@@ -92,6 +93,11 @@ describe('Mikoto Seedance model mapping', () => {
       duration: 5,
       ratio: '16:9',
     });
+    expect(body.resolution).toBe('2K');
+    expect(minimaxVideoBody({ model: 'MiniMax-H3', prompt: 'camera orbit', inputImages: [], inputVideos: [], inputAudios: [], resolution: '720p' } as never).resolution)
+      .toBe('768P');
+    expect(minimaxVideoBody({ model: 'MiniMax-H3', prompt: 'camera orbit', inputImages: [], inputVideos: [], inputAudios: [], resolution: '480p' } as never).resolution)
+      .toBe('768P');
   });
 
   it('maps the two client models to Mikoto resolution-specific model ids', () => {

@@ -3155,7 +3155,11 @@ export function minimaxVideoBody(input: VideoInput) {
     })),
   ];
   const requestedResolution = String(input.resolution || '').trim().toLowerCase();
-  const resolution = requestedResolution === '720p' || requestedResolution === '1k' ? '1K' : '2K';
+  // MiniMax H3 accepts only its native 768P/2K labels. Keep the client's
+  // Seedance-compatible 480p/720p/1080p controls and translate them here.
+  const resolution = requestedResolution === '1080p' || requestedResolution === '2k'
+    ? '2K'
+    : '768P';
   const ratio = String(input.aspectRatio || 'adaptive').trim() || 'adaptive';
   const duration = Math.max(4, Math.min(15, Math.round(Number(input.duration) || 5)));
   return {
