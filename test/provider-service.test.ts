@@ -67,6 +67,7 @@ describe('provider connection probes', () => {
     );
 
     expect(result.ok).toBe(true);
+    expect(result.message).toBe('连接成功；MiniMax H3 视频接口可访问');
     expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
       'https://example.com/api/minimax/v2/query/video_generation?task_id=probe',
     );

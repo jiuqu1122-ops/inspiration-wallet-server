@@ -814,15 +814,19 @@ export async function testProvider(prisma: PrismaClient, providerId: string) {
     throw new Error(modelErrors.join(' | ').slice(0, 1_000) || 'Provider model catalog is unavailable');
   }
   status = 'OK';
-  const details = [
-    modelCatalogReachable
-      ? models.length ? `${models.length} models discovered` : 'model catalog returned no model IDs'
-      : xaisProfileReachable ? 'connected through XAIS userProfile' : 'model catalog unavailable',
-    ...(probeModel
-      ? [`${provider.capabilities.includes('VISION') ? 'Vision' : 'LLM'} probe passed (${probeModel})`]
-      : []),
-  ];
-  message = `Connected successfully; ${details.join('; ')}`;
+  if (provider.kind === 'MINIMAX') {
+    message = '连接成功；MiniMax H3 视频接口可访问';
+  } else {
+    const details = [
+      modelCatalogReachable
+        ? models.length ? `${models.length} models discovered` : 'model catalog returned no model IDs'
+        : xaisProfileReachable ? 'connected through XAIS userProfile' : 'model catalog unavailable',
+      ...(probeModel
+        ? [`${provider.capabilities.includes('VISION') ? 'Vision' : 'LLM'} probe passed (${probeModel})`]
+        : []),
+    ];
+    message = `Connected successfully; ${details.join('; ')}`;
+  }
 
   const testedAt = new Date();
   await prisma.aiProviderChannel.update({
