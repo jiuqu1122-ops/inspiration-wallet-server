@@ -44,6 +44,7 @@ import {
   resolveXaisModel,
   resolveXaisWorkerRatio,
   runXaisWorkerTask,
+  selectVideoProvider,
   sizeFromRatio,
   stageXaisPublicReference,
   uniqueImages,
@@ -52,6 +53,22 @@ import {
 import { getImageResult } from '../src/modules/ai/image-result-store.js';
 
 describe('Mikoto Seedance model mapping', () => {
+  it('does not fall back to another provider when MiniMax is explicitly requested', async () => {
+    const findMany = vi.fn(async () => []);
+    const prisma = { aiProviderChannel: { findMany } } as never;
+
+    await expect(selectVideoProvider(prisma, 'minimax')).rejects.toMatchObject({
+      code: 'provider_unavailable',
+      statusCode: 503,
+    });
+    expect(findMany).toHaveBeenCalledTimes(1);
+    expect(findMany.mock.calls[0]?.[0]).toMatchObject({
+      where: {
+        kind: 'MINIMAX',
+      },
+    });
+  });
+
   it('builds the independent MiniMax H3 multimodal video contract', () => {
     expect(minimaxVideoBody({
       model: 'MiniMax-H3',

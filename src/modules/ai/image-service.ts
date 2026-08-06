@@ -2900,7 +2900,7 @@ function videoProviderKind(provider?: VideoInput['provider']) {
   return undefined;
 }
 
-async function selectVideoProvider(prisma: PrismaClient, preference?: VideoInput['provider'], providerChannelId?: string) {
+export async function selectVideoProvider(prisma: PrismaClient, preference?: VideoInput['provider'], providerChannelId?: string) {
   const kind = videoProviderKind(preference);
   const common = { status: 'ACTIVE' as const, capabilities: { hasSome: VIDEO_PROVIDER_CAPABILITIES } };
   if (providerChannelId) {
