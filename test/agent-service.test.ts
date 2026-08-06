@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
+  drainAgentCompletionStreamAfterDone,
   buildAgentModelCandidates,
   buildSingleProviderAgentRetryModels,
   AgentCompletionResponseAccumulator,
@@ -176,6 +177,69 @@ describe('Agent provider fallback policy', () => {
     expect(parser.finish()).toMatchObject({
       choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
     });
+  });
+
+  it('drains a completed SSE response through EOF without cancelling it', async () => {
+    const encoder = new TextEncoder();
+    let cancelCount = 0;
+    let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+        controller.enqueue(encoder.encode(
+          'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        ));
+      },
+      cancel() {
+        cancelCount += 1;
+      },
+    });
+    const reader = stream.getReader();
+    const first = await reader.read();
+    const accumulator = new AgentCompletionResponseAccumulator('text/event-stream');
+    accumulator.push(new TextDecoder().decode(first.value));
+
+    expect(accumulator.isDone()).toBe(true);
+    const draining = drainAgentCompletionStreamAfterDone(reader, 50);
+    streamController?.close();
+    await expect(draining).resolves.toBe('eof');
+    expect(cancelCount).toBe(0);
+    expect(accumulator.finish()).toMatchObject({
+      choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+    });
+  });
+
+  it('cancels a completed SSE response only after the close grace expires', async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let cancelReason: unknown;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(
+            'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+          ));
+        },
+        cancel(reason) {
+          cancelReason = reason;
+        },
+      });
+      const reader = stream.getReader();
+      const first = await reader.read();
+      const accumulator = new AgentCompletionResponseAccumulator('text/event-stream');
+      accumulator.push(new TextDecoder().decode(first.value));
+
+      expect(accumulator.isDone()).toBe(true);
+      const draining = drainAgentCompletionStreamAfterDone(reader, 50);
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(draining).resolves.toBe('timeout');
+      expect(cancelReason).toBeInstanceOf(Error);
+      expect(accumulator.finish()).toMatchObject({
+        choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('detects SSE payloads when an upstream sends the wrong content type', () => {

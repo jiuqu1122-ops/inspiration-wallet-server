@@ -98,7 +98,7 @@ async function discoverModel(
     preferredModel,
     preferProviderDefault,
   );
-  if (configuredModel) return configuredModel;
+  if (configuredModel && isLikelyAgentTextModel(configuredModel)) return configuredModel;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15_000);
   try {
@@ -118,6 +118,7 @@ async function discoverModel(
           && typeof item === 'object'
           && 'id' in item
           && typeof (item as { id?: unknown }).id === 'string'
+          && isLikelyAgentTextModel((item as { id: string }).id)
         ))
       : null;
     const modelId = model
@@ -129,7 +130,7 @@ async function discoverModel(
     if (!modelId) {
       throw new CloudAiError(
         'provider_model_missing',
-        '渠道没有配置默认 Agent 模型，也未能自动读取模型',
+        '渠道没有配置可用于 Agent 的文本模型，也未能自动读取模型',
         503,
       );
     }
@@ -661,6 +662,40 @@ async function readChunkWithIdleTimeout(
   });
 }
 
+export const AGENT_STREAM_CLOSE_GRACE_MS = 2_000;
+
+// Give successful SSE responses time to reach EOF. Cancelling immediately after
+// [DONE] makes upstream gateways record an otherwise successful request as client_gone.
+export async function drainAgentCompletionStreamAfterDone(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  graceMs = AGENT_STREAM_CLOSE_GRACE_MS,
+): Promise<'eof' | 'timeout'> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const graceExpired = new Promise<{ kind: 'timeout' }>((resolve) => {
+    timeout = setTimeout(() => resolve({ kind: 'timeout' }), Math.max(0, graceMs));
+  });
+
+  try {
+    while (true) {
+      const next = await Promise.race([
+        reader.read().then(
+          value => ({ kind: 'read' as const, value }),
+          () => ({ kind: 'read-error' as const }),
+        ),
+        graceExpired,
+      ]);
+      if (next.kind === 'timeout') {
+        await reader.cancel(new Error('Agent stream did not close after [DONE]')).catch(() => undefined);
+        return 'timeout';
+      }
+      if (next.kind === 'read-error') return 'timeout';
+      if (next.value.done) return 'eof';
+    }
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
 async function requestStreamingCompletion(
   provider: AiProviderChannel,
   model: string,
@@ -683,6 +718,8 @@ async function requestStreamingCompletion(
       model,
       attempt,
     });
+    // Bigmodel/Mikoto use the OpenAI-compatible text route here. Their native
+    // image protocols are isolated in image-service.ts and never share this body.
     response = await fetch(providerEndpoint(provider.baseUrl, '/v1/chat/completions'), {
       method: 'POST',
       headers: upstreamHeaders(secrets.apiKey, secrets.headers),
@@ -763,7 +800,7 @@ async function requestStreamingCompletion(
       lastProgressAt = now;
     }
     if (accumulator.isDone()) {
-      await reader.cancel().catch(() => undefined);
+      await drainAgentCompletionStreamAfterDone(reader);
       break;
     }
   }
@@ -855,8 +892,13 @@ async function readProviderModels(
 export async function listWalletAgentModels(prisma: PrismaClient) {
   const provider = await selectProvider(prisma);
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-  const models = await readProviderModels(provider, secrets.apiKey, secrets.headers);
-  return { models, defaultModel: provider.defaultModel?.trim() || models[0] || null };
+  const models = (await readProviderModels(provider, secrets.apiKey, secrets.headers))
+    .filter(isLikelyAgentTextModel);
+  const configuredModel = provider.defaultModel?.trim() ?? '';
+  return {
+    models,
+    defaultModel: isLikelyAgentTextModel(configuredModel) ? configuredModel : models[0] || null,
+  };
 }
 
 async function reserveCredits(

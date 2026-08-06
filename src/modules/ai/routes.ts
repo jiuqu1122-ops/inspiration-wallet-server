@@ -60,6 +60,10 @@ const isSeedance20VideoModel = (model: string) => {
     || token === 'sourcemix20fast';
 };
 
+const isMiniMaxH3VideoModel = (model: string) => (
+  model.trim().toLowerCase().replace(/[\s_.-]+/g, '') === 'minimaxh3'
+);
+
 const imageSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
   provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'bigmodel', 'openai-compatible', 'custom']).nullish()
@@ -80,7 +84,7 @@ const imageSchema = z.object({
 
 const videoSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
-  provider: z.enum(['new-api', 'xais-chat', 'mikoto']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'minimax']).nullish()
     .transform((value) => value ?? undefined),
   providerChannelId: z.string().trim().min(1).max(128).nullish()
     .transform((value) => value ?? undefined),
@@ -95,20 +99,23 @@ const videoSchema = z.object({
   inputMode: z.enum(['REF', 'FLF']).nullish().transform((value) => value ?? undefined),
   count: z.number().int().min(1).max(4).default(1),
 }).strict().superRefine((value, context) => {
-  if (!isSeedance20VideoModel(value.model)) return;
+  const isSeedance = isSeedance20VideoModel(value.model);
+  const isMinimax = isMiniMaxH3VideoModel(value.model);
+  if (!isSeedance && !isMinimax) return;
+  const label = isSeedance ? 'Seedance 2.0' : 'MiniMax H3';
   if (value.inputImages.length > 9) {
-    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 9, inclusive: true, path: ['inputImages'], message: 'Seedance 2.0 supports at most 9 reference images' });
+    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 9, inclusive: true, path: ['inputImages'], message: `${label} supports at most 9 reference images` });
   }
   if (value.inputVideos.length > 3) {
-    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 3, inclusive: true, path: ['inputVideos'], message: 'Seedance 2.0 supports at most 3 reference videos' });
+    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 3, inclusive: true, path: ['inputVideos'], message: `${label} supports at most 3 reference videos` });
   }
   if (value.inputAudios.length > 3) {
-    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 3, inclusive: true, path: ['inputAudios'], message: 'Seedance 2.0 supports at most 3 reference audios' });
+    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 3, inclusive: true, path: ['inputAudios'], message: `${label} supports at most 3 reference audios` });
   }
 });
 
 const videoStatusSchema = z.object({
-  provider: z.enum(['new-api', 'xais-chat', 'mikoto']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'minimax']).nullish()
     .transform((value) => value ?? undefined),
   providerChannelId: z.string().trim().min(1).max(128).nullish()
     .transform((value) => value ?? undefined),

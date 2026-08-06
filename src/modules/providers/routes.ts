@@ -2,6 +2,7 @@ import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import {
   createProvider,
+  deleteProvider,
   getProviderBalance,
   listProviders,
   ProviderServiceError,
@@ -12,7 +13,7 @@ import {
 
 const providerIdSchema = z.object({ providerId: z.string().min(1).max(64) });
 const operationKeySchema = z.string().min(16).max(128).regex(/^[a-zA-Z0-9_-]+$/);
-const kindSchema = z.enum(['NEW_API', 'XAIS', 'MIKOTO', 'BIGMODEL']);
+const kindSchema = z.enum(['NEW_API', 'XAIS', 'MIKOTO', 'BIGMODEL', 'MINIMAX']);
 const capabilitySchema = z.enum([
   'LLM',
   'VISION',
@@ -23,6 +24,7 @@ const capabilitySchema = z.enum([
   'IMAGE_GPT',
   'IMAGE_GPT_1K',
   'VIDEO',
+  'VIDEO_MINIMAX',
 ]);
 const prioritySchema = z.number().int().min(0).max(9_999);
 const headersSchema = z.record(z.string().max(100), z.string().max(2_000)).refine(
@@ -92,6 +94,17 @@ export const providerAdminRoutes: FastifyPluginAsync = async (app) => {
     if (!params.success || !body.success) return invalid(reply, 'Provider update is invalid');
     try {
       return await updateProvider(app.prisma, params.data.providerId, body.data);
+    } catch (error) {
+      return providerError(reply, error);
+    }
+  });
+
+  app.delete('/:providerId', async (request, reply) => {
+    const params = providerIdSchema.safeParse(request.params);
+    const body = z.object({ idempotencyKey: operationKeySchema }).safeParse(request.body);
+    if (!params.success || !body.success) return invalid(reply, 'Provider deletion is invalid');
+    try {
+      return await deleteProvider(app.prisma, params.data.providerId, body.data.idempotencyKey);
     } catch (error) {
       return providerError(reply, error);
     }

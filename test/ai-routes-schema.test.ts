@@ -106,6 +106,32 @@ describe('wallet AI request compatibility', () => {
     expect(normalized.inputAudios).toHaveLength(3);
   });
 
+  it('accepts MiniMax H3 with the Seedance-compatible 9/3/3 reference limits', () => {
+    const normalized = normalizeVideoRequestBody({
+      clientRequestId: 'canvas-video-request-minimax',
+      provider: 'minimax',
+      model: 'MiniMax-H3',
+      prompt: 'use all references',
+      inputImages: Array.from({ length: 9 }, (_, index) => `https://example.com/image-${index}.png`),
+      inputVideos: Array.from({ length: 3 }, (_, index) => `https://example.com/video-${index}.mp4`),
+      inputAudios: Array.from({ length: 3 }, (_, index) => `https://example.com/audio-${index}.mp3`),
+      count: 1,
+    });
+    expect(normalized.provider).toBe('minimax');
+    expect(normalized.inputImages).toHaveLength(9);
+  });
+
+  it('rejects more than nine MiniMax H3 image references', () => {
+    expect(() => normalizeVideoRequestBody({
+      clientRequestId: 'canvas-video-request-minimax-limit',
+      provider: 'minimax',
+      model: 'MiniMax-H3',
+      prompt: 'use the references',
+      inputImages: Array.from({ length: 10 }, (_, index) => `https://example.com/image-${index}.png`),
+      count: 1,
+    })).toThrow();
+  });
+
   it('keeps the legacy thirteen-image limit for non-Seedance XAIS video models', () => {
     const normalized = normalizeVideoRequestBody({
       clientRequestId: 'canvas-video-request-legacy-xais',

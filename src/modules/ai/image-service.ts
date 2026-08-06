@@ -127,6 +127,7 @@ const IMAGE_PROVIDER_CAPABILITIES: AiCapability[] = [
   'IMAGE_GPT',
   'IMAGE_GPT_1K',
 ];
+const VIDEO_PROVIDER_CAPABILITIES: AiCapability[] = ['VIDEO', 'VIDEO_MINIMAX'];
 
 export function imageCapabilityForModel(model: string, resolution?: string): AiCapability {
   const token = imageModelToken(model);
@@ -254,18 +255,35 @@ async function listImageProviders(prisma: PrismaClient) {
     },
     orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }],
   });
-  return providers.filter((provider) => !provider.capabilities.includes('LLM'));
+  return providers.filter(providerCanServeImageAlongsideAgent);
 }
 
 async function listVideoProviders(prisma: PrismaClient) {
   const providers = await prisma.aiProviderChannel.findMany({
     where: {
       status: 'ACTIVE',
-      capabilities: { has: 'VIDEO' },
+      capabilities: { hasSome: VIDEO_PROVIDER_CAPABILITIES },
     },
     orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }],
   });
   return providers.filter((provider) => !provider.capabilities.includes('LLM'));
+}
+
+/**
+ * Bigmodel and Mikoto expose separate native image and OpenAI-compatible text
+ * routes, so one channel may safely advertise both capabilities. Other
+ * providers keep the historical isolation between Agent and image channels.
+ */
+export function providerCanServeImageAlongsideAgent(
+  provider: Pick<AiProviderChannel, 'kind' | 'capabilities'>,
+) {
+  const hasImageCapability = provider.capabilities.some((capability) => (
+    IMAGE_PROVIDER_CAPABILITIES.includes(capability)
+  ));
+  if (!hasImageCapability) return false;
+  return provider.kind === 'BIGMODEL'
+    || provider.kind === 'MIKOTO'
+    || !provider.capabilities.includes('LLM');
 }
 
 function isRetryableNewApiTaskPollError(error: unknown) {
@@ -1697,7 +1715,11 @@ export async function generateNewApiImages(
   let images: string[];
   if (startError) {
     images = imagesFromUpstreamError(startError, input.inputImages, input.count);
-    if (images.length === 0) throw startError;
+    if (images.length === 0) {
+      throw startError instanceof Error
+        ? startError
+        : new Error(typeof startError === 'string' ? startError : 'Image generation failed');
+    }
   } else try {
     images = await resolveNewApiImageResponse(
       provider,
@@ -2747,7 +2769,7 @@ export async function getWalletImageGenerationByRequest(
 export type VideoInput = {
   userId: string;
   clientRequestId: string;
-  provider?: 'new-api' | 'xais-chat' | 'mikoto' | undefined;
+  provider?: 'new-api' | 'xais-chat' | 'mikoto' | 'minimax' | undefined;
   providerChannelId?: string | undefined;
   model: string;
   prompt: string;
@@ -2770,6 +2792,10 @@ const isSeedance20VideoModel = (model: string) => {
     || token === 'sourcemix20'
     || token === 'sourcemix20fast';
 };
+
+const isMiniMaxH3VideoModel = (model: string) => (
+  model.trim().toLowerCase().replace(/[\s_.-]+/g, '') === 'minimaxh3'
+);
 
 const VIDEO_RESULT_KEYS = /^(?:result|results|output|outputs|video|videos|video_url|videoUrl|url|urls|uri|uris|href|download|downloads|file|files)$/i;
 const VIDEO_REFERENCE_KEYS = /^(?:image|images|input|inputs|reference|references|referenceImages|referenceVideos|referenceAudios|audio|audios)$/i;
@@ -2870,12 +2896,13 @@ function videoProviderKind(provider?: VideoInput['provider']) {
   if (provider === 'xais-chat') return 'XAIS' as const;
   if (provider === 'new-api') return 'NEW_API' as const;
   if (provider === 'mikoto') return 'MIKOTO' as const;
+  if (provider === 'minimax') return 'MINIMAX' as const;
   return undefined;
 }
 
 async function selectVideoProvider(prisma: PrismaClient, preference?: VideoInput['provider'], providerChannelId?: string) {
   const kind = videoProviderKind(preference);
-  const common = { status: 'ACTIVE' as const, capabilities: { has: 'VIDEO' as const } };
+  const common = { status: 'ACTIVE' as const, capabilities: { hasSome: VIDEO_PROVIDER_CAPABILITIES } };
   if (providerChannelId) {
     const selected = await prisma.aiProviderChannel.findFirst({ where: { ...common, id: providerChannelId, ...(kind ? { kind } : {}) } });
     if (!selected) throw new CloudAiError('provider_unavailable', '所选视频渠道不可用或已被停用', 503);
@@ -3101,6 +3128,38 @@ function mikotoVideoBody(input: VideoInput, modelOverride?: string) {
   };
 }
 
+export function minimaxVideoBody(input: VideoInput) {
+  const content: Array<Record<string, unknown>> = [
+    { type: 'text', text: input.prompt },
+    ...input.inputImages.map((url, index) => ({
+      type: 'image_url',
+      image_url: { url },
+      ...(index === 0 ? { role: 'first_frame' } : {}),
+    })),
+    ...input.inputVideos.map((url) => ({
+      type: 'video_url',
+      video_url: { url },
+      role: 'reference_video',
+    })),
+    ...input.inputAudios.map((url) => ({
+      type: 'audio_url',
+      audio_url: { url },
+      role: 'reference_audio',
+    })),
+  ];
+  const requestedResolution = String(input.resolution || '').trim().toLowerCase();
+  const resolution = requestedResolution === '720p' || requestedResolution === '1k' ? '1K' : '2K';
+  const ratio = String(input.aspectRatio || 'adaptive').trim() || 'adaptive';
+  const duration = Math.max(4, Math.min(15, Math.round(Number(input.duration) || 5)));
+  return {
+    model: 'MiniMax-H3',
+    content,
+    resolution,
+    duration,
+    ratio,
+  };
+}
+
 function shouldTryMikotoVideoModel(error: unknown) {
   if (error instanceof UpstreamImageError) {
     return [400, 404, 422, 500, 502, 503, 504].includes(error.status);
@@ -3224,6 +3283,10 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
     && (input.inputImages.length > 9 || input.inputVideos.length > 3 || input.inputAudios.length > 3)) {
     throw new CloudAiError('invalid_request', 'Seedance 2.0 supports 9 images, 3 videos, and 3 audios at most', 400);
   }
+  if (isMiniMaxH3VideoModel(input.model)
+    && (input.inputImages.length > 9 || input.inputVideos.length > 3 || input.inputAudios.length > 3)) {
+    throw new CloudAiError('invalid_request', 'MiniMax H3 supports 9 images, 3 videos, and 3 audios at most', 400);
+  }
   const reservation = await reserveVideo(prisma, input);
   try {
     const provider = await selectVideoProvider(prisma, input.provider, input.providerChannelId);
@@ -3254,7 +3317,9 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
     for (let index = 0; index < input.count; index += 1) {
       const path = provider.kind === 'XAIS'
         ? '/xais/workerTaskStart'
-        : provider.kind === 'MIKOTO' ? '/v1/videos' : '/v1/video/generations';
+        : provider.kind === 'MIKOTO' ? '/v1/videos'
+          : provider.kind === 'MINIMAX' ? '/api/minimax/v2/video_generation'
+          : '/v1/video/generations';
       const mikotoModels = provider.kind === 'MIKOTO'
         ? isSeedance20VideoModel(input.model)
           ? mikotoSeedanceModelCandidates(input, provider.defaultModel)
@@ -3267,7 +3332,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       let lastError: unknown = null;
       for (let modelIndex = 0; modelIndex < modelAttempts.length; modelIndex += 1) {
         const modelOverride = modelAttempts[modelIndex];
-        const body = provider.kind === 'XAIS' ? xaisVideoBody(input) : provider.kind === 'MIKOTO' ? mikotoVideoBody(input, modelOverride) : {
+        const body = provider.kind === 'XAIS' ? xaisVideoBody(input) : provider.kind === 'MIKOTO' ? mikotoVideoBody(input, modelOverride) : provider.kind === 'MINIMAX' ? minimaxVideoBody(input) : {
           model: input.model,
           prompt: input.prompt,
           n: 1,
@@ -3336,6 +3401,8 @@ export async function executeWalletVideoStatus(
     ? `/xais/workerTaskWait?json=1&id=${encodeURIComponent(input.taskId)}`
     : provider.kind === 'MIKOTO'
       ? `/v1/videos/${encodeURIComponent(input.taskId)}`
+      : provider.kind === 'MINIMAX'
+        ? `/api/minimax/v2/query/video_generation?task_id=${encodeURIComponent(input.taskId)}`
       : `/v1/video/generations/${encodeURIComponent(input.taskId)}`;
   const waited = await providerRequest(provider, secrets, path);
   const failure = getFailure(waited);

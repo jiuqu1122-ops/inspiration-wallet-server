@@ -58,6 +58,7 @@ const KNOWN_VIDEO_MODELS = [
   'seedance2fast',
   'kling-video',
   'kling-omni-video',
+  'MiniMax-H3',
 ] as const;
 
 const CANONICAL_IMAGE_PRICING_MODELS = [

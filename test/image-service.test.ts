@@ -23,11 +23,13 @@ import {
   materializeNewApiReferenceImage,
   mirrorGeneratedImageResults,
   mirrorGeneratedVideoResponse,
+  minimaxVideoBody,
   mirrorXaisImageResults,
   newApiImageRequestParams,
   parseWalletImageGenerationResult,
   parseXaisTaskId,
   providerSupportsImageModel,
+  providerCanServeImageAlongsideAgent,
   resolveBigmodelImageModel,
   resolveImageModel,
   resolveMikotoImageModel,
@@ -50,6 +52,31 @@ import {
 import { getImageResult } from '../src/modules/ai/image-result-store.js';
 
 describe('Mikoto Seedance model mapping', () => {
+  it('builds the independent MiniMax H3 multimodal video contract', () => {
+    expect(minimaxVideoBody({
+      model: 'MiniMax-H3',
+      prompt: 'camera orbit',
+      inputImages: ['https://media.example/first.jpg', 'https://media.example/style.jpg'],
+      inputVideos: ['https://media.example/ref.mp4'],
+      inputAudios: ['https://media.example/music.mp3'],
+      aspectRatio: '16:9',
+      resolution: '1080p',
+      duration: 5,
+    } as never)).toEqual({
+      model: 'MiniMax-H3',
+      content: [
+        { type: 'text', text: 'camera orbit' },
+        { type: 'image_url', image_url: { url: 'https://media.example/first.jpg' }, role: 'first_frame' },
+        { type: 'image_url', image_url: { url: 'https://media.example/style.jpg' } },
+        { type: 'video_url', video_url: { url: 'https://media.example/ref.mp4' }, role: 'reference_video' },
+        { type: 'audio_url', audio_url: { url: 'https://media.example/music.mp3' }, role: 'reference_audio' },
+      ],
+      resolution: '2K',
+      duration: 5,
+      ratio: '16:9',
+    });
+  });
+
   it('maps the two client models to Mikoto resolution-specific model ids', () => {
     expect(resolveMikotoSeedanceModel('seedance2', '1080p')).toBe('seedance-2.0-1080p');
     expect(resolveMikotoSeedanceModel('seedance2', '720p')).toBe('seedance-2.0-720p');
@@ -150,6 +177,27 @@ describe('Mikoto Seedance model mapping', () => {
       upstream,
     });
     expect(mirror).toHaveBeenCalledWith('https://media.example/output.mp4');
+  });
+});
+
+describe('dual-protocol image channels', () => {
+  it('keeps Bigmodel and Mikoto image routes available when LLM is also enabled', () => {
+    expect(providerCanServeImageAlongsideAgent({
+      kind: 'BIGMODEL',
+      capabilities: ['LLM', 'IMAGE_NANO_BANANA'],
+    })).toBe(true);
+    expect(providerCanServeImageAlongsideAgent({
+      kind: 'MIKOTO',
+      capabilities: ['LLM', 'IMAGE_NANO_BANANA'],
+    })).toBe(true);
+    expect(providerCanServeImageAlongsideAgent({
+      kind: 'NEW_API',
+      capabilities: ['LLM', 'IMAGE'],
+    })).toBe(false);
+    expect(providerCanServeImageAlongsideAgent({
+      kind: 'BIGMODEL',
+      capabilities: ['LLM'],
+    })).toBe(false);
   });
 });
 
