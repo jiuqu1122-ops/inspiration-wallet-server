@@ -2879,14 +2879,17 @@ export async function mirrorGeneratedVideoResponse(
 function providerVideoResultMirror(
   provider: Pick<AiProviderChannel, 'baseUrl'>,
   secrets: ProviderSecrets,
+  cacheScope?: string,
 ) {
   const providerOrigin = new URL(provider.baseUrl).origin;
   return (source: string) => {
-    if (!/^https?:\/\//i.test(source)) return mirrorGeneratedVideoResultToOss(source);
+    if (!/^https?:\/\//i.test(source)) {
+      return mirrorGeneratedVideoResultToOss(source, undefined, cacheScope);
+    }
     const sourceOrigin = new URL(source).origin;
     return sourceOrigin === providerOrigin
-      ? mirrorGeneratedVideoResultToOss(source, upstreamHeaders(secrets))
-      : mirrorGeneratedVideoResultToOss(source);
+      ? mirrorGeneratedVideoResultToOss(source, upstreamHeaders(secrets), cacheScope)
+      : mirrorGeneratedVideoResultToOss(source, undefined, cacheScope);
   };
 }
 
@@ -3427,12 +3430,13 @@ export async function executeWalletVideoStatus(
     throw new CloudAiError('video_generation_failed', failure, 502);
   }
   if (provider.kind !== 'XAIS') {
+    const cacheScope = `${provider.id}:${input.taskId}`;
     const mirrorVideo = provider.kind === 'MIKOTO'
-      ? providerVideoResultMirror(provider, secrets)
+      ? providerVideoResultMirror(provider, secrets, cacheScope)
       : (source: string) => mirrorGeneratedVideoResultToOss(
         source,
         undefined,
-        `${provider.id}:${input.taskId}`,
+        cacheScope,
       );
     return mirrorGeneratedVideoResponse(waited, provider.name, mirrorVideo);
   }
