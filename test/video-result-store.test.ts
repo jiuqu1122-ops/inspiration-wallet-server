@@ -79,4 +79,29 @@ describe('generated video OSS mirroring', () => {
     )).resolves.toMatch(/^https:\/\/api\.example\.test\/v1\/ai\/video-results\/[a-f0-9]{64}\.mp4$/);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it('does not share a mirror between distinct task-scoped video results', async () => {
+    const mp4 = Buffer.from('000000186674797069736f6d0000020069736f6d69736f32', 'hex');
+    const fetchMock = vi.fn(async () => new Response(mp4, {
+      status: 200,
+      headers: {
+        'content-type': 'video/mp4',
+        'content-length': String(mp4.byteLength),
+      },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    bridgeMocks.upload.mockImplementation(async (input: { namespace: string; filename: string }) => (
+      `${input.namespace}/${input.filename}`
+    ));
+
+    const source = 'https://1.1.1.1/shared-task-result.mp4';
+    const [first, second] = await Promise.all([
+      mirrorGeneratedVideoResultToOss(source, undefined, 'minimax:task-first'),
+      mirrorGeneratedVideoResultToOss(source, undefined, 'minimax:task-second'),
+    ]);
+
+    expect(first).not.toBe(second);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(bridgeMocks.upload).toHaveBeenCalledTimes(2);
+  });
 });

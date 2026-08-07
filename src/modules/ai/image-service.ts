@@ -3426,13 +3426,16 @@ export async function executeWalletVideoStatus(
     }
     throw new CloudAiError('video_generation_failed', failure, 502);
   }
-  if (provider.kind !== 'XAIS') return mirrorGeneratedVideoResponse(
-    waited,
-    provider.name,
-    provider.kind === 'MIKOTO'
+  if (provider.kind !== 'XAIS') {
+    const mirrorVideo = provider.kind === 'MIKOTO'
       ? providerVideoResultMirror(provider, secrets)
-      : mirrorGeneratedVideoResultToOss,
-  );
+      : (source: string) => mirrorGeneratedVideoResultToOss(
+        source,
+        undefined,
+        `${provider.id}:${input.taskId}`,
+      );
+    return mirrorGeneratedVideoResponse(waited, provider.name, mirrorVideo);
+  }
   const attachments = collectAttachmentIds(waited)
     .filter((value) => !/^(?:pending|processing|queued|completed|success|succeeded|failed|failure|error|cancelled|canceled)$/i.test(value));
   if (!attachments.length) return mirrorGeneratedVideoResponse(waited, provider.name);

@@ -214,15 +214,24 @@ async function performGeneratedVideoResultMirror(source: string, requestHeaders?
   }
 }
 
-export async function mirrorGeneratedVideoResultToOss(source: string, requestHeaders?: HeadersInit) {
+export async function mirrorGeneratedVideoResultToOss(
+  source: string,
+  requestHeaders?: HeadersInit,
+  cacheScope?: string,
+) {
   const trimmed = source.trim();
   if (isStoredVideoResultUrl(trimmed)) return performGeneratedVideoResultMirror(trimmed, requestHeaders);
   const normalizedHeaders = requestHeaders
     ? Array.from(new Headers(requestHeaders).entries()).sort(([left], [right]) => left.localeCompare(right))
     : [];
+  // Some video providers return a shared download endpoint whose response is
+  // bound to the generation task. Keep those task responses from sharing a
+  // cached mirror even when the upstream URL text is identical.
+  const normalizedScope = cacheScope?.trim() || '';
   const cacheKey = createHash('sha256')
     .update(trimmed)
     .update(JSON.stringify(normalizedHeaders))
+    .update(normalizedScope)
     .digest('hex');
   const cached = completedVideoMirrors.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.url;
