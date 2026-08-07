@@ -79,13 +79,14 @@ describe('Mikoto Seedance model mapping', () => {
       aspectRatio: '16:9',
       resolution: '1080p',
       duration: 5,
+      inputMode: 'REF',
     } as never);
     expect(body).toEqual({
       model: 'MiniMax-H3',
       content: [
         { type: 'text', text: 'camera orbit' },
-        { type: 'image_url', image_url: { url: 'https://media.example/first.jpg' }, role: 'first_frame' },
-        { type: 'image_url', image_url: { url: 'https://media.example/style.jpg' } },
+        { type: 'image_url', image_url: { url: 'https://media.example/first.jpg' }, role: 'reference_image' },
+        { type: 'image_url', image_url: { url: 'https://media.example/style.jpg' }, role: 'reference_image' },
         { type: 'video_url', video_url: { url: 'https://media.example/ref.mp4' }, role: 'reference_video' },
         { type: 'audio_url', audio_url: { url: 'https://media.example/music.mp3' }, role: 'reference_audio' },
       ],
@@ -98,6 +99,19 @@ describe('Mikoto Seedance model mapping', () => {
       .toBe('768P');
     expect(minimaxVideoBody({ model: 'MiniMax-H3', prompt: 'camera orbit', inputImages: [], inputVideos: [], inputAudios: [], resolution: '480p' } as never).resolution)
       .toBe('768P');
+    expect(minimaxVideoBody({
+      model: 'MiniMax-H3',
+      prompt: 'transition',
+      inputImages: ['https://media.example/start.jpg', 'https://media.example/end.jpg'],
+      inputVideos: [],
+      inputAudios: [],
+      inputMode: 'FLF',
+      resolution: '768P',
+    } as never).content).toEqual([
+      { type: 'text', text: 'transition' },
+      { type: 'image_url', image_url: { url: 'https://media.example/start.jpg' }, role: 'first_frame' },
+      { type: 'image_url', image_url: { url: 'https://media.example/end.jpg' }, role: 'last_frame' },
+    ]);
   });
 
   it('maps the two client models to Mikoto resolution-specific model ids', () => {

@@ -3136,12 +3136,15 @@ function mikotoVideoBody(input: VideoInput, modelOverride?: string) {
 }
 
 export function minimaxVideoBody(input: VideoInput) {
+  const isFirstLastFrame = input.inputMode === 'FLF';
   const content: Array<Record<string, unknown>> = [
     { type: 'text', text: input.prompt },
     ...input.inputImages.map((url, index) => ({
       type: 'image_url',
       image_url: { url },
-      ...(index === 0 ? { role: 'first_frame' } : {}),
+      role: isFirstLastFrame
+        ? index === 0 ? 'first_frame' : 'last_frame'
+        : 'reference_image',
     })),
     ...input.inputVideos.map((url) => ({
       type: 'video_url',
