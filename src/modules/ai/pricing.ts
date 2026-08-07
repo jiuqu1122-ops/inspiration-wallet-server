@@ -16,7 +16,7 @@ export type VideoModelCreditPrice = {
   creditsPerVideo?: string | undefined;
   /** Per-video override keyed by duration in seconds. */
   creditsByDuration?: Record<string, string> | undefined;
-  /** Per-video surcharge keyed by output resolution. */
+  /** Per-second surcharge keyed by output resolution. */
   creditsByResolution?: Record<string, string> | undefined;
   /** Exact request total keyed by requested output count. */
   creditsByCount?: Record<string, string> | undefined;
@@ -385,8 +385,12 @@ export function calculateVideoRequestCredits(
     ? BigInt(price.creditsByDuration[durationKey])
     : perSecond * BigInt(safeDuration);
   const perVideo = BigInt(price?.creditsPerVideo ?? '0');
-  const resolutionSurcharge = BigInt(price?.creditsByResolution?.[resolutionKey] ?? '0');
-  return (durationCredits + perVideo + resolutionSurcharge) * BigInt(safeCount);
+  const resolutionSurchargePerSecond = BigInt(price?.creditsByResolution?.[resolutionKey] ?? '0');
+  return (
+    durationCredits
+    + perVideo
+    + resolutionSurchargePerSecond * BigInt(safeDuration)
+  ) * BigInt(safeCount);
 }
 
 export async function configuredVideoRequestCredits(

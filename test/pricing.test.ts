@@ -134,7 +134,7 @@ describe('AI credit pricing', () => {
       creditsByResolution: { '1080p': '8' },
       creditsByCount: { '3': '200' },
     };
-    expect(calculateVideoRequestCredits(price, '1', 10, '1080p', 2)).toBe(106n);
+    expect(calculateVideoRequestCredits(price, '1', 10, '1080p', 2)).toBe(250n);
     expect(calculateVideoRequestCredits(price, '1', 10, '720p', 3)).toBe(200n);
 
     const prisma = prismaWithPricing({
@@ -145,6 +145,6 @@ describe('AI credit pricing', () => {
       imageModelPrices: [],
       videoModelPrices: [price],
     });
-    expect(await configuredVideoRequestCredits(prisma, 'Kling Video', 10, '1080p', 2)).toBe(106n);
+    expect(await configuredVideoRequestCredits(prisma, 'Kling Video', 10, '1080p', 2)).toBe(250n);
   });
 });
