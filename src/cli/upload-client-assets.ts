@@ -47,9 +47,41 @@ async function download(url: string, path: string) {
   );
 }
 
+function headerValue(headers: Record<string, string | string[] | number | undefined>, name: string) {
+  const raw = headers[name];
+  return Array.isArray(raw) ? raw[0] : raw;
+}
+
+function isNotFound(error: unknown) {
+  if (!error || typeof error !== 'object') return false;
+  const value = error as { status?: unknown; statusCode?: unknown; code?: unknown };
+  const code = typeof value.code === 'string' ? value.code : '';
+  return Number(value.statusCode || value.status) === 404
+    || ['NoSuchKey', 'NoSuchObject', 'NotFound'].includes(code);
+}
+
+async function remoteAssetIsCurrent(objectName: string, size: number, sha256: string) {
+  try {
+    const head = await client.head(objectName, { timeout: 30_000 });
+    const headers = head.res.headers as Record<string, string | string[] | number | undefined>;
+    const remoteSize = Number(headerValue(headers, 'content-length'));
+    const remoteSha256 = String(headerValue(headers, 'x-oss-meta-sha256') || '').toUpperCase();
+    return remoteSize === size && remoteSha256 === sha256;
+  } catch (error) {
+    if (isNotFound(error)) return false;
+    throw error;
+  }
+}
+
 async function uploadAssets(sourceDirectory: string, shouldDownload: boolean) {
   await mkdir(sourceDirectory, { recursive: true });
   for (const [name, asset] of Object.entries(CLIENT_ENGINE_ASSETS)) {
+    const objectName = `client-assets/${name}`;
+    if (await remoteAssetIsCurrent(objectName, asset.size, asset.sha256)) {
+      process.stdout.write(`${name} is already verified in OSS.\n`);
+      continue;
+    }
+
     const path = resolve(sourceDirectory, basename(name));
     if (shouldDownload) {
       process.stdout.write(`Downloading ${name}... `);
@@ -66,7 +98,6 @@ async function uploadAssets(sourceDirectory: string, shouldDownload: boolean) {
       throw new Error(`${name} SHA-256 mismatch: expected ${asset.sha256}, received ${digest}`);
     }
 
-    const objectName = `client-assets/${name}`;
     process.stdout.write(`Uploading ${name} (${asset.size} bytes)... `);
     await client.put(objectName, path, {
       timeout: 10 * 60_000,
@@ -76,12 +107,8 @@ async function uploadAssets(sourceDirectory: string, shouldDownload: boolean) {
         'x-oss-meta-sha256': asset.sha256,
       },
     });
-    const head = await client.head(objectName, { timeout: 30_000 });
-    const headers = head.res.headers as Record<string, string | string[] | number | undefined>;
-    const rawRemoteSize = headers['content-length'];
-    const remoteSize = Number(Array.isArray(rawRemoteSize) ? rawRemoteSize[0] : rawRemoteSize);
-    if (Number.isFinite(remoteSize) && remoteSize !== asset.size) {
-      throw new Error(`${name} OSS size mismatch: expected ${asset.size}, received ${remoteSize}`);
+    if (!await remoteAssetIsCurrent(objectName, asset.size, asset.sha256)) {
+      throw new Error(`${name} OSS verification failed after upload`);
     }
     process.stdout.write('verified\n');
   }

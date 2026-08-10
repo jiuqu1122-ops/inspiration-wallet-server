@@ -39,6 +39,11 @@ docker compose config --quiet
 log 'Building the shared API/worker image...'
 docker compose build api
 
+log 'Ensuring immutable client engine archives are present and verified in OSS...'
+if ! docker compose run --rm --no-deps api npm run client-assets:upload -- --download; then
+  fail 'Client engine assets could not be verified in OSS. Deployment stopped before updating the running services.'
+fi
+
 log 'Starting PostgreSQL...'
 docker compose up -d postgres
 
