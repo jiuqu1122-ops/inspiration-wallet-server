@@ -92,6 +92,29 @@ describe('OSS public bridge service', () => {
     await expect(ossUploadService.exists(name)).resolves.toBe(true);
   });
 
+  it('supports immutable client engine archives', async () => {
+    const { ossUploadService } = await import('../src/modules/ai/oss-uploader.js');
+    const name = await ossUploadService.upload({
+      namespace: 'client-assets',
+      source: '/tmp/engine.zip',
+      filename: 'engine.zip',
+      mime: 'application/zip',
+    });
+    expect(name).toBe('client-assets/engine.zip');
+    expect(ossMocks.put).toHaveBeenCalledWith(
+      'client-assets/engine.zip',
+      '/tmp/engine.zip',
+      expect.objectContaining({
+        timeout: 10 * 60_000,
+        headers: expect.objectContaining({
+          'Content-Type': 'application/zip',
+          'Cache-Control': 'private, max-age=31536000, immutable',
+        }),
+      }),
+    );
+    expect(() => ossUploadService.getPublicUrl(name)).not.toThrow();
+  });
+
   it('supports reference image deletion', async () => {
     const { ossUploadService } = await import('../src/modules/ai/oss-uploader.js');
     await expect(ossUploadService.delete('reference-images/share-0.jpg')).resolves.toBe(true);

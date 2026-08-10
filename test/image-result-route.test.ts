@@ -109,6 +109,38 @@ describe('generated image OSS delivery route', () => {
     await app.close();
   });
 
+  it('redirects a whitelisted client engine asset to a signed OSS URL', async () => {
+    const app = await makeApp();
+    const filename = 'ffmpeg-tools-n8.1-win64-gpl.zip';
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/ai/client-assets/${filename}`,
+    });
+    expect(response.statusCode).toBe(302);
+    expect(bridgeMocks.exists).toHaveBeenCalledWith(`client-assets/${filename}`);
+    expect(bridgeMocks.getPublicUrl).toHaveBeenCalledWith(
+      `client-assets/${filename}`,
+      { filename },
+    );
+    expect(response.headers['cache-control']).toBe('public, max-age=300');
+    expect(response.headers['x-asset-sha256']).toBe(
+      'D4B1D805749E6FA174E4BE158E844AD93BACBF23C2C68EDD473EEBE96B09CA63',
+    );
+    expect(response.headers['x-asset-size']).toBe('109205730');
+    await app.close();
+  });
+
+  it('rejects client asset names outside the fixed manifest', async () => {
+    const app = await makeApp();
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/ai/client-assets/unapproved.zip',
+    });
+    expect(response.statusCode).toBe(404);
+    expect(bridgeMocks.exists).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it('signs an OSS result even when the API container has no local copy', async () => {
     vi.mocked(getImageResult).mockResolvedValue(null);
     const key = `${'a'.repeat(64)}.png`;
