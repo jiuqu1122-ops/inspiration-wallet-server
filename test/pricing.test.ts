@@ -147,4 +147,58 @@ describe('AI credit pricing', () => {
     });
     expect(await configuredVideoRequestCredits(prisma, 'Kling Video', 10, '1080p', 2)).toBe(250n);
   });
+
+  it('adds MiniMax H3 reference-image and reference-video material credits', async () => {
+    const price = {
+      model: 'MiniMax-H3',
+      credits: '15',
+      creditsByResolution: { '2k': '10' },
+      includedReferenceImages: 5,
+      creditsPerExtraReferenceImage: '9',
+      creditsPerReferenceVideoSecond: '15',
+      referenceVideoCreditsByResolution: { '2k': '10' },
+    };
+
+    expect(calculateVideoRequestCredits(
+      price,
+      '1',
+      4,
+      '768P',
+      1,
+      { imageCount: 5, videoCount: 0 },
+    )).toBe(60n);
+    expect(calculateVideoRequestCredits(
+      price,
+      '1',
+      4,
+      '768P',
+      1,
+      { imageCount: 7, videoCount: 1 },
+    )).toBe(138n);
+    expect(calculateVideoRequestCredits(
+      price,
+      '1',
+      4,
+      '2K',
+      2,
+      { imageCount: 6, videoCount: 1 },
+    )).toBe(418n);
+
+    const prisma = prismaWithPricing({
+      agentRequestCredits: 8n,
+      inspirationAnalysisCredits: 2n,
+      imageDefaultCredits: 66n,
+      videoDefaultCredits: 1n,
+      imageModelPrices: [],
+      videoModelPrices: [{ model: 'MiniMax-H3', credits: '15', creditsByResolution: { '2k': '10' } }],
+    });
+    expect(await configuredVideoRequestCredits(
+      prisma,
+      'MiniMax H3',
+      4,
+      '2K',
+      1,
+      { imageCount: 6, videoCount: 1 },
+    )).toBe(209n);
+  });
 });

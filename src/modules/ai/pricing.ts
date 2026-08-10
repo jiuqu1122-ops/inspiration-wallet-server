@@ -20,6 +20,19 @@ export type VideoModelCreditPrice = {
   creditsByResolution?: Record<string, string> | undefined;
   /** Exact request total keyed by requested output count. */
   creditsByCount?: Record<string, string> | undefined;
+  /** Number of reference images included in the output price. */
+  includedReferenceImages?: number | undefined;
+  /** Per-image price after includedReferenceImages has been exceeded. */
+  creditsPerExtraReferenceImage?: string | undefined;
+  /** Base per-second price for each reference video. */
+  creditsPerReferenceVideoSecond?: string | undefined;
+  /** Per-second reference-video surcharge keyed by output resolution. */
+  referenceVideoCreditsByResolution?: Record<string, string> | undefined;
+};
+
+export type VideoReferenceCreditInput = {
+  imageCount?: number | undefined;
+  videoCount?: number | undefined;
 };
 
 export type AiPricingConfigValue = {
@@ -168,6 +181,17 @@ const defaultVideoModelPrices = (): VideoModelCreditPrice[] => (
   KNOWN_VIDEO_MODELS.map((model) => ({
     model,
     credits: DEFAULT_VIDEO_REQUEST_CREDITS.toString(),
+    ...(model === 'MiniMax-H3'
+      ? {
+        includedReferenceImages: 5,
+        creditsPerExtraReferenceImage: '9',
+        creditsPerReferenceVideoSecond: '15',
+        referenceVideoCreditsByResolution: {
+          '1080p': '10',
+          '2k': '10',
+        },
+      }
+      : {}),
   }))
 );
 
@@ -229,6 +253,13 @@ const normalizeStoredVideoModels = (value: Prisma.JsonValue): VideoModelCreditPr
     const creditsByDuration = normalizeMap(record.creditsByDuration);
     const creditsByResolution = normalizeMap(record.creditsByResolution);
     const creditsByCount = normalizeMap(record.creditsByCount);
+    const referenceVideoCreditsByResolution = normalizeMap(record.referenceVideoCreditsByResolution);
+    const includedReferenceImages = typeof record.includedReferenceImages === 'number'
+      && Number.isSafeInteger(record.includedReferenceImages)
+      && record.includedReferenceImages >= 0
+      && record.includedReferenceImages <= 100
+      ? record.includedReferenceImages
+      : undefined;
     return [{
       model,
       credits: record.credits,
@@ -237,6 +268,14 @@ const normalizeStoredVideoModels = (value: Prisma.JsonValue): VideoModelCreditPr
       ...(creditsByDuration ? { creditsByDuration } : {}),
       ...(creditsByResolution ? { creditsByResolution } : {}),
       ...(creditsByCount ? { creditsByCount } : {}),
+      ...(includedReferenceImages !== undefined ? { includedReferenceImages } : {}),
+      ...(validCreditString(record.creditsPerExtraReferenceImage)
+        ? { creditsPerExtraReferenceImage: record.creditsPerExtraReferenceImage }
+        : {}),
+      ...(validCreditString(record.creditsPerReferenceVideoSecond)
+        ? { creditsPerReferenceVideoSecond: record.creditsPerReferenceVideoSecond }
+        : {}),
+      ...(referenceVideoCreditsByResolution ? { referenceVideoCreditsByResolution } : {}),
     }];
   });
 };
@@ -256,9 +295,14 @@ const mergeKnownVideoModels = (
   stored: VideoModelCreditPrice[],
   defaults: VideoModelCreditPrice[],
 ) => {
-  const knownTokens = new Set(stored.map(item => videoPricingModelToken(item.model)));
+  const defaultsByToken = new Map(defaults.map(item => [videoPricingModelToken(item.model), item]));
+  const mergedStored = stored.map((item) => ({
+    ...defaultsByToken.get(videoPricingModelToken(item.model)),
+    ...item,
+  }));
+  const knownTokens = new Set(mergedStored.map(item => videoPricingModelToken(item.model)));
   return [
-    ...stored,
+    ...mergedStored,
     ...defaults.filter(item => !knownTokens.has(videoPricingModelToken(item.model))),
   ];
 };
@@ -371,6 +415,7 @@ export function calculateVideoRequestCredits(
   duration = 15,
   resolution = '720p',
   count = 1,
+  references: VideoReferenceCreditInput = {},
 ) {
   const safeDuration = Math.max(1, Math.ceil(Number(duration) || 15));
   const safeCount = Math.max(1, Math.ceil(Number(count) || 1));
@@ -378,7 +423,6 @@ export function calculateVideoRequestCredits(
   const resolutionKey = String(resolution || '720p').trim().toLowerCase() || '720p';
   const countKey = String(safeCount);
   const countOverride = price?.creditsByCount?.[countKey];
-  if (countOverride !== undefined) return BigInt(countOverride);
 
   const perSecond = BigInt(price?.creditsPerSecond ?? price?.credits ?? fallbackPerSecond);
   const durationCredits = price?.creditsByDuration?.[durationKey] !== undefined
@@ -386,11 +430,29 @@ export function calculateVideoRequestCredits(
     : perSecond * BigInt(safeDuration);
   const perVideo = BigInt(price?.creditsPerVideo ?? '0');
   const resolutionSurchargePerSecond = BigInt(price?.creditsByResolution?.[resolutionKey] ?? '0');
-  return (
-    durationCredits
-    + perVideo
-    + resolutionSurchargePerSecond * BigInt(safeDuration)
-  ) * BigInt(safeCount);
+  const outputCredits = countOverride !== undefined
+    ? BigInt(countOverride)
+    : (
+      durationCredits
+      + perVideo
+      + resolutionSurchargePerSecond * BigInt(safeDuration)
+    ) * BigInt(safeCount);
+
+  const imageCount = Math.max(0, Math.floor(Number(references.imageCount) || 0));
+  const videoCount = Math.max(0, Math.floor(Number(references.videoCount) || 0));
+  const includedReferenceImages = Math.max(0, Math.floor(Number(price?.includedReferenceImages) || 0));
+  const extraReferenceImageCount = Math.max(0, imageCount - includedReferenceImages);
+  const extraReferenceImageCredits = BigInt(price?.creditsPerExtraReferenceImage ?? '0')
+    * BigInt(extraReferenceImageCount);
+  const referenceVideoCreditsPerSecond = BigInt(price?.creditsPerReferenceVideoSecond ?? '0')
+    + BigInt(price?.referenceVideoCreditsByResolution?.[resolutionKey] ?? '0');
+  const referenceVideoCredits = referenceVideoCreditsPerSecond
+    * BigInt(safeDuration)
+    * BigInt(videoCount);
+
+  // The provider receives the same references once for every requested output.
+  return outputCredits
+    + (extraReferenceImageCredits + referenceVideoCredits) * BigInt(safeCount);
 }
 
 export async function configuredVideoRequestCredits(
@@ -399,6 +461,7 @@ export async function configuredVideoRequestCredits(
   duration?: number,
   resolution?: string,
   count = 1,
+  references: VideoReferenceCreditInput = {},
 ) {
   const pricing = await getAiPricingConfig(prisma);
   const price = pricing.videoModels.find(
@@ -410,5 +473,6 @@ export async function configuredVideoRequestCredits(
     duration,
     resolution,
     count,
+    references,
   );
 }

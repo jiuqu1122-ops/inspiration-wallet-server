@@ -80,6 +80,10 @@ const videoModelPriceSchema = z.object({
   creditsByDuration: z.record(z.string().trim().min(1).max(20), pricingCreditsSchema).optional(),
   creditsByResolution: z.record(z.string().trim().min(1).max(20), pricingCreditsSchema).optional(),
   creditsByCount: z.record(z.string().trim().min(1).max(20), pricingCreditsSchema).optional(),
+  includedReferenceImages: z.number().int().min(0).max(100).optional(),
+  creditsPerExtraReferenceImage: pricingCreditsSchema.optional(),
+  creditsPerReferenceVideoSecond: pricingCreditsSchema.optional(),
+  referenceVideoCreditsByResolution: z.record(z.string().trim().min(1).max(20), pricingCreditsSchema).optional(),
 }).strict();
 const pricingSchema = z.object({
   agentRequestCredits: pricingCreditsSchema,

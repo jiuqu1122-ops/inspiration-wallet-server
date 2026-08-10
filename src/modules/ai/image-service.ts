@@ -3313,6 +3313,10 @@ async function reserveVideo(prisma: PrismaClient, input: VideoInput) {
     input.duration,
     input.resolution,
     input.count,
+    {
+      imageCount: input.inputImages.length,
+      videoCount: input.inputVideos.length,
+    },
   );
   return prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({ where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } } });
