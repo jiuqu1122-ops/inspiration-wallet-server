@@ -2202,16 +2202,33 @@ const VIDEO_TASK_ID_KEYS = [
   'taskid',
   'video_generation_id',
   'videoGenerationId',
+  'video_id',
+  'videoId',
+  'job_id',
+  'jobId',
+  'generation_id',
+  'generationId',
 ] as const;
 
 function directVideoTaskIds(value: Record<string, unknown>) {
-  return VIDEO_TASK_ID_KEYS
+  const taskIds = VIDEO_TASK_ID_KEYS
     .map(key => value[key])
     .filter((candidate): candidate is string | number => (
       typeof candidate === 'string' || typeof candidate === 'number'
     ))
     .map(candidate => String(candidate).trim())
     .filter(Boolean);
+  const genericId = value.id;
+  if (typeof genericId === 'string' || typeof genericId === 'number') {
+    const normalized = String(genericId).trim();
+    if (normalized) taskIds.push(normalized);
+  }
+  return Array.from(new Set(taskIds));
+}
+
+function hasDirectVideoTaskState(value: Record<string, unknown>) {
+  return ['status', 'state', 'task_status', 'taskStatus', 'phase']
+    .some(key => typeof value[key] === 'string');
 }
 
 function pruneMismatchedVideoTasks(
@@ -2227,7 +2244,17 @@ function pruneMismatchedVideoTasks(
   }
 
   const record = value as Record<string, unknown>;
-  const taskIds = directVideoTaskIds(record);
+  const taskIds = VIDEO_TASK_ID_KEYS
+    .map(key => record[key])
+    .filter((candidate): candidate is string | number => (
+      typeof candidate === 'string' || typeof candidate === 'number'
+    ))
+    .map(candidate => String(candidate).trim())
+    .filter(Boolean);
+  if (hasDirectVideoTaskState(record)
+    && (typeof record.id === 'string' || typeof record.id === 'number')) {
+    taskIds.push(String(record.id).trim());
+  }
   if (taskIds.length > 0 && !taskIds.includes(expectedTaskId)) return undefined;
 
   return Object.fromEntries(Object.entries(record).flatMap(([key, nested]) => {
@@ -2272,6 +2299,20 @@ export function selectVideoTaskPayload(value: unknown, taskId: string): unknown 
   const expectedTaskId = String(taskId || '').trim();
   if (!expectedTaskId) return undefined;
   return findVideoTaskPayload(value, expectedTaskId);
+}
+
+/**
+ * A newly accepted MiniMax task can be briefly absent from the provider's
+ * query response. Keep polling with a task-scoped, media-free placeholder
+ * instead of treating historical rows as the current task or failing early.
+ */
+export function scopeMiniMaxVideoStatusPayload(value: unknown, taskId: string): unknown {
+  const expectedTaskId = String(taskId || '').trim();
+  if (!expectedTaskId) return undefined;
+  return selectVideoTaskPayload(value, expectedTaskId) ?? {
+    task_id: expectedTaskId,
+    status: 'processing',
+  };
 }
 
 function getFailure(value: unknown, depth = 0): string {
@@ -3500,21 +3541,19 @@ export async function executeWalletVideoStatus(
         ? `/api/minimax/v2/query/video_generation?task_id=${encodeURIComponent(input.taskId)}`
       : `/v1/video/generations/${encodeURIComponent(input.taskId)}`;
   const upstreamStatus = await providerRequest(provider, secrets, path);
-  const waited = provider.kind === 'MINIMAX'
+  const selectedMiniMaxStatus = provider.kind === 'MINIMAX'
     ? selectVideoTaskPayload(upstreamStatus, input.taskId)
-    : upstreamStatus;
-  if (provider.kind === 'MINIMAX' && waited === undefined) {
+    : undefined;
+  if (provider.kind === 'MINIMAX' && selectedMiniMaxStatus === undefined) {
     console.warn('[minimax_video_status_task_mismatch]', {
       provider: provider.name,
       expectedTaskId: input.taskId,
       receivedTaskId: getTaskId(upstreamStatus) || undefined,
     });
-    throw new CloudAiError(
-      'video_status_task_mismatch',
-      `H3 状态响应未包含当前任务：${input.taskId}`,
-      502,
-    );
   }
+  const waited = provider.kind === 'MINIMAX'
+    ? scopeMiniMaxVideoStatusPayload(upstreamStatus, input.taskId)
+    : upstreamStatus;
   const failure = getFailure(waited);
   if (failure) {
     if (input.clientRequestId) {

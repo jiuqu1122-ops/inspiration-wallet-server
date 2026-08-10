@@ -44,6 +44,7 @@ import {
   resolveXaisModel,
   resolveXaisWorkerRatio,
   runXaisWorkerTask,
+  scopeMiniMaxVideoStatusPayload,
   selectVideoTaskPayload,
   selectVideoProvider,
   sizeFromRatio,
@@ -239,6 +240,41 @@ describe('Mikoto Seedance model mapping', () => {
     const selected = selectVideoTaskPayload(response, 'current-task');
     expect(selected).toEqual(currentTask);
     expect(collectGeneratedVideoStrings(selected)).toEqual([]);
+  });
+
+  it('recognizes the generic id field returned by MiniMax H3 status rows', () => {
+    const currentTask = {
+      id: 'current-task',
+      status: 'processing',
+    };
+    const selected = selectVideoTaskPayload({
+      tasks: [
+        {
+          id: 'old-task',
+          status: 'failed',
+          error: 'HTTP 402: H3 积分余额不足 (1008)',
+          video_url: 'https://media.example/old.mp4',
+        },
+        currentTask,
+      ],
+    }, 'current-task');
+
+    expect(selected).toEqual(currentTask);
+    expect(collectGeneratedVideoStrings(selected)).toEqual([]);
+  });
+
+  it('keeps polling safely while a newly accepted H3 task is not listed yet', () => {
+    const scoped = scopeMiniMaxVideoStatusPayload({
+      tasks: [{
+        id: 'old-task',
+        status: 'failed',
+        error: 'HTTP 402: H3 积分余额不足 (1008)',
+        video_url: 'https://media.example/old.mp4',
+      }],
+    }, 'current-task');
+
+    expect(scoped).toEqual({ task_id: 'current-task', status: 'processing' });
+    expect(collectGeneratedVideoStrings(scoped)).toEqual([]);
   });
 
   it('prunes nested historical H3 tasks from a matching response root', () => {
