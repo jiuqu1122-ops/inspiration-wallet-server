@@ -44,6 +44,7 @@ import {
   resolveXaisModel,
   resolveXaisWorkerRatio,
   runXaisWorkerTask,
+  selectVideoTaskPayload,
   selectVideoProvider,
   sizeFromRatio,
   stageXaisPublicReference,
@@ -214,6 +215,51 @@ describe('Mikoto Seedance model mapping', () => {
       upstream,
     });
     expect(mirror).toHaveBeenCalledWith('https://media.example/output.mp4');
+  });
+
+  it('isolates the requested H3 task from failed history and old video URLs', () => {
+    const currentTask = {
+      task_id: 'current-task',
+      status: 'processing',
+    };
+    const response = {
+      status: 'processing',
+      walletVideoResults: ['https://api.unmind.art/v1/ai/video-results/old.mp4'],
+      tasks: [
+        {
+          task_id: 'old-task',
+          status: 'failed',
+          error: 'HTTP 402: H3 积分余额不足 (1008)',
+          video_url: 'https://media.example/old.mp4',
+        },
+        currentTask,
+      ],
+    };
+
+    const selected = selectVideoTaskPayload(response, 'current-task');
+    expect(selected).toEqual(currentTask);
+    expect(collectGeneratedVideoStrings(selected)).toEqual([]);
+  });
+
+  it('prunes nested historical H3 tasks from a matching response root', () => {
+    const selected = selectVideoTaskPayload({
+      task_id: 'current-task',
+      status: 'succeeded',
+      data: { video_url: 'https://media.example/current.mp4' },
+      history: [
+        {
+          task_id: 'old-task',
+          status: 'succeeded',
+          video_url: 'https://media.example/old.mp4',
+        },
+      ],
+    }, 'current-task');
+
+    expect(collectGeneratedVideoStrings(selected)).toEqual([
+      'https://media.example/current.mp4',
+    ]);
+    expect(selectVideoTaskPayload({ tasks: [{ task_id: 'old-task' }] }, 'current-task'))
+      .toBeUndefined();
   });
 });
 

@@ -2196,6 +2196,84 @@ const isFailureTaskState = (state: string) => (
   || /(?:^|_)(?:failed|failure|error|cancelled|canceled|rejected|aborted|expired|timeout|timed_out)(?:_|$)/.test(state)
 );
 
+const VIDEO_TASK_ID_KEYS = [
+  'task_id',
+  'taskId',
+  'taskid',
+  'video_generation_id',
+  'videoGenerationId',
+] as const;
+
+function directVideoTaskIds(value: Record<string, unknown>) {
+  return VIDEO_TASK_ID_KEYS
+    .map(key => value[key])
+    .filter((candidate): candidate is string | number => (
+      typeof candidate === 'string' || typeof candidate === 'number'
+    ))
+    .map(candidate => String(candidate).trim())
+    .filter(Boolean);
+}
+
+function pruneMismatchedVideoTasks(
+  value: unknown,
+  expectedTaskId: string,
+  depth = 0,
+): unknown {
+  if (!value || typeof value !== 'object' || depth > 10) return value;
+  if (Array.isArray(value)) {
+    return value
+      .map(item => pruneMismatchedVideoTasks(item, expectedTaskId, depth + 1))
+      .filter(item => item !== undefined);
+  }
+
+  const record = value as Record<string, unknown>;
+  const taskIds = directVideoTaskIds(record);
+  if (taskIds.length > 0 && !taskIds.includes(expectedTaskId)) return undefined;
+
+  return Object.fromEntries(Object.entries(record).flatMap(([key, nested]) => {
+    const scoped = pruneMismatchedVideoTasks(nested, expectedTaskId, depth + 1);
+    return scoped === undefined ? [] : [[key, scoped]];
+  }));
+}
+
+function findVideoTaskPayload(
+  value: unknown,
+  expectedTaskId: string,
+  depth = 0,
+): unknown {
+  if (!value || typeof value !== 'object' || depth > 10) return undefined;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const matched = findVideoTaskPayload(item, expectedTaskId, depth + 1);
+      if (matched !== undefined) return matched;
+    }
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+  // Prefer the narrowest matching task object over an outer response wrapper.
+  // H3 may return current and historical jobs together in one response.
+  for (const nested of Object.values(record)) {
+    if (!nested || typeof nested !== 'object') continue;
+    const matched = findVideoTaskPayload(nested, expectedTaskId, depth + 1);
+    if (matched !== undefined) return matched;
+  }
+
+  return directVideoTaskIds(record).includes(expectedTaskId)
+    ? pruneMismatchedVideoTasks(record, expectedTaskId, depth)
+    : undefined;
+}
+
+/**
+ * Select only the H3 task requested by the client. This keeps historical task
+ * failures and result URLs from affecting the current task or its OSS mirror.
+ */
+export function selectVideoTaskPayload(value: unknown, taskId: string): unknown {
+  const expectedTaskId = String(taskId || '').trim();
+  if (!expectedTaskId) return undefined;
+  return findVideoTaskPayload(value, expectedTaskId);
+}
+
 function getFailure(value: unknown, depth = 0): string {
   if (!value || typeof value !== 'object' || depth > 8) return '';
   if (Array.isArray(value)) {
@@ -3421,7 +3499,22 @@ export async function executeWalletVideoStatus(
       : provider.kind === 'MINIMAX'
         ? `/api/minimax/v2/query/video_generation?task_id=${encodeURIComponent(input.taskId)}`
       : `/v1/video/generations/${encodeURIComponent(input.taskId)}`;
-  const waited = await providerRequest(provider, secrets, path);
+  const upstreamStatus = await providerRequest(provider, secrets, path);
+  const waited = provider.kind === 'MINIMAX'
+    ? selectVideoTaskPayload(upstreamStatus, input.taskId)
+    : upstreamStatus;
+  if (provider.kind === 'MINIMAX' && waited === undefined) {
+    console.warn('[minimax_video_status_task_mismatch]', {
+      provider: provider.name,
+      expectedTaskId: input.taskId,
+      receivedTaskId: getTaskId(upstreamStatus) || undefined,
+    });
+    throw new CloudAiError(
+      'video_status_task_mismatch',
+      `H3 状态响应未包含当前任务：${input.taskId}`,
+      502,
+    );
+  }
   const failure = getFailure(waited);
   if (failure) {
     if (input.clientRequestId) {
