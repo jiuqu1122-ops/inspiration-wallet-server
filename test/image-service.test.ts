@@ -12,6 +12,7 @@ import {
   filterProviderImageModels,
   generateBigmodelBananaImages,
   generateMikotoBananaImages,
+  generateUselgGeminiImages,
   generateNewApiImages,
   getWalletImageGenerationByRequest,
   imageCapabilityForModel,
@@ -41,6 +42,8 @@ import {
   resolveMikotoVideoModel,
   resolveNewApiImageModel,
   resolveNewApiImageResponse,
+  resolveUselgImageModel,
+  resolveUselgImageResponse,
   resolveXaisModel,
   resolveXaisWorkerRatio,
   runXaisWorkerTask,
@@ -300,7 +303,7 @@ describe('Mikoto Seedance model mapping', () => {
 });
 
 describe('dual-protocol image channels', () => {
-  it('keeps Bigmodel and Mikoto image routes available when LLM is also enabled', () => {
+  it('keeps Bigmodel, Mikoto, and USELG image routes available when LLM is also enabled', () => {
     expect(providerCanServeImageAlongsideAgent({
       kind: 'BIGMODEL',
       capabilities: ['LLM', 'IMAGE_NANO_BANANA'],
@@ -308,6 +311,10 @@ describe('dual-protocol image channels', () => {
     expect(providerCanServeImageAlongsideAgent({
       kind: 'MIKOTO',
       capabilities: ['LLM', 'IMAGE_NANO_BANANA'],
+    })).toBe(true);
+    expect(providerCanServeImageAlongsideAgent({
+      kind: 'USELG',
+      capabilities: ['LLM', 'IMAGE_GPT'],
     })).toBe(true);
     expect(providerCanServeImageAlongsideAgent({
       kind: 'NEW_API',
@@ -524,6 +531,33 @@ describe('wallet image provider normalization', () => {
     )).resolves.toEqual([`data:image/png;base64,${generated}`]);
   });
 
+  it('calls USELG Gemini through its native v1beta endpoint', async () => {
+    const generated = 'iVBORw0KGgo' + 'c'.repeat(40);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('https://api.ai-media.vip/v1beta/models/gemini-3.1-flash-image-preview:generateContent');
+      expect(new Headers(init?.headers).get('x-goog-api-key')).toBe('sk-uselg');
+      const body = JSON.parse(String(init?.body));
+      expect(body.generationConfig.responseModalities).toEqual(['TEXT', 'IMAGE']);
+      expect(body.generationConfig.imageConfig).toEqual({ aspectRatio: '16:9', imageSize: '2K' });
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: generated } }] } }],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateUselgGeminiImages(
+      { baseUrl: 'https://api.ai-media.vip', name: 'uselg', kind: 'USELG' } as never,
+      { apiKey: 'sk-uselg', headers: {} },
+      {
+        userId: 'user-1', clientRequestId: 'request-uselg', model: 'Nano Banana 2', prompt: 'a red apple',
+        inputImages: [], aspectRatio: '16:9', resolution: '2k', outputFormat: 'png', count: 1,
+      },
+    )).resolves.toEqual([`data:image/png;base64,${generated}`]);
+  });
+
   it('extracts URL and Base64 image results while excluding reference inputs', () => {
     const reference = 'https://assets.example.test/reference.png';
     const images = uniqueImages({
@@ -714,6 +748,15 @@ describe('wallet image provider normalization', () => {
     expect(resolveMikotoImageModel('Nano Banana 2')).toBe('gemini-3.1-flash-image-preview');
     expect(resolveMikotoImageModel('GPT Image 2')).toBe('gpt-image-2');
     expect(resolveImageModel({ kind: 'MIKOTO', defaultModel: 'Nano Banana Pro' }, '')).toBe('gemini-3-pro-image-preview');
+  });
+
+  it('normalizes public image models to USELG protocol-specific model IDs', () => {
+    expect(resolveUselgImageModel('Nano Banana Pro')).toBe('gemini-3-pro-image-preview');
+    expect(resolveUselgImageModel('Nano Banana 2')).toBe('gemini-3.1-flash-image-preview');
+    expect(resolveUselgImageModel('GPT Image 2')).toBe('gpt-image-2');
+    expect(resolveUselgImageModel('grok-imagine-image-quality', true)).toBe('grok-imagine-image-edit');
+    expect(resolveImageModel({ kind: 'USELG', defaultModel: 'Nano Banana Pro' }, ''))
+      .toBe('gemini-3-pro-image-preview');
   });
 
   it('mirrors inline and stable image results for every non-XAIS image channel', async () => {
@@ -1423,6 +1466,37 @@ describe('wallet image provider normalization', () => {
       .toBe('https://provider.example/v1/images/generations/task-123');
     expect(fetchMock.mock.calls[1]?.[0])
       .toBe('https://provider.example/v1/images/task-123/content');
+  });
+
+  it('polls a USELG async task through status_url and returns its signed asset', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('https://api.ai-media.vip/v1/images/tasks/imgtask-123?view=summary');
+      expect(new Headers(init?.headers).get('authorization')).toBe('Bearer sk-uselg');
+      return new Response(JSON.stringify({
+        task_id: 'imgtask-123',
+        status: 'success',
+        assets: [{ signed_url: 'https://cdn.example.test/generated.png' }],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(resolveUselgImageResponse(
+      { baseUrl: 'https://api.ai-media.vip', name: 'uselg', kind: 'USELG' } as never,
+      { apiKey: 'sk-uselg', headers: {} },
+      {
+        task_id: 'imgtask-123',
+        status: 'queued',
+        status_url: '/v1/images/tasks/imgtask-123?view=summary',
+        poll_after_ms: 2_000,
+      },
+      [],
+      1,
+      async () => {},
+    )).resolves.toEqual(['https://cdn.example.test/generated.png']);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('keeps async task content images when the content endpoint reports a post-processing error', async () => {

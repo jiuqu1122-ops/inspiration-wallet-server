@@ -18,6 +18,11 @@ describe('provider URL safety and normalization', () => {
       .toBe('https://api.mikoto.vip');
   });
 
+  it('normalizes the configured USELG /v1 URL to the channel root', () => {
+    expect(normalizeProviderBaseUrl('USELG', 'https://api.ai-media.vip/v1'))
+      .toBe('https://api.ai-media.vip');
+  });
+
   it('normalizes a Bigmodel native Gemini endpoint to the channel root', () => {
     expect(normalizeProviderBaseUrl('BIGMODEL', 'https://st.smart-agi.com/v1beta/models/gemini-3-pro-image-preview:generateContent'))
       .toBe('https://st.smart-agi.com');

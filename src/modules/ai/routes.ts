@@ -67,7 +67,7 @@ const isMiniMaxH3VideoModel = (model: string) => (
 
 const imageSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
-  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'bigmodel', 'openai-compatible', 'custom']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'bigmodel', 'uselg', 'openai-compatible', 'custom']).nullish()
     .transform((value) => value ?? undefined),
   providerChannelId: z.string().trim().min(1).max(128).nullish()
     .transform((value) => value ?? undefined),
@@ -126,7 +126,7 @@ const videoStatusSchema = z.object({
 }).strict();
 
 const imageModelsQuerySchema = z.object({
-  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'bigmodel', 'openai-compatible', 'custom']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'bigmodel', 'uselg', 'openai-compatible', 'custom']).nullish()
     .transform((value) => value ?? undefined),
 }).strict();
 

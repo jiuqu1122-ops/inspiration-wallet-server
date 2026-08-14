@@ -44,6 +44,7 @@ enum AiCapability {
   IMAGE_NANO_BANANA_DUAL_2K
   IMAGE_GPT
   IMAGE_GPT_1K
+  IMAGE_GROK
   VIDEO
   VIDEO_MINIMAX
 }
@@ -85,6 +86,7 @@ enum AiProviderKind {
   MIKOTO
   BIGMODEL
   MINIMAX
+  USELG
 }
 
 enum AiProviderStatus {

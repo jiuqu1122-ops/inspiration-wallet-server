@@ -544,6 +544,8 @@ export async function getProviderBalance(prisma: PrismaClient, providerId: strin
 
   const candidates = provider.kind === 'XAIS'
     ? [{ name: 'XAIS /xais/userProfile', path: '/xais/userProfile' }]
+    : provider.kind === 'USELG'
+      ? [{ name: 'uselg /v1/models', path: '/v1/models' }]
     : provider.kind === 'MIKOTO'
       ? [{ name: 'Mikoto /v1/models', path: '/v1/models' }]
     : provider.kind === 'MINIMAX'
@@ -619,7 +621,8 @@ function isLikelyTextModel(model: string) {
 function isOpenAiImageCapability(capability: AiCapability) {
   return capability === 'IMAGE'
     || capability === 'IMAGE_GPT'
-    || capability === 'IMAGE_GPT_1K';
+    || capability === 'IMAGE_GPT_1K'
+    || capability === 'IMAGE_GROK';
 }
 
 function isNativeBigmodelImageCapability(capability: AiCapability) {

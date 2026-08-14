@@ -114,7 +114,7 @@ npm run start
 npm run start:worker
 ```
 
-`POST /v1/ai/images/generations` 需要 Access Token，接受客户端幂等 ID、渠道类型、模型、提示词、参考图、比例、分辨率、格式、透明背景和数量。服务器按模型自动匹配 `IMAGE_NANO_BANANA`、`IMAGE_NANO_BANANA_2`、`IMAGE_GPT` 专用渠道；没有专用渠道时回退到旧的 `IMAGE` 通用渠道，传统渠道默认排除同时声明 `LLM` 的文字渠道，Bigmodel/Mikoto 则会按图片能力单独路由。客户端不需要传新的渠道选择参数。服务端会把主程序的 Nano Banana Pro、Nano Banana 2、GPT Image 2 显示名或旧别名归一化为标准 NewAPI 模型 ID，其他自定义模型保持原样。NewAPI 文生图调用 `/v1/images/generations`，有参考图时优先以临时磁盘流式 multipart 调用 `/v1/images/edits`；如果渠道明确拒绝旧参考图字段或 edits 协议，则自动回退到 `/v1/images/generations` 的 `image` / `images` JSON 形式。请求同时携带比例与精确像素尺寸，4K、多参考图和批量请求使用异步任务并轮询结果。XAIS 保持独立的图片协议。生图按模型族与清晰度定价：Nano Banana Pro 2K/4K 为 18/20，Nano Banana 2 2K/4K 为 15/18，GPT Image 2 1K/2K/4K 为 10/15/18，GPT Image 2 H 2K/4K 为 30/35；未列入价格表的模型使用 `IMAGE_REQUEST_CREDITS`。PNG 请求会向支持的上游透传透明背景参数并加入真实 Alpha 通道约束。服务按单价乘请求数量预扣，成功后按实际返回图片数结算，少返回的部分自动退回，失败则释放全部预扣额度。上游 API Key 只在服务器解密和使用。
+`POST /v1/ai/images/generations` 需要 Access Token，接受客户端幂等 ID、渠道类型、模型、提示词、参考图、比例、分辨率、格式、透明背景和数量。服务器按模型自动匹配 `IMAGE_NANO_BANANA`、`IMAGE_NANO_BANANA_2`、`IMAGE_GPT`、`IMAGE_GROK` 专用渠道；没有专用渠道时回退到旧的 `IMAGE` 通用渠道，传统渠道默认排除同时声明 `LLM` 的文字渠道，Bigmodel/Mikoto/USELG 则会按图片能力单独路由。客户端不需要识别或传递 USELG 类型，只提交现有公开模型和服务端返回的 `providerChannelId`；模型列表中的 USELG 渠道继续以 `NEW_API` 兼容类型返回。服务端会把主程序的 Nano Banana Pro、Nano Banana 2、GPT Image 2 显示名或旧别名归一化为各渠道的实际模型 ID，其他自定义模型保持原样。USELG 的 GPT/Grok 图片调用 `/v1/images/generations` 或 `/v1/images/edits`，Gemini 图片调用原生 `/v1beta/models/{model}:generateContent`，异步响应按 `status_url` 轮询并从 `assets` 下载结果。NewAPI 文生图调用 `/v1/images/generations`，有参考图时优先以临时磁盘流式 multipart 调用 `/v1/images/edits`；如果渠道明确拒绝旧参考图字段或 edits 协议，则自动回退到 `/v1/images/generations` 的 `image` / `images` JSON 形式。请求同时携带比例与精确像素尺寸，4K、多参考图和批量请求使用异步任务并轮询结果。XAIS 保持独立的图片协议。生图按模型族与清晰度定价：Nano Banana Pro 2K/4K 为 18/20，Nano Banana 2 2K/4K 为 15/18，GPT Image 2 1K/2K/4K 为 10/15/18，GPT Image 2 H 2K/4K 为 30/35；未列入价格表的模型使用 `IMAGE_REQUEST_CREDITS`。PNG 请求会向支持的上游透传透明背景参数并加入真实 Alpha 通道约束。服务按单价乘请求数量预扣，成功后按实际返回图片数结算，少返回的部分自动退回，失败则释放全部预扣额度。上游 API Key 只在服务器解密和使用。
 
 `POST /v1/ai/videos` 与 `GET /v1/ai/videos/:taskId` 需要 Access Token。创建视频任务时服务器会选择已启用且声明 `VIDEO` 能力的 NewAPI/XAIS 渠道，按 `VIDEO_REQUEST_CREDITS × 请求数量` 预扣，创建上游任务成功后结算，创建失败自动释放；客户端轮询到上游明确失败状态时，服务端会按原请求 ID 一次性退款，重复轮询不会重复退款。客户端只轮询本服务，不接触上游地址或 API Key。
 
@@ -125,7 +125,7 @@ npm run start:worker
 
 ## 管理员额度工作台
 
-`/v1/admin` 只供私有 Tauri 工作台使用。服务器仅保存管理员密钥的 SHA-256 哈希；工作台可以管理注册用户的显示名、状态、授权到期日和钱包，所有账户统一为高级版。工作台还可以生成额度兑换码、查看兑换记录，创建、更新、启停和测试 NewAPI/XAIS/Mikoto/Bigmodel 渠道，并设置默认 Agent 模型；声明 `LLM` 或 `VISION` 的渠道会在测试时执行一次最小 OpenAI 兼容推理；永远无法读取已保存的完整 API Key。
+`/v1/admin` 只供私有 Tauri 工作台使用。服务器仅保存管理员密钥的 SHA-256 哈希；工作台可以管理注册用户的显示名、状态、授权到期日和钱包，所有账户统一为高级版。工作台还可以生成额度兑换码、查看兑换记录，创建、更新、启停和测试 NewAPI/XAIS/Mikoto/Bigmodel/USELG 渠道，并设置默认 Agent 模型；声明 `LLM` 或 `VISION` 的渠道会在测试时执行一次最小 OpenAI 兼容推理；永远无法读取已保存的完整 API Key。
 
 桌面端已有的本地 API 配置不会上传或迁移到服务器，仍由用户电脑本地保存并可用于查询本地 XAIS 余额。登录云账户后，画布图片和视频默认通过服务器渠道和授权钱包；没有云账户时继续使用原有本地 API 模式。用户的上游密钥不会离开本机，服务器渠道密钥只保存在服务器的加密存储中。
 

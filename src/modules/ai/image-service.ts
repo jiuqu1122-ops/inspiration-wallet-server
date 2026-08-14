@@ -105,6 +105,9 @@ const NEW_API_IMAGE_MODEL_MAP: Record<string, string> = {
   gptimage2: 'gpt-image-2',
 };
 
+const USELG_GROK_GENERATION_MODEL = 'grok-imagine-image-quality';
+const USELG_GROK_EDIT_MODEL = 'grok-imagine-image-edit';
+
 export function imageUnitCredits(model: string, resolution?: string) {
   return defaultImageUnitCredits(model, resolution);
 }
@@ -126,11 +129,15 @@ const IMAGE_PROVIDER_CAPABILITIES: AiCapability[] = [
   'IMAGE_NANO_BANANA_PRO_1K',
   'IMAGE_GPT',
   'IMAGE_GPT_1K',
+  'IMAGE_GROK',
 ];
 const VIDEO_PROVIDER_CAPABILITIES: AiCapability[] = ['VIDEO', 'VIDEO_MINIMAX'];
 
 export function imageCapabilityForModel(model: string, resolution?: string): AiCapability {
   const token = imageModelToken(model);
+  if (token.includes('grokimagineimage') || token.includes('grokimage')) {
+    return 'IMAGE_GROK';
+  }
   if (token.includes('gptimage') || token.includes('image2') || token.includes('img2')) {
     const requestedResolution = String(resolution || '').trim().toLowerCase();
     if (requestedResolution === '1k' || token.includes('1k')) return 'IMAGE_GPT_1K';
@@ -203,7 +210,7 @@ export function filterProviderImageModels(
 export type ImageInput = {
   userId: string;
   clientRequestId: string;
-  provider?: 'new-api' | 'xais-chat' | 'mikoto' | 'bigmodel' | 'openai-compatible' | 'custom' | undefined;
+  provider?: 'new-api' | 'xais-chat' | 'mikoto' | 'bigmodel' | 'uselg' | 'openai-compatible' | 'custom' | undefined;
   providerChannelId?: string | undefined;
   model: string;
   prompt: string;
@@ -270,7 +277,7 @@ async function listVideoProviders(prisma: PrismaClient) {
 }
 
 /**
- * Bigmodel and Mikoto expose separate native image and OpenAI-compatible text
+ * Bigmodel, Mikoto, and uselg expose separate native image and OpenAI-compatible text
  * routes, so one channel may safely advertise both capabilities. Other
  * providers keep the historical isolation between Agent and image channels.
  */
@@ -283,6 +290,7 @@ export function providerCanServeImageAlongsideAgent(
   if (!hasImageCapability) return false;
   return provider.kind === 'BIGMODEL'
     || provider.kind === 'MIKOTO'
+    || provider.kind === 'USELG'
     || !provider.capabilities.includes('LLM');
 }
 
@@ -338,12 +346,14 @@ export function chooseProviderForCapability<T extends Pick<AiProviderChannel, 'c
 export function resolveImageModel(
   provider: Pick<AiProviderChannel, 'defaultModel' | 'kind'>,
   requestedModel: string,
+  hasInputImages = false,
 ) {
   const requested = requestedModel.trim();
   if (requested) {
     if (provider.kind === 'NEW_API') return resolveNewApiImageModel(requested);
     if (provider.kind === 'BIGMODEL') return resolveBigmodelImageModel(requested);
     if (provider.kind === 'MIKOTO') return resolveMikotoImageModel(requested);
+    if (provider.kind === 'USELG') return resolveUselgImageModel(requested, hasInputImages);
     return requested;
   }
   const configured = provider.defaultModel?.trim();
@@ -351,12 +361,13 @@ export function resolveImageModel(
     if (provider.kind === 'NEW_API') return resolveNewApiImageModel(configured);
     if (provider.kind === 'BIGMODEL') return resolveBigmodelImageModel(configured);
     if (provider.kind === 'MIKOTO') return resolveMikotoImageModel(configured);
+    if (provider.kind === 'USELG') return resolveUselgImageModel(configured, hasInputImages);
     return configured;
   }
   throw new CloudAiError('provider_model_missing', '生图请求和渠道都没有配置模型', 503);
 }
 
-function upstreamHeaders(secrets: ProviderSecrets) {
+function upstreamHeaders(secrets: ProviderSecrets, extraHeaders?: Record<string, string>) {
   const headers = new Headers({
     accept: 'application/json, text/plain, */*',
     authorization: `Bearer ${secrets.apiKey}`,
@@ -364,7 +375,18 @@ function upstreamHeaders(secrets: ProviderSecrets) {
     'user-agent': 'Inspiration-Wallet-Server/1',
   });
   for (const [name, value] of Object.entries(secrets.headers)) headers.set(name, value);
+  for (const [name, value] of Object.entries(extraHeaders ?? {})) headers.set(name, value);
   return headers;
+}
+
+function providerRequestUrl(provider: Pick<AiProviderChannel, 'baseUrl'>, pathOrUrl: string) {
+  if (!/^https?:\/\//i.test(pathOrUrl)) return providerEndpoint(provider.baseUrl, pathOrUrl);
+  const base = new URL(provider.baseUrl);
+  const target = new URL(pathOrUrl);
+  if (target.origin !== base.origin) {
+    throw new UpstreamImageError(502, 'Upstream task URL changed origin unexpectedly');
+  }
+  return target.toString();
 }
 
 function parseProviderValue(text: string): unknown {
@@ -387,14 +409,15 @@ async function providerRequest(
   path: string,
   body?: unknown,
   timeoutOverrideMs?: number,
+  extraHeaders?: Record<string, string>,
 ) {
   const controller = new AbortController();
   const timeoutMs = timeoutOverrideMs ?? (/(?:video|workerTask)/i.test(path) ? 10 * 60_000 : 4 * 60_000);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(providerEndpoint(provider.baseUrl, path), {
+    const response = await fetch(providerRequestUrl(provider, path), {
       method: body === undefined ? 'GET' : 'POST',
-      headers: upstreamHeaders(secrets),
+      headers: upstreamHeaders(secrets, extraHeaders),
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       redirect: 'error',
       signal: controller.signal,
@@ -483,6 +506,12 @@ export function collectProviderModelIds(value: unknown) {
     .slice(0, 200);
 }
 
+function publicWalletImageProviderKind(provider: Pick<AiProviderChannel, 'kind'>) {
+  // USELG is an internal routing channel. The desktop client only needs the
+  // existing OpenAI-compatible protocol hint plus providerChannelId.
+  return provider.kind === 'USELG' ? 'NEW_API' as const : provider.kind;
+}
+
 export async function listWalletImageModels(
   prisma: PrismaClient,
 ) {
@@ -503,15 +532,19 @@ export async function listWalletImageModels(
         : await providerRequest(provider, secrets, '/v1/models', undefined, 15_000);
       const models = provider.kind === 'BIGMODEL'
         ? bigmodelConfiguredImageModels(provider)
-        : filterProviderImageModels(provider, collectProviderModelIds(value));
+        : provider.kind === 'USELG'
+          ? uselgConfiguredImageModels(provider, collectProviderModelIds(value))
+          : filterProviderImageModels(provider, collectProviderModelIds(value));
       const defaultModel = provider.defaultModel
         && providerSupportsImageModel(provider, provider.defaultModel)
-        ? provider.defaultModel
+        ? provider.kind === 'USELG'
+          ? resolveUselgImageModel(provider.defaultModel)
+          : provider.defaultModel
         : null;
       return {
         id: provider.id,
         name: provider.name,
-        provider: provider.kind,
+        provider: publicWalletImageProviderKind(provider),
         defaultModel,
         models,
         capabilities: provider.capabilities,
@@ -521,7 +554,7 @@ export async function listWalletImageModels(
       return {
         id: provider.id,
         name: provider.name,
-        provider: provider.kind,
+        provider: publicWalletImageProviderKind(provider),
         defaultModel: provider.defaultModel,
         models: [] as string[],
         capabilities: provider.capabilities,
@@ -571,7 +604,7 @@ async function bigmodelRequest(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), IMAGE_GENERATION_TIMEOUT_MS);
   try {
-    const response = await fetch(providerEndpoint(provider.baseUrl, path), {
+    const response = await fetch(providerRequestUrl(provider, path), {
       method: body === undefined ? 'GET' : 'POST',
       headers: bigmodelHeaders(secrets),
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -628,6 +661,57 @@ export function resolveMikotoImageModel(model: string) {
   return trimmed;
 }
 
+export function resolveUselgImageModel(model: string, hasInputImages = false) {
+  const trimmed = model.trim();
+  const token = imageModelToken(trimmed);
+  if (token.includes('grokimagineimage') || token.includes('grokimage')) {
+    return hasInputImages ? USELG_GROK_EDIT_MODEL : USELG_GROK_GENERATION_MODEL;
+  }
+  if (isNanoBananaProModelToken(token)) return 'gemini-3-pro-image-preview';
+  if (token.includes('nanobanana2')
+    || token.includes('gemini31flashimage')
+    || token.includes('gemini3flashimage')) {
+    return 'gemini-3.1-flash-image-preview';
+  }
+  if (token.includes('gptimage2') || token.includes('image2') || token.includes('img2')) {
+    return 'gpt-image-2';
+  }
+  return trimmed;
+}
+
+function uselgPublicImageModels(models: string[]) {
+  const normalized = models
+    .filter((model) => imageModelToken(model) !== imageModelToken(USELG_GROK_EDIT_MODEL))
+    .map((model) => resolveUselgImageModel(model));
+  return Array.from(new Set(normalized));
+}
+
+function uselgConfiguredImageModels(
+  provider: Pick<AiProviderChannel, 'capabilities' | 'defaultModel'>,
+  discoveredModels: string[],
+) {
+  const models = uselgPublicImageModels(discoveredModels);
+  const hasBananaDual2K = provider.capabilities.includes('IMAGE_NANO_BANANA_DUAL_2K')
+    || provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K');
+  if (provider.capabilities.includes('IMAGE_NANO_BANANA') || hasBananaDual2K) {
+    models.push('gemini-3-pro-image-preview');
+  }
+  if (provider.capabilities.includes('IMAGE_NANO_BANANA_2') || hasBananaDual2K) {
+    models.push('gemini-3.1-flash-image-preview');
+  }
+  if (provider.capabilities.includes('IMAGE_GPT')
+    || provider.capabilities.includes('IMAGE_GPT_1K')) {
+    models.push('gpt-image-2');
+  }
+  if (provider.capabilities.includes('IMAGE_GROK')) {
+    models.push(USELG_GROK_GENERATION_MODEL);
+  }
+  if (provider.defaultModel?.trim()) {
+    models.push(resolveUselgImageModel(provider.defaultModel));
+  }
+  return filterProviderImageModels(provider, Array.from(new Set(models)));
+}
+
 function isNanoBananaProModelToken(token: string) {
   return token.includes('nanobananapro')
     || token.includes('nanopro')
@@ -641,6 +725,11 @@ function isBigmodelBananaModel(model: string) {
 
 function isMikotoBananaModel(model: string) {
   const capability = imageCapabilityForModel(model);
+  return capability === 'IMAGE_NANO_BANANA' || capability === 'IMAGE_NANO_BANANA_2';
+}
+
+function isUselgGeminiImageModel(model: string) {
+  const capability = imageCapabilityForModel(resolveUselgImageModel(model));
   return capability === 'IMAGE_NANO_BANANA' || capability === 'IMAGE_NANO_BANANA_2';
 }
 
@@ -705,7 +794,36 @@ export async function generateMikotoBananaImages(
   secrets: ProviderSecrets,
   input: ImageInput,
 ) {
-  const model = resolveMikotoImageModel(input.model);
+  return generateGeminiImageConfigImages(
+    provider,
+    secrets,
+    input,
+    resolveMikotoImageModel(input.model),
+    'Mikoto Banana',
+  );
+}
+
+export async function generateUselgGeminiImages(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  input: ImageInput,
+) {
+  return generateGeminiImageConfigImages(
+    provider,
+    secrets,
+    input,
+    resolveUselgImageModel(input.model),
+    'uselg Gemini',
+  );
+}
+
+async function generateGeminiImageConfigImages(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  input: ImageInput,
+  model: string,
+  label: string,
+) {
   const materialized = await Promise.all(input.inputImages.map(materializeNewApiReferenceImage));
   const parts = [
     { text: promptWithConstraints(input) },
@@ -739,7 +857,7 @@ export async function generateMikotoBananaImages(
     images.push(...uniqueImages(value, input.inputImages, 1));
   }
   const unique = Array.from(new Set(images)).slice(0, input.count);
-  if (!unique.length) throw new Error('Mikoto Banana 没有返回图片数据');
+  if (!unique.length) throw new Error(`${label} 没有返回图片数据`);
   return unique;
 }
 
@@ -819,7 +937,7 @@ async function providerImageContentRequest(
     const headers = upstreamHeaders(secrets);
     headers.delete('content-type');
     headers.set('accept', 'image/*, application/json, */*');
-    const response = await fetch(providerEndpoint(provider.baseUrl, path), {
+    const response = await fetch(providerRequestUrl(provider, path), {
       method: 'GET',
       headers,
       redirect: 'error',
@@ -1145,6 +1263,163 @@ function newApiImageTaskState(value: unknown): string {
   return '';
 }
 
+function nestedStringByKeys(
+  value: unknown,
+  keys: ReadonlySet<string>,
+  depth = 0,
+): string {
+  if (!value || typeof value !== 'object' || depth > 8) return '';
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = nestedStringByKeys(item, keys, depth + 1);
+      if (found) return found;
+    }
+    return '';
+  }
+  const record = value as Record<string, unknown>;
+  for (const [key, nested] of Object.entries(record)) {
+    if (keys.has(key.toLowerCase()) && typeof nested === 'string' && nested.trim()) {
+      return nested.trim();
+    }
+  }
+  for (const nested of Object.values(record)) {
+    const found = nestedStringByKeys(nested, keys, depth + 1);
+    if (found) return found;
+  }
+  return '';
+}
+
+function uselgPollAfterMs(value: unknown) {
+  if (!value || typeof value !== 'object') return 2_000;
+  const record = value as Record<string, unknown>;
+  const raw = record.poll_after_ms ?? record.pollAfterMs;
+  const parsed = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : NaN;
+  return Number.isFinite(parsed) ? Math.max(2_000, Math.min(10_000, Math.round(parsed))) : 2_000;
+}
+
+function isUselgTaskControlUrl(value: string) {
+  try {
+    const pathname = new URL(value).pathname;
+    return /\/v1\/images\/tasks\/[^/]+\/?$/i.test(pathname);
+  } catch {
+    return false;
+  }
+}
+
+function uniqueUselgImages(value: unknown, inputImages: string[], count: number) {
+  const inputs = new Set(inputImages.map((item) => item.trim()).filter(Boolean));
+  return Array.from(new Set(collectImageStrings(value).map((item) => item.trim()).filter(Boolean)))
+    .filter((source) => !inputs.has(source) && !isUselgTaskControlUrl(source))
+    .slice(0, Math.max(1, count));
+}
+
+type UselgTaskAsset = { key: 'signed_url' | 'download_url' | 'url'; value: string };
+
+function collectUselgTaskAssets(value: unknown, output: UselgTaskAsset[] = [], depth = 0) {
+  if (!value || typeof value !== 'object' || depth > 8) return output;
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectUselgTaskAssets(item, output, depth + 1));
+    return output;
+  }
+  const record = value as Record<string, unknown>;
+  if (Array.isArray(record.assets)) {
+    for (const asset of record.assets) {
+      if (!asset || typeof asset !== 'object') continue;
+      const assetRecord = asset as Record<string, unknown>;
+      for (const key of ['signed_url', 'download_url', 'url'] as const) {
+        const candidate = assetRecord[key];
+        if (typeof candidate === 'string' && candidate.trim()) {
+          output.push({ key, value: candidate.trim() });
+          break;
+        }
+      }
+    }
+  }
+  for (const key of ['data', 'result', 'task', 'response']) {
+    collectUselgTaskAssets(record[key], output, depth + 1);
+  }
+  return output;
+}
+
+export async function resolveUselgImageResponse(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  started: unknown,
+  inputImages: string[],
+  count: number,
+  wait: (milliseconds: number) => Promise<unknown> = (
+    milliseconds,
+  ) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+) {
+  const immediate = uniqueUselgImages(started, inputImages, count);
+  if (immediate.length) return immediate;
+  const taskId = getTaskId(started);
+  if (!taskId) throw new Error('uselg 没有返回图片数据或 task_id');
+
+  let statusUrl = nestedStringByKeys(started, new Set(['status_url', 'poll_url']))
+    || `/v1/images/tasks/${encodeURIComponent(taskId)}?view=summary`;
+  let resultUrl = nestedStringByKeys(started, new Set(['result_url']));
+  let pollAfterMs = uselgPollAfterMs(started);
+  let lastStatus: unknown = started;
+  let lastPollError: unknown = null;
+  const deadline = Date.now() + IMAGE_GENERATION_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    await wait(pollAfterMs);
+    try {
+      lastStatus = await providerRequest(provider, secrets, statusUrl, undefined, 45_000);
+      lastPollError = null;
+    } catch (error) {
+      const errorImages = imagesFromUpstreamError(error, inputImages, count);
+      if (errorImages.length) return errorImages;
+      if (!isRetryableNewApiTaskPollError(error)) throw error;
+      lastPollError = error;
+      continue;
+    }
+
+    statusUrl = nestedStringByKeys(lastStatus, new Set(['status_url', 'poll_url'])) || statusUrl;
+    resultUrl = nestedStringByKeys(lastStatus, new Set(['result_url'])) || resultUrl;
+    pollAfterMs = uselgPollAfterMs(lastStatus);
+    const images = uniqueUselgImages(lastStatus, inputImages, count);
+    if (images.length) return images;
+    const failure = getFailure(lastStatus);
+    if (failure) throw new Error(failure);
+    const state = newApiImageTaskState(lastStatus);
+    if (/^(?:failed|failure|error|cancelled|canceled|uncertain|client_disconnected)$/.test(state)) {
+      throw new Error(`uselg 图片任务失败（${state}）：${taskId}`);
+    }
+    if (!/^(?:completed|complete|succeeded|success|finished|done)$/.test(state)) continue;
+
+    const completedStatus = lastStatus;
+    if (resultUrl) {
+      try {
+        const result = await providerRequest(provider, secrets, resultUrl, undefined, 45_000);
+        const resultImages = uniqueUselgImages(result, inputImages, count);
+        if (resultImages.length) return resultImages;
+      } catch (error) {
+        const resultImages = imagesFromUpstreamError(error, inputImages, count);
+        if (resultImages.length) return resultImages;
+      }
+    }
+
+    const resolvedAssets: string[] = [];
+    for (const asset of collectUselgTaskAssets(completedStatus)) {
+      if (asset.key === 'signed_url' && /^https?:\/\//i.test(asset.value)) {
+        resolvedAssets.push(asset.value);
+      } else {
+        const content = await providerImageContentRequest(provider, secrets, asset.value);
+        resolvedAssets.push(...uniqueUselgImages(content, inputImages, count));
+      }
+      if (resolvedAssets.length >= count) break;
+    }
+    if (resolvedAssets.length) return Array.from(new Set(resolvedAssets)).slice(0, count);
+    throw new Error(`uselg 图片任务已成功但没有返回可下载资产：${taskId}`);
+  }
+
+  const pollDetail = lastPollError instanceof Error ? `：${lastPollError.message}` : '';
+  throw new Error(`uselg 图片任务等待超时：${taskId}${pollDetail}`);
+}
+
 export async function resolveNewApiImageResponse(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
@@ -1155,6 +1430,9 @@ export async function resolveNewApiImageResponse(
     milliseconds,
   ) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 ) {
+  if (provider.kind === 'USELG') {
+    return resolveUselgImageResponse(provider, secrets, started, inputImages, count, wait);
+  }
   const immediate = uniqueImages(started, inputImages, count);
   if (immediate.length) return immediate;
   const taskId = getTaskId(started);
@@ -1549,6 +1827,12 @@ function isUnsupportedNewApiAsyncParameter(error: unknown) {
   return /(?:async|task).*(?:unsupported|unknown|invalid|not\s+allowed|not\s+support)|(?:unsupported|unknown|invalid).*(?:async|task)/i.test(error.message);
 }
 
+function uselgIdempotencyHeaders(provider: Pick<AiProviderChannel, 'kind'>, clientRequestId: string) {
+  return provider.kind === 'USELG'
+    ? { 'Idempotency-Key': clientRequestId }
+    : undefined;
+}
+
 export function isNewApiReferenceProtocolCompatibilityError(error: unknown) {
   if (!(error instanceof UpstreamImageError)
     || ![400, 404, 405, 415, 422, 500, 501].includes(error.status)) return false;
@@ -1605,7 +1889,10 @@ async function providerNewApiImageEditRequest(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), IMAGE_GENERATION_TIMEOUT_MS);
   try {
-    const headers = upstreamHeaders(secrets);
+    const headers = upstreamHeaders(
+      secrets,
+      uselgIdempotencyHeaders(provider, input.clientRequestId),
+    );
     headers.set('content-type', `multipart/form-data; boundary=${boundary}`);
     headers.set('content-length', String(contentLength));
     const request: RequestInit & { duplex?: 'half' } = {
@@ -1672,6 +1959,7 @@ export async function generateNewApiImages(
         );
       } catch (error) {
         if (!isNewApiReferenceProtocolCompatibilityError(error)) throw error;
+        if (provider.kind === 'USELG') throw error;
         if (newApiImageFamily(input.model) === 'gpt-image-2') {
           throw new CloudAiError(
             'provider_reference_edit_unsupported',
@@ -1694,6 +1982,7 @@ export async function generateNewApiImages(
             '/v1/images/generations',
             buildNewApiImageGenerationBody(input, input.inputImages, asyncOverride),
             IMAGE_GENERATION_TIMEOUT_MS,
+            uselgIdempotencyHeaders(provider, input.clientRequestId),
           ),
         );
       }
@@ -1704,6 +1993,7 @@ export async function generateNewApiImages(
         '/v1/images/generations',
         buildNewApiImageGenerationBody(input, input.inputImages, asyncOverride),
         IMAGE_GENERATION_TIMEOUT_MS,
+        uselgIdempotencyHeaders(provider, input.clientRequestId),
       );
       started = await requestNewApiImageWithAsyncFallback(preferAsync, startGeneration);
     }
@@ -2789,7 +3079,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     && !provider.capabilities.includes('IMAGE');
   const effectiveInput = {
     ...input,
-    model: resolveImageModel(provider, input.model),
+    model: resolveImageModel(provider, input.model, input.inputImages.length > 0),
     ...(isImage2OneKOnly && !input.resolution ? { resolution: '1k' } : {}),
     ...(isBananaDualTwoKOnly && !input.resolution ? { resolution: '2k' } : {}),
   };
@@ -2802,6 +3092,8 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         ? await generateBigmodelBananaImages(provider, secrets, effectiveInput)
         : provider.kind === 'MIKOTO' && isMikotoBananaModel(effectiveInput.model)
           ? await generateMikotoBananaImages(provider, secrets, effectiveInput)
+          : provider.kind === 'USELG' && isUselgGeminiImageModel(effectiveInput.model)
+            ? await generateUselgGeminiImages(provider, secrets, effectiveInput)
         : await generateNewApiImages(provider, secrets, effectiveInput);
     const images = provider.kind === 'XAIS'
       ? await mirrorXaisImageResults(providerImages, provider.name)
@@ -2816,7 +3108,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       images.length,
       {
         images,
-        provider: provider.kind,
+        provider: publicWalletImageProviderKind(provider),
         providerChannelId: provider.id,
         providerChannelName: provider.name,
         model: effectiveInput.model,
@@ -2824,7 +3116,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     );
     return {
       images,
-      provider: provider.kind,
+      provider: publicWalletImageProviderKind(provider),
       providerChannelId: provider.id,
       providerChannelName: provider.name,
       model: effectiveInput.model,
