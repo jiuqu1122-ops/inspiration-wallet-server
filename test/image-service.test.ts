@@ -9,6 +9,7 @@ import {
   collectProviderModelIds,
   confirmXaisReferenceAttachment,
   convertGptImage2ChromaKeyToTransparentPng,
+  executeWalletImageGeneration,
   filterProviderImageModels,
   generateBigmodelBananaImages,
   generateMikotoBananaImages,
@@ -19,6 +20,7 @@ import {
   imageUnitCredits,
   isNewApiGeminiImageDecodeError,
   isNewApiParamOverrideCopyError,
+  isImageProviderFailoverStatus,
   isPublicNewApiImageReference,
   isRetryableXaisPollError,
   materializeNewApiReferenceImage,
@@ -56,6 +58,7 @@ import {
   xaisAttachmentRegistrationUrls,
 } from '../src/modules/ai/image-service.js';
 import { getImageResult } from '../src/modules/ai/image-result-store.js';
+import { encryptProviderSecrets } from '../src/lib/provider-secrets.js';
 
 describe('Mikoto Seedance model mapping', () => {
   it('does not fall back to another provider when MiniMax is explicitly requested', async () => {
@@ -332,6 +335,96 @@ afterEach(() => {
 });
 
 describe('wallet image provider normalization', () => {
+  it('fails over to the next compatible image channel after an upstream 5xx response', async () => {
+    const encryptedSecrets = encryptProviderSecrets({ apiKey: 'sk-image-test', headers: {} });
+    const provider = (id: string, baseUrl: string, priority: number) => ({
+      id,
+      name: id,
+      kind: 'MIKOTO',
+      status: 'ACTIVE',
+      priority,
+      baseUrl,
+      defaultModel: 'gemini-3-pro-image-preview',
+      allowInsecureHttp: false,
+      encryptedSecrets,
+      apiKeyLast4: 'test',
+      capabilities: ['IMAGE_NANO_BANANA'],
+      lastTestStatus: null,
+      lastTestMessage: null,
+      lastTestModelCount: null,
+      lastTestedAt: null,
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    });
+    const primary = provider('primary-channel', 'https://1.1.1.1', 0);
+    const fallback = provider('fallback-channel', 'https://8.8.8.8', 10);
+    const requestRow = { id: 'image-request-1', userId: 'user-1', status: 'RESERVED' };
+    const transaction = {
+      aiRequest: {
+        findUnique: vi.fn(async () => null),
+        create: vi.fn(async () => requestRow),
+        update: vi.fn(async () => requestRow),
+      },
+      wallet: {
+        updateMany: vi.fn(async () => ({ count: 1 })),
+        findUniqueOrThrow: vi.fn(async () => ({ availableCredits: 1000n })),
+        update: vi.fn(async () => ({ availableCredits: 1000n })),
+      },
+      walletLedger: { create: vi.fn(async () => ({})) },
+    };
+    const prisma = {
+      aiProviderChannel: { findMany: vi.fn(async () => [primary, fallback]) },
+      aiPricingConfig: { findUnique: vi.fn(async () => null) },
+      $transaction: vi.fn(async (callback: (tx: typeof transaction) => unknown) => callback(transaction)),
+    };
+    const resultUrl = 'https://api.example.test/v1/ai/image-results/fallback.png';
+    const fetchMock = vi.fn(async (source: RequestInfo | URL) => {
+      if (String(source).startsWith(primary.baseUrl)) {
+        return new Response(JSON.stringify({ error: { message: 'temporarily unavailable' } }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ fileData: { mimeType: 'image/png', fileUri: resultUrl } }] } }],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(executeWalletImageGeneration(prisma as never, {
+      userId: 'user-1',
+      clientRequestId: 'request-image-failover',
+      providerChannelId: primary.id,
+      model: 'gemini-3-pro-image-preview',
+      prompt: 'a red apple',
+      inputImages: [],
+      aspectRatio: '1:1',
+      resolution: '2k',
+      outputFormat: 'png',
+      count: 1,
+    })).resolves.toMatchObject({
+      images: [resultUrl],
+      providerChannelId: fallback.id,
+      providerChannelName: fallback.name,
+    });
+    expect(fetchMock.mock.calls.map(([source]) => String(source))).toEqual([
+      'https://1.1.1.1/v1beta/models/gemini-3-pro-image-preview:generateContent',
+      'https://8.8.8.8/v1beta/models/gemini-3-pro-image-preview:generateContent',
+    ]);
+  });
+
+  it('only treats HTTP 5xx responses as image channel failover statuses', () => {
+    expect(isImageProviderFailoverStatus(500)).toBe(true);
+    expect(isImageProviderFailoverStatus(503)).toBe(true);
+    expect(isImageProviderFailoverStatus(599)).toBe(true);
+    expect(isImageProviderFailoverStatus(429)).toBe(false);
+    expect(isImageProviderFailoverStatus(0)).toBe(false);
+  });
+
   it('allows image generation jobs to run for fifteen minutes', () => {
     expect(IMAGE_GENERATION_TIMEOUT_MS).toBe(15 * 60_000);
   });

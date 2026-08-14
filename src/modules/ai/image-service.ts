@@ -304,38 +304,42 @@ function isRetryableNewApiTaskPollError(error: unknown) {
     && (error.status === 0 || error.status === 429 || error.status >= 500);
 }
 
-async function selectImageProvider(
+async function selectImageProviders(
   prisma: PrismaClient,
   providerChannelId: string | undefined,
   requestedModel: string,
   requestedResolution?: string,
 ) {
   const providers = await listImageProviders(prisma);
-  const provider = providerChannelId
+  const compatible = providers.filter((candidate) => {
+    const model = requestedModel.trim() || candidate.defaultModel?.trim() || '';
+    return model
+      ? providerSupportsImageModel(candidate, model, requestedResolution)
+      : candidate.capabilities.includes('IMAGE');
+  });
+  const selected = providerChannelId
     ? providers.find((candidate) => candidate.id === providerChannelId)
-    : providers.find((candidate) => {
-      const model = requestedModel.trim() || candidate.defaultModel?.trim() || '';
-      return model
-        ? providerSupportsImageModel(candidate, model, requestedResolution)
-        : candidate.capabilities.includes('IMAGE');
-    });
-  if (!provider) {
+    : compatible[0];
+  if (!selected) {
     throw new CloudAiError(
       'provider_unavailable',
       providerChannelId ? '所选生图渠道不可用或已被停用' : '当前没有可用的生图渠道',
       503,
     );
   }
-  const effectiveModel = requestedModel.trim() || provider.defaultModel?.trim() || '';
-  if (effectiveModel && !providerSupportsImageModel(provider, effectiveModel, requestedResolution)) {
+  const effectiveModel = requestedModel.trim() || selected.defaultModel?.trim() || '';
+  if (effectiveModel && !providerSupportsImageModel(selected, effectiveModel, requestedResolution)) {
     throw new CloudAiError(
       'provider_model_family_mismatch',
       '所选生图模型与该渠道启用的模型家族不匹配',
       400,
     );
   }
-  await assertPublicProviderUrl(provider.baseUrl);
-  return provider;
+  return [selected, ...compatible.filter((candidate) => candidate.id !== selected.id)];
+}
+
+export function isImageProviderFailoverStatus(status: number) {
+  return status >= 500 && status <= 599;
 }
 
 export function chooseProviderForCapability<T extends Pick<AiProviderChannel, 'capabilities'>>(
@@ -3092,8 +3096,7 @@ async function releaseImageCredits(
   });
 }
 
-export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
-  const provider = await selectImageProvider(prisma, input.providerChannelId, input.model, input.resolution);
+function effectiveImageInputForProvider(provider: AiProviderChannel, input: ImageInput) {
   if (provider.kind === 'XAIS' && input.inputImages.length > 8) {
     throw new CloudAiError('invalid_request', 'XAIS 生图最多支持 8 张参考图', 400);
   }
@@ -3107,56 +3110,102 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     && !provider.capabilities.includes('IMAGE_NANO_BANANA')
     && !provider.capabilities.includes('IMAGE_NANO_BANANA_2')
     && !provider.capabilities.includes('IMAGE');
-  const effectiveInput = {
+  return {
     ...input,
     model: resolveImageModel(provider, input.model, input.inputImages.length > 0),
     ...(isImage2OneKOnly && !input.resolution ? { resolution: '1k' } : {}),
     ...(isBananaDualTwoKOnly && !input.resolution ? { resolution: '2k' } : {}),
   };
-  const reservation = await reserveImageCredits(prisma, effectiveInput);
+}
+
+async function generateImagesFromProvider(
+  provider: AiProviderChannel,
+  effectiveInput: ImageInput,
+) {
+  const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+  const providerImages = provider.kind === 'XAIS'
+    ? await generateXaisImages(provider, secrets, effectiveInput)
+    : provider.kind === 'BIGMODEL' && isBigmodelBananaModel(effectiveInput.model)
+      ? await generateBigmodelBananaImages(provider, secrets, effectiveInput)
+      : provider.kind === 'MIKOTO' && isMikotoBananaModel(effectiveInput.model)
+        ? await generateMikotoBananaImages(provider, secrets, effectiveInput)
+        : provider.kind === 'USELG' && isUselgGeminiImageModel(effectiveInput.model)
+          ? await generateUselgGeminiImages(provider, secrets, effectiveInput)
+          : await generateNewApiImages(provider, secrets, effectiveInput);
+  const images = provider.kind === 'XAIS'
+    ? await mirrorXaisImageResults(providerImages, provider.name)
+    : await mirrorGeneratedImageResults(providerImages, provider.name);
+  if (!images.length) throw new Error('渠道没有返回图片数据');
+  return images;
+}
+
+export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
+  const providers = await selectImageProviders(
+    prisma,
+    input.providerChannelId,
+    input.model,
+    input.resolution,
+  );
+  const primaryProvider = providers[0]!;
+  const reservationInput = effectiveImageInputForProvider(primaryProvider, input);
+  await assertPublicProviderUrl(primaryProvider.baseUrl);
+  const reservation = await reserveImageCredits(prisma, reservationInput);
+  let activeProvider = primaryProvider;
+  let activeInput = reservationInput;
   try {
-    const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-    const providerImages = provider.kind === 'XAIS'
-      ? await generateXaisImages(provider, secrets, effectiveInput)
-      : provider.kind === 'BIGMODEL' && isBigmodelBananaModel(effectiveInput.model)
-        ? await generateBigmodelBananaImages(provider, secrets, effectiveInput)
-        : provider.kind === 'MIKOTO' && isMikotoBananaModel(effectiveInput.model)
-          ? await generateMikotoBananaImages(provider, secrets, effectiveInput)
-          : provider.kind === 'USELG' && isUselgGeminiImageModel(effectiveInput.model)
-            ? await generateUselgGeminiImages(provider, secrets, effectiveInput)
-        : await generateNewApiImages(provider, secrets, effectiveInput);
-    const images = provider.kind === 'XAIS'
-      ? await mirrorXaisImageResults(providerImages, provider.name)
-      : await mirrorGeneratedImageResults(providerImages, provider.name);
-    if (!images.length) throw new Error('渠道没有返回图片数据');
-    const charged = await settleImageCredits(
-      prisma,
-      effectiveInput,
-      reservation.requestId,
-      reservation.estimated,
-      reservation.unitCredits,
-      images.length,
-      {
-        images,
-        provider: publicWalletImageProviderKind(provider),
-        providerChannelId: provider.id,
-        providerChannelName: provider.name,
-        model: effectiveInput.model,
-      },
-    );
-    return {
-      images,
-      provider: publicWalletImageProviderKind(provider),
-      providerChannelId: provider.id,
-      providerChannelName: provider.name,
-      model: effectiveInput.model,
-      chargedCredits: charged.toString(),
-    };
+    for (let index = 0; index < providers.length; index += 1) {
+      activeProvider = providers[index]!;
+      activeInput = index === 0
+        ? reservationInput
+        : effectiveImageInputForProvider(activeProvider, input);
+      if (index > 0) await assertPublicProviderUrl(activeProvider.baseUrl);
+      try {
+        const images = await generateImagesFromProvider(activeProvider, activeInput);
+        const charged = await settleImageCredits(
+          prisma,
+          activeInput,
+          reservation.requestId,
+          reservation.estimated,
+          reservation.unitCredits,
+          images.length,
+          {
+            images,
+            provider: publicWalletImageProviderKind(activeProvider),
+            providerChannelId: activeProvider.id,
+            providerChannelName: activeProvider.name,
+            model: activeInput.model,
+          },
+        );
+        return {
+          images,
+          provider: publicWalletImageProviderKind(activeProvider),
+          providerChannelId: activeProvider.id,
+          providerChannelName: activeProvider.name,
+          model: activeInput.model,
+          chargedCredits: charged.toString(),
+        };
+      } catch (error) {
+        const nextProvider = providers[index + 1];
+        if (!(error instanceof UpstreamImageError)
+          || !isImageProviderFailoverStatus(error.status)
+          || !nextProvider) throw error;
+        console.warn('[image_provider_failover]', {
+          clientRequestId: input.clientRequestId,
+          model: input.model,
+          status: error.status,
+          fromProviderId: activeProvider.id,
+          fromProvider: activeProvider.name,
+          toProviderId: nextProvider.id,
+          toProvider: nextProvider.name,
+        });
+      }
+    }
+    throw new Error('全部生图渠道请求失败');
   } catch (error) {
-    await releaseImageCredits(prisma, effectiveInput, reservation.requestId, reservation.estimated);
+    await releaseImageCredits(prisma, reservationInput, reservation.requestId, reservation.estimated);
     if (error instanceof CloudAiError) throw error;
     if (error instanceof UpstreamImageError) {
-      if (provider.kind === 'NEW_API' && isNewApiParamOverrideCopyError(error)) {
+      if (activeProvider.kind === 'NEW_API' && isNewApiParamOverrideCopyError(error)) {
         throw new CloudAiError(
           'provider_param_override_invalid',
           'NewAPI 生图渠道的参数覆盖配置错误：copy.from 指向 images/generations 或 images/edits 请求中不存在的字段，请检查该渠道的 ParamOverride operations',
