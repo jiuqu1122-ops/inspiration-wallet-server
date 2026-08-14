@@ -814,6 +814,7 @@ export async function generateUselgGeminiImages(
     input,
     resolveUselgImageModel(input.model),
     'uselg Gemini',
+    true,
   );
 }
 
@@ -823,6 +824,7 @@ async function generateGeminiImageConfigImages(
   input: ImageInput,
   model: string,
   label: string,
+  preferUrlResults = false,
 ) {
   const materialized = await Promise.all(input.inputImages.map(materializeNewApiReferenceImage));
   const parts = [
@@ -849,12 +851,14 @@ async function generateGeminiImageConfigImages(
         },
       );
     } catch (error) {
-      const recovered = imagesFromUpstreamError(error, input.inputImages, 1);
+      const recovered = error instanceof UpstreamImageError
+        ? selectUniqueImages(error.responseValue, input.inputImages, 1, preferUrlResults)
+        : [];
       if (!recovered.length) throw error;
       images.push(...recovered);
       continue;
     }
-    images.push(...uniqueImages(value, input.inputImages, 1));
+    images.push(...selectUniqueImages(value, input.inputImages, 1, preferUrlResults));
   }
   const unique = Array.from(new Set(images)).slice(0, input.count);
   if (!unique.length) throw new Error(`${label} 没有返回图片数据`);
@@ -862,10 +866,26 @@ async function generateGeminiImageConfigImages(
 }
 
 export function uniqueImages(value: unknown, inputImages: string[], count: number) {
+  return selectUniqueImages(value, inputImages, count, false);
+}
+
+export function uniqueImagesPreferUrls(value: unknown, inputImages: string[], count: number) {
+  return selectUniqueImages(value, inputImages, count, true);
+}
+
+function selectUniqueImages(
+  value: unknown,
+  inputImages: string[],
+  count: number,
+  preferUrls: boolean,
+) {
   const inputs = new Set(inputImages.map((value) => value.trim()));
-  return Array.from(new Set(collectImageStrings(value).map((value) => value.trim()).filter(Boolean)))
-    .filter((value) => !inputs.has(value))
-    .slice(0, count);
+  const images = Array.from(new Set(collectImageStrings(value).map((value) => value.trim()).filter(Boolean)))
+    .filter((value) => !inputs.has(value));
+  if (preferUrls) {
+    images.sort((left, right) => Number(!/^https?:\/\//i.test(left)) - Number(!/^https?:\/\//i.test(right)));
+  }
+  return images.slice(0, count);
 }
 
 export function sizeFromRatio(ratio: ImageInput['aspectRatio']) {

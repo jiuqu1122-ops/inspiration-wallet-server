@@ -558,6 +558,33 @@ describe('wallet image provider normalization', () => {
     )).resolves.toEqual([`data:image/png;base64,${generated}`]);
   });
 
+  it('prefers a USELG result URL when the response also contains inline Base64', async () => {
+    const generated = 'iVBORw0KGgo' + 'c'.repeat(40);
+    const resultUrl = 'https://api.ai-media.vip/api/v1/image-workshop/download/result.png';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      candidates: [{
+        content: {
+          parts: [
+            { inlineData: { mimeType: 'image/png', data: generated } },
+            { fileData: { mimeType: 'image/png', fileUri: resultUrl } },
+          ],
+        },
+      }],
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })));
+
+    await expect(generateUselgGeminiImages(
+      { baseUrl: 'https://api.ai-media.vip', name: 'uselg', kind: 'USELG' } as never,
+      { apiKey: 'sk-uselg', headers: {} },
+      {
+        userId: 'user-1', clientRequestId: 'request-uselg-url', model: 'Nano Banana 2', prompt: 'a red apple',
+        inputImages: [], aspectRatio: '16:9', resolution: '2k', outputFormat: 'png', count: 1,
+      },
+    )).resolves.toEqual([resultUrl]);
+  });
+
   it('extracts URL and Base64 image results while excluding reference inputs', () => {
     const reference = 'https://assets.example.test/reference.png';
     const images = uniqueImages({
