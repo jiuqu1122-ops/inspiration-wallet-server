@@ -512,6 +512,7 @@ describe('wallet image provider normalization', () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       expect(String(input)).toBe('https://api.mikoto.example/v1beta/models/gemini-3-pro-image-preview:generateContent');
       expect(new Headers(init?.headers).get('x-goog-api-key')).toBe('sk-mikoto');
+      expect((init as RequestInit & { dispatcher?: unknown })?.dispatcher).toBeDefined();
       const body = JSON.parse(String(init?.body));
       expect(body.generationConfig.responseModalities).toEqual(['TEXT', 'IMAGE']);
       expect(body.generationConfig.imageConfig).toEqual({ aspectRatio: '1:1', imageSize: '1K' });

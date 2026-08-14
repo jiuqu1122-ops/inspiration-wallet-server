@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import sharp from 'sharp';
+import { Agent } from 'undici';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
 import { CloudAiError } from './service.js';
@@ -28,6 +29,10 @@ import { ossUploadService } from './oss-uploader.js';
 import { mirrorGeneratedVideoResultToOss } from './video-result-store.js';
 
 export const IMAGE_GENERATION_TIMEOUT_MS = 15 * 60_000;
+const longImageRequestDispatcher = new Agent({
+  headersTimeout: IMAGE_GENERATION_TIMEOUT_MS,
+  bodyTimeout: IMAGE_GENERATION_TIMEOUT_MS,
+});
 const NEW_API_IMAGE_TASK_POLL_INTERVAL_MS = 3_000;
 const NEW_API_REFERENCE_DOWNLOAD_ATTEMPTS = 3;
 const NEW_API_REFERENCE_DOWNLOAD_RETRY_DELAYS_MS = [500, 1_500];
@@ -610,7 +615,12 @@ async function bigmodelRequest(
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       redirect: 'error',
       signal: controller.signal,
-    });
+      // Node's default Undici dispatcher stops waiting for response headers
+      // after 300 seconds. Gemini image generation can legitimately exceed
+      // that, so keep the transport timeout aligned with our 15-minute job
+      // deadline without changing fetch behavior for ordinary API calls.
+      dispatcher: longImageRequestDispatcher,
+    } as RequestInit & { dispatcher: Agent });
     const text = await response.text();
     if (!response.ok) {
       throw new UpstreamImageError(
