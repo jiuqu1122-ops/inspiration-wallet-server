@@ -679,6 +679,45 @@ describe('wallet image provider normalization', () => {
     )).resolves.toEqual([resultUrl]);
   });
 
+  it('polls a pending USELG Gemini response before returning its generated asset', async () => {
+    const resultUrl = 'https://cdn.example.test/generated-async.png';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        task_id: 'gemini-task-123',
+        status: 'processing',
+        status_url: '/v1/images/tasks/gemini-task-123?view=summary',
+        poll_after_ms: 2_000,
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        task_id: 'gemini-task-123',
+        status: 'success',
+        assets: [{ signed_url: resultUrl }],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateUselgGeminiImages(
+      { baseUrl: 'https://api.ai-media.vip', name: 'uselg', kind: 'USELG' } as never,
+      { apiKey: 'sk-uselg', headers: {} },
+      {
+        userId: 'user-1', clientRequestId: 'request-uselg-async', model: 'Nano Banana Pro', prompt: 'a red apple',
+        inputImages: [], aspectRatio: '1:1', resolution: '2k', outputFormat: 'png', count: 1,
+      },
+    )).resolves.toEqual([resultUrl]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      'https://api.ai-media.vip/v1beta/models/gemini-3-pro-image-preview:generateContent',
+    );
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      'https://api.ai-media.vip/v1/images/tasks/gemini-task-123?view=summary',
+    );
+  });
+
   it('extracts URL and Base64 image results while excluding reference inputs', () => {
     const reference = 'https://assets.example.test/reference.png';
     const images = uniqueImages({

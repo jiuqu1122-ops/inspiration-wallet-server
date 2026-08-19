@@ -829,6 +829,13 @@ export async function generateUselgGeminiImages(
     resolveUselgImageModel(input.model),
     'uselg Gemini',
     true,
+    (started) => resolveUselgImageResponse(
+      provider,
+      secrets,
+      started,
+      input.inputImages,
+      1,
+    ),
   );
 }
 
@@ -839,6 +846,7 @@ async function generateGeminiImageConfigImages(
   model: string,
   label: string,
   preferUrlResults = false,
+  resolvePendingResponse?: (started: unknown) => Promise<string[]>,
 ) {
   const materialized = await Promise.all(input.inputImages.map(materializeNewApiReferenceImage));
   const parts = [
@@ -872,7 +880,12 @@ async function generateGeminiImageConfigImages(
       images.push(...recovered);
       continue;
     }
-    images.push(...selectUniqueImages(value, input.inputImages, 1, preferUrlResults));
+    const immediate = selectUniqueImages(value, input.inputImages, 1, preferUrlResults);
+    images.push(...(
+      immediate.length > 0 || !resolvePendingResponse
+        ? immediate
+        : await resolvePendingResponse(value)
+    ));
   }
   const unique = Array.from(new Set(images)).slice(0, input.count);
   if (!unique.length) throw new Error(`${label} 没有返回图片数据`);
