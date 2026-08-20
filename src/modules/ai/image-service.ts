@@ -173,18 +173,13 @@ export function imageCapabilityForModel(model: string, resolution?: string): AiC
 }
 
 export function providerSupportsImageModel(
-  provider: { capabilities: readonly AiCapability[]; kind?: AiProviderChannel['kind'] },
+  provider: { capabilities: readonly AiCapability[] },
   model: string,
   resolution?: string,
 ) {
   const capability = imageCapabilityForModel(model, resolution);
   const modelToken = imageModelToken(model);
   const requestedResolution = String(resolution || '').trim().toLowerCase();
-  if (provider.kind === 'XAIS' && capability === 'IMAGE_GPT_1K') {
-    // XAIS exposes Image2 as explicit 2K/4K worker models. A public 1K
-    // request must continue to a channel that actually supports 1K.
-    return false;
-  }
   if (provider.capabilities.includes('IMAGE')) return true;
   const modelResolution = modelToken.includes('4k')
     ? '4k'
@@ -220,6 +215,7 @@ export function filterProviderImageModels(
 export type ImageInput = {
   userId: string;
   clientRequestId: string;
+  clientPlatform?: 'tablet' | undefined;
   provider?: 'new-api' | 'xais-chat' | 'mikoto' | 'bigmodel' | 'uselg' | 'openai-compatible' | 'custom' | undefined;
   providerChannelId?: string | undefined;
   model: string;
@@ -314,10 +310,16 @@ async function selectImageProviders(
   providerChannelId: string | undefined,
   requestedModel: string,
   requestedResolution?: string,
+  clientPlatform?: ImageInput['clientPlatform'],
 ) {
   const providers = await listImageProviders(prisma);
   const compatible = providers.filter((candidate) => {
     const model = requestedModel.trim() || candidate.defaultModel?.trim() || '';
+    if (clientPlatform === 'tablet'
+      && candidate.kind === 'XAIS'
+      && imageCapabilityForModel(model, requestedResolution) === 'IMAGE_GPT_1K') {
+      return false;
+    }
     return model
       ? providerSupportsImageModel(candidate, model, requestedResolution)
       : candidate.capabilities.includes('IMAGE');
@@ -344,9 +346,13 @@ async function selectImageProviders(
 }
 
 export function isImageProviderFailoverStatus(status: number) {
+  return status >= 500 && status <= 599;
+}
+
+export function isTabletImageProviderFailoverStatus(status: number) {
   return status === 0
     || [401, 403, 404, 408, 409, 425, 429].includes(status)
-    || (status >= 500 && status <= 599);
+    || isImageProviderFailoverStatus(status);
 }
 
 export function chooseProviderForCapability<T extends Pick<AiProviderChannel, 'capabilities'>>(
@@ -363,11 +369,9 @@ export function resolveImageModel(
   provider: Pick<AiProviderChannel, 'defaultModel' | 'kind'>,
   requestedModel: string,
   hasInputImages = false,
-  resolution?: string,
 ) {
   const requested = requestedModel.trim();
   if (requested) {
-    if (provider.kind === 'XAIS') return resolveXaisPublicImageModel(requested, resolution);
     if (provider.kind === 'NEW_API') return resolveNewApiImageModel(requested);
     if (provider.kind === 'BIGMODEL') return resolveBigmodelImageModel(requested);
     if (provider.kind === 'MIKOTO') return resolveMikotoImageModel(requested);
@@ -376,7 +380,6 @@ export function resolveImageModel(
   }
   const configured = provider.defaultModel?.trim();
   if (configured) {
-    if (provider.kind === 'XAIS') return resolveXaisPublicImageModel(configured, resolution);
     if (provider.kind === 'NEW_API') return resolveNewApiImageModel(configured);
     if (provider.kind === 'BIGMODEL') return resolveBigmodelImageModel(configured);
     if (provider.kind === 'MIKOTO') return resolveMikotoImageModel(configured);
@@ -3153,12 +3156,9 @@ function effectiveImageInputForProvider(provider: AiProviderChannel, input: Imag
     && !provider.capabilities.includes('IMAGE');
   return {
     ...input,
-    model: resolveImageModel(
-      provider,
-      input.model,
-      input.inputImages.length > 0,
-      input.resolution,
-    ),
+    model: input.clientPlatform === 'tablet' && provider.kind === 'XAIS'
+      ? resolveXaisPublicImageModel(input.model, input.resolution)
+      : resolveImageModel(provider, input.model, input.inputImages.length > 0),
     ...(isImage2OneKOnly && !input.resolution ? { resolution: '1k' } : {}),
     ...(isBananaDualTwoKOnly && !input.resolution ? { resolution: '2k' } : {}),
   };
@@ -3191,6 +3191,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     input.providerChannelId,
     input.model,
     input.resolution,
+    input.clientPlatform,
   );
   const primaryProvider = providers[0]!;
   const reservationInput = effectiveImageInputForProvider(primaryProvider, input);
@@ -3232,8 +3233,11 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         };
       } catch (error) {
         const nextProvider = providers[index + 1];
+        const canFailOver = input.clientPlatform === 'tablet'
+          ? isTabletImageProviderFailoverStatus(error instanceof UpstreamImageError ? error.status : -1)
+          : isImageProviderFailoverStatus(error instanceof UpstreamImageError ? error.status : -1);
         if (!(error instanceof UpstreamImageError)
-          || !isImageProviderFailoverStatus(error.status)
+          || !canFailOver
           || !nextProvider) throw error;
         console.warn('[image_provider_failover]', {
           clientRequestId: input.clientRequestId,

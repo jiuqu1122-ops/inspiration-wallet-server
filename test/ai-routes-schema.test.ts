@@ -23,6 +23,44 @@ describe('wallet AI request compatibility', () => {
     });
   });
 
+  it('keeps the client platform absent for existing desktop requests', () => {
+    expect(normalizeImageRequestBody({
+      clientRequestId: 'canvas-image-request-desktop',
+      model: 'gpt-image-2',
+      prompt: 'render a projector',
+      inputImages: [],
+      aspectRatio: '1:1',
+      resolution: '1k',
+      outputFormat: 'png',
+      count: 1,
+    }).clientPlatform).toBeUndefined();
+  });
+
+  it('accepts the explicit tablet client platform without selecting a provider', () => {
+    expect(normalizeImageRequestBody({
+      clientRequestId: 'canvas-image-request-tablet',
+      clientPlatform: 'tablet',
+      model: 'gpt-image-2',
+      prompt: 'render a projector',
+      inputImages: [],
+      aspectRatio: '16:9',
+      resolution: '2k',
+      outputFormat: 'png',
+      count: 1,
+    })).toMatchObject({ clientPlatform: 'tablet' });
+  });
+
+  it('rejects unknown client platform values', () => {
+    expect(() => normalizeImageRequestBody({
+      clientRequestId: 'canvas-image-request-unknown-client',
+      clientPlatform: 'android-phone',
+      model: 'gpt-image-2',
+      prompt: 'render a projector',
+      inputImages: [],
+      count: 1,
+    })).toThrow();
+  });
+
   it('accepts Bigmodel as a wallet image provider', () => {
     expect(normalizeImageRequestBody({
       clientRequestId: 'canvas-image-request-bigmodel',

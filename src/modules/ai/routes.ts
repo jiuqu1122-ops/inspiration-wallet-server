@@ -67,6 +67,7 @@ const isMiniMaxH3VideoModel = (model: string) => (
 
 const imageSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
+  clientPlatform: z.literal('tablet').optional(),
   provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'bigmodel', 'uselg', 'openai-compatible', 'custom']).nullish()
     .transform((value) => value ?? undefined),
   providerChannelId: z.string().trim().min(1).max(128).nullish()
