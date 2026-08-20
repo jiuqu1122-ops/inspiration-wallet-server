@@ -47,6 +47,7 @@ import {
   resolveUselgImageModel,
   resolveUselgImageResponse,
   resolveXaisModel,
+  resolveXaisPublicImageModel,
   resolveXaisWorkerRatio,
   runXaisWorkerTask,
   scopeMiniMaxVideoStatusPayload,
@@ -417,12 +418,16 @@ describe('wallet image provider normalization', () => {
     ]);
   });
 
-  it('only treats HTTP 5xx responses as image channel failover statuses', () => {
+  it('fails over on channel authentication, throttling, network and HTTP 5xx errors', () => {
+    expect(isImageProviderFailoverStatus(0)).toBe(true);
+    expect(isImageProviderFailoverStatus(401)).toBe(true);
+    expect(isImageProviderFailoverStatus(408)).toBe(true);
+    expect(isImageProviderFailoverStatus(429)).toBe(true);
     expect(isImageProviderFailoverStatus(500)).toBe(true);
     expect(isImageProviderFailoverStatus(503)).toBe(true);
     expect(isImageProviderFailoverStatus(599)).toBe(true);
-    expect(isImageProviderFailoverStatus(429)).toBe(false);
-    expect(isImageProviderFailoverStatus(0)).toBe(false);
+    expect(isImageProviderFailoverStatus(400)).toBe(false);
+    expect(isImageProviderFailoverStatus(422)).toBe(false);
   });
 
   it('allows image generation jobs to run for fifteen minutes', () => {
@@ -598,6 +603,23 @@ describe('wallet image provider normalization', () => {
     );
     expect(result).toEqual([`data:image/png;base64,${generated}`]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('maps the three public tablet models to XAIS resolution-specific routes', () => {
+    expect(resolveXaisPublicImageModel('nano-banana-pro', '2k')).toBe('Xais Nano Pro_2K');
+    expect(resolveXaisPublicImageModel('nano-banana-pro', '4k')).toBe('Xais Nano Pro_4K');
+    expect(resolveXaisPublicImageModel('nano-banana-2', '4k')).toBe('Xais Nano2_4K');
+    expect(resolveXaisPublicImageModel('gpt-image-2', '2k')).toBe('Xais Img2_2K');
+    expect(resolveImageModel({ kind: 'XAIS', defaultModel: null }, 'gpt-image-2', false, '4k'))
+      .toBe('Xais Img2_4K');
+  });
+
+  it('does not route public GPT Image 2 1K requests to XAIS', () => {
+    expect(providerSupportsImageModel(
+      { kind: 'XAIS', capabilities: ['IMAGE_GPT'] as const },
+      'gpt-image-2',
+      '1k',
+    )).toBe(false);
   });
 
   it('calls Mikoto Gemini native endpoint with imageConfig', async () => {

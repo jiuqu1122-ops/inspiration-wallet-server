@@ -173,14 +173,19 @@ export function imageCapabilityForModel(model: string, resolution?: string): AiC
 }
 
 export function providerSupportsImageModel(
-  provider: { capabilities: readonly AiCapability[] },
+  provider: { capabilities: readonly AiCapability[]; kind?: AiProviderChannel['kind'] },
   model: string,
   resolution?: string,
 ) {
-  if (provider.capabilities.includes('IMAGE')) return true;
   const capability = imageCapabilityForModel(model, resolution);
   const modelToken = imageModelToken(model);
   const requestedResolution = String(resolution || '').trim().toLowerCase();
+  if (provider.kind === 'XAIS' && capability === 'IMAGE_GPT_1K') {
+    // XAIS exposes Image2 as explicit 2K/4K worker models. A public 1K
+    // request must continue to a channel that actually supports 1K.
+    return false;
+  }
+  if (provider.capabilities.includes('IMAGE')) return true;
   const modelResolution = modelToken.includes('4k')
     ? '4k'
     : modelToken.includes('2k') ? '2k' : modelToken.includes('1k') ? '1k' : '';
@@ -339,7 +344,9 @@ async function selectImageProviders(
 }
 
 export function isImageProviderFailoverStatus(status: number) {
-  return status >= 500 && status <= 599;
+  return status === 0
+    || [401, 403, 404, 408, 409, 425, 429].includes(status)
+    || (status >= 500 && status <= 599);
 }
 
 export function chooseProviderForCapability<T extends Pick<AiProviderChannel, 'capabilities'>>(
@@ -356,9 +363,11 @@ export function resolveImageModel(
   provider: Pick<AiProviderChannel, 'defaultModel' | 'kind'>,
   requestedModel: string,
   hasInputImages = false,
+  resolution?: string,
 ) {
   const requested = requestedModel.trim();
   if (requested) {
+    if (provider.kind === 'XAIS') return resolveXaisPublicImageModel(requested, resolution);
     if (provider.kind === 'NEW_API') return resolveNewApiImageModel(requested);
     if (provider.kind === 'BIGMODEL') return resolveBigmodelImageModel(requested);
     if (provider.kind === 'MIKOTO') return resolveMikotoImageModel(requested);
@@ -367,6 +376,7 @@ export function resolveImageModel(
   }
   const configured = provider.defaultModel?.trim();
   if (configured) {
+    if (provider.kind === 'XAIS') return resolveXaisPublicImageModel(configured, resolution);
     if (provider.kind === 'NEW_API') return resolveNewApiImageModel(configured);
     if (provider.kind === 'BIGMODEL') return resolveBigmodelImageModel(configured);
     if (provider.kind === 'MIKOTO') return resolveMikotoImageModel(configured);
@@ -386,6 +396,24 @@ function upstreamHeaders(secrets: ProviderSecrets, extraHeaders?: Record<string,
   for (const [name, value] of Object.entries(secrets.headers)) headers.set(name, value);
   for (const [name, value] of Object.entries(extraHeaders ?? {})) headers.set(name, value);
   return headers;
+}
+
+export function resolveXaisPublicImageModel(model: string, resolution?: string) {
+  const trimmed = model.trim();
+  const token = imageModelToken(trimmed);
+  const suffix = String(resolution || '').trim().toLowerCase() === '4k' ? '4K' : '2K';
+  if (isNanoBananaProModelToken(token)) return `Xais Nano Pro_${suffix}`;
+  if (token.includes('nanobanana2')
+    || token.includes('gemini31flashimage')
+    || token.includes('gemini3flashimage')
+    || token.includes('xaisnano2')
+    || token.includes('nano2')) {
+    return `Xais Nano2_${suffix}`;
+  }
+  if (token.includes('gptimage2') || token.includes('image2') || token.includes('img2')) {
+    return `Xais Img2_${suffix}`;
+  }
+  return trimmed;
 }
 
 function providerRequestUrl(provider: Pick<AiProviderChannel, 'baseUrl'>, pathOrUrl: string) {
@@ -3125,7 +3153,12 @@ function effectiveImageInputForProvider(provider: AiProviderChannel, input: Imag
     && !provider.capabilities.includes('IMAGE');
   return {
     ...input,
-    model: resolveImageModel(provider, input.model, input.inputImages.length > 0),
+    model: resolveImageModel(
+      provider,
+      input.model,
+      input.inputImages.length > 0,
+      input.resolution,
+    ),
     ...(isImage2OneKOnly && !input.resolution ? { resolution: '1k' } : {}),
     ...(isBananaDualTwoKOnly && !input.resolution ? { resolution: '2k' } : {}),
   };
