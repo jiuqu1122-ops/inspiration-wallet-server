@@ -3206,6 +3206,10 @@ export function splitTabletImageProviderInputs(input: ImageInput): ImageInput[] 
   });
 }
 
+export function boundProviderImageResults(images: string[], count: number) {
+  return Array.from(new Set(images)).slice(0, Math.max(0, count));
+}
+
 async function generateImagesFromProvider(
   provider: AiProviderChannel,
   effectiveInput: ImageInput,
@@ -3224,9 +3228,10 @@ async function generateImagesFromProvider(
   for (const input of splitTabletImageProviderInputs(effectiveInput)) {
     providerImages.push(...await generateBatch(input));
   }
+  const boundedProviderImages = boundProviderImageResults(providerImages, effectiveInput.count);
   const images = provider.kind === 'XAIS'
-    ? await mirrorXaisImageResults(providerImages, provider.name)
-    : await mirrorGeneratedImageResults(providerImages, provider.name);
+    ? await mirrorXaisImageResults(boundedProviderImages, provider.name)
+    : await mirrorGeneratedImageResults(boundedProviderImages, provider.name);
   if (!images.length) throw new Error('渠道没有返回图片数据');
   return images;
 }

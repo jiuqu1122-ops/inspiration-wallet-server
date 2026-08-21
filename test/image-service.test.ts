@@ -33,6 +33,7 @@ import {
   parseWalletImageGenerationResult,
   parseXaisTaskId,
   providerSupportsImageModel,
+  boundProviderImageResults,
   providerCanServeImageAlongsideAgent,
   resolveBigmodelImageModel,
   resolveImageModel,
@@ -456,6 +457,13 @@ describe('wallet image provider normalization', () => {
     expect(new Set(tabletTasks.map((task) => task.clientRequestId)).size).toBe(2);
     expect(splitTabletImageProviderInputs({ ...input, clientPlatform: undefined })).toEqual([
       { ...input, clientPlatform: undefined },
+    ]);
+  });
+
+  it('never returns or settles more provider images than the requested count', () => {
+    expect(boundProviderImageResults(['first', 'second', 'third', 'second'], 2)).toEqual([
+      'first',
+      'second',
     ]);
   });
 
