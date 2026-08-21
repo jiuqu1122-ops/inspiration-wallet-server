@@ -623,13 +623,14 @@ export async function listWalletImageModels(
   };
 }
 
-function bigmodelHeaders(secrets: ProviderSecrets) {
+function bigmodelHeaders(secrets: ProviderSecrets, extraHeaders?: Record<string, string>) {
   const headers = new Headers({
     accept: 'application/json, text/plain, */*',
     'content-type': 'application/json',
     'user-agent': 'Inspiration-Wallet-Server/1',
   });
   for (const [name, value] of Object.entries(secrets.headers)) headers.set(name, value);
+  for (const [name, value] of Object.entries(extraHeaders ?? {})) headers.set(name, value);
   // Bigmodel's native Gemini endpoint uses the Google-style API key header.
   headers.set('x-goog-api-key', secrets.apiKey);
   return headers;
@@ -640,13 +641,14 @@ async function bigmodelRequest(
   secrets: ProviderSecrets,
   path: string,
   body?: unknown,
+  extraHeaders?: Record<string, string>,
 ) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), IMAGE_GENERATION_TIMEOUT_MS);
   try {
     const response = await fetch(providerRequestUrl(provider, path), {
       method: body === undefined ? 'GET' : 'POST',
-      headers: bigmodelHeaders(secrets),
+      headers: bigmodelHeaders(secrets, extraHeaders),
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       redirect: 'error',
       signal: controller.signal,
@@ -867,6 +869,7 @@ export async function generateUselgGeminiImages(
       input.inputImages,
       1,
     ),
+    (outputIndex) => uselgImageRequestHeaders(input, outputIndex),
   );
 }
 
@@ -878,6 +881,7 @@ async function generateGeminiImageConfigImages(
   label: string,
   preferUrlResults = false,
   resolvePendingResponse?: (started: unknown) => Promise<string[]>,
+  requestHeaders?: (outputIndex: number) => Record<string, string> | undefined,
 ) {
   const materialized = await Promise.all(input.inputImages.map(materializeNewApiReferenceImage));
   const parts = [
@@ -902,6 +906,7 @@ async function generateGeminiImageConfigImages(
             },
           },
         },
+        requestHeaders?.(index),
       );
     } catch (error) {
       const recovered = error instanceof UpstreamImageError
@@ -1905,9 +1910,33 @@ function isUnsupportedNewApiAsyncParameter(error: unknown) {
   return /(?:async|task).*(?:unsupported|unknown|invalid|not\s+allowed|not\s+support)|(?:unsupported|unknown|invalid).*(?:async|task)/i.test(error.message);
 }
 
-function uselgIdempotencyHeaders(provider: Pick<AiProviderChannel, 'kind'>, clientRequestId: string) {
+export function uselgImageRequestHeaders(input: Pick<
+  ImageInput,
+  'clientRequestId' | 'model' | 'prompt' | 'resolution' | 'aspectRatio' | 'outputFormat' | 'inputImages'
+>, outputIndex = 0) {
+  const requestFingerprint = createHash('sha256')
+    .update(JSON.stringify({
+      clientRequestId: input.clientRequestId.trim(),
+      model: input.model.trim(),
+      prompt: createHash('sha256').update(input.prompt.trim(), 'utf8').digest('hex'),
+      resolution: String(input.resolution || '').trim().toLowerCase(),
+      aspectRatio: input.aspectRatio,
+      outputFormat: input.outputFormat,
+      inputImages: input.inputImages.map((source) => createHash('sha256').update(source, 'utf8').digest('hex')),
+      outputIndex,
+    }), 'utf8')
+    .digest('hex');
+  return {
+    'Idempotency-Key': requestFingerprint,
+    'X-Request-Id': requestFingerprint,
+    'Cache-Control': 'no-cache, no-store',
+    Pragma: 'no-cache',
+  };
+}
+
+function uselgIdempotencyHeaders(provider: Pick<AiProviderChannel, 'kind'>, input: ImageInput) {
   return provider.kind === 'USELG'
-    ? { 'Idempotency-Key': clientRequestId }
+    ? uselgImageRequestHeaders(input)
     : undefined;
 }
 
@@ -1969,7 +1998,7 @@ async function providerNewApiImageEditRequest(
   try {
     const headers = upstreamHeaders(
       secrets,
-      uselgIdempotencyHeaders(provider, input.clientRequestId),
+      uselgIdempotencyHeaders(provider, input),
     );
     headers.set('content-type', `multipart/form-data; boundary=${boundary}`);
     headers.set('content-length', String(contentLength));
@@ -2060,7 +2089,7 @@ export async function generateNewApiImages(
             '/v1/images/generations',
             buildNewApiImageGenerationBody(input, input.inputImages, asyncOverride),
             IMAGE_GENERATION_TIMEOUT_MS,
-            uselgIdempotencyHeaders(provider, input.clientRequestId),
+            uselgIdempotencyHeaders(provider, input),
           ),
         );
       }
@@ -2071,7 +2100,7 @@ export async function generateNewApiImages(
         '/v1/images/generations',
         buildNewApiImageGenerationBody(input, input.inputImages, asyncOverride),
         IMAGE_GENERATION_TIMEOUT_MS,
-        uselgIdempotencyHeaders(provider, input.clientRequestId),
+        uselgIdempotencyHeaders(provider, input),
       );
       started = await requestNewApiImageWithAsyncFallback(preferAsync, startGeneration);
     }
@@ -3164,20 +3193,37 @@ function effectiveImageInputForProvider(provider: AiProviderChannel, input: Imag
   };
 }
 
+export function splitTabletImageProviderInputs(input: ImageInput): ImageInput[] {
+  if (input.clientPlatform !== 'tablet' || input.count <= 1) return [input];
+  return Array.from({ length: input.count }, (_, index) => {
+    const suffix = `:output:${index + 1}`;
+    const requestId = `${input.clientRequestId.slice(0, Math.max(1, 128 - suffix.length))}${suffix}`;
+    return {
+      ...input,
+      clientRequestId: requestId,
+      count: 1,
+    };
+  });
+}
+
 async function generateImagesFromProvider(
   provider: AiProviderChannel,
   effectiveInput: ImageInput,
 ) {
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-  const providerImages = provider.kind === 'XAIS'
-    ? await generateXaisImages(provider, secrets, effectiveInput)
-    : provider.kind === 'BIGMODEL' && isBigmodelBananaModel(effectiveInput.model)
-      ? await generateBigmodelBananaImages(provider, secrets, effectiveInput)
-      : provider.kind === 'MIKOTO' && isMikotoBananaModel(effectiveInput.model)
-        ? await generateMikotoBananaImages(provider, secrets, effectiveInput)
-        : provider.kind === 'USELG' && isUselgGeminiImageModel(effectiveInput.model)
-          ? await generateUselgGeminiImages(provider, secrets, effectiveInput)
-          : await generateNewApiImages(provider, secrets, effectiveInput);
+  const generateBatch = async (input: ImageInput) => provider.kind === 'XAIS'
+    ? generateXaisImages(provider, secrets, input)
+    : provider.kind === 'BIGMODEL' && isBigmodelBananaModel(input.model)
+      ? generateBigmodelBananaImages(provider, secrets, input)
+      : provider.kind === 'MIKOTO' && isMikotoBananaModel(input.model)
+        ? generateMikotoBananaImages(provider, secrets, input)
+        : provider.kind === 'USELG' && isUselgGeminiImageModel(input.model)
+          ? generateUselgGeminiImages(provider, secrets, input)
+          : generateNewApiImages(provider, secrets, input);
+  const providerImages: string[] = [];
+  for (const input of splitTabletImageProviderInputs(effectiveInput)) {
+    providerImages.push(...await generateBatch(input));
+  }
   const images = provider.kind === 'XAIS'
     ? await mirrorXaisImageResults(providerImages, provider.name)
     : await mirrorGeneratedImageResults(providerImages, provider.name);

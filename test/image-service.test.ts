@@ -55,8 +55,10 @@ import {
   selectVideoTaskPayload,
   selectVideoProvider,
   sizeFromRatio,
+  splitTabletImageProviderInputs,
   stageXaisPublicReference,
   uniqueImages,
+  uselgImageRequestHeaders,
   xaisAttachmentRegistrationUrls,
 } from '../src/modules/ai/image-service.js';
 import { getImageResult } from '../src/modules/ai/image-result-store.js';
@@ -435,6 +437,48 @@ describe('wallet image provider normalization', () => {
     expect(isTabletImageProviderFailoverStatus(400)).toBe(false);
   });
 
+  it('splits tablet multi-image requests into distinct single-image upstream tasks only', () => {
+    const input = {
+      userId: 'user-1',
+      clientRequestId: 'tablet-request-1',
+      clientPlatform: 'tablet' as const,
+      model: 'nano-banana-pro',
+      prompt: 'a red apple',
+      inputImages: [],
+      aspectRatio: '1:1' as const,
+      resolution: '4k',
+      outputFormat: 'png' as const,
+      count: 2,
+    };
+    const tabletTasks = splitTabletImageProviderInputs(input);
+    expect(tabletTasks).toHaveLength(2);
+    expect(tabletTasks.map((task) => task.count)).toEqual([1, 1]);
+    expect(new Set(tabletTasks.map((task) => task.clientRequestId)).size).toBe(2);
+    expect(splitTabletImageProviderInputs({ ...input, clientPlatform: undefined })).toEqual([
+      { ...input, clientPlatform: undefined },
+    ]);
+  });
+
+  it('uses a fresh USELG request fingerprint for resolution and output changes', () => {
+    const input = {
+      clientRequestId: 'desktop-generation-run-1',
+      model: 'nano-banana-pro',
+      prompt: 'same prompt',
+      inputImages: [],
+      aspectRatio: '16:9' as const,
+      resolution: '4k',
+      outputFormat: 'png' as const,
+    };
+    const first = uselgImageRequestHeaders(input, 0);
+    const repeated = uselgImageRequestHeaders(input, 0);
+    const nextOutput = uselgImageRequestHeaders(input, 1);
+    const lowerResolution = uselgImageRequestHeaders({ ...input, resolution: '2k' }, 0);
+    expect(first['Idempotency-Key']).toBe(repeated['Idempotency-Key']);
+    expect(first['Idempotency-Key']).not.toBe(nextOutput['Idempotency-Key']);
+    expect(first['Idempotency-Key']).not.toBe(lowerResolution['Idempotency-Key']);
+    expect(first['Cache-Control']).toBe('no-cache, no-store');
+  });
+
   it('allows image generation jobs to run for fifteen minutes', () => {
     expect(IMAGE_GENERATION_TIMEOUT_MS).toBe(15 * 60_000);
   });
@@ -656,7 +700,10 @@ describe('wallet image provider normalization', () => {
     const generated = 'iVBORw0KGgo' + 'c'.repeat(40);
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       expect(String(input)).toBe('https://api.ai-media.vip/v1beta/models/gemini-3.1-flash-image-preview:generateContent');
-      expect(new Headers(init?.headers).get('x-goog-api-key')).toBe('sk-uselg');
+      const headers = new Headers(init?.headers);
+      expect(headers.get('x-goog-api-key')).toBe('sk-uselg');
+      expect(headers.get('idempotency-key')).toMatch(/^[a-f0-9]{64}$/);
+      expect(headers.get('cache-control')).toBe('no-cache, no-store');
       const body = JSON.parse(String(init?.body));
       expect(body.generationConfig.responseModalities).toEqual(['TEXT', 'IMAGE']);
       expect(body.generationConfig.imageConfig).toEqual({ aspectRatio: '16:9', imageSize: '2K' });
