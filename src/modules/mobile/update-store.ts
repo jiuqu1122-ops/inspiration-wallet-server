@@ -40,6 +40,16 @@ export function getMobileUpdateSignedUrl(object: MobileUpdateObject) {
   });
 }
 
+export async function getMobileUpdateStream(object: MobileUpdateObject) {
+  const response = await requireClient().getStream(getMobileUpdateObjectKey(object), {
+    timeout: object === 'apk' ? 10 * 60_000 : 30_000,
+  });
+  if (response.res.status !== 200 || !response.stream) {
+    throw new Error(`Mobile update object returned HTTP ${response.res.status}`);
+  }
+  return response;
+}
+
 export async function getMobileUpdateManifest() {
   const response = await fetch(getMobileUpdateSignedUrl('manifest'), {
     redirect: 'error',

@@ -1,18 +1,25 @@
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
-import { getMobileUpdateManifest, getMobileUpdateSignedUrl } from './update-store.js';
+import { getMobileUpdateManifest, getMobileUpdateStream } from './update-store.js';
 
-function redirectToMobileObject(
-  object: 'manifest' | 'apk',
+async function streamMobileApk(
   reply: FastifyReply,
 ) {
   try {
-    return reply
-      .header('cache-control', object === 'apk' ? 'public, max-age=300' : 'no-cache')
-      .redirect(getMobileUpdateSignedUrl(object));
+    const response = await getMobileUpdateStream('apk');
+    const headers = response.res.headers as Record<string, unknown>;
+    const contentLength = headers['content-length'];
+    const output = reply
+      .header('cache-control', 'public, max-age=300')
+      .header('content-type', 'application/vnd.android.package-archive')
+      .header('content-disposition', 'attachment; filename="Inspiration-Drawer-Mobile-arm64.apk"');
+    if (typeof contentLength === 'string' || typeof contentLength === 'number') {
+      output.header('content-length', contentLength);
+    }
+    return output.send(response.stream);
   } catch {
     return reply.code(503).send({
       error: 'mobile_update_unavailable',
-      message: 'Mobile update storage is temporarily unavailable',
+      message: 'Mobile update APK is temporarily unavailable',
     });
   }
 }
@@ -35,6 +42,6 @@ export const mobileRoutes: FastifyPluginAsync = async (app) => {
   app.get(
     '/apk',
     { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
-    async (_request, reply) => redirectToMobileObject('apk', reply),
+    async (_request, reply) => streamMobileApk(reply),
   );
 };

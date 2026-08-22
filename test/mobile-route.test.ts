@@ -12,7 +12,10 @@ const updateMocks = vi.hoisted(() => ({
       architecture: 'arm64-v8a',
     },
   })),
-  getMobileUpdateSignedUrl: vi.fn(() => 'https://oss.example.test/mobile.apk?signature=test'),
+  getMobileUpdateStream: vi.fn(async () => ({
+    stream: Buffer.from('apk-bytes'),
+    res: { status: 200, headers: { 'content-length': '9' } },
+  })),
 }));
 
 vi.mock('../src/modules/mobile/update-store.js', () => updateMocks);
@@ -22,7 +25,7 @@ import { mobileRoutes } from '../src/modules/mobile/routes.js';
 describe('mobile update routes', () => {
   beforeEach(() => {
     updateMocks.getMobileUpdateManifest.mockClear();
-    updateMocks.getMobileUpdateSignedUrl.mockClear();
+    updateMocks.getMobileUpdateStream.mockClear();
   });
 
   it('serves the manifest through the API without exposing the OSS manifest URL', async () => {
@@ -34,19 +37,21 @@ describe('mobile update routes', () => {
     expect(response.statusCode).toBe(200);
     expect(response.headers['cache-control']).toBe('no-cache');
     expect(response.json().apk.url).toBe('https://api.example.test/v1/mobile/apk');
-    expect(updateMocks.getMobileUpdateSignedUrl).not.toHaveBeenCalled();
+    expect(updateMocks.getMobileUpdateStream).not.toHaveBeenCalled();
     await app.close();
   });
 
-  it('redirects APK requests to a short-lived signed OSS URL', async () => {
+  it('streams APK requests through the API instead of public OSS distribution', async () => {
     const app = Fastify();
     await app.register(mobileRoutes, { prefix: '/v1/mobile' });
 
     const response = await app.inject({ method: 'GET', url: '/v1/mobile/apk' });
 
-    expect(response.statusCode).toBe(302);
-    expect(response.headers.location).toBe('https://oss.example.test/mobile.apk?signature=test');
-    expect(updateMocks.getMobileUpdateSignedUrl).toHaveBeenCalledWith('apk');
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('application/vnd.android.package-archive');
+    expect(response.headers['content-disposition']).toContain('Inspiration-Drawer-Mobile-arm64.apk');
+    expect(response.body).toBe('apk-bytes');
+    expect(updateMocks.getMobileUpdateStream).toHaveBeenCalledWith('apk');
     await app.close();
   });
 
