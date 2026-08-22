@@ -1128,7 +1128,25 @@ function requiresGptImage2AlphaPostProcessing(input: ImageInput) {
     && (input.outputFormat === 'png' || input.background === 'transparent');
 }
 
-function promptWithConstraints(input: ImageInput) {
+export function buildUselgImage2VariationPrompt(prompt: string, clientRequestId: string) {
+  // USELG may cache GPT Image 2 by the visible request payload. Keep the
+  // client prompt untouched while making each server-side rerun distinct.
+  const nonce = createHash('sha256')
+    .update(clientRequestId.trim(), 'utf8')
+    .digest('hex')
+    .slice(0, 16);
+  return `${prompt.trim()}\n\nInternal generation instruction (do not render this instruction or token): this is a fresh independent render for request ${nonce}. Preserve the requested subject, composition, style, textual content, and all explicit constraints, but generate a new visual variation and do not reproduce any earlier output.`;
+}
+
+function promptWithConstraints(
+  input: ImageInput,
+  providerKind?: AiProviderChannel['kind'],
+) {
+  const shouldVaryUselgImage2 = providerKind === 'USELG'
+    && newApiImageFamily(input.model) === 'gpt-image-2';
+  const prompt = shouldVaryUselgImage2
+    ? buildUselgImage2VariationPrompt(input.prompt, input.clientRequestId)
+    : input.prompt.trim();
   const constraints = [`must output exactly ${input.aspectRatio} aspect ratio`];
   if (input.resolution) constraints.push(`target resolution ${input.resolution}`);
   if (input.inputImages.length > 0) {
@@ -1139,7 +1157,7 @@ function promptWithConstraints(input: ImageInput) {
   } else if (input.background === 'transparent') {
     constraints.push('use a truly transparent background with an alpha channel, not a checkerboard pattern');
   }
-  return `${input.prompt.trim()}\n\nStrict image constraints: ${constraints.join(', ')}.`;
+  return `${prompt}\n\nStrict image constraints: ${constraints.join(', ')}.`;
 }
 
 function chatContent(input: ImageInput, inputImages = input.inputImages) {
@@ -1155,6 +1173,7 @@ export function buildNewApiImageGenerationBody(
   input: ImageInput,
   inputImages = input.inputImages,
   asyncOverride?: boolean,
+  providerKind?: AiProviderChannel['kind'],
 ) {
   const imageParams = newApiImageRequestParams(
     input.model,
@@ -1166,7 +1185,7 @@ export function buildNewApiImageGenerationBody(
   );
   return {
     model: input.model,
-    prompt: promptWithConstraints(input),
+    prompt: promptWithConstraints(input, providerKind),
     ...imageParams,
     ...(input.negativePrompt ? { negative_prompt: input.negativePrompt } : {}),
     ...(inputImages.length === 1 ? { image: inputImages[0] } : {}),
@@ -1892,8 +1911,12 @@ function newApiMultipartFileHeader(boundary: string, image: StagedNewApiEditImag
   );
 }
 
-function newApiEditFields(input: ImageInput, asyncOverride?: boolean) {
-  const body = buildNewApiImageGenerationBody(input, input.inputImages, asyncOverride) as Record<string, unknown>;
+function newApiEditFields(
+  input: ImageInput,
+  asyncOverride?: boolean,
+  providerKind?: AiProviderChannel['kind'],
+) {
+  const body = buildNewApiImageGenerationBody(input, input.inputImages, asyncOverride, providerKind) as Record<string, unknown>;
   delete body.image;
   delete body.images;
   return Object.entries(body)
@@ -1967,7 +1990,7 @@ async function providerNewApiImageEditRequest(
   asyncOverride?: boolean,
 ) {
   const boundary = `inspiration-${randomUUID().replace(/-/g, '')}`;
-  const textParts = newApiEditFields(input, asyncOverride).map(([name, value]) => (
+  const textParts = newApiEditFields(input, asyncOverride, provider.kind).map(([name, value]) => (
     newApiMultipartTextPart(boundary, name, value)
   ));
   const fileHeaders = images.map((image) => newApiMultipartFileHeader(boundary, image));
@@ -2087,7 +2110,7 @@ export async function generateNewApiImages(
             provider,
             secrets,
             '/v1/images/generations',
-            buildNewApiImageGenerationBody(input, input.inputImages, asyncOverride),
+            buildNewApiImageGenerationBody(input, input.inputImages, asyncOverride, provider.kind),
             IMAGE_GENERATION_TIMEOUT_MS,
             uselgIdempotencyHeaders(provider, input),
           ),
@@ -2098,7 +2121,7 @@ export async function generateNewApiImages(
         provider,
         secrets,
         '/v1/images/generations',
-        buildNewApiImageGenerationBody(input, input.inputImages, asyncOverride),
+        buildNewApiImageGenerationBody(input, input.inputImages, asyncOverride, provider.kind),
         IMAGE_GENERATION_TIMEOUT_MS,
         uselgIdempotencyHeaders(provider, input),
       );

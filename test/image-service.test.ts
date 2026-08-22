@@ -4,6 +4,7 @@ import sharp from 'sharp';
 import {
   IMAGE_GENERATION_TIMEOUT_MS,
   buildNewApiImageGenerationBody,
+  buildUselgImage2VariationPrompt,
   chooseProviderForCapability,
   collectGeneratedVideoStrings,
   collectProviderModelIds,
@@ -1276,6 +1277,38 @@ describe('wallet image provider normalization', () => {
     expect(body).not.toHaveProperty('background');
     expect(body.prompt).toContain('RGB(255,0,255)');
     expect(body.prompt).toContain('do not draw a transparency checkerboard');
+  });
+
+  it('varies only the server-side USELG GPT Image 2 prompt per request', () => {
+    const base = {
+      userId: 'user-1',
+      model: 'gpt-image-2',
+      prompt: 'render a product cutout',
+      inputImages: [],
+      aspectRatio: '1:1' as const,
+      resolution: '2K',
+      outputFormat: 'jpg' as const,
+      count: 1,
+    };
+    const first = buildNewApiImageGenerationBody({
+      ...base,
+      clientRequestId: 'uselg-rerun-1',
+    }, [], false, 'USELG');
+    const second = buildNewApiImageGenerationBody({
+      ...base,
+      clientRequestId: 'uselg-rerun-2',
+    }, [], false, 'USELG');
+    const nonUselg = buildNewApiImageGenerationBody({
+      ...base,
+      clientRequestId: 'uselg-rerun-1',
+    }, [], false, 'NEW_API');
+
+    expect(first.prompt).toContain(base.prompt);
+    expect(first.prompt).toContain('fresh independent render');
+    expect(first.prompt).not.toBe(second.prompt);
+    expect(nonUselg.prompt).not.toContain('fresh independent render');
+    expect(buildUselgImage2VariationPrompt(base.prompt, 'uselg-rerun-1'))
+      .toBe(first.prompt.replace(/\n\nStrict image constraints:[\s\S]*$/, ''));
   });
 
   it('converts the GPT Image 2 chroma key into real PNG alpha', async () => {
