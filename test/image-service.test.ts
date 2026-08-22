@@ -423,6 +423,110 @@ describe('wallet image provider normalization', () => {
     ]);
   });
 
+  it('fails over after a USELG async image task reports a generation failure', async () => {
+    const encryptedSecrets = encryptProviderSecrets({ apiKey: 'sk-image-test', headers: {} });
+    const provider = (
+      id: string,
+      kind: 'USELG' | 'MIKOTO',
+      baseUrl: string,
+      priority: number,
+    ) => ({
+      id,
+      name: id,
+      kind,
+      status: 'ACTIVE',
+      priority,
+      baseUrl,
+      defaultModel: 'gemini-3-pro-image-preview',
+      allowInsecureHttp: false,
+      encryptedSecrets,
+      apiKeyLast4: 'test',
+      capabilities: ['IMAGE_NANO_BANANA'],
+      lastTestStatus: null,
+      lastTestMessage: null,
+      lastTestModelCount: null,
+      lastTestedAt: null,
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    });
+    const primary = provider('uselg-channel', 'USELG', 'https://1.1.1.1', 0);
+    const fallback = provider('fallback-channel', 'MIKOTO', 'https://8.8.8.8', 10);
+    const requestRow = { id: 'image-request-uselg-task-failover', userId: 'user-1', status: 'RESERVED' };
+    const transaction = {
+      aiRequest: {
+        findUnique: vi.fn(async () => null),
+        create: vi.fn(async () => requestRow),
+        update: vi.fn(async () => requestRow),
+      },
+      wallet: {
+        updateMany: vi.fn(async () => ({ count: 1 })),
+        findUniqueOrThrow: vi.fn(async () => ({ availableCredits: 1000n })),
+        update: vi.fn(async () => ({ availableCredits: 1000n })),
+      },
+      walletLedger: { create: vi.fn(async () => ({})) },
+    };
+    const prisma = {
+      aiProviderChannel: { findMany: vi.fn(async () => [primary, fallback]) },
+      aiPricingConfig: { findUnique: vi.fn(async () => null) },
+      $transaction: vi.fn(async (callback: (tx: typeof transaction) => unknown) => callback(transaction)),
+    };
+    const resultUrl = 'https://api.example.test/v1/ai/image-results/fallback-after-task-failure.png';
+    const fetchMock = vi.fn(async (source: RequestInfo | URL) => {
+      const url = String(source);
+      if (url === 'https://1.1.1.1/v1beta/models/gemini-3-pro-image-preview:generateContent') {
+        return new Response(JSON.stringify({
+          task_id: 'uselg-failed-task',
+          status: 'queued',
+          status_url: '/v1/images/tasks/uselg-failed-task?view=summary',
+          poll_after_ms: 2_000,
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url === 'https://1.1.1.1/v1/images/tasks/uselg-failed-task?view=summary') {
+        return new Response(JSON.stringify({
+          task_id: 'uselg-failed-task',
+          status: 'failed',
+          error: 'Image generation failed; please check the request or try again later',
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ fileData: { mimeType: 'image/png', fileUri: resultUrl } }] } }],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(executeWalletImageGeneration(prisma as never, {
+      userId: 'user-1',
+      clientRequestId: 'request-uselg-task-failover',
+      providerChannelId: primary.id,
+      model: 'gemini-3-pro-image-preview',
+      prompt: 'a red apple',
+      inputImages: [],
+      aspectRatio: '1:1',
+      resolution: '2k',
+      outputFormat: 'png',
+      count: 1,
+    })).resolves.toMatchObject({
+      images: [resultUrl],
+      providerChannelId: fallback.id,
+      providerChannelName: fallback.name,
+    });
+    expect(fetchMock.mock.calls.map(([source]) => String(source))).toEqual([
+      'https://1.1.1.1/v1beta/models/gemini-3-pro-image-preview:generateContent',
+      'https://1.1.1.1/v1/images/tasks/uselg-failed-task?view=summary',
+      'https://8.8.8.8/v1beta/models/gemini-3-pro-image-preview:generateContent',
+    ]);
+  });
+
   it('keeps desktop failover on HTTP 5xx and extends transient failures only for tablet requests', () => {
     expect(isImageProviderFailoverStatus(500)).toBe(true);
     expect(isImageProviderFailoverStatus(503)).toBe(true);

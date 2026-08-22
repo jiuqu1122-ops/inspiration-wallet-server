@@ -1485,10 +1485,14 @@ export async function resolveUselgImageResponse(
     const images = uniqueUselgImages(lastStatus, inputImages, count);
     if (images.length) return images;
     const failure = getFailure(lastStatus);
-    if (failure) throw new Error(failure);
+    if (failure) throw new UpstreamImageError(502, failure, lastStatus);
     const state = newApiImageTaskState(lastStatus);
     if (/^(?:failed|failure|error|cancelled|canceled|uncertain|client_disconnected)$/.test(state)) {
-      throw new Error(`uselg 图片任务失败（${state}）：${taskId}`);
+      throw new UpstreamImageError(
+        502,
+        `uselg 图片任务失败（${state}）：${taskId}`,
+        lastStatus,
+      );
     }
     if (!/^(?:completed|complete|succeeded|success|finished|done)$/.test(state)) continue;
 
