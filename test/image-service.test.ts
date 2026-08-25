@@ -1438,6 +1438,46 @@ describe('wallet image provider normalization', () => {
     expect(alphaAt(3, 3)).toBe(255);
   });
 
+  it('returns the original GPT Image 2 result when no transparent background can be produced', async () => {
+    const generated = await sharp({
+      create: {
+        width: 8,
+        height: 8,
+        channels: 4,
+        background: { r: 32, g: 96, b: 160, alpha: 1 },
+      },
+    }).png().toBuffer();
+    const original = `data:image/png;base64,${generated.toString('base64')}`;
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({
+      output: [{ result: generated.toString('base64') }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      await expect(generateNewApiImages(
+        { baseUrl: 'https://provider.example', name: 'Image2 channel' } as Parameters<typeof generateNewApiImages>[0],
+        { apiKey: 'test-key', headers: {} },
+        {
+          userId: 'user-1',
+          clientRequestId: 'request-transparent-fallback',
+          model: 'gpt-image-2',
+          prompt: 'remove only the background',
+          inputImages: [],
+          aspectRatio: '1:1',
+          resolution: '2K',
+          outputFormat: 'png',
+          background: 'transparent',
+          count: 1,
+        },
+      )).resolves.toEqual([original]);
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps transparent GPT Image 2 reference requests on the multipart edits endpoint', async () => {
     const reference = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
     const generated = await sharp({

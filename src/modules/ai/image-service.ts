@@ -1892,7 +1892,20 @@ async function readNewApiResultBytes(source: string, index: number) {
 
 async function createTransparentGptImage2Result(source: string, index: number) {
   const sourceBytes = await readNewApiResultBytes(source, index);
-  const png = await convertGptImage2ChromaKeyToTransparentPng(sourceBytes);
+  let png: Buffer;
+  try {
+    png = await convertGptImage2ChromaKeyToTransparentPng(sourceBytes);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/(?:did not return a usable chroma-key background|background conversion produced no transparent pixels)/i.test(message)) {
+      throw error;
+    }
+    // The provider still produced a valid image. Transparency is best-effort:
+    // never discard a paid generation just because its background cannot be
+    // converted safely to alpha.
+    console.warn('[gpt_image_2_transparency_fallback]', { index, error: message });
+    return source;
+  }
   return createImageResultFromResponse(new Response(new Uint8Array(png), {
     headers: {
       'content-type': 'image/png',
