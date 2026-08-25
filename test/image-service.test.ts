@@ -326,6 +326,10 @@ describe('dual-protocol image channels', () => {
       capabilities: ['LLM', 'IMAGE_GPT'],
     })).toBe(true);
     expect(providerCanServeImageAlongsideAgent({
+      kind: 'USELG',
+      capabilities: ['VISION', 'IMAGE_GPT'],
+    })).toBe(true);
+    expect(providerCanServeImageAlongsideAgent({
       kind: 'NEW_API',
       capabilities: ['LLM', 'IMAGE'],
     })).toBe(false);

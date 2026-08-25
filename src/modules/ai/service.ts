@@ -2,7 +2,7 @@ import type { AiCapability, AiProviderChannel, PrismaClient } from '@prisma/clie
 import { env } from '../../config/env.js';
 import { decryptProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
-import { normalizeImageTagAnalysis } from './tag-analysis.js';
+import { MIN_AI_IMAGE_TAGS, normalizeImageTagAnalysis } from './tag-analysis.js';
 import {
   configuredAgentRequestCredits,
   configuredInspirationAnalysisCredits,
@@ -30,11 +30,23 @@ async function listProviders(prisma: PrismaClient, capability: 'LLM' | 'VISION' 
   });
 }
 
+export function providerSupportsInspirationAnalysis(
+  provider: Pick<AiProviderChannel, 'capabilities'>,
+) {
+  return provider.capabilities.includes('VISION');
+}
+
 async function listInspirationProviders(prisma: PrismaClient) {
-  const visionProviders = await listProviders(prisma, 'VISION');
+  const visionProviders = (await listProviders(prisma, 'VISION'))
+    .filter(providerSupportsInspirationAnalysis);
   // Existing installations only have LLM channels. Keep them working until a
-  // dedicated visual channel is configured in the manager.
-  return visionProviders.length > 0 ? visionProviders : listProviders(prisma);
+  // dedicated visual channel is configured in the manager. USELG is excluded
+  // from this legacy fallback so its independent LLM and Vision checkboxes keep
+  // their intended meaning.
+  if (visionProviders.length > 0) return visionProviders;
+  return (await listProviders(prisma)).filter(provider => (
+    provider.kind !== 'USELG'
+  ));
 }
 
 async function selectProvider(prisma: PrismaClient) {
@@ -284,6 +296,7 @@ type AgentChoiceAccumulator = {
   index: number;
   role: string;
   content: string;
+  reasoningContent: string;
   refusal: string;
   toolCalls: Map<number, AgentToolCallAccumulator>;
   finishReason: unknown;
@@ -364,6 +377,7 @@ function mergeStreamedChoice(
     index,
     role: 'assistant',
     content: '',
+    reasoningContent: '',
     refusal: '',
     toolCalls: new Map<number, AgentToolCallAccumulator>(),
     finishReason: null,
@@ -371,6 +385,7 @@ function mergeStreamedChoice(
   const delta = objectValue(choice.delta) ?? objectValue(choice.message);
   if (typeof delta?.role === 'string' && delta.role) accumulator.role = delta.role;
   accumulator.content += streamedText(delta?.content);
+  accumulator.reasoningContent += streamedText(delta?.reasoning_content);
   accumulator.refusal += streamedText(delta?.refusal);
   mergeStreamedToolCalls(accumulator, delta?.tool_calls);
   if (choice.finish_reason !== undefined && choice.finish_reason !== null) {
@@ -399,6 +414,7 @@ function buildAgentCompletionResult(
         message: {
           role: choice.role,
           content: choice.content,
+          ...(choice.reasoningContent ? { reasoning_content: choice.reasoningContent } : {}),
           ...(choice.refusal ? { refusal: choice.refusal } : {}),
           ...(choice.toolCalls.size > 0 ? {
             tool_calls: Array.from(choice.toolCalls.entries())
@@ -549,6 +565,90 @@ export function parseAgentCompletionResponseText(text: string): unknown {
   const parser = new AgentCompletionSseParser();
   parser.push(text);
   return parser.finish();
+}
+
+function analysisResponseContentText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    return value.map((part) => {
+      if (typeof part === 'string') return part;
+      const partRecord = objectValue(part);
+      if (!partRecord) return '';
+      if (typeof partRecord.text === 'string') return partRecord.text;
+      if (partRecord.json && typeof partRecord.json === 'object') {
+        return JSON.stringify(partRecord.json);
+      }
+      return '';
+    }).join('');
+  }
+  return value && typeof value === 'object' ? JSON.stringify(value) : '';
+}
+
+function jsonObjectTextCandidates(text: string) {
+  const normalized = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+  if (!normalized) return [];
+  const objects: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < normalized.length; index += 1) {
+    const character = normalized[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      continue;
+    }
+    if (character === '{') {
+      if (depth === 0) start = index;
+      depth += 1;
+    } else if (character === '}' && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        objects.push(normalized.slice(start, index + 1));
+        start = -1;
+      }
+    }
+  }
+  return Array.from(new Set([normalized, ...objects.reverse()]));
+}
+
+export function parseImageAnalysisResponsePayloads(value: unknown) {
+  const root = objectValue(value);
+  const choice = Array.isArray(root?.choices) ? objectValue(root.choices[0]) : null;
+  const message = objectValue(choice?.message);
+  const response = objectValue(root?.response);
+  const texts = [
+    analysisResponseContentText(message?.content),
+    analysisResponseContentText(message?.reasoning_content),
+    analysisResponseContentText(choice?.text),
+    analysisResponseContentText(root?.output_text),
+    analysisResponseContentText(response?.output_text),
+    root && ('tags' in root || 'cmf' in root || 'form' in root) ? JSON.stringify(root) : '',
+  ].filter(Boolean);
+  const payloads: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  for (const text of texts) {
+    for (const candidate of jsonObjectTextCandidates(text)) {
+      try {
+        const parsed = JSON.parse(candidate) as unknown;
+        const parsedRecord = objectValue(parsed);
+        if (!parsedRecord) continue;
+        const key = JSON.stringify(parsedRecord);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        payloads.push(parsedRecord);
+      } catch {
+        // A compatible JSON object may still appear later in the same text.
+      }
+    }
+  }
+  return payloads;
 }
 
 class AgentUpstreamHttpError extends Error {
@@ -718,8 +818,9 @@ async function requestStreamingCompletion(
       model,
       attempt,
     });
-    // Bigmodel/Mikoto use the OpenAI-compatible text route here. Their native
-    // image protocols are isolated in image-service.ts and never share this body.
+    // Bigmodel/Mikoto/USELG use the OpenAI-compatible text route here. Their
+    // native image protocols are isolated in image-service.ts and never share
+    // this body.
     response = await fetch(providerEndpoint(provider.baseUrl, '/v1/chat/completions'), {
       method: 'POST',
       headers: upstreamHeaders(secrets.apiKey, secrets.headers),
@@ -1190,7 +1291,7 @@ Allowed tag categories are exactly: 产品类别, 设计领域, 风格, 材质, 
 Do not use generic or subjective labels such as 图片, 照片, 素材, 设计作品, 漂亮, 好看, 高级, 产品, 设计.
 Return this exact JSON shape:
 {"tags":[{"name":"","category":"产品类别","confidence":0.0}],"description":"","objects":[],"colors":[],"form":{"silhouette":[],"geometry":[],"proportion":[]},"cmf":{"colors":[],"materials":[],"finishes":[]},"style":[],"interaction":[],"scene":[]}
-Generate 4-16 concise tags. Confidence must be a number from 0 to 1. Keep uncertain fields empty.
+Generate 5-16 concise tags. Confidence must be a number from 0 to 1. Keep uncertain fields empty.
 User tags: ${JSON.stringify(input.userTags ?? [])}
 User notes: ${JSON.stringify(input.userNotes ?? [])}
 Existing profile: ${JSON.stringify(input.existingProfile ?? null)}`;
@@ -1257,28 +1358,18 @@ Existing profile: ${JSON.stringify(input.existingProfile ?? null)}`;
       502,
     );
   }
-  const content = (value as { choices?: Array<{ message?: { content?: unknown } }> })
-    ?.choices?.[0]?.message?.content;
-  const raw = typeof content === 'string'
-    ? content
-    : Array.isArray(content)
-      ? content.map((part: unknown) => {
-        if (!part || typeof part !== 'object' || !('text' in part)) return '';
-        const text = (part as Record<string, unknown>).text;
-        return typeof text === 'string' ? text : '';
-      }).join('')
-      : '';
-  const jsonText = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
-  try {
-    const analysis = normalizeImageTagAnalysis(JSON.parse(jsonText) as unknown, input);
-    if (analysis.tags.length === 0) {
-      throw new CloudAiError('provider_invalid_response', '灵感自动分析没有返回有效标签', 502);
-    }
-    return analysis;
-  } catch (error) {
-    if (error instanceof CloudAiError) throw error;
+  const payloads = parseImageAnalysisResponsePayloads(value);
+  if (payloads.length === 0) {
     throw new CloudAiError('provider_invalid_response', '灵感自动分析未返回有效 JSON', 502);
   }
+  let bestAnalysis: ReturnType<typeof normalizeImageTagAnalysis> | null = null;
+  for (const payload of payloads) {
+    const analysis = normalizeImageTagAnalysis(payload, input);
+    if (!bestAnalysis || analysis.tags.length > bestAnalysis.tags.length) bestAnalysis = analysis;
+    if (analysis.tags.length >= MIN_AI_IMAGE_TAGS) return analysis;
+  }
+  if (bestAnalysis?.tags.length) return bestAnalysis;
+  throw new CloudAiError('provider_invalid_response', '灵感自动分析没有返回有效标签', 502);
 }
 
 export async function executeWalletInspirationAnalysis(

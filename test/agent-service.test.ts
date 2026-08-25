@@ -13,11 +13,25 @@ import {
   looksLikeAgentSsePayload,
   getAgentRequestCredits,
   parseAgentCompletionResponseText,
+  parseImageAnalysisResponsePayloads,
+  providerSupportsInspirationAnalysis,
   resolveConfiguredAgentModel,
   sanitizeAgentUpstreamDetail,
 } from '../src/modules/ai/service.js';
 
 describe('Agent provider fallback policy', () => {
+  it('keeps USELG LLM and Vision capabilities independent', () => {
+    expect(providerSupportsInspirationAnalysis({
+      capabilities: ['VISION'],
+    })).toBe(true);
+    expect(providerSupportsInspirationAnalysis({
+      capabilities: ['LLM', 'VISION'],
+    })).toBe(true);
+    expect(providerSupportsInspirationAnalysis({
+      capabilities: ['LLM'],
+    })).toBe(false);
+  });
+
   it('charges ten server-side credits for each Agent request', () => {
     expect(getAgentRequestCredits()).toBe(10n);
   });
@@ -283,5 +297,40 @@ describe('Agent provider fallback policy', () => {
     accumulator.push('"ok"},"finish_reason":"stop"}]}');
     expect(accumulator.isDone()).toBe(false);
     expect(accumulator.finish()).toEqual(value);
+  });
+});
+
+describe('image analysis response compatibility', () => {
+  it('recovers JSON from reasoning_content when content is empty', () => {
+    const payloads = parseImageAnalysisResponsePayloads({
+      choices: [{
+        message: {
+          content: '',
+          reasoning_content: 'analysis complete\n```json\n{"tags":[{"name":"桌面音响","category":"产品类别","confidence":0.9}]}\n```',
+        },
+      }],
+    });
+
+    expect(payloads).toContainEqual({
+      tags: [{ name: '桌面音响', category: '产品类别', confidence: 0.9 }],
+    });
+  });
+
+  it('accepts object content and JSON surrounded by explanatory text', () => {
+    expect(parseImageAnalysisResponsePayloads({
+      choices: [{ message: { content: { tags: [{ name: '金属', category: '材质', confidence: 0.8 }] } } }],
+    })).toContainEqual({ tags: [{ name: '金属', category: '材质', confidence: 0.8 }] });
+
+    expect(parseImageAnalysisResponsePayloads({
+      choices: [{ text: 'Result follows: {"colors":["黑色"],"style":["工业风"]} done.' }],
+    })).toContainEqual({ colors: ['黑色'], style: ['工业风'] });
+  });
+
+  it('preserves streamed reasoning_content for the analysis fallback parser', () => {
+    const parser = new AgentCompletionSseParser();
+    parser.push('data: {"choices":[{"index":0,"delta":{"reasoning_content":"{\\"colors\\":[\\"银色\\"],"},"finish_reason":null}]}\n\n');
+    parser.push('data: {"choices":[{"index":0,"delta":{"reasoning_content":"\\"style\\":[\\"极简主义\\"]}"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+    const payloads = parseImageAnalysisResponsePayloads(parser.finish());
+    expect(payloads).toContainEqual({ colors: ['银色'], style: ['极简主义'] });
   });
 });

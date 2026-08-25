@@ -21,6 +21,10 @@ describe('provider URL safety and normalization', () => {
   it('normalizes the configured USELG /v1 URL to the channel root', () => {
     expect(normalizeProviderBaseUrl('USELG', 'https://api.ai-media.vip/v1'))
       .toBe('https://api.ai-media.vip');
+    expect(normalizeProviderBaseUrl('USELG', 'https://api.uselg.top/v1'))
+      .toBe('https://api.uselg.top');
+    expect(providerEndpoint('https://api.uselg.top', '/v1/chat/completions'))
+      .toBe('https://api.uselg.top/v1/chat/completions');
   });
 
   it('normalizes a Bigmodel native Gemini endpoint to the channel root', () => {

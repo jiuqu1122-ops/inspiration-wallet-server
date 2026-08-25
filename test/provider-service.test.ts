@@ -6,7 +6,7 @@ import {
 } from '../src/modules/providers/service.js';
 
 function provider(
-  kind: 'MIKOTO' | 'BIGMODEL' | 'MINIMAX',
+  kind: 'MIKOTO' | 'BIGMODEL' | 'MINIMAX' | 'USELG',
   capabilities: string[],
   defaultModel = 'gpt-5.4',
 ) {
@@ -91,6 +91,61 @@ describe('provider connection probes', () => {
     expect(result.message).toContain('Vision probe passed (qwen-vl-max)');
     const probeBody = JSON.parse(String((fetchMock.mock.calls[1]?.[1] as RequestInit).body)) as Record<string, unknown>;
     expect(probeBody).toMatchObject({ response_format: { type: 'json_object' }, stream: false });
+  });
+
+  it('checks a standalone USELG Vision channel through OpenAI chat completions', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [{ id: 'gpt-5.6-luna' }, { id: 'gpt-image-2' }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: '{"label":"square"}' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await testProvider(
+      prismaFor(provider('USELG', ['VISION', 'IMAGE_GPT'], 'gpt-5.6-luna')),
+      'provider-test-1',
+    );
+
+    expect(result.message).toContain('Vision probe passed (gpt-5.6-luna)');
+    expect(String(fetchMock.mock.calls[1]?.[0])).toBe(
+      'https://example.com/v1/chat/completions',
+    );
+    const probeBody = JSON.parse(String((fetchMock.mock.calls[1]?.[1] as RequestInit).body)) as Record<string, unknown>;
+    expect(probeBody).toMatchObject({
+      model: 'gpt-5.6-luna',
+      response_format: { type: 'json_object' },
+      stream: false,
+    });
+  });
+
+  it('checks a standalone USELG LLM channel through OpenAI chat completions', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [{ id: 'gpt-5.6-luna' }, { id: 'gpt-image-2' }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: 'OK' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await testProvider(
+      prismaFor(provider('USELG', ['LLM', 'IMAGE_GPT'], 'gpt-5.6-luna')),
+      'provider-test-1',
+    );
+
+    expect(result.message).toContain('LLM probe passed (gpt-5.6-luna)');
+    expect(String(fetchMock.mock.calls[1]?.[0])).toBe(
+      'https://example.com/v1/chat/completions',
+    );
+    const probeBody = JSON.parse(String((fetchMock.mock.calls[1]?.[1] as RequestInit).body)) as Record<string, unknown>;
+    expect(probeBody).toMatchObject({
+      model: 'gpt-5.6-luna',
+      stream: false,
+      max_tokens: 1,
+    });
+    expect(probeBody).not.toHaveProperty('response_format');
   });
 
   it('tests Bigmodel OpenAI text and native image catalogs independently', async () => {
