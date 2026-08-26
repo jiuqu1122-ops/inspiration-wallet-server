@@ -75,6 +75,7 @@ const imageSchema = z.object({
   model: z.string().trim().min(1).max(200),
   prompt: z.string().trim().min(1).max(50_000),
   negativePrompt: optionalString(20_000),
+  preserveReferenceIdentity: z.boolean().default(false),
   inputImages: z.array(z.string().min(1).max(12_000_000)).max(9).default([]),
   aspectRatio: z.enum(['1:1', '3:4', '4:3', '9:16', '16:9']).default('1:1'),
   resolution: optionalString(20),

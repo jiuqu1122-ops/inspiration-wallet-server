@@ -1377,6 +1377,22 @@ describe('wallet image provider normalization', () => {
       response_format: 'url',
       stream: false,
     });
+    expect(body.prompt).not.toContain('treat every supplied reference image as authoritative');
+
+    const productConsistencyBody = buildNewApiImageGenerationBody({
+      userId: 'user-1',
+      clientRequestId: 'request-product-consistency',
+      model: 'gemini-3-pro-image',
+      prompt: 'render the projector',
+      preserveReferenceIdentity: true,
+      inputImages: [reference],
+      aspectRatio: '16:9',
+      resolution: '2K',
+      outputFormat: 'jpg',
+      count: 1,
+    }, [reference]);
+    expect(productConsistencyBody.prompt)
+      .toContain('treat every supplied reference image as authoritative');
   });
 
   it('uses a chroma-key PNG request for GPT Image 2 instead of unsupported native alpha', () => {
@@ -1534,7 +1550,7 @@ describe('wallet image provider normalization', () => {
     expect(multipartBody).toContain('name="image"; filename="reference-1.png"');
     expect(multipartBody).toContain('name="output_format"\r\n\r\npng');
     expect(multipartBody).not.toContain('name="background"');
-    expect(multipartBody).toContain('treat every supplied reference image as authoritative');
+    expect(multipartBody).not.toContain('treat every supplied reference image as authoritative');
     expect(result).toContain('/v1/ai/image-results/');
 
     const key = new URL(result!).pathname.split('/').pop()!;

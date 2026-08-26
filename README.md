@@ -97,6 +97,7 @@ npm run build
 ### 钱包
 
 - `GET /v1/wallet/transactions?limit=50&cursor=...`：需要 Access Token，按游标分页返回额度流水。
+- `GET /v1/wallet/usage?limit=50&cursor=...`：需要 Access Token，按游标分页返回非零的最终积分消耗记录，不包含预扣和失败释放记录。
 - `POST /v1/wallet/redeem`：需要 Access Token，提交一次性或多次可用的额度兑换码。
 - 钱包数值均返回字符串，例如 `"availableCredits": "10000"`。
 - 客户端没有“直接扣款”或“直接加款”接口。AI 接口由服务器计算价格并在事务中预扣、结算或释放。

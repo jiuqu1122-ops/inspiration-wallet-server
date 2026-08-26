@@ -24,7 +24,7 @@ describe('wallet AI request compatibility', () => {
   });
 
   it('keeps the client platform absent for existing desktop requests', () => {
-    expect(normalizeImageRequestBody({
+    const normalized = normalizeImageRequestBody({
       clientRequestId: 'canvas-image-request-desktop',
       model: 'gpt-image-2',
       prompt: 'render a projector',
@@ -33,7 +33,23 @@ describe('wallet AI request compatibility', () => {
       resolution: '1k',
       outputFormat: 'png',
       count: 1,
-    }).clientPlatform).toBeUndefined();
+    });
+    expect(normalized.clientPlatform).toBeUndefined();
+    expect(normalized.preserveReferenceIdentity).toBe(false);
+  });
+
+  it('accepts an explicit product-consistency reference lock', () => {
+    expect(normalizeImageRequestBody({
+      clientRequestId: 'canvas-image-request-product-lock',
+      model: 'gemini-3-pro-image',
+      prompt: 'render a projector',
+      preserveReferenceIdentity: true,
+      inputImages: ['https://example.com/projector.png'],
+      aspectRatio: '16:9',
+      resolution: '2k',
+      outputFormat: 'jpg',
+      count: 1,
+    }).preserveReferenceIdentity).toBe(true);
   });
 
   it('accepts the explicit tablet client platform without selecting a provider', () => {

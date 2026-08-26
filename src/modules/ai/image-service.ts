@@ -228,6 +228,7 @@ export type ImageInput = {
   model: string;
   prompt: string;
   negativePrompt?: string | undefined;
+  preserveReferenceIdentity?: boolean | undefined;
   inputImages: string[];
   aspectRatio: '1:1' | '3:4' | '4:3' | '9:16' | '16:9';
   resolution?: string | undefined;
@@ -1156,7 +1157,7 @@ function promptWithConstraints(
     : input.prompt.trim();
   const constraints = [`must output exactly ${input.aspectRatio} aspect ratio`];
   if (input.resolution) constraints.push(`target resolution ${input.resolution}`);
-  if (input.inputImages.length > 0) {
+  if (input.preserveReferenceIdentity === true && input.inputImages.length > 0) {
     constraints.push('treat every supplied reference image as authoritative and preserve its subject, geometry, details, colors, and branding outside changes explicitly requested by the user');
   }
   if (requiresGptImage2AlphaPostProcessing(input)) {
