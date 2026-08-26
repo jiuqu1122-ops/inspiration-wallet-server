@@ -3061,8 +3061,17 @@ async function generateXaisImages(
   return uniqueImages(value, input.inputImages, input.count);
 }
 
-async function reserveImageCredits(prisma: PrismaClient, input: ImageInput) {
-  const unitCredits = await configuredImageUnitCredits(prisma, input.model, input.resolution);
+async function reserveImageCredits(
+  prisma: PrismaClient,
+  input: ImageInput,
+  capabilities?: readonly string[],
+) {
+  const unitCredits = await configuredImageUnitCredits(
+    prisma,
+    input.model,
+    input.resolution,
+    capabilities,
+  );
   const estimated = unitCredits * BigInt(input.count);
   const requestId = await prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({
@@ -3294,7 +3303,11 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
   const primaryProvider = providers[0]!;
   const reservationInput = effectiveImageInputForProvider(primaryProvider, input);
   await assertPublicProviderUrl(primaryProvider.baseUrl);
-  const reservation = await reserveImageCredits(prisma, reservationInput);
+  const reservation = await reserveImageCredits(
+    prisma,
+    reservationInput,
+    primaryProvider.capabilities,
+  );
   let activeProvider = primaryProvider;
   let activeInput = reservationInput;
   try {

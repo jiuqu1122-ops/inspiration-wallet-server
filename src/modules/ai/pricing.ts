@@ -77,6 +77,8 @@ const KNOWN_VIDEO_MODELS = [
 const CANONICAL_IMAGE_PRICING_MODELS = [
   'nano-banana-pro',
   'nano-banana-2',
+  'nano-banana-pro-fast',
+  'nano-banana-2-fast',
   'image2',
 ] as const;
 
@@ -96,6 +98,8 @@ export const videoPricingModelToken = (model: string) => {
 
 export const imagePricingModelToken = (model: string) => {
   const token = aiPricingModelToken(model);
+  if (token.includes('nanobananaprofast')) return 'nanobananaprofast';
+  if (token.includes('nanobanana2fast')) return 'nanobanana2fast';
   if (token.includes('nanobananapro') || token.includes('nanopro') || token.includes('gemini3proimage')) return 'nanobananapro';
   if (token.includes('nanobanana2') || token.includes('nano2') || token.includes('gemini31flashimage')) return 'nanobanana2';
   if (token.includes('gptimage2') || token.includes('image2') || token.includes('img2')) return 'image2';
@@ -104,6 +108,8 @@ export const imagePricingModelToken = (model: string) => {
 
 const canonicalImagePricingModel = (model: string) => {
   const token = imagePricingModelToken(model);
+  if (token === 'nanobananaprofast') return 'nano-banana-pro-fast';
+  if (token === 'nanobanana2fast') return 'nano-banana-2-fast';
   if (token === 'nanobananapro') return 'nano-banana-pro';
   if (token === 'nanobanana2') return 'nano-banana-2';
   if (token === 'image2') return 'image2';
@@ -121,6 +127,7 @@ const isRetiredImageModel = (model: string) => RETIRED_IMAGE_MODEL_TOKENS.has(ai
 const supportsImageOneK = (model: string) => {
   const token = imagePricingModelToken(model);
   if (token.startsWith('xais')) return false;
+  if (token === 'nanobananaprofast' || token === 'nanobanana2fast') return false;
   if (token === 'nanobananapro' || token === 'image2') return true;
   return token !== 'nanobanana2'
     && !token.includes('nanolite')
@@ -159,10 +166,10 @@ export function defaultImageUnitCredits(model: string, resolution?: string) {
     return selectedResolution === '4k' ? 18n : 15n;
   }
 
-  const isNanoBananaPro = token === 'nanobananapro';
+  const isNanoBananaPro = token === 'nanobananapro' || token === 'nanobananaprofast';
   if (isNanoBananaPro) return selectedResolution === '4k' ? 20n : 18n;
 
-  const isNanoBanana2 = token === 'nanobanana2';
+  const isNanoBanana2 = token === 'nanobanana2' || token === 'nanobanana2fast';
   if (isNanoBanana2) return selectedResolution === '4k' ? 18n : 15n;
 
   return DEFAULT_IMAGE_REQUEST_CREDITS;
@@ -285,9 +292,23 @@ const mergeKnownImageModels = (
   defaults: ImageModelCreditPrice[],
 ) => {
   const knownTokens = new Set(stored.map(item => imagePricingModelToken(item.model)));
+  const storedByToken = new Map(stored.map(item => [imagePricingModelToken(item.model), item]));
+  const missingDefaults = defaults
+    .filter(item => !knownTokens.has(imagePricingModelToken(item.model)))
+    .map((item) => {
+      const token = imagePricingModelToken(item.model);
+      const base = token === 'nanobananaprofast'
+        ? storedByToken.get('nanobananapro')
+        : token === 'nanobanana2fast'
+          ? storedByToken.get('nanobanana2')
+          : undefined;
+      return base
+        ? { model: item.model, credits2k: base.credits2k, credits4k: base.credits4k }
+        : item;
+    });
   return [
     ...stored,
-    ...defaults.filter(item => !knownTokens.has(imagePricingModelToken(item.model))),
+    ...missingDefaults,
   ];
 };
 
@@ -382,10 +403,20 @@ export async function configuredImageUnitCredits(
   prisma: PrismaClient,
   model: string,
   resolution?: string,
+  capabilities?: readonly string[],
 ) {
   const pricing = await getAiPricingConfig(prisma);
+  const modelToken = imagePricingModelToken(model);
+  const normalizedCapabilities = new Set((capabilities || []).map((item) => item.trim().toUpperCase()));
+  const pricingModel = normalizedCapabilities.has('IMAGE_NANO_BANANA_PRO_FAST')
+    && modelToken === 'nanobananapro'
+    ? 'nano-banana-pro-fast'
+    : normalizedCapabilities.has('IMAGE_NANO_BANANA_2_FAST')
+      && modelToken === 'nanobanana2'
+      ? 'nano-banana-2-fast'
+      : model;
   const exact = pricing.imageModels.find(
-    (item) => imagePricingModelToken(item.model) === imagePricingModelToken(model),
+    (item) => imagePricingModelToken(item.model) === imagePricingModelToken(pricingModel),
   );
   if (!exact) {
     const fallback = defaultImageUnitCredits(model, resolution);
