@@ -209,6 +209,25 @@ describe('provider connection probes', () => {
     expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://example.com/v1/models');
   });
 
+  it('recognizes fast Banana capabilities as native Bigmodel image channels', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        models: [{ name: 'models/gemini-3-pro-image-preview' }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await testProvider(
+      prismaFor(provider('BIGMODEL', ['IMAGE_NANO_BANANA_PRO_FAST'], 'gemini-3-pro-image-preview')),
+      'provider-test-1',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://example.com/v1beta/models');
+    const requestInit = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(new Headers(requestInit.headers).get('x-goog-api-key')).toBe('test-api-key-123456');
+  });
+
   it('accepts a configured Mikoto model when chat works but model listing is unavailable', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response('model list disabled', { status: 403 }))

@@ -129,6 +129,8 @@ const IMAGE_PROVIDER_CAPABILITIES: AiCapability[] = [
   'IMAGE',
   'IMAGE_NANO_BANANA',
   'IMAGE_NANO_BANANA_2',
+  'IMAGE_NANO_BANANA_PRO_FAST',
+  'IMAGE_NANO_BANANA_2_FAST',
   'IMAGE_NANO_BANANA_DUAL_2K',
   // Kept during the transition so existing database rows remain routable.
   'IMAGE_NANO_BANANA_PRO_1K',
@@ -186,6 +188,9 @@ export function providerSupportsImageModel(
     : modelToken.includes('2k') ? '2k' : modelToken.includes('1k') ? '1k' : '';
   const hasBananaDual2K = provider.capabilities.includes('IMAGE_NANO_BANANA_DUAL_2K')
     || provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K');
+  const hasFastBananaPro = provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_FAST')
+    && isNanoBananaProModelToken(modelToken);
+  const hasFastBanana2 = provider.capabilities.includes('IMAGE_NANO_BANANA_2_FAST');
   if (hasBananaDual2K
     && (!requestedResolution || requestedResolution === '2k')
     && (!modelResolution || modelResolution === '2k')
@@ -201,6 +206,8 @@ export function providerSupportsImageModel(
     // requested resolution is checked again when a generation is started.
     return true;
   }
+  if (capability === 'IMAGE_NANO_BANANA' && hasFastBananaPro) return true;
+  if (capability === 'IMAGE_NANO_BANANA_2' && hasFastBanana2) return true;
   return provider.capabilities.includes(capability)
     || (capability === 'IMAGE_GPT_1K' && provider.capabilities.includes('IMAGE_GPT'));
 }

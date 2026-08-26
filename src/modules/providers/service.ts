@@ -628,6 +628,8 @@ function isOpenAiImageCapability(capability: AiCapability) {
 function isNativeBigmodelImageCapability(capability: AiCapability) {
   return capability === 'IMAGE_NANO_BANANA'
     || capability === 'IMAGE_NANO_BANANA_2'
+    || capability === 'IMAGE_NANO_BANANA_PRO_FAST'
+    || capability === 'IMAGE_NANO_BANANA_2_FAST'
     || capability === 'IMAGE_NANO_BANANA_PRO_1K'
     || capability === 'IMAGE_NANO_BANANA_DUAL_2K';
 }

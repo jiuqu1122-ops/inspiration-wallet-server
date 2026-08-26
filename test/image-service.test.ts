@@ -678,6 +678,8 @@ describe('wallet image provider normalization', () => {
   it('separates Nano Banana and GPT Image provider capabilities', () => {
     const nano = { capabilities: ['IMAGE_NANO_BANANA'] as const };
     const nano2 = { capabilities: ['IMAGE_NANO_BANANA_2'] as const };
+    const nanoProFast = { capabilities: ['IMAGE_NANO_BANANA_PRO_FAST'] as const };
+    const nano2Fast = { capabilities: ['IMAGE_NANO_BANANA_2_FAST'] as const };
     const gpt = { capabilities: ['IMAGE_GPT'] as const };
     const legacy = { capabilities: ['IMAGE'] as const };
 
@@ -691,6 +693,11 @@ describe('wallet image provider normalization', () => {
     expect(providerSupportsImageModel(nano, 'gpt-image-2')).toBe(false);
     expect(providerSupportsImageModel(nano, 'Nano Banana 2')).toBe(false);
     expect(providerSupportsImageModel(nano2, 'Nano Banana 2')).toBe(true);
+    expect(providerSupportsImageModel(nanoProFast, 'gemini-3-pro-image', '2k')).toBe(true);
+    expect(providerSupportsImageModel(nanoProFast, 'gemini-3-pro-image', '4k')).toBe(true);
+    expect(providerSupportsImageModel(nanoProFast, 'gemini-3.1-flash-image', '2k')).toBe(false);
+    expect(providerSupportsImageModel(nano2Fast, 'gemini-3.1-flash-image', '2k')).toBe(true);
+    expect(providerSupportsImageModel(nano2Fast, 'gemini-3-pro-image', '2k')).toBe(false);
     expect(providerSupportsImageModel(gpt, 'gemini-3.1-flash-image')).toBe(false);
     expect(providerSupportsImageModel({ capabilities: ['IMAGE_GPT_1K'] as const }, 'Image2_1K')).toBe(true);
     expect(providerSupportsImageModel({ capabilities: ['IMAGE_GPT_1K'] as const }, 'Image2_4K')).toBe(false);
@@ -713,6 +720,11 @@ describe('wallet image provider normalization', () => {
     expect(filterProviderImageModels(nano, [
       'gemini-3-pro-image',
       'gemini-2.5-pro',
+      'gpt-image-2',
+    ])).toEqual(['gemini-3-pro-image']);
+    expect(filterProviderImageModels(nanoProFast, [
+      'gemini-3-pro-image',
+      'gemini-3.1-flash-image',
       'gpt-image-2',
     ])).toEqual(['gemini-3-pro-image']);
   });
