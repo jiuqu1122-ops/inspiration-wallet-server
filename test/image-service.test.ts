@@ -764,7 +764,8 @@ describe('wallet image provider normalization', () => {
       expect(new Headers(init?.headers).get('x-goog-api-key')).toBe('sk-test');
       const body = JSON.parse(String(init?.body));
       expect(body.generationConfig.responseModalities).toEqual(['IMAGE']);
-      expect(body.generationConfig.responseFormat.image).toEqual({ aspectRatio: '16:9', imageSize: '1K' });
+      expect(body.generationConfig.imageConfig).toEqual({ aspectRatio: '16:9', imageSize: '1K' });
+      expect(body.generationConfig.responseFormat).toBeUndefined();
       return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: generated } }] } }] }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
