@@ -644,6 +644,10 @@ export async function generateBigmodelBananaImages(
 ) {
   const model = resolveBigmodelImageModel(input.model);
   const materialized = await Promise.all(input.inputImages.map(materializeNewApiReferenceImage));
+  const imageConfig = {
+    aspectRatio: input.aspectRatio,
+    imageSize: bigmodelImageSize(input.resolution),
+  };
   const parts = [
     { text: promptWithConstraints(input) },
     ...materialized.map(bigmodelInlineImagePart),
@@ -660,11 +664,9 @@ export async function generateBigmodelBananaImages(
           contents: [{ role: 'user', parts }],
           generationConfig: {
             responseModalities: ['IMAGE'],
+            imageConfig,
             responseFormat: {
-              image: {
-                aspectRatio: input.aspectRatio,
-                imageSize: bigmodelImageSize(input.resolution),
-              },
+              image: imageConfig,
             },
           },
         },
