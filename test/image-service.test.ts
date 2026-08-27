@@ -752,6 +752,7 @@ describe('wallet image provider normalization', () => {
       expect(new Headers(init?.headers).get('x-goog-api-key')).toBe('sk-test');
       const body = JSON.parse(String(init?.body));
       expect(body.generationConfig.responseModalities).toEqual(['IMAGE']);
+      expect(body.generationConfig.imageConfig).toEqual({ aspectRatio: '16:9', imageSize: '1K' });
       expect(body.generationConfig.responseFormat.image).toEqual({ aspectRatio: '16:9', imageSize: '1K' });
       return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: generated } }] } }] }), {
         status: 200,
@@ -767,6 +768,40 @@ describe('wallet image provider normalization', () => {
         inputImages: [], aspectRatio: '16:9', resolution: '1k', outputFormat: 'png', count: 1,
       },
     );
+    expect(result).toEqual([`data:image/png;base64,${generated}`]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('passes Bigmodel 4K image requests through as imageSize 4K', async () => {
+    const generated = 'iVBORw0KGgo' + 'b'.repeat(40);
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      expect(body.generationConfig.imageConfig).toEqual({
+        aspectRatio: '16:9',
+        imageSize: '4K',
+      });
+      expect(body.generationConfig.responseFormat.image).toEqual({
+        aspectRatio: '16:9',
+        imageSize: '4K',
+      });
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: generated } }] } }],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await generateBigmodelBananaImages(
+      { baseUrl: 'https://bigmodel.example', name: 'Bigmodel', kind: 'BIGMODEL' } as never,
+      { apiKey: 'sk-test', headers: {} },
+      {
+        userId: 'user-1', clientRequestId: 'request-4k', model: 'gemini-3-pro-image-preview', prompt: 'a red apple',
+        inputImages: [], aspectRatio: '16:9', resolution: '4k', outputFormat: 'png', count: 1,
+      },
+    );
+
     expect(result).toEqual([`data:image/png;base64,${generated}`]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
