@@ -783,6 +783,38 @@ describe('wallet image provider normalization', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('returns the final Bigmodel image instead of the lower-resolution thought image', async () => {
+    const thoughtImage = 'iVBORw0KGgo' + 't'.repeat(40);
+    const finalImage = 'iVBORw0KGgo' + 'f'.repeat(40);
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      expect(body.generationConfig.responseFormat.image).toEqual({ aspectRatio: '16:9', imageSize: '4K' });
+      return new Response(JSON.stringify({
+        candidates: [{
+          content: {
+            parts: [
+              { thought: true, inlineData: { mimeType: 'image/png', data: thoughtImage } },
+              { inlineData: { mimeType: 'image/png', data: finalImage }, thoughtSignature: 'signature' },
+            ],
+          },
+        }],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateBigmodelBananaImages(
+      { baseUrl: 'https://bigmodel.example', name: 'Bigmodel', kind: 'BIGMODEL' } as never,
+      { apiKey: 'sk-test', headers: {} },
+      {
+        userId: 'user-1', clientRequestId: 'request-4k', model: 'gemini-3-pro-image-preview', prompt: 'a red apple',
+        inputImages: [], aspectRatio: '16:9', resolution: '4k', outputFormat: 'png', count: 1,
+      },
+    )).resolves.toEqual([`data:image/png;base64,${finalImage}`]);
+  });
+
   it('maps the three public tablet models to XAIS resolution-specific routes', () => {
     expect(resolveXaisPublicImageModel('nano-banana-pro', '2k')).toBe('Xais Nano Pro_2K');
     expect(resolveXaisPublicImageModel('nano-banana-pro', '4k')).toBe('Xais Nano Pro_4K');

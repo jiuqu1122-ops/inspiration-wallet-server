@@ -832,12 +832,14 @@ export async function generateBigmodelBananaImages(
         },
       );
     } catch (error) {
-      const recovered = imagesFromUpstreamError(error, input.inputImages, 1);
+      const recovered = error instanceof UpstreamImageError
+        ? selectBigmodelImages(error.responseValue, input.inputImages, 1)
+        : [];
       if (!recovered.length) throw error;
       images.push(...recovered);
       continue;
     }
-    images.push(...uniqueImages(value, input.inputImages, 1));
+    images.push(...selectBigmodelImages(value, input.inputImages, 1));
   }
   const unique = Array.from(new Set(images)).slice(0, input.count);
   if (!unique.length) throw new Error('Bigmodel Banana Pro 没有返回图片数据');
@@ -957,6 +959,45 @@ function selectUniqueImages(
     images.sort((left, right) => Number(!/^https?:\/\//i.test(left)) - Number(!/^https?:\/\//i.test(right)));
   }
   return images.slice(0, count);
+}
+
+function selectBigmodelImages(value: unknown, inputImages: string[], count: number) {
+  const candidateParts: unknown[] = [];
+  const visited = new Set<object>();
+
+  const collectCandidateParts = (nested: unknown) => {
+    if (!nested || typeof nested !== 'object' || visited.has(nested)) return;
+    visited.add(nested);
+    if (Array.isArray(nested)) {
+      for (const item of nested) collectCandidateParts(item);
+      return;
+    }
+
+    const record = nested as Record<string, unknown>;
+    if (Array.isArray(record.candidates)) {
+      for (const candidate of record.candidates) {
+        if (!candidate || typeof candidate !== 'object') continue;
+        const content = (candidate as Record<string, unknown>).content;
+        if (!content || typeof content !== 'object') continue;
+        const parts = (content as Record<string, unknown>).parts;
+        if (Array.isArray(parts)) {
+          for (const part of parts as unknown[]) candidateParts.push(part);
+        }
+      }
+    }
+    for (const child of Object.values(record)) collectCandidateParts(child);
+  };
+
+  collectCandidateParts(value);
+  const finalParts = candidateParts.filter((part) => {
+    if (!part || typeof part !== 'object') return true;
+    const record = part as Record<string, unknown>;
+    return record.thought !== true && record.isThought !== true && record.is_thought !== true;
+  });
+  const finalImages = selectUniqueImages(finalParts, inputImages, count, false);
+  return finalImages.length > 0
+    ? finalImages
+    : selectUniqueImages(value, inputImages, count, false);
 }
 
 export function sizeFromRatio(ratio: ImageInput['aspectRatio']) {
