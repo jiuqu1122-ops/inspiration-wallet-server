@@ -820,15 +820,23 @@ export async function generateBigmodelBananaImages(
         `/v1beta/models/${encodeURIComponent(model)}:generateContent`,
         {
           contents: [{ role: 'user', parts }],
-          generationConfig: {
-            responseModalities: ['IMAGE'],
-            responseFormat: {
-              image: {
+          generationConfig: model === 'gemini-3-pro-image-preview'
+            ? {
+              responseModalities: ['IMAGE'],
+              responseFormat: {
+                image: {
+                  aspectRatio: input.aspectRatio,
+                  imageSize: bigmodelImageSize(input.resolution),
+                },
+              },
+            }
+            : {
+              responseModalities: ['IMAGE'],
+              imageConfig: {
                 aspectRatio: input.aspectRatio,
                 imageSize: bigmodelImageSize(input.resolution),
               },
             },
-          },
         },
       );
     } catch (error) {

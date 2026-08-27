@@ -786,9 +786,11 @@ describe('wallet image provider normalization', () => {
   it('returns the final Bigmodel image instead of the lower-resolution thought image', async () => {
     const thoughtImage = 'iVBORw0KGgo' + 't'.repeat(40);
     const finalImage = 'iVBORw0KGgo' + 'f'.repeat(40);
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('https://bigmodel.example/v1beta/models/gemini-3.1-flash-image-preview:generateContent');
       const body = JSON.parse(String(init?.body));
-      expect(body.generationConfig.responseFormat.image).toEqual({ aspectRatio: '16:9', imageSize: '4K' });
+      expect(body.generationConfig.imageConfig).toEqual({ aspectRatio: '16:9', imageSize: '4K' });
+      expect(body.generationConfig.responseFormat).toBeUndefined();
       return new Response(JSON.stringify({
         candidates: [{
           content: {
@@ -809,7 +811,7 @@ describe('wallet image provider normalization', () => {
       { baseUrl: 'https://bigmodel.example', name: 'Bigmodel', kind: 'BIGMODEL' } as never,
       { apiKey: 'sk-test', headers: {} },
       {
-        userId: 'user-1', clientRequestId: 'request-4k', model: 'gemini-3-pro-image-preview', prompt: 'a red apple',
+        userId: 'user-1', clientRequestId: 'request-4k', model: 'Nano Banana 2', prompt: 'a red apple',
         inputImages: [], aspectRatio: '16:9', resolution: '4k', outputFormat: 'png', count: 1,
       },
     )).resolves.toEqual([`data:image/png;base64,${finalImage}`]);
