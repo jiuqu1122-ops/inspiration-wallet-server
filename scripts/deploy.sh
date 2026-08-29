@@ -4,6 +4,7 @@ set -euo pipefail
 
 readonly PROJECT_DIR="${PROJECT_DIR:-/opt/inspiration-wallet-server}"
 readonly HEALTH_URL="${HEALTH_URL:-https://api.unmind.art/health}"
+readonly PROMPT_SMOKE_URL="${PROMPT_SMOKE_URL:-https://api.unmind.art/v1/inspiration-space?kind=PROMPT&limit=1}"
 
 log() {
   printf '[deploy] %s\n' "$*"
@@ -78,4 +79,9 @@ if ! curl --fail --silent --show-error --retry 8 --retry-delay 3 --retry-all-err
   fail 'Public health check failed. Inspect the logs above; no data or volume was deleted.'
 fi
 printf '\n'
+log 'Checking prompt-sharing API support...'
+if ! curl --fail --silent --show-error --retry 5 --retry-delay 2 --retry-all-errors "$PROMPT_SMOKE_URL" >/dev/null; then
+  docker compose logs --tail=150 api caddy >&2 || true
+  fail 'Prompt-sharing API smoke check failed. Confirm the PROMPT enum migration was applied.'
+fi
 log 'Deployment workflow completed and the public health check passed.'

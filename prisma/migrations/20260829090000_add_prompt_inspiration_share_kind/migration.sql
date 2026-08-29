@@ -1,0 +1,1 @@
+ALTER TYPE "InspirationShareKind" ADD VALUE IF NOT EXISTS 'PROMPT';

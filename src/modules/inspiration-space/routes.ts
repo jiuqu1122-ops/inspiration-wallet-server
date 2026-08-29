@@ -68,7 +68,7 @@ export const inspirationSpaceRoutes: FastifyPluginAsync = async (app) => {
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : '投稿处理失败';
-        if (/JSON|image|Preview|preset|workflow|预览|图片/i.test(message)) {
+        if (/JSON|image|Preview|preset|workflow|prompt|预览|图片|提示词/i.test(message)) {
           return invalid(reply, message);
         }
         request.log.error({ requestId: request.id }, 'Inspiration space submission failed');

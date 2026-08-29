@@ -20,6 +20,17 @@ describe('inspiration space payload validation', () => {
     })).toEqual(['WORKFLOW']);
   });
 
+  it('recognizes standalone prompt shares without treating node presets as prompts', () => {
+    expect(classifyInspirationPayload({
+      type: 'inspiration-drawer-prompt-share',
+      version: 1,
+      title: '产品摄影提示词',
+      prompt: '生成一张具有柔和侧光的产品摄影效果图。',
+    })).toEqual(['PROMPT']);
+    expect(classifyInspirationPayload({ label: '节点预设', prompt: '测试' }))
+      .toEqual(['NODE_PRESET']);
+  });
+
   it('recognizes exported preset and workflow containers', () => {
     expect(classifyInspirationPayload({
       presets: [{ label: '节点预设', prompt: '测试' }],
@@ -49,5 +60,44 @@ describe('inspiration space payload validation', () => {
       payload: { label: '节点预设', prompt: '测试' },
       previews: [{ dataUrl: onePixelPng, width: 1, height: 1 }],
     })).not.toThrow();
+  });
+
+  it('accepts a prompt share with exactly one generated image', () => {
+    expect(() => validateInspirationSubmission({
+      kind: 'PROMPT',
+      payload: {
+        type: 'inspiration-drawer-prompt-share',
+        version: 1,
+        title: '产品摄影提示词',
+        prompt: '生成一张具有柔和侧光的产品摄影效果图。',
+      },
+      previews: [{ dataUrl: onePixelPng, width: 1, height: 1 }],
+    })).not.toThrow();
+  });
+
+  it('rejects a prompt share without its generated image', () => {
+    expect(() => validateInspirationSubmission({
+      kind: 'PROMPT',
+      payload: {
+        type: 'inspiration-drawer-prompt-share',
+        version: 1,
+        title: '产品摄影提示词',
+        prompt: '生成一张具有柔和侧光的产品摄影效果图。',
+      },
+      previews: [],
+    })).toThrow(/exactly one generated preview image/i);
+  });
+
+  it('rejects prompt content shorter than ten characters', () => {
+    expect(() => validateInspirationSubmission({
+      kind: 'PROMPT',
+      payload: {
+        type: 'inspiration-drawer-prompt-share',
+        version: 1,
+        title: '短提示词',
+        prompt: '太短了',
+      },
+      previews: [{ dataUrl: onePixelPng, width: 1, height: 1 }],
+    })).toThrow(/between 10 and 20,000 characters/i);
   });
 });
