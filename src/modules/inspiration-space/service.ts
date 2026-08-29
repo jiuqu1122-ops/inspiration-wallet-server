@@ -7,7 +7,7 @@ import {
   uploadInspirationPreview,
 } from './asset-store.js';
 
-export const INSPIRATION_SHARE_KINDS = ['NODE_PRESET', 'WORKFLOW'] as const;
+export const INSPIRATION_SHARE_KINDS = ['NODE_PRESET', 'WORKFLOW', 'PROMPT'] as const;
 export const INSPIRATION_SHARE_STATUSES = ['PENDING', 'PUBLISHED', 'REJECTED'] as const;
 export type InspirationShareKind = typeof INSPIRATION_SHARE_KINDS[number];
 export type InspirationShareStatus = typeof INSPIRATION_SHARE_STATUSES[number];
@@ -27,12 +27,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function classifyCandidate(value: unknown, result: Set<InspirationShareKind>) {
   if (!isRecord(value)) return;
+  if (
+    value.type === 'inspiration-drawer-prompt-share'
+    && typeof value.prompt === 'string'
+    && value.prompt.trim().length > 0
+  ) {
+    result.add('PROMPT');
+    return;
+  }
   if (typeof value.label === 'string' && typeof value.prompt === 'string') {
     result.add('NODE_PRESET');
   }
   if (typeof value.label === 'string' && Array.isArray(value.nodes)) {
     result.add('WORKFLOW');
   }
+}
+
+function promptFromPayload(value: unknown) {
+  if (
+    isRecord(value)
+    && value.type === 'inspiration-drawer-prompt-share'
+    && typeof value.prompt === 'string'
+  ) {
+    return value.prompt.trim() || null;
+  }
+  return null;
 }
 
 export function classifyInspirationPayload(value: unknown) {
@@ -92,7 +111,16 @@ export function validateInspirationSubmission(input: {
   }
   const kinds = classifyInspirationPayload(input.payload);
   if (!kinds.includes(input.kind)) {
-    throw new Error('JSON content does not match the selected preset or workflow type');
+    throw new Error('JSON content does not match the selected inspiration share type');
+  }
+  if (input.kind === 'PROMPT') {
+    const prompt = promptFromPayload(input.payload);
+    if (!prompt || prompt.length < 10 || prompt.length > 20_000) {
+      throw new Error('Prompt content must be between 10 and 20,000 characters');
+    }
+    if (input.previews.length !== 1) {
+      throw new Error('Prompt shares must include exactly one generated preview image');
+    }
   }
   return input.previews.map((preview) => ({
     ...preview,
@@ -302,7 +330,12 @@ export async function listAdminInspirationShares(
     take: input.limit,
     include: shareInclude,
   });
-  return { items: shares.map(serializeShare) };
+  return {
+    items: shares.map((share) => ({
+      ...serializeShare(share),
+      prompt: share.kind === 'PROMPT' ? promptFromPayload(share.jsonPayload) : null,
+    })),
+  };
 }
 
 export async function updateInspirationShareStatus(

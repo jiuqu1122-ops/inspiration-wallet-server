@@ -104,6 +104,7 @@ enum CreditRedemptionCodeStatus {
 enum InspirationShareKind {
   NODE_PRESET
   WORKFLOW
+  PROMPT
 }
 
 enum InspirationShareStatus {

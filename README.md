@@ -147,3 +147,11 @@ docker compose run --rm --no-deps api \
 该命令会在一个数据库事务中增加可用额度与累计赠送额度，并写入 `GRANT` 流水。`amount` 必须是正整数；不要把这个命令暴露成客户端 API。
 
 生产部署、升级迁移、备份、恢复和回滚参见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
+
+### 灵感空间提示词分享
+
+`POST /v1/inspiration-space` 支持 `kind: "PROMPT"`。`payload` 使用
+`{ "type": "inspiration-drawer-prompt-share", "version": 1, "prompt": "..." }`，
+提示词长度必须为 10–20,000 个字符，并且 `previews` 必须恰好包含 1 张由该提示词
+生成的 JPEG、PNG 或 WebP 效果图。审核通过后，网页可复制提示词或下载 JSON，桌面端
+会把提示词节点和效果图一起添加到当前画布。

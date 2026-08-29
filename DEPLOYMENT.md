@@ -328,3 +328,28 @@ docker compose run --rm --no-deps api \
 命令成功会输出用户 ID、增加额度、最新余额和流水 ID，不输出任何凭据。加错额度时不要直接修改数据库；应新增经过审计的反向 `ADJUSTMENT` 工具后再处理。
 
 Docker 安装命令依据 [Docker 官方 Ubuntu 安装文档](https://docs.docker.com/engine/install/ubuntu/)；Compose 使用官方推荐的 [Docker Compose Plugin](https://docs.docker.com/compose/install/linux/)。
+
+## 15. 提示词分享功能上线
+
+提示词分享由 `20260829090000_add_prompt_inspiration_share_kind` 迁移为
+`InspirationShareKind` 增加 `PROMPT` 类型。服务端会同时校验提示词正文为 10–20,000
+个字符，并强制每份提示词投稿包含且只包含 1 张生成效果图。生产环境不要使用
+`prisma db push`，按以下顺序备份、迁移和更新：
+
+```bash
+cd /opt/inspiration-wallet-server
+./scripts/backup-postgres.sh
+git pull --ff-only
+docker compose build api
+docker compose up -d postgres
+docker compose run --rm --no-deps api npm run prisma:migrate:deploy
+docker compose up -d api worker caddy
+
+curl --fail --show-error https://api.unmind.art/health
+curl --fail --show-error \
+  'https://api.unmind.art/v1/inspiration-space?kind=PROMPT&limit=1'
+```
+
+也可以直接运行 `./scripts/deploy.sh`。脚本在健康检查后会额外请求 `PROMPT`
+分类接口；若迁移未生效，部署会明确失败并输出 API 日志。该迁移只增加枚举值，
+不会删除或改写已有灵感空间数据。
