@@ -9,6 +9,8 @@ COPY prisma ./prisma
 RUN npm run prisma:generate
 
 COPY tsconfig.json ./
+ARG SOURCE_REV=local
+RUN printf '%s' "$SOURCE_REV" > /tmp/source-revision
 COPY src ./src
 RUN npm run build && npm prune --omit=dev
 

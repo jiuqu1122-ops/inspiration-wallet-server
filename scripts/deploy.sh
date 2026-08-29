@@ -38,7 +38,8 @@ log 'Validating Docker Compose configuration...'
 docker compose config --quiet
 
 log 'Building the shared API/worker image...'
-docker compose build api
+source_revision="$(git rev-parse HEAD 2>/dev/null || date +%s)"
+docker compose build --build-arg "SOURCE_REV=$source_revision" api
 
 log 'Ensuring immutable client engine archives are present and verified in OSS...'
 if ! docker compose run --rm --no-deps api npm run client-assets:upload -- --download; then
