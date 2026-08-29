@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   classifyInspirationPayload,
+  listPublishedInspirationShares,
   validateInspirationSubmission,
 } from '../src/modules/inspiration-space/service.js';
 
@@ -99,5 +100,37 @@ describe('inspiration space payload validation', () => {
       },
       previews: [{ dataUrl: onePixelPng, width: 1, height: 1 }],
     })).toThrow(/between 10 and 20,000 characters/i);
+  });
+
+  it('includes the actual prompt in published prompt cards', async () => {
+    const prompt = '生成一张具有柔和侧光的产品摄影效果图。';
+    const prisma = {
+      inspirationShare: {
+        findMany: vi.fn(async () => [{
+          id: 'share-prompt-1',
+          kind: 'PROMPT',
+          status: 'PUBLISHED',
+          title: '产品摄影提示词',
+          description: null,
+          authorName: 'unmind',
+          tags: ['产品摄影'],
+          fileName: 'prompt.json',
+          jsonPayload: {
+            type: 'inspiration-drawer-prompt-share',
+            version: 1,
+            prompt,
+          },
+          downloadCount: 0,
+          createdAt: new Date('2026-08-29T00:00:00.000Z'),
+          updatedAt: new Date('2026-08-29T00:00:00.000Z'),
+          publishedAt: new Date('2026-08-29T00:00:00.000Z'),
+          previews: [],
+        }]),
+      },
+    };
+
+    const result = await listPublishedInspirationShares(prisma as never, { limit: 24 });
+
+    expect(result.items[0]).toMatchObject({ kind: 'PROMPT', prompt });
   });
 });

@@ -150,6 +150,7 @@ function serializeShare(share: {
   authorName: string;
   tags: string[];
   fileName: string;
+  jsonPayload?: unknown;
   downloadCount: number;
   createdAt: Date;
   updatedAt: Date;
@@ -172,6 +173,7 @@ function serializeShare(share: {
     authorName: share.authorName,
     tags: share.tags,
     fileName: share.fileName,
+    prompt: share.kind === 'PROMPT' ? promptFromPayload(share.jsonPayload) : null,
     downloadCount: share.downloadCount,
     createdAt: share.createdAt.toISOString(),
     updatedAt: share.updatedAt.toISOString(),
