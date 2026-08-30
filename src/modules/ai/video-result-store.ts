@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { env } from '../../config/env.js';
 import { assertPublicProviderUrl } from '../providers/url.js';
-import { ossUploadService } from './oss-uploader.js';
+import { storageService } from '../storage/service.js';
 
 const VIDEO_RESULT_KEY_PATTERN = /^[a-f0-9]{64}\.(?:mp4|webm|mov|m4v|avi)$/;
 const MAX_VIDEO_RESULT_BYTES = 2 * 1024 * 1024 * 1024;
@@ -187,10 +187,10 @@ async function performGeneratedVideoResultMirror(source: string, requestHeaders?
   const trimmed = source.trim();
   if (isStoredVideoResultUrl(trimmed)) {
     const key = new URL(trimmed).pathname.split('/').filter(Boolean).pop();
-    if (!key || !isVideoResultKey(key) || !await ossUploadService.exists(`generated-videos/${key}`)) {
-      throw new Error('stored generated video is missing from OSS');
+    if (!key || !isVideoResultKey(key) || !await storageService.exists(`generated-videos/${key}`)) {
+      throw new Error('stored generated video is missing from object storage');
     }
-    ossUploadService.getPublicUrl(`generated-videos/${key}`, { filename: key });
+    storageService.getDownloadUrl(`generated-videos/${key}`);
     return trimmed;
   }
   const staged = /^data:video\//i.test(trimmed)
@@ -198,23 +198,23 @@ async function performGeneratedVideoResultMirror(source: string, requestHeaders?
     : await stagePublicVideo(trimmed, requestHeaders);
   try {
     const key = `${randomBytes(32).toString('hex')}.${staged.extension}`;
-    const objectName = await ossUploadService.upload({
+    const objectName = await storageService.uploadMedia({
       namespace: 'generated-videos',
       filename: key,
       source: staged.path,
       mime: staged.mime,
     });
-    if (!await ossUploadService.exists(objectName)) {
+    if (!await storageService.exists(objectName)) {
       throw new Error('generated video mirror object is missing after upload');
     }
-    ossUploadService.getPublicUrl(objectName, { mime: staged.mime, filename: key });
+    storageService.getDownloadUrl(objectName);
     return videoResultUrl(key);
   } finally {
     await staged.cleanup().catch(() => {});
   }
 }
 
-export async function mirrorGeneratedVideoResultToOss(
+export async function mirrorGeneratedVideoResultToStorage(
   source: string,
   requestHeaders?: HeadersInit,
   cacheScope?: string,
@@ -255,3 +255,6 @@ export async function mirrorGeneratedVideoResultToOss(
   pendingVideoMirrors.set(cacheKey, mirror);
   return mirror;
 }
+
+/** Compatibility export retained for external callers during the provider migration. */
+export const mirrorGeneratedVideoResultToOss = mirrorGeneratedVideoResultToStorage;

@@ -12,8 +12,8 @@ import { mkdir, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { env } from '../../config/env.js';
-import { ossUploadService } from './oss-uploader.js';
 import { getClientEngineAsset } from './client-assets.js';
+import { storageService } from '../storage/service.js';
 import { getImageReference } from './reference-store.js';
 import { isVideoResultKey } from './video-result-store.js';
 import { getImageResult, imageResultMimeForKey } from './image-result-store.js';
@@ -259,10 +259,10 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
         return reply.code(404).send({ error: 'not_found', message: 'Client asset not found' });
       }
       try {
-        if (!await ossUploadService.exists(asset.objectName)) {
+        if (!await storageService.exists(asset.objectName)) {
           return reply.code(404).send({ error: 'not_found', message: 'Client asset is not available' });
         }
-        const url = ossUploadService.getPublicUrl(asset.objectName, { filename: asset.name });
+        const url = storageService.getDownloadUrl(asset.objectName);
         return reply
           .header('Cache-Control', 'public, max-age=300')
           .header('X-Asset-SHA256', asset.sha256)
@@ -298,11 +298,11 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       }
       let objectName = `generated-images/${key}`;
       try {
-        if (!await ossUploadService.exists(objectName)) {
+        if (!await storageService.exists(objectName)) {
           if (!result) {
             return reply.code(404).send({ error: 'not_found', message: 'Image result not found or expired' });
           }
-          objectName = await ossUploadService.upload({
+          objectName = await storageService.uploadMedia({
             namespace: 'generated-images',
             source: result.path,
             filename: key,
@@ -317,7 +317,7 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
         });
       }
       try {
-        if (!await ossUploadService.exists(objectName)) {
+        if (!await storageService.exists(objectName)) {
           return reply.code(502).send({
             error: 'oss_object_missing',
             message: 'Generated image was uploaded but could not be verified',
@@ -331,15 +331,11 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
         });
       }
       try {
-        const url = ossUploadService.getPublicUrl(objectName, {
-          mime: resultMime,
-          filename: key,
-          download: false,
-        });
+        const url = storageService.getDownloadUrl(objectName);
         if (query.data.redirect === '0') {
           return {
             url,
-            expiresAt: Date.now() + 24 * 60 * 60 * 1_000,
+            expiresAt: Date.now() + env.STORAGE_SIGNED_URL_EXPIRES_SECONDS * 1_000,
           };
         }
         return reply.redirect(url);
@@ -368,12 +364,12 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       }
       const objectName = `generated-videos/${key}`;
       try {
-        if (!await ossUploadService.exists(objectName)) {
+        if (!await storageService.exists(objectName)) {
           return reply.code(404).send({ error: 'not_found', message: 'Video result not found or expired' });
         }
-        const url = ossUploadService.getPublicUrl(objectName, { filename: key, download: false });
+        const url = storageService.getDownloadUrl(objectName);
         if (query.data.redirect === '0') {
-          return { url, expiresAt: Date.now() + 24 * 60 * 60 * 1_000 };
+          return { url, expiresAt: Date.now() + env.STORAGE_SIGNED_URL_EXPIRES_SECONDS * 1_000 };
         }
         return reply.redirect(url);
       } catch (error) {
@@ -414,21 +410,21 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
           const filename = `${shareId}-${index}.${extension}`;
           const localPath = join(cacheDir, filename);
           await writeFile(localPath, bytes, { flag: 'wx' });
-          const name = await ossUploadService.upload({
+          const name = await storageService.uploadMedia({
             namespace: 'reference-images',
             filename,
             source: localPath,
             mime: image.mime,
           });
           names.push(name);
-          const url = ossUploadService.getPublicUrl(name, { mime: image.mime, filename });
-          await ossUploadService.verifyPublicImageUrl(name, url);
+          const url = storageService.getDownloadUrl(name);
+          await storageService.verifyImageUrl(name, url);
           urls.push(url);
         }
         referenceShares.set(shareId, names);
         return { shareId, urls };
       } catch (error) {
-        await Promise.all(names.map(name => ossUploadService.delete(name).catch(() => false)));
+        await Promise.all(names.map(name => storageService.delete(name).catch(() => false)));
         request.log.error({ err: error }, 'OSS reference image upload failed');
         return reply.code(503).send({ error: 'image_delivery_unavailable', message: 'Reference image upload is temporarily unavailable' });
       }
@@ -443,7 +439,7 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       const shareId = typeof rawShareId === 'string' ? rawShareId : '';
       const names = referenceShares.get(shareId) || [];
       referenceShares.delete(shareId);
-      await Promise.all(names.map(name => ossUploadService.delete(name).catch(() => false)));
+      await Promise.all(names.map(name => storageService.delete(name).catch(() => false)));
       return reply.code(204).send();
     },
   );

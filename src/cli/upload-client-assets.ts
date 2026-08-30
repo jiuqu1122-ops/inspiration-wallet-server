@@ -6,24 +6,11 @@ import { basename, join, resolve } from 'node:path';
 import process from 'node:process';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import OSS from 'ali-oss';
 import { CLIENT_ENGINE_ASSETS } from '../modules/ai/client-assets.js';
 
 const envFile = resolve(process.cwd(), '.env');
 if (existsSync(envFile)) process.loadEnvFile(envFile);
-
-const requiredEnv = ['OSS_REGION', 'OSS_BUCKET', 'OSS_ACCESS_KEY_ID', 'OSS_ACCESS_KEY_SECRET'] as const;
-for (const key of requiredEnv) {
-  if (!process.env[key]) throw new Error(`${key} is required`);
-}
-
-const client = new OSS({
-  region: process.env.OSS_REGION!,
-  bucket: process.env.OSS_BUCKET!,
-  accessKeyId: process.env.OSS_ACCESS_KEY_ID!,
-  accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET!,
-  secure: true,
-});
+const { storageService } = await import('../modules/storage/service.js');
 
 async function sha256(path: string) {
   const hash = createHash('sha256');
@@ -47,30 +34,9 @@ async function download(url: string, path: string) {
   );
 }
 
-function headerValue(headers: Record<string, string | string[] | number | undefined>, name: string) {
-  const raw = headers[name];
-  return Array.isArray(raw) ? raw[0] : raw;
-}
-
-function isNotFound(error: unknown) {
-  if (!error || typeof error !== 'object') return false;
-  const value = error as { status?: unknown; statusCode?: unknown; code?: unknown };
-  const code = typeof value.code === 'string' ? value.code : '';
-  return Number(value.statusCode || value.status) === 404
-    || ['NoSuchKey', 'NoSuchObject', 'NotFound'].includes(code);
-}
-
 async function remoteAssetIsCurrent(objectName: string, size: number, sha256: string) {
-  try {
-    const head = await client.head(objectName, { timeout: 30_000 });
-    const headers = head.res.headers as Record<string, string | string[] | number | undefined>;
-    const remoteSize = Number(headerValue(headers, 'content-length'));
-    const remoteSha256 = String(headerValue(headers, 'x-oss-meta-sha256') || '').toUpperCase();
-    return remoteSize === size && remoteSha256 === sha256;
-  } catch (error) {
-    if (isNotFound(error)) return false;
-    throw error;
-  }
+  const head = await storageService.headObject(objectName);
+  return head?.contentLength === size && head.metadata.sha256?.toUpperCase() === sha256;
 }
 
 async function uploadAssets(sourceDirectory: string, shouldDownload: boolean) {
@@ -78,7 +44,7 @@ async function uploadAssets(sourceDirectory: string, shouldDownload: boolean) {
   for (const [name, asset] of Object.entries(CLIENT_ENGINE_ASSETS)) {
     const objectName = `client-assets/${name}`;
     if (await remoteAssetIsCurrent(objectName, asset.size, asset.sha256)) {
-      process.stdout.write(`${name} is already verified in OSS.\n`);
+      process.stdout.write(`${name} is already verified in ${storageService.providerName}.\n`);
       continue;
     }
 
@@ -99,16 +65,16 @@ async function uploadAssets(sourceDirectory: string, shouldDownload: boolean) {
     }
 
     process.stdout.write(`Uploading ${name} (${asset.size} bytes)... `);
-    await client.put(objectName, path, {
-      timeout: 10 * 60_000,
-      headers: {
-        'Content-Type': 'application/zip',
-        'Cache-Control': 'private, max-age=31536000, immutable',
-        'x-oss-meta-sha256': asset.sha256,
-      },
+    await storageService.upload({
+      objectKey: objectName,
+      source: path,
+      contentType: 'application/zip',
+      cacheControl: 'private, max-age=31536000, immutable',
+      metadata: { sha256: asset.sha256 },
+      timeoutMs: 10 * 60_000,
     });
     if (!await remoteAssetIsCurrent(objectName, asset.size, asset.sha256)) {
-      throw new Error(`${name} OSS verification failed after upload`);
+      throw new Error(`${name} object storage verification failed after upload`);
     }
     process.stdout.write('verified\n');
   }
@@ -122,7 +88,7 @@ const sourceDirectory = temporaryDirectory ?? resolve(process.argv[2] || 'client
 
 try {
   await uploadAssets(sourceDirectory, shouldDownload);
-  process.stdout.write('All client engine assets are available in OSS.\n');
+  process.stdout.write(`All client engine assets are available in ${storageService.providerName}.\n`);
 } finally {
   if (temporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true });
 }

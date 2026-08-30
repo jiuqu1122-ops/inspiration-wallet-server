@@ -117,6 +117,11 @@ nano .env
 - `AI_TASK_RETENTION_DAYS`：完成、失败和取消任务的保留天数。
 - `AI_UPSTREAM_CONNECT_TIMEOUT_MS`、`AI_UPSTREAM_IDLE_TIMEOUT_MS`：上游连接建立与流读取空闲超时。
 - `WORKER_HEALTH_FILE`：容器内 liveness 文件路径，通常保持默认值。
+- `STORAGE_PROVIDER`：对象存储实现，迁移阶段可选 `aliyun-oss` 或 `tencent-cos`。未设置时默认 `aliyun-oss`，便于旧环境平滑升级。
+- `STORAGE_SIGNED_URL_EXPIRES_SECONDS`：私有对象下载 URL 有效期，建议 `3600`。
+- 当 `STORAGE_PROVIDER=aliyun-oss` 时，必须配置 `OSS_REGION`、`OSS_BUCKET`、`OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`。
+- 当 `STORAGE_PROVIDER=tencent-cos` 时，必须配置 `COS_REGION`、`COS_BUCKET`、`COS_SECRET_ID`、`COS_SECRET_KEY`。`COS_BUCKET` 必须使用控制台显示的完整 `BucketName-APPID`，例如 `inspirationdrawer-1475663212`，不要另写 AppId。
+- 迁移期间保留两套配置，但只有当前 provider 的凭据是启动必需项。切换到 COS 后若验证失败，只需把 `STORAGE_PROVIDER` 改回 `aliyun-oss` 并重启 `api`、`worker`；不要修改数据库或 object key。
 - `ADMIN_API_KEY_HASH`：私有运营工作台管理员密钥的 SHA-256 哈希；原始管理员密钥只放密码管理器。
 - `PROVIDER_SECRETS_ENCRYPTION_KEY`：Base64 编码的 32 字节随机主密钥，用于 AES-256-GCM 加密上游渠道凭据。必须长期备份且不能随意轮换。
 - `CORS_ALLOWED_ORIGINS`：逗号分隔的精确来源。网页管理后台和灵感空间上线时至少加入 `https://www.unmind.art,https://unmind.art`；本地联调可另外加入 `http://localhost:3000`。原生无 Origin 请求仍可访问。

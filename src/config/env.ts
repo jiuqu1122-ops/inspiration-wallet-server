@@ -81,10 +81,19 @@ const envSchema = z
     IMAGE_RESULT_STORE_DIR: z.string().min(1).default(join(tmpdir(), 'inspiration-image-results')),
     IMAGE_RESULT_TTL_MINUTES: z.coerce.number().int().min(30).max(10_080).default(1_440),
     IMAGE_RESULT_STORE_MAX_MB: z.coerce.number().int().min(128).max(32_768).default(4_096),
+    STORAGE_PROVIDER: z.enum(['aliyun-oss', 'tencent-cos']).default('aliyun-oss'),
+    STORAGE_SIGNED_URL_EXPIRES_SECONDS: z.coerce.number().int().min(60).max(604_800).default(3_600),
     OSS_REGION: z.string().trim().default(''),
     OSS_BUCKET: z.string().trim().default(''),
     OSS_ACCESS_KEY_ID: z.string().trim().default(''),
     OSS_ACCESS_KEY_SECRET: z.string().trim().default(''),
+    COS_REGION: z.string().trim().default(''),
+    COS_BUCKET: z.string().trim().refine(
+      value => !value || /-\d+$/.test(value),
+      'must use the complete BucketName-APPID format',
+    ).default(''),
+    COS_SECRET_ID: z.string().trim().default(''),
+    COS_SECRET_KEY: z.string().trim().default(''),
   })
   .superRefine((value, context) => {
     if (value.JWT_ACCESS_SECRET === value.JWT_REFRESH_SECRET) {
@@ -109,33 +118,38 @@ const envSchema = z
       });
     }
     if (value.NODE_ENV === 'production') {
-      for (const key of ['OSS_REGION', 'OSS_BUCKET', 'OSS_ACCESS_KEY_ID', 'OSS_ACCESS_KEY_SECRET'] as const) {
+      const requiredKeys = value.STORAGE_PROVIDER === 'tencent-cos'
+        ? ['COS_REGION', 'COS_BUCKET', 'COS_SECRET_ID', 'COS_SECRET_KEY'] as const
+        : ['OSS_REGION', 'OSS_BUCKET', 'OSS_ACCESS_KEY_ID', 'OSS_ACCESS_KEY_SECRET'] as const;
+      for (const key of requiredKeys) {
         if (!value[key]) {
           context.addIssue({
             code: 'custom',
             path: [key],
-            message: 'is required in production for the OSS public-access bridge',
+            message: `is required in production for ${value.STORAGE_PROVIDER}`,
           });
         }
       }
     }
   });
 
-const parsed = envSchema.safeParse(process.env);
-
-if (!parsed.success) {
-  const details = parsed.error.issues
-    .map((issue) => `${issue.path.join('.') || 'environment'}: ${issue.message}`)
-    .join('; ');
-  throw new Error(`Invalid environment configuration: ${details}`);
+export function parseEnvironment(input: NodeJS.ProcessEnv) {
+  const parsed = envSchema.safeParse(input);
+  if (!parsed.success) {
+    const details = parsed.error.issues
+      .map((issue) => `${issue.path.join('.') || 'environment'}: ${issue.message}`)
+      .join('; ');
+    throw new Error(`Invalid environment configuration: ${details}`);
+  }
+  return {
+    ...parsed.data,
+    smtpSecure: parsed.data.SMTP_SECURE === 'true',
+    corsAllowedOrigins: parsed.data.CORS_ALLOWED_ORIGINS.split(',')
+      .map((origin) => origin.trim())
+      .filter(Boolean),
+  };
 }
 
-export const env = {
-  ...parsed.data,
-  smtpSecure: parsed.data.SMTP_SECURE === 'true',
-  corsAllowedOrigins: parsed.data.CORS_ALLOWED_ORIGINS.split(',')
-    .map((origin) => origin.trim())
-    .filter(Boolean),
-};
+export const env = parseEnvironment(process.env);
 
 export type Environment = typeof env;

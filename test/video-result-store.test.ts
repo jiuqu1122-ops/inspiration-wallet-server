@@ -2,22 +2,22 @@ import { access, readFile } from 'node:fs/promises';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const bridgeMocks = vi.hoisted(() => ({
-  upload: vi.fn(async (input: { namespace: string; filename: string }) => `${input.namespace}/${input.filename}`),
+  uploadMedia: vi.fn(async (input: { namespace: string; filename: string }) => `${input.namespace}/${input.filename}`),
   exists: vi.fn(async () => true),
-  getPublicUrl: vi.fn((name: string) => `https://oss.example/${name}?token=1`),
+  getDownloadUrl: vi.fn((name: string) => `https://storage.example/${name}?token=1`),
 }));
 
-vi.mock('../src/modules/ai/oss-uploader.js', () => ({
-  ossUploadService: bridgeMocks,
+vi.mock('../src/modules/storage/service.js', () => ({
+  storageService: bridgeMocks,
 }));
 
 import { mirrorGeneratedVideoResultToOss } from '../src/modules/ai/video-result-store.js';
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  bridgeMocks.upload.mockClear();
+  bridgeMocks.uploadMedia.mockClear();
   bridgeMocks.exists.mockClear();
-  bridgeMocks.getPublicUrl.mockClear();
+  bridgeMocks.getDownloadUrl.mockClear();
 });
 
 describe('generated video OSS mirroring', () => {
@@ -32,7 +32,7 @@ describe('generated video OSS mirroring', () => {
     }));
     vi.stubGlobal('fetch', fetchMock);
     let stagedPath = '';
-    bridgeMocks.upload.mockImplementationOnce(async (input: {
+    bridgeMocks.uploadMedia.mockImplementationOnce(async (input: {
       namespace: string;
       filename: string;
       source: string;
@@ -49,14 +49,13 @@ describe('generated video OSS mirroring', () => {
     const result = await mirrorGeneratedVideoResultToOss('https://1.1.1.1/output.mp4');
     expect(result).toMatch(/^https:\/\/api\.example\.test\/v1\/ai\/video-results\/[a-f0-9]{64}\.mp4$/);
     expect(bridgeMocks.exists).toHaveBeenCalledWith(expect.stringMatching(/^generated-videos\//));
-    expect(bridgeMocks.getPublicUrl).toHaveBeenCalledWith(
+    expect(bridgeMocks.getDownloadUrl).toHaveBeenCalledWith(
       expect.stringMatching(/^generated-videos\//),
-      expect.objectContaining({ mime: 'video/mp4' }),
     );
     await expect(access(stagedPath)).rejects.toThrow();
     await expect(mirrorGeneratedVideoResultToOss('https://1.1.1.1/output.mp4')).resolves.toBe(result);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(bridgeMocks.upload).toHaveBeenCalledTimes(1);
+    expect(bridgeMocks.uploadMedia).toHaveBeenCalledTimes(1);
   });
 
   it('uses provider authorization for protected video content downloads', async () => {
@@ -90,7 +89,7 @@ describe('generated video OSS mirroring', () => {
       },
     }));
     vi.stubGlobal('fetch', fetchMock);
-    bridgeMocks.upload.mockImplementation(async (input: { namespace: string; filename: string }) => (
+    bridgeMocks.uploadMedia.mockImplementation(async (input: { namespace: string; filename: string }) => (
       `${input.namespace}/${input.filename}`
     ));
 
@@ -102,6 +101,6 @@ describe('generated video OSS mirroring', () => {
 
     expect(first).not.toBe(second);
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(bridgeMocks.upload).toHaveBeenCalledTimes(2);
+    expect(bridgeMocks.uploadMedia).toHaveBeenCalledTimes(2);
   });
 });

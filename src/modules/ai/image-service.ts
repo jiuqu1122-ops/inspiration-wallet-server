@@ -25,8 +25,8 @@ import {
   getImageResult,
   isStoredImageResultUrl,
 } from './image-result-store.js';
-import { ossUploadService } from './oss-uploader.js';
-import { mirrorGeneratedVideoResultToOss } from './video-result-store.js';
+import { storageService } from '../storage/service.js';
+import { mirrorGeneratedVideoResultToStorage } from './video-result-store.js';
 
 export const IMAGE_GENERATION_TIMEOUT_MS = 15 * 60_000;
 const longImageRequestDispatcher = new Agent({
@@ -1748,37 +1748,37 @@ async function stagePublicGeneratedImageResult(source: string, index: number) {
   }
 }
 
-async function uploadStoredImageResultToOss(stableUrl: string) {
+async function uploadStoredImageResultToStorage(stableUrl: string) {
   const key = new URL(stableUrl).pathname.split('/').filter(Boolean).pop();
   const stored = key ? await getImageResult(key) : null;
   if (!key || !stored) throw new Error('generated image mirror could not reopen the stored result');
-  const objectName = await ossUploadService.upload({
+  const objectName = await storageService.uploadMedia({
     namespace: 'generated-images',
     filename: key,
     source: stored.path,
     mime: stored.mime,
   });
-  if (!await ossUploadService.exists(objectName)) {
+  if (!await storageService.exists(objectName)) {
     throw new Error('generated image mirror object is missing after upload');
   }
   // Validate that the object key can be signed before publishing the stable
-  // API URL. Clients resolve that URL to a fresh signed Hong Kong OSS URL.
-  ossUploadService.getPublicUrl(objectName, { mime: stored.mime, filename: key });
+  // API URL. Clients resolve that URL to a fresh provider-specific signed URL.
+  storageService.getDownloadUrl(objectName);
   return stableUrl;
 }
 
-async function mirrorPublicGeneratedImageResultToOss(source: string, index: number) {
+async function mirrorPublicGeneratedImageResultToStorage(source: string, index: number) {
   const staged = await stagePublicGeneratedImageResult(source, index);
   try {
     if (!staged.path) throw new Error('generated image mirror did not create a temporary file');
     const stableUrl = await createImageResultFromFile(staged.path, staged.mime);
-    return uploadStoredImageResultToOss(stableUrl);
+    return uploadStoredImageResultToStorage(stableUrl);
   } finally {
     await staged.cleanup().catch(() => {});
   }
 }
 
-async function mirrorInlineGeneratedImageResultToOss(source: string) {
+async function mirrorInlineGeneratedImageResultToStorage(source: string) {
   const inline = dataUrlImageBytes(source, MAX_GENERATED_IMAGE_BYTES);
   const stableUrl = await createImageResultFromResponse(new Response(inline.bytes, {
     headers: {
@@ -1786,19 +1786,19 @@ async function mirrorInlineGeneratedImageResultToOss(source: string) {
       'content-length': String(inline.bytes.byteLength),
     },
   }));
-  return uploadStoredImageResultToOss(stableUrl);
+  return uploadStoredImageResultToStorage(stableUrl);
 }
 
-async function mirrorGeneratedImageResultToOss(source: string, index: number) {
-  if (isStoredImageResultUrl(source)) return uploadStoredImageResultToOss(source);
-  if (/^data:image\//i.test(source.trim())) return mirrorInlineGeneratedImageResultToOss(source);
-  return mirrorPublicGeneratedImageResultToOss(source, index);
+async function mirrorGeneratedImageResultToStorage(source: string, index: number) {
+  if (isStoredImageResultUrl(source)) return uploadStoredImageResultToStorage(source);
+  if (/^data:image\//i.test(source.trim())) return mirrorInlineGeneratedImageResultToStorage(source);
+  return mirrorPublicGeneratedImageResultToStorage(source, index);
 }
 
 export async function mirrorXaisImageResults(
   images: string[],
   providerName: string,
-  mirrorImage: (source: string, index: number) => Promise<string> = mirrorPublicGeneratedImageResultToOss,
+  mirrorImage: (source: string, index: number) => Promise<string> = mirrorPublicGeneratedImageResultToStorage,
 ) {
   return Promise.all(images.map(async (source, index) => {
     if (!isPublicNewApiImageReference(source) || isStoredImageResultUrl(source)) return source;
@@ -1818,7 +1818,7 @@ export async function mirrorXaisImageResults(
 export async function mirrorGeneratedImageResults(
   images: string[],
   providerName: string,
-  mirrorImage: (source: string, index: number) => Promise<string> = mirrorGeneratedImageResultToOss,
+  mirrorImage: (source: string, index: number) => Promise<string> = mirrorGeneratedImageResultToStorage,
 ) {
   return Promise.all(images.map(async (source, index) => {
     const trimmed = source.trim();
@@ -3449,7 +3449,9 @@ export async function getWalletImageGenerationByRequest(
     },
   });
   if (!request || request.capability !== 'IMAGE') return null;
-  const result = parseWalletImageGenerationResult(request.result);
+  const result = parseWalletImageGenerationResult(
+    storageService.rewriteStoredUrls(request.result) as Prisma.JsonValue | null,
+  );
   return {
     status: request.status.toLowerCase(),
     completedAt: request.completedAt?.getTime() ?? null,
@@ -3547,7 +3549,7 @@ export function collectGeneratedVideoStrings(
 export async function mirrorGeneratedVideoResponse(
   value: unknown,
   providerName: string,
-  mirrorVideo: (source: string) => Promise<string> = mirrorGeneratedVideoResultToOss,
+  mirrorVideo: (source: string) => Promise<string> = mirrorGeneratedVideoResultToStorage,
   trusted = false,
 ) {
   const sources = Array.from(new Set(collectGeneratedVideoStrings(value, [], trusted)));
@@ -3575,12 +3577,12 @@ function providerVideoResultMirror(
   const providerOrigin = new URL(provider.baseUrl).origin;
   return (source: string) => {
     if (!/^https?:\/\//i.test(source)) {
-      return mirrorGeneratedVideoResultToOss(source, undefined, cacheScope);
+      return mirrorGeneratedVideoResultToStorage(source, undefined, cacheScope);
     }
     const sourceOrigin = new URL(source).origin;
     return sourceOrigin === providerOrigin
-      ? mirrorGeneratedVideoResultToOss(source, upstreamHeaders(secrets), cacheScope)
-      : mirrorGeneratedVideoResultToOss(source, undefined, cacheScope);
+      ? mirrorGeneratedVideoResultToStorage(source, upstreamHeaders(secrets), cacheScope)
+      : mirrorGeneratedVideoResultToStorage(source, undefined, cacheScope);
   };
 }
 
@@ -4091,7 +4093,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
         provider.name,
         provider.kind === 'MIKOTO'
           ? providerVideoResultMirror(provider, secrets)
-          : mirrorGeneratedVideoResultToOss,
+          : mirrorGeneratedVideoResultToStorage,
       ));
     }
     await settleVideo(prisma, input.userId, reservation.requestId, reservation.estimated);
@@ -4141,7 +4143,7 @@ export async function executeWalletVideoStatus(
     const cacheScope = `${provider.id}:${input.taskId}`;
     const mirrorVideo = provider.kind === 'MIKOTO'
       ? providerVideoResultMirror(provider, secrets, cacheScope)
-      : (source: string) => mirrorGeneratedVideoResultToOss(
+      : (source: string) => mirrorGeneratedVideoResultToStorage(
         source,
         undefined,
         cacheScope,
@@ -4158,7 +4160,7 @@ export async function executeWalletVideoStatus(
   return mirrorGeneratedVideoResponse(
     { result: waited, attachments: resolved },
     provider.name,
-    mirrorGeneratedVideoResultToOss,
+    mirrorGeneratedVideoResultToStorage,
     true,
   );
 }

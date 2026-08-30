@@ -1,15 +1,16 @@
-# OSS public bridge lifecycle
+# Object storage lifecycle
 
-Aliyun OSS is only a temporary public-access bridge. Generated results remain
-in `IMAGE_RESULT_STORE_DIR`, and uploaded references are cached temporarily
-under `IMAGE_RESULT_STORE_DIR/reference-images`.
+The active object storage provider is selected with `STORAGE_PROVIDER` and can
+be either Aliyun OSS or Tencent COS. Object keys are identical in both buckets.
+Generated image results also remain in `IMAGE_RESULT_STORE_DIR`.
 
 Configure two Bucket lifecycle rules:
 
 - Prefix `reference-images/`: permanently delete after 1 day (24 hours).
 - Prefix `generated-images/`: permanently delete after 1 day (24 hours).
 
-Do not apply these rules to the whole Bucket. Reference-image URLs are signed
-for 30 minutes because the upstream AI only needs to read them during request
-processing. Generated-image download URLs are signed for 24 hours. Lifecycle
-rules clean up objects even if explicit deletion does not complete.
+Do not apply these rules to the whole Bucket, and do not add a provider-specific
+prefix. URLs are signed for `STORAGE_SIGNED_URL_EXPIRES_SECONDS`; lifecycle rules
+clean up temporary objects even if explicit deletion does not complete. Review
+the retention requirement for `generated-videos/` separately because videos are
+served from object storage rather than the local image-result volume.
