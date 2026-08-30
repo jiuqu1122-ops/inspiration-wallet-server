@@ -198,7 +198,13 @@ export class TencentCosProvider implements ObjectStorageProvider {
     } catch {
       return null;
     }
-    if (parsed.protocol !== 'https:' || parsed.hostname.toLowerCase() !== this.endpointHost()) return null;
+    if (
+      parsed.protocol !== 'https:'
+      || parsed.username
+      || parsed.password
+      || parsed.port
+      || parsed.hostname.toLowerCase() !== this.endpointHost()
+    ) return null;
     return objectKeyFromPathname(parsed.pathname);
   }
 

@@ -63,6 +63,7 @@ export class ObjectStorageService {
   readonly providerName: StorageProviderName;
   private readonly provider: ObjectStorageProvider;
   private readonly urlProviders: ObjectStorageProvider[];
+  private readonly internalUrlProviders: ObjectStorageProvider[];
 
   constructor(
     private readonly config: ObjectStorageConfig,
@@ -73,6 +74,10 @@ export class ObjectStorageService {
     this.provider = config.provider === 'tencent-cos' ? tencent : aliyun;
     this.providerName = this.provider.name;
     this.urlProviders = this.provider === aliyun ? [aliyun, tencent] : [tencent, aliyun];
+    // Only the active provider is an internal URL source. Historical URLs from
+    // the configured OSS bucket remain readable after switching to COS because
+    // the migrated objects retain the same keys in the active provider.
+    this.internalUrlProviders = this.provider === tencent ? [tencent, aliyun] : [aliyun];
   }
 
   get configured() {
@@ -151,6 +156,19 @@ export class ObjectStorageService {
 
   validateSignedUrl(objectKey: string, url: string) {
     return this.provider.validateSignedUrl(validateObjectKey(objectKey), url);
+  }
+
+  tryResolveObjectKeyFromUrl(value: string) {
+    if (!/^https:\/\//i.test(value)) return null;
+    for (const provider of this.internalUrlProviders) {
+      try {
+        const objectKey = provider.extractObjectKey(value);
+        if (objectKey) return objectKey;
+      } catch {
+        return null;
+      }
+    }
+    return null;
   }
 
   async verifyImageUrl(objectKey: string, url: string) {

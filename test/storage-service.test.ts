@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { ObjectStorageService, type ObjectStorageConfig } from '../src/modules/storage/service.js';
 
@@ -109,6 +110,81 @@ describe('object storage abstraction', () => {
     expect(() => service.extractObjectKey(
       'https://other-bucket.cos.ap-singapore.myqcloud.com/generated-images/a.png',
     )).toThrow(/does not belong/i);
+  });
+
+  it('recognizes internal URLs only for the active provider and the configured historical OSS bucket', () => {
+    const ownCosUrl = (
+      'https://inspirationdrawer-1475663212.cos.ap-singapore.myqcloud.com/'
+      + 'reference-images/a.png?q-signature=signed'
+    );
+    const cosService = new ObjectStorageService(
+      { ...baseConfig, provider: 'tencent-cos' },
+      { tencent: tencentClient() as never },
+    );
+    const ossService = new ObjectStorageService(baseConfig, { aliyun: aliyunClient() as never });
+
+    expect(cosService.tryResolveObjectKeyFromUrl(ownCosUrl)).toBe('reference-images/a.png');
+    expect(cosService.tryResolveObjectKeyFromUrl(
+      'https://test-bucket.oss-cn-hongkong.aliyuncs.com/reference-images/history.png',
+    )).toBe('reference-images/history.png');
+    expect(ossService.tryResolveObjectKeyFromUrl(
+      'https://test-bucket.oss-cn-hongkong.aliyuncs.com/reference-images/a.png',
+    )).toBe('reference-images/a.png');
+    expect(ossService.tryResolveObjectKeyFromUrl(ownCosUrl)).toBeNull();
+    expect(ossService.tryResolveObjectKeyFromUrl(
+      'https://other-bucket.oss-cn-hongkong.aliyuncs.com/reference-images/a.png',
+    )).toBeNull();
+    expect(ossService.tryResolveObjectKeyFromUrl(
+      'https://test-bucket.oss-cn-shanghai.aliyuncs.com/reference-images/a.png',
+    )).toBeNull();
+    expect(cosService.tryResolveObjectKeyFromUrl(
+      'https://test-bucket.oss-cn-hongkong.aliyuncs.com.evil.example/reference-images/a.png',
+    )).toBeNull();
+
+    expect(cosService.tryResolveObjectKeyFromUrl(
+      'https://evil.myqcloud.com/reference-images/a.png',
+    )).toBeNull();
+    expect(cosService.tryResolveObjectKeyFromUrl(
+      'https://other-1475663212.cos.ap-singapore.myqcloud.com/reference-images/a.png',
+    )).toBeNull();
+    expect(cosService.tryResolveObjectKeyFromUrl(
+      'https://inspirationdrawer-1475663212.cos.ap-tokyo.myqcloud.com/reference-images/a.png',
+    )).toBeNull();
+    expect(cosService.tryResolveObjectKeyFromUrl(
+      'https://inspirationdrawer-1475663212.cos.ap-singapore.myqcloud.com.evil.example/reference-images/a.png',
+    )).toBeNull();
+    expect(cosService.tryResolveObjectKeyFromUrl(
+      'https://inspirationdrawer-1475663212.cos.ap-singapore.myqcloud.com:444/reference-images/a.png',
+    )).toBeNull();
+    expect(cosService.tryResolveObjectKeyFromUrl(
+      'https://inspirationdrawer-1475663212.cos.ap-singapore.myqcloud.com/%E0%A4%A',
+    )).toBeNull();
+    expect(cosService.tryResolveObjectKeyFromUrl(
+      'http://inspirationdrawer-1475663212.cos.ap-singapore.myqcloud.com/reference-images/a.png',
+    )).toBeNull();
+  });
+
+  it('reads a recognized COS object through the configured SDK client', async () => {
+    const tencent = tencentClient();
+    tencent.getObjectStream.mockReturnValue(Readable.from([Buffer.from('image')]));
+    const service = new ObjectStorageService(
+      { ...baseConfig, provider: 'tencent-cos' },
+      { tencent: tencent as never },
+    );
+    const url = (
+      'https://inspirationdrawer-1475663212.cos.ap-singapore.myqcloud.com/'
+      + 'reference-images/sdk.png?q-signature=signed'
+    );
+    const objectKey = service.tryResolveObjectKeyFromUrl(url);
+
+    expect(objectKey).toBe('reference-images/sdk.png');
+    const result = await service.getObjectStream(objectKey!);
+    expect(result.statusCode).toBe(200);
+    expect(tencent.getObjectStream).toHaveBeenCalledWith(expect.objectContaining({
+      Bucket: 'inspirationdrawer-1475663212',
+      Region: 'ap-singapore',
+      Key: 'reference-images/sdk.png',
+    }));
   });
 
   it('generates provider-specific signed URLs with the configured expiry', () => {

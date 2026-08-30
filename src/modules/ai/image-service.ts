@@ -1314,6 +1314,43 @@ async function readLimitedImageBody(response: Response) {
   return `data:${mime};base64,${bytes.toString('base64')}`;
 }
 
+function storageObjectResponseHeaders(headers: Record<string, unknown>) {
+  const normalized = new Headers();
+  for (const [name, value] of Object.entries(headers)) {
+    const values = Array.isArray(value) ? value : [value];
+    const serializable = values.filter(
+      (item): item is string | number => typeof item === 'string' || typeof item === 'number',
+    );
+    if (!serializable.length) continue;
+    try {
+      normalized.set(name, serializable.map(String).join(', '));
+    } catch {
+      // Ignore malformed SDK metadata headers; content validation still runs.
+    }
+  }
+  return normalized;
+}
+
+async function readStorageImageReference<T>(
+  objectKey: string,
+  read: (response: Response) => Promise<T>,
+) {
+  const stored = await storageService.getObjectStream(objectKey);
+  const response = new Response(
+    Readable.toWeb(stored.stream) as unknown as BodyInit,
+    {
+      status: stored.statusCode,
+      headers: storageObjectResponseHeaders(stored.headers),
+    },
+  );
+  try {
+    if (!response.ok) throw new Error(`reference image HTTP ${response.status}`);
+    return await read(response);
+  } finally {
+    stored.stream.destroy();
+  }
+}
+
 function readCachedImageReference(source: string) {
   const cached = imageReferenceCache.get(source);
   if (!cached) return undefined;
@@ -1346,7 +1383,12 @@ async function fetchPublicImageReference(source: string) {
   try {
     let current = new URL(source);
     for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
-      await assertPublicProviderUrl(current.toString());
+      const currentUrl = current.toString();
+      const objectKey = storageService.tryResolveObjectKeyFromUrl(currentUrl);
+      if (objectKey) {
+        return readStorageImageReference(objectKey, readLimitedImageBody);
+      }
+      await assertPublicProviderUrl(currentUrl);
       const response = await fetch(current, {
         method: 'GET',
         headers: { accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.1' },
@@ -2129,7 +2171,9 @@ export async function generateNewApiImages(
     );
   }
   for (const source of input.inputImages.filter(isPublicNewApiImageReference)) {
-    await assertPublicProviderUrl(source);
+    if (!storageService.tryResolveObjectKeyFromUrl(source)) {
+      await assertPublicProviderUrl(source);
+    }
   }
   const stagedImages: StagedNewApiEditImage[] = [];
   let started: unknown;
@@ -2329,7 +2373,15 @@ async function downloadPublicImageReferenceToFile(
   try {
     let current = new URL(source);
     for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
-      await assertPublicProviderUrl(current.toString());
+      const currentUrl = current.toString();
+      const objectKey = storageService.tryResolveObjectKeyFromUrl(currentUrl);
+      if (objectKey) {
+        return readStorageImageReference(
+          objectKey,
+          response => writeResponseBodyToFile(response, path),
+        );
+      }
+      await assertPublicProviderUrl(currentUrl);
       const response = await fetch(current, {
         method: 'GET',
         headers: { accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.1' },
