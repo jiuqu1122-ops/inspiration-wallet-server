@@ -47,33 +47,20 @@ export async function buildApp() {
   await app.register(rateLimit, {
     global: false,
     hook: 'preHandler',
-    errorResponseBuilder: () => ({
-      error: 'rate_limit_exceeded',
-      message: 'Too many requests; try again later',
-    }),
+    errorResponseBuilder: (_request, context) => {
+      const error = new Error('Too many requests; try again later') as FastifyError & {
+        code: string;
+      };
+      error.code = 'rate_limit_exceeded';
+      error.statusCode = context.statusCode;
+      return error;
+    },
   });
 
   await app.register(prismaPlugin);
   await app.register(jwtPlugin);
   await app.register(adminAuthPlugin);
   await app.register(healthRoutes);
-
-  await app.register(
-    async (v1) => {
-      v1.get('/', async () => ({
-        name: 'inspiration-wallet-server',
-        status: 'running',
-      }));
-      await v1.register(authRoutes, { prefix: '/auth' });
-      await v1.register(accountRoutes);
-      await v1.register(walletRoutes, { prefix: '/wallet' });
-      await v1.register(aiRoutes, { prefix: '/ai' });
-      await v1.register(inspirationSpaceRoutes, { prefix: '/inspiration-space' });
-      await v1.register(mobileRoutes, { prefix: '/mobile' });
-      await v1.register(adminRoutes, { prefix: '/admin' });
-    },
-    { prefix: '/v1' },
-  );
 
   app.setNotFoundHandler(async (_request, reply) => {
     await reply.code(404).send({ error: 'not_found', message: 'Route not found' });
@@ -91,11 +78,34 @@ export async function buildApp() {
     );
 
     const statusCode = error.statusCode && error.statusCode < 500 ? error.statusCode : 500;
+    if (error.statusCode === 429) {
+      return reply.code(429).send({
+        error: 'rate_limit_exceeded',
+        message: 'Too many requests; try again later',
+      });
+    }
     await reply.code(statusCode).send({
       error: statusCode >= 500 ? 'internal_server_error' : 'request_error',
       message: statusCode >= 500 ? 'An unexpected error occurred' : error.message,
     });
   });
+
+  await app.register(
+    async (v1) => {
+      v1.get('/', async () => ({
+        name: 'inspiration-wallet-server',
+        status: 'running',
+      }));
+      await v1.register(authRoutes, { prefix: '/auth' });
+      await v1.register(accountRoutes);
+      await v1.register(walletRoutes, { prefix: '/wallet' });
+      await v1.register(aiRoutes, { prefix: '/ai' });
+      await v1.register(inspirationSpaceRoutes, { prefix: '/inspiration-space' });
+      await v1.register(mobileRoutes, { prefix: '/mobile' });
+      await v1.register(adminRoutes, { prefix: '/admin' });
+    },
+    { prefix: '/v1' },
+  );
 
   return app;
 }
