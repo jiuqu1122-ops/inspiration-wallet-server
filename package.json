@@ -18,6 +18,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src --max-warnings=0",
     "credits:grant": "node dist/cli/grant-credits.js",
+    "client-assets:upload": "node dist/cli/upload-client-assets.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate:dev": "prisma migrate dev",
     "prisma:migrate:deploy": "prisma migrate deploy"
@@ -29,12 +30,14 @@
     "@fastify/rate-limit": "^10.3.0",
     "@prisma/client": "6.19.3",
     "ali-oss": "^6.23.0",
+    "cos-nodejs-sdk-v5": "^3.0.0",
     "fast-jwt": "^6.2.4",
     "fastify": "^5.6.0",
     "fastify-plugin": "^5.1.0",
     "nodemailer": "^9.0.3",
     "prisma": "6.19.3",
     "sharp": "^0.35.3",
+    "undici": "^7.29.0",
     "zod": "^4.1.0"
   },
   "devDependencies": {

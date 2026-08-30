@@ -35,7 +35,11 @@ describe('AI credit pricing', () => {
     expect(defaultImageUnitCredits('gpt-image-2', '4k')).toBe(18n);
     expect(defaultImageUnitCredits('Xais Img2_2K(高画质)', '4k')).toBe(35n);
     expect(defaultAiPricingConfig().imageModels.map(item => item.model)).toEqual([
-      'nano-banana-pro', 'nano-banana-2', 'image2',
+      'nano-banana-pro',
+      'nano-banana-2',
+      'nano-banana-pro-fast',
+      'nano-banana-2-fast',
+      'image2',
     ]);
     expect(defaultAiPricingConfig().inspirationAnalysisCredits).toBe('0');
   });
@@ -60,7 +64,57 @@ describe('AI credit pricing', () => {
     }));
     expect(models.find((item) => item.model === 'nano-banana-2')?.credits1k).toBeUndefined();
     expect(models.find((item) => item.model === 'nano-banana-pro')?.credits1k).toBeDefined();
+    expect(models.find((item) => item.model === 'nano-banana-pro-fast')?.credits1k).toBeUndefined();
+    expect(models.find((item) => item.model === 'nano-banana-2-fast')?.credits1k).toBeUndefined();
     expect(models.find((item) => item.model === 'image2')?.credits1k).toBeDefined();
+  });
+
+  it('uses separate 2K and 4K prices for fast Banana channel capabilities', async () => {
+    const prisma = prismaWithPricing({
+      agentRequestCredits: 8n,
+      inspirationAnalysisCredits: 2n,
+      imageDefaultCredits: 66n,
+      videoDefaultCredits: 300n,
+      imageModelPrices: [{
+        model: 'nano-banana-pro',
+        credits1k: '6',
+        credits2k: '8',
+        credits4k: '10',
+      }, {
+        model: 'nano-banana-2',
+        credits2k: '11',
+        credits4k: '13',
+      }, {
+        model: 'nano-banana-pro-fast',
+        credits2k: '28',
+        credits4k: '30',
+      }, {
+        model: 'nano-banana-2-fast',
+        credits2k: '24',
+        credits4k: '27',
+      }],
+      videoModelPrices: [],
+    });
+
+    expect(await configuredImageUnitCredits(
+      prisma,
+      'gemini-3-pro-image',
+      '2K',
+      ['IMAGE_NANO_BANANA_PRO_FAST'],
+    )).toBe(28n);
+    expect(await configuredImageUnitCredits(
+      prisma,
+      'gemini-3-pro-image',
+      '4K',
+      ['IMAGE_NANO_BANANA_PRO_FAST'],
+    )).toBe(30n);
+    expect(await configuredImageUnitCredits(
+      prisma,
+      'gemini-3.1-flash-image',
+      '2K',
+      ['IMAGE_NANO_BANANA_2_FAST'],
+    )).toBe(24n);
+    expect(await configuredImageUnitCredits(prisma, 'gemini-3-pro-image', '2K')).toBe(8n);
   });
 
   it('uses exact configured model prices and configured unknown-model defaults', async () => {
@@ -122,6 +176,11 @@ describe('AI credit pricing', () => {
       credits2k: '18',
       credits4k: '20',
     });
+    expect(resolved.imageModels.find(item => item.model === 'nano-banana-pro-fast')).toEqual({
+      model: 'nano-banana-pro-fast',
+      credits2k: '18',
+      credits4k: '20',
+    });
   });
 
   it('calculates video credits from duration, resolution, per-video, and count rules', async () => {
@@ -134,7 +193,7 @@ describe('AI credit pricing', () => {
       creditsByResolution: { '1080p': '8' },
       creditsByCount: { '3': '200' },
     };
-    expect(calculateVideoRequestCredits(price, '1', 10, '1080p', 2)).toBe(106n);
+    expect(calculateVideoRequestCredits(price, '1', 10, '1080p', 2)).toBe(250n);
     expect(calculateVideoRequestCredits(price, '1', 10, '720p', 3)).toBe(200n);
 
     const prisma = prismaWithPricing({
@@ -145,6 +204,60 @@ describe('AI credit pricing', () => {
       imageModelPrices: [],
       videoModelPrices: [price],
     });
-    expect(await configuredVideoRequestCredits(prisma, 'Kling Video', 10, '1080p', 2)).toBe(106n);
+    expect(await configuredVideoRequestCredits(prisma, 'Kling Video', 10, '1080p', 2)).toBe(250n);
+  });
+
+  it('adds MiniMax H3 reference-image and reference-video material credits', async () => {
+    const price = {
+      model: 'MiniMax-H3',
+      credits: '15',
+      creditsByResolution: { '2k': '10' },
+      includedReferenceImages: 5,
+      creditsPerExtraReferenceImage: '9',
+      creditsPerReferenceVideoSecond: '15',
+      referenceVideoCreditsByResolution: { '2k': '10' },
+    };
+
+    expect(calculateVideoRequestCredits(
+      price,
+      '1',
+      4,
+      '768P',
+      1,
+      { imageCount: 5, videoCount: 0 },
+    )).toBe(60n);
+    expect(calculateVideoRequestCredits(
+      price,
+      '1',
+      4,
+      '768P',
+      1,
+      { imageCount: 7, videoCount: 1 },
+    )).toBe(138n);
+    expect(calculateVideoRequestCredits(
+      price,
+      '1',
+      4,
+      '2K',
+      2,
+      { imageCount: 6, videoCount: 1 },
+    )).toBe(418n);
+
+    const prisma = prismaWithPricing({
+      agentRequestCredits: 8n,
+      inspirationAnalysisCredits: 2n,
+      imageDefaultCredits: 66n,
+      videoDefaultCredits: 1n,
+      imageModelPrices: [],
+      videoModelPrices: [{ model: 'MiniMax-H3', credits: '15', creditsByResolution: { '2k': '10' } }],
+    });
+    expect(await configuredVideoRequestCredits(
+      prisma,
+      'MiniMax H3',
+      4,
+      '2K',
+      1,
+      { imageCount: 6, videoCount: 1 },
+    )).toBe(209n);
   });
 });

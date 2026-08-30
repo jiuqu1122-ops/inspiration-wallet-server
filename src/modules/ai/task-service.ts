@@ -1,6 +1,7 @@
 import { AiTaskStatus, AiTaskType, Prisma, type AiTask, type PrismaClient } from '@prisma/client';
 import { releaseRequestCreditsForClientRequest, sanitizeAgentUpstreamDetail } from './service.js';
 import type { CreateAiTaskInput } from './task-schema.js';
+import { storageService } from '../storage/service.js';
 
 export type PublicTaskError = {
   code: string;
@@ -20,7 +21,7 @@ export function serializeAiTask(task: AiTask) {
     status: publicTaskStatus(task.status),
     progress: task.progress,
     stage: task.stage,
-    ...(task.result !== null ? { result: task.result } : {}),
+    ...(task.result !== null ? { result: storageService.rewriteStoredUrls(task.result) } : {}),
     ...(task.error !== null ? { error: task.error } : {}),
     requestId: task.requestId,
     retryCount: task.retryCount,

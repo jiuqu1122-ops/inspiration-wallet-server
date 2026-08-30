@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
+  drainAgentCompletionStreamAfterDone,
   buildAgentModelCandidates,
   buildSingleProviderAgentRetryModels,
   AgentCompletionResponseAccumulator,
@@ -12,11 +13,25 @@ import {
   looksLikeAgentSsePayload,
   getAgentRequestCredits,
   parseAgentCompletionResponseText,
+  parseImageAnalysisResponsePayloads,
+  providerSupportsInspirationAnalysis,
   resolveConfiguredAgentModel,
   sanitizeAgentUpstreamDetail,
 } from '../src/modules/ai/service.js';
 
 describe('Agent provider fallback policy', () => {
+  it('keeps USELG LLM and Vision capabilities independent', () => {
+    expect(providerSupportsInspirationAnalysis({
+      capabilities: ['VISION'],
+    })).toBe(true);
+    expect(providerSupportsInspirationAnalysis({
+      capabilities: ['LLM', 'VISION'],
+    })).toBe(true);
+    expect(providerSupportsInspirationAnalysis({
+      capabilities: ['LLM'],
+    })).toBe(false);
+  });
+
   it('charges ten server-side credits for each Agent request', () => {
     expect(getAgentRequestCredits()).toBe(10n);
   });
@@ -178,6 +193,69 @@ describe('Agent provider fallback policy', () => {
     });
   });
 
+  it('drains a completed SSE response through EOF without cancelling it', async () => {
+    const encoder = new TextEncoder();
+    let cancelCount = 0;
+    let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+        controller.enqueue(encoder.encode(
+          'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        ));
+      },
+      cancel() {
+        cancelCount += 1;
+      },
+    });
+    const reader = stream.getReader();
+    const first = await reader.read();
+    const accumulator = new AgentCompletionResponseAccumulator('text/event-stream');
+    accumulator.push(new TextDecoder().decode(first.value));
+
+    expect(accumulator.isDone()).toBe(true);
+    const draining = drainAgentCompletionStreamAfterDone(reader, 50);
+    streamController?.close();
+    await expect(draining).resolves.toBe('eof');
+    expect(cancelCount).toBe(0);
+    expect(accumulator.finish()).toMatchObject({
+      choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+    });
+  });
+
+  it('cancels a completed SSE response only after the close grace expires', async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let cancelReason: unknown;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(
+            'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+          ));
+        },
+        cancel(reason) {
+          cancelReason = reason;
+        },
+      });
+      const reader = stream.getReader();
+      const first = await reader.read();
+      const accumulator = new AgentCompletionResponseAccumulator('text/event-stream');
+      accumulator.push(new TextDecoder().decode(first.value));
+
+      expect(accumulator.isDone()).toBe(true);
+      const draining = drainAgentCompletionStreamAfterDone(reader, 50);
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(draining).resolves.toBe('timeout');
+      expect(cancelReason).toBeInstanceOf(Error);
+      expect(accumulator.finish()).toMatchObject({
+        choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('detects SSE payloads when an upstream sends the wrong content type', () => {
     expect(looksLikeAgentSsePayload('data: {"choices":[]}\n\n')).toBe(true);
     expect(looksLikeAgentSsePayload(': keep-alive\n\n')).toBe(true);
@@ -219,5 +297,40 @@ describe('Agent provider fallback policy', () => {
     accumulator.push('"ok"},"finish_reason":"stop"}]}');
     expect(accumulator.isDone()).toBe(false);
     expect(accumulator.finish()).toEqual(value);
+  });
+});
+
+describe('image analysis response compatibility', () => {
+  it('recovers JSON from reasoning_content when content is empty', () => {
+    const payloads = parseImageAnalysisResponsePayloads({
+      choices: [{
+        message: {
+          content: '',
+          reasoning_content: 'analysis complete\n```json\n{"tags":[{"name":"桌面音响","category":"产品类别","confidence":0.9}]}\n```',
+        },
+      }],
+    });
+
+    expect(payloads).toContainEqual({
+      tags: [{ name: '桌面音响', category: '产品类别', confidence: 0.9 }],
+    });
+  });
+
+  it('accepts object content and JSON surrounded by explanatory text', () => {
+    expect(parseImageAnalysisResponsePayloads({
+      choices: [{ message: { content: { tags: [{ name: '金属', category: '材质', confidence: 0.8 }] } } }],
+    })).toContainEqual({ tags: [{ name: '金属', category: '材质', confidence: 0.8 }] });
+
+    expect(parseImageAnalysisResponsePayloads({
+      choices: [{ text: 'Result follows: {"colors":["黑色"],"style":["工业风"]} done.' }],
+    })).toContainEqual({ colors: ['黑色'], style: ['工业风'] });
+  });
+
+  it('preserves streamed reasoning_content for the analysis fallback parser', () => {
+    const parser = new AgentCompletionSseParser();
+    parser.push('data: {"choices":[{"index":0,"delta":{"reasoning_content":"{\\"colors\\":[\\"银色\\"],"},"finish_reason":null}]}\n\n');
+    parser.push('data: {"choices":[{"index":0,"delta":{"reasoning_content":"\\"style\\":[\\"极简主义\\"]}"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+    const payloads = parseImageAnalysisResponsePayloads(parser.finish());
+    expect(payloads).toContainEqual({ colors: ['银色'], style: ['极简主义'] });
   });
 });

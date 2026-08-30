@@ -23,6 +23,60 @@ describe('wallet AI request compatibility', () => {
     });
   });
 
+  it('keeps the client platform absent for existing desktop requests', () => {
+    const normalized = normalizeImageRequestBody({
+      clientRequestId: 'canvas-image-request-desktop',
+      model: 'gpt-image-2',
+      prompt: 'render a projector',
+      inputImages: [],
+      aspectRatio: '1:1',
+      resolution: '1k',
+      outputFormat: 'png',
+      count: 1,
+    });
+    expect(normalized.clientPlatform).toBeUndefined();
+    expect(normalized.preserveReferenceIdentity).toBe(false);
+  });
+
+  it('accepts an explicit product-consistency reference lock', () => {
+    expect(normalizeImageRequestBody({
+      clientRequestId: 'canvas-image-request-product-lock',
+      model: 'gemini-3-pro-image',
+      prompt: 'render a projector',
+      preserveReferenceIdentity: true,
+      inputImages: ['https://example.com/projector.png'],
+      aspectRatio: '16:9',
+      resolution: '2k',
+      outputFormat: 'jpg',
+      count: 1,
+    }).preserveReferenceIdentity).toBe(true);
+  });
+
+  it('accepts the explicit tablet client platform without selecting a provider', () => {
+    expect(normalizeImageRequestBody({
+      clientRequestId: 'canvas-image-request-tablet',
+      clientPlatform: 'tablet',
+      model: 'gpt-image-2',
+      prompt: 'render a projector',
+      inputImages: [],
+      aspectRatio: '16:9',
+      resolution: '2k',
+      outputFormat: 'png',
+      count: 1,
+    })).toMatchObject({ clientPlatform: 'tablet' });
+  });
+
+  it('rejects unknown client platform values', () => {
+    expect(() => normalizeImageRequestBody({
+      clientRequestId: 'canvas-image-request-unknown-client',
+      clientPlatform: 'android-phone',
+      model: 'gpt-image-2',
+      prompt: 'render a projector',
+      inputImages: [],
+      count: 1,
+    })).toThrow();
+  });
+
   it('accepts Bigmodel as a wallet image provider', () => {
     expect(normalizeImageRequestBody({
       clientRequestId: 'canvas-image-request-bigmodel',
@@ -104,6 +158,32 @@ describe('wallet AI request compatibility', () => {
     expect(normalized.inputImages).toHaveLength(9);
     expect(normalized.inputVideos).toHaveLength(3);
     expect(normalized.inputAudios).toHaveLength(3);
+  });
+
+  it('accepts MiniMax H3 with the Seedance-compatible 9/3/3 reference limits', () => {
+    const normalized = normalizeVideoRequestBody({
+      clientRequestId: 'canvas-video-request-minimax',
+      provider: 'minimax',
+      model: 'MiniMax-H3',
+      prompt: 'use all references',
+      inputImages: Array.from({ length: 9 }, (_, index) => `https://example.com/image-${index}.png`),
+      inputVideos: Array.from({ length: 3 }, (_, index) => `https://example.com/video-${index}.mp4`),
+      inputAudios: Array.from({ length: 3 }, (_, index) => `https://example.com/audio-${index}.mp3`),
+      count: 1,
+    });
+    expect(normalized.provider).toBe('minimax');
+    expect(normalized.inputImages).toHaveLength(9);
+  });
+
+  it('rejects more than nine MiniMax H3 image references', () => {
+    expect(() => normalizeVideoRequestBody({
+      clientRequestId: 'canvas-video-request-minimax-limit',
+      provider: 'minimax',
+      model: 'MiniMax-H3',
+      prompt: 'use the references',
+      inputImages: Array.from({ length: 10 }, (_, index) => `https://example.com/image-${index}.png`),
+      count: 1,
+    })).toThrow();
   });
 
   it('keeps the legacy thirteen-image limit for non-Seedance XAIS video models', () => {

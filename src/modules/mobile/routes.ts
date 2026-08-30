@@ -6,7 +6,7 @@ async function streamMobileApk(
 ) {
   try {
     const response = await getMobileUpdateStream('apk');
-    const headers = response.res.headers as Record<string, unknown>;
+    const headers = response.res.headers;
     const contentLength = headers['content-length'];
     const output = reply
       .header('cache-control', 'public, max-age=300')

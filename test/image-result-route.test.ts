@@ -2,14 +2,15 @@ import Fastify from 'fastify';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const bridgeMocks = vi.hoisted(() => ({
-  upload: vi.fn(async () => 'generated-images/result.png'),
+  uploadMedia: vi.fn(async () => 'generated-images/result.png'),
   exists: vi.fn(async () => true),
-  getPublicUrl: vi.fn(() => (
+  getDownloadUrl: vi.fn(() => (
     'https://inspiration-drawer-prod.oss-cn-hongkong.aliyuncs.com/generated-images/result.png'
     + '?token=a%2Bb%3D'
   )),
-  verifyPublicImageUrl: vi.fn(async () => true),
+  verifyImageUrl: vi.fn(async () => true),
   delete: vi.fn(async () => true),
+  rewriteStoredUrls: vi.fn((value: unknown) => value),
 }));
 
 vi.mock('../src/modules/ai/image-result-store.js', () => ({
@@ -21,8 +22,8 @@ vi.mock('../src/modules/ai/image-result-store.js', () => ({
   imageResultMimeForKey: vi.fn((key: string) => key.endsWith('.png') ? 'image/png' : null),
 }));
 
-vi.mock('../src/modules/ai/oss-uploader.js', () => ({
-  ossUploadService: bridgeMocks,
+vi.mock('../src/modules/storage/service.js', () => ({
+  storageService: bridgeMocks,
 }));
 
 import { aiRoutes } from '../src/modules/ai/routes.js';
@@ -40,16 +41,16 @@ async function makeApp() {
 
 describe('generated image OSS delivery route', () => {
   beforeEach(() => {
-    bridgeMocks.upload.mockClear();
+    bridgeMocks.uploadMedia.mockClear();
     bridgeMocks.exists.mockClear();
-    bridgeMocks.getPublicUrl.mockClear();
-    bridgeMocks.verifyPublicImageUrl.mockClear();
+    bridgeMocks.getDownloadUrl.mockClear();
+    bridgeMocks.verifyImageUrl.mockClear();
     bridgeMocks.delete.mockClear();
     bridgeMocks.exists.mockResolvedValue(true);
-    bridgeMocks.upload.mockImplementation(async (input: { namespace: string; filename: string }) => (
+    bridgeMocks.uploadMedia.mockImplementation(async (input: { namespace: string; filename: string }) => (
       `${input.namespace}/${input.filename}`
     ));
-    bridgeMocks.getPublicUrl.mockImplementation((name: string) => (
+    bridgeMocks.getDownloadUrl.mockImplementation((name: string) => (
       `https://inspiration-drawer-prod.oss-cn-hongkong.aliyuncs.com/${name}?token=a%2Bb%3D`
     ));
     vi.mocked(getImageResult).mockResolvedValue({
@@ -63,15 +64,12 @@ describe('generated image OSS delivery route', () => {
     bridgeMocks.exists.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
     const app = await makeApp();
     await app.inject({ method: 'GET', url: '/v1/ai/image-results/result.png?redirect=0' });
-    expect(bridgeMocks.upload).toHaveBeenCalledWith(expect.objectContaining({
+    expect(bridgeMocks.uploadMedia).toHaveBeenCalledWith(expect.objectContaining({
       namespace: 'generated-images',
       filename: 'result.png',
     }));
     expect(bridgeMocks.exists).toHaveBeenCalledWith('generated-images/result.png');
-    expect(bridgeMocks.getPublicUrl).toHaveBeenCalledWith(
-      'generated-images/result.png',
-      expect.objectContaining({ mime: 'image/png', download: false }),
-    );
+    expect(bridgeMocks.getDownloadUrl).toHaveBeenCalledWith('generated-images/result.png');
     await app.close();
   });
 
@@ -80,7 +78,7 @@ describe('generated image OSS delivery route', () => {
     const response = await app.inject({ method: 'GET', url: '/v1/ai/image-results/result.png?redirect=0' });
     expect(response.statusCode).toBe(200);
     expect(bridgeMocks.exists).toHaveBeenCalledWith('generated-images/result.png');
-    expect(bridgeMocks.upload).not.toHaveBeenCalled();
+    expect(bridgeMocks.uploadMedia).not.toHaveBeenCalled();
     await app.close();
   });
 
@@ -105,7 +103,36 @@ describe('generated image OSS delivery route', () => {
       url: expect.stringContaining('token=a%2Bb%3D'),
       expiresAt: expect.any(Number),
     });
-    expect(response.json().expiresAt).toBeGreaterThan(before + 23 * 60 * 60 * 1_000);
+    expect(response.json().expiresAt).toBeGreaterThan(before + 59 * 60 * 1_000);
+    await app.close();
+  });
+
+  it('redirects a whitelisted client engine asset to a signed OSS URL', async () => {
+    const app = await makeApp();
+    const filename = 'ffmpeg-tools-n8.1-win64-gpl.zip';
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/ai/client-assets/${filename}`,
+    });
+    expect(response.statusCode).toBe(302);
+    expect(bridgeMocks.exists).toHaveBeenCalledWith(`client-assets/${filename}`);
+    expect(bridgeMocks.getDownloadUrl).toHaveBeenCalledWith(`client-assets/${filename}`);
+    expect(response.headers['cache-control']).toBe('public, max-age=300');
+    expect(response.headers['x-asset-sha256']).toBe(
+      'D4B1D805749E6FA174E4BE158E844AD93BACBF23C2C68EDD473EEBE96B09CA63',
+    );
+    expect(response.headers['x-asset-size']).toBe('109205730');
+    await app.close();
+  });
+
+  it('rejects client asset names outside the fixed manifest', async () => {
+    const app = await makeApp();
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/ai/client-assets/unapproved.zip',
+    });
+    expect(response.statusCode).toBe(404);
+    expect(bridgeMocks.exists).not.toHaveBeenCalled();
     await app.close();
   });
 
@@ -122,7 +149,7 @@ describe('generated image OSS delivery route', () => {
       url: expect.stringContaining(`/generated-images/${key}`),
       expiresAt: expect.any(Number),
     });
-    expect(bridgeMocks.upload).not.toHaveBeenCalled();
+    expect(bridgeMocks.uploadMedia).not.toHaveBeenCalled();
     await app.close();
   });
 
@@ -139,16 +166,13 @@ describe('generated image OSS delivery route', () => {
       expiresAt: expect.any(Number),
     });
     expect(bridgeMocks.exists).toHaveBeenCalledWith(`generated-videos/${key}`);
-    expect(bridgeMocks.getPublicUrl).toHaveBeenCalledWith(
-      `generated-videos/${key}`,
-      expect.objectContaining({ filename: key, download: false }),
-    );
+    expect(bridgeMocks.getDownloadUrl).toHaveBeenCalledWith(`generated-videos/${key}`);
     await app.close();
   });
 
   it('returns an explicit error when OSS upload fails', async () => {
     bridgeMocks.exists.mockResolvedValueOnce(false);
-    bridgeMocks.upload.mockRejectedValueOnce(new Error('put failed'));
+    bridgeMocks.uploadMedia.mockRejectedValueOnce(new Error('put failed'));
     const app = await makeApp();
     const response = await app.inject({ method: 'GET', url: '/v1/ai/image-results/result.png?redirect=0' });
     expect(response.statusCode).toBe(503);
@@ -160,7 +184,7 @@ describe('generated image OSS delivery route', () => {
   });
 
   it('returns an explicit error when signing fails', async () => {
-    bridgeMocks.getPublicUrl.mockImplementationOnce(() => {
+    bridgeMocks.getDownloadUrl.mockImplementationOnce(() => {
       throw new Error('sign failed');
     });
     const app = await makeApp();
@@ -179,7 +203,7 @@ describe('generated image OSS delivery route', () => {
     const response = await app.inject({ method: 'GET', url: '/v1/ai/image-results/result.png?redirect=0' });
     expect(response.statusCode).toBe(502);
     expect(response.json().error).toBe('oss_object_missing');
-    expect(bridgeMocks.getPublicUrl).not.toHaveBeenCalled();
+    expect(bridgeMocks.getDownloadUrl).not.toHaveBeenCalled();
     await app.close();
   });
 
@@ -201,15 +225,14 @@ describe('generated image OSS delivery route', () => {
       shareId: expect.any(String),
       urls: [expect.stringContaining('/reference-images/')],
     });
-    expect(bridgeMocks.upload).toHaveBeenCalledWith(expect.objectContaining({
+    expect(bridgeMocks.uploadMedia).toHaveBeenCalledWith(expect.objectContaining({
       namespace: 'reference-images',
       mime: 'image/png',
     }));
-    expect(bridgeMocks.getPublicUrl).toHaveBeenCalledWith(
+    expect(bridgeMocks.getDownloadUrl).toHaveBeenCalledWith(
       expect.stringMatching(/^reference-images\//),
-      expect.objectContaining({ mime: 'image/png' }),
     );
-    expect(bridgeMocks.verifyPublicImageUrl).toHaveBeenCalledWith(
+    expect(bridgeMocks.verifyImageUrl).toHaveBeenCalledWith(
       expect.stringMatching(/^reference-images\//),
       expect.stringContaining('/reference-images/'),
     );
@@ -217,7 +240,7 @@ describe('generated image OSS delivery route', () => {
   });
 
   it('rejects and cleans up an unreadable OSS reference URL before generation', async () => {
-    bridgeMocks.verifyPublicImageUrl.mockRejectedValueOnce(
+    bridgeMocks.verifyImageUrl.mockRejectedValueOnce(
       new Error('OSS signed image URL returned HTTP 403'),
     );
     const app = await makeApp();

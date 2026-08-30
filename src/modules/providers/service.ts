@@ -64,7 +64,7 @@ function configurationError(error: unknown): never {
 function serializeProvider(provider: AiProviderChannel) {
   const capabilities = Array.from(new Set(provider.capabilities.map(capability => (
     capability === 'IMAGE_NANO_BANANA_PRO_1K'
-      ? 'IMAGE_NANO_BANANA_DUAL_2K' as AiCapability
+      ? 'IMAGE_NANO_BANANA_DUAL_2K'
       : capability
   ))));
   return {
@@ -335,6 +335,84 @@ async function providerGet(
   }
 }
 
+export async function deleteProvider(prisma: PrismaClient, providerId: string, idempotencyKey: string) {
+  const replayed = await replayProviderOperation(prisma, idempotencyKey);
+  if (replayed) return { replayed: true, provider: replayed.result };
+  const current = await prisma.aiProviderChannel.findUnique({ where: { id: providerId } });
+  if (!current) throw new ProviderServiceError('provider_not_found', 'Provider not found', 404);
+  const result = { id: current.id, name: current.name, kind: current.kind, deleted: true };
+  try {
+    return await prisma.$transaction(async (tx) => {
+      await tx.aiProviderChannel.delete({ where: { id: providerId } });
+      await tx.adminOperation.create({
+        data: {
+          idempotencyKey,
+          type: 'DELETE_PROVIDER',
+          description: `Deleted ${current.kind} provider ${current.name}`,
+          result,
+        },
+      });
+      return { replayed: false, provider: result };
+    });
+  } catch (error) {
+    if (typeof error === 'object' && error && 'code' in error && error.code === 'P2002') {
+      const concurrentReplay = await replayProviderOperation(prisma, idempotencyKey);
+      if (concurrentReplay) return { replayed: true, provider: concurrentReplay.result };
+    }
+    throw error;
+  }
+}
+
+const PROVIDER_PROBE_TIMEOUT_MS = 30_000;
+
+function parseProviderJson(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) throw new Error('Provider returned an empty response');
+  if (/^\s*data\s*:/i.test(trimmed)) {
+    const event = trimmed
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .find(line => /^data\s*:/i.test(line) && !/^data\s*:\s*\[DONE\]/i.test(line));
+    if (!event) throw new Error('Provider returned an empty stream');
+    return JSON.parse(event.replace(/^data\s*:\s*/i, '')) as unknown;
+  }
+  return JSON.parse(trimmed) as unknown;
+}
+
+async function providerPost(
+  url: string,
+  secrets: ProviderSecrets,
+  body: Record<string, unknown>,
+  options?: { bearerToken?: string | undefined; headers?: Record<string, string> | undefined },
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), PROVIDER_PROBE_TIMEOUT_MS);
+  try {
+    const headers = new Headers({
+      accept: 'application/json, text/event-stream, text/plain, */*',
+      authorization: `Bearer ${options?.bearerToken ?? secrets.apiKey}`,
+      'content-type': 'application/json',
+      'user-agent': 'Inspiration-Wallet-Server/1',
+    });
+    for (const [name, value] of Object.entries(secrets.headers)) headers.set(name, value);
+    for (const [name, value] of Object.entries(options?.headers ?? {})) headers.set(name, value);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      redirect: 'error',
+      signal: controller.signal,
+    });
+    const text = await readLimitedBody(response);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${responsePreview(text, secrets) || 'empty response'}`);
+    }
+    return parseProviderJson(text);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function valueAt(value: unknown, pointers: string[]) {
   for (const pointer of pointers) {
     let current: unknown = value;
@@ -466,8 +544,12 @@ export async function getProviderBalance(prisma: PrismaClient, providerId: strin
 
   const candidates = provider.kind === 'XAIS'
     ? [{ name: 'XAIS /xais/userProfile', path: '/xais/userProfile' }]
+    : provider.kind === 'USELG'
+      ? [{ name: 'uselg /v1/models', path: '/v1/models' }]
     : provider.kind === 'MIKOTO'
       ? [{ name: 'Mikoto /v1/models', path: '/v1/models' }]
+    : provider.kind === 'MINIMAX'
+      ? [{ name: 'MiniMax video endpoint', path: '/api/minimax/v2/query/video_generation?task_id=probe' }]
     : provider.kind === 'BIGMODEL'
       ? [{ name: 'Bigmodel /v1beta/models', path: '/v1beta/models', headers: { 'x-goog-api-key': secrets.apiKey } }]
     : [
@@ -495,6 +577,11 @@ export async function getProviderBalance(prisma: PrismaClient, providerId: strin
       if (result.available) return result;
       reachableResult = result;
     } catch (error) {
+      if (provider.kind === 'MINIMAX'
+        && /HTTP (?:400|404|422):/i.test(error instanceof Error ? error.message : '')) {
+        reachableResult = normalizeProviderBalance(provider.kind, candidate.name, {});
+        continue;
+      }
       errors.push(`${candidate.name}: ${error instanceof Error ? error.message : 'request failed'}`);
     }
   }
@@ -508,20 +595,138 @@ export async function getProviderBalance(prisma: PrismaClient, providerId: strin
 
 function modelIds(value: unknown) {
   if (!value || typeof value !== 'object') return [];
-  const data: unknown = Reflect.get(value, 'data') ?? Reflect.get(value, 'models');
+  const record = value as Record<string, unknown>;
+  const data: unknown = record.data ?? record.models;
   if (!Array.isArray(data)) return [];
   return data
-    .map((item: unknown) => (
-      item && typeof item === 'object'
-        ? Reflect.get(item, 'id') ?? (
-          typeof Reflect.get(item, 'name') === 'string'
-            ? String(Reflect.get(item, 'name')).replace(/^models\//, '')
-            : null
-        )
-        : null
-    ))
+    .map((item: unknown) => {
+      if (!item || typeof item !== 'object') return null;
+      const itemRecord = item as Record<string, unknown>;
+      if (typeof itemRecord.id === 'string') return itemRecord.id;
+      return typeof itemRecord.name === 'string'
+        ? itemRecord.name.replace(/^models\//, '')
+        : null;
+    })
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
     .slice(0, 50);
+}
+
+const NON_TEXT_MODEL_PATTERN = /(?:^|[-_/.\s])(?:embeddings?|embed|rerank|re-rank|image|images|imagen|img2|flux|sdxl|stable[-_.\s]?diffusion|dall[-_.\s]?e|recraft|ideogram|midjourney|seedream|nano[-_.\s]?banana|video|sora|veo|kling|seedance|tts|speech|whisper|transcrib(?:e|er)|transcription|moderation)(?:$|[-_/.\s\d])/i;
+
+function isLikelyTextModel(model: string) {
+  const normalized = model.trim();
+  return normalized.length > 0 && !NON_TEXT_MODEL_PATTERN.test(normalized);
+}
+
+function isOpenAiImageCapability(capability: AiCapability) {
+  return capability === 'IMAGE'
+    || capability === 'IMAGE_GPT'
+    || capability === 'IMAGE_GPT_1K'
+    || capability === 'IMAGE_GROK';
+}
+
+function isNativeBigmodelImageCapability(capability: AiCapability) {
+  return capability === 'IMAGE_NANO_BANANA'
+    || capability === 'IMAGE_NANO_BANANA_2'
+    || capability === 'IMAGE_NANO_BANANA_PRO_FAST'
+    || capability === 'IMAGE_NANO_BANANA_2_FAST'
+    || capability === 'IMAGE_NANO_BANANA_PRO_1K'
+    || capability === 'IMAGE_NANO_BANANA_DUAL_2K';
+}
+
+function providerModelProbeCandidates(
+  provider: Pick<AiProviderChannel, 'kind' | 'capabilities'>,
+  apiKey: string,
+) {
+  if (provider.kind === 'MINIMAX') return [];
+  if (provider.kind !== 'BIGMODEL') return [
+    { name: 'OpenAI /v1/models', path: '/v1/models' },
+  ];
+  const candidates: Array<{ name: string; path: string; headers?: Record<string, string> }> = [];
+  const needsOpenAi = provider.capabilities.includes('LLM')
+    || provider.capabilities.includes('VISION')
+    || provider.capabilities.some(isOpenAiImageCapability);
+  const needsNativeImage = provider.capabilities.some(isNativeBigmodelImageCapability);
+  if (needsOpenAi || !needsNativeImage) {
+    candidates.push({ name: 'Bigmodel OpenAI /v1/models', path: '/v1/models' });
+  }
+  if (needsNativeImage) {
+    candidates.push({
+      name: 'Bigmodel image /v1beta/models',
+      path: '/v1beta/models',
+      headers: { 'x-goog-api-key': apiKey },
+    });
+  }
+  return candidates;
+}
+
+function completionMessageContent(value: unknown) {
+  if (!value || typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  const choices = record.choices;
+  if (!Array.isArray(choices)) return null;
+  for (const choice of choices) {
+    if (!choice || typeof choice !== 'object') continue;
+    const choiceRecord = choice as Record<string, unknown>;
+    const message = choiceRecord.message;
+    if (!message || typeof message !== 'object') continue;
+    const messageRecord = message as Record<string, unknown>;
+    const content = messageRecord.content;
+    if (typeof content === 'string' && content.trim()) return content;
+    if (Array.isArray(content)) {
+      const text = content.map((part: unknown) => {
+        if (typeof part === 'string') return part;
+        if (!part || typeof part !== 'object') return '';
+        const partRecord = part as Record<string, unknown>;
+        return typeof partRecord.text === 'string' ? partRecord.text : '';
+      }).join('');
+      if (text.trim()) return text;
+    }
+    // Reasoning models and refusal-only responses can omit message.content,
+    // but they still prove that the upstream completed a valid chat request.
+    for (const key of ['reasoning_content', 'refusal']) {
+      const fallback = messageRecord[key];
+      if (typeof fallback === 'string' && fallback.trim()) {
+        return fallback;
+      }
+    }
+    const toolCalls = messageRecord.tool_calls;
+    if (Array.isArray(toolCalls) && toolCalls.length > 0) return '[tool_call]';
+  }
+  return null;
+}
+
+function completionHasOutput(value: unknown, requireJson = false) {
+  const content = completionMessageContent(value);
+  if (typeof content !== 'string' || !content.trim()) return false;
+  if (!requireJson) return true;
+  try {
+    const parsed = JSON.parse(content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '')) as unknown;
+    return !!parsed && typeof parsed === 'object' && !Array.isArray(parsed);
+  } catch {
+    return false;
+  }
+}
+
+const MINIMAL_PROBE_IMAGE = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+
+export function buildProviderProbeBody(model: string, vision = false) {
+  return {
+    model,
+    messages: [{
+      role: 'user',
+      content: vision
+        ? [
+          { type: 'text', text: 'Return JSON only: {"label":"one short word describing the image"}.' },
+          { type: 'image_url', image_url: { url: MINIMAL_PROBE_IMAGE, detail: 'low' } },
+        ]
+        : 'Reply with exactly: OK',
+    }],
+    stream: false,
+    ...(vision
+      ? { response_format: { type: 'json_object' }, max_tokens: 32 }
+      : { max_tokens: 1 }),
+  };
 }
 
 export async function testProvider(prisma: PrismaClient, providerId: string) {
@@ -539,20 +744,93 @@ export async function testProvider(prisma: PrismaClient, providerId: string) {
   let status = 'FAILED';
   let message = 'Provider connection failed';
   let models: string[] = [];
-  try {
-    const path = provider.kind === 'BIGMODEL' ? '/v1beta/models' : '/v1/models';
-    const headers = provider.kind === 'BIGMODEL' ? { 'x-goog-api-key': secrets.apiKey } : undefined;
-    const value = await providerGet(providerEndpoint(provider.baseUrl, path), secrets, headers ? { headers } : undefined);
-    models = modelIds(value);
-    status = 'OK';
-    message = models.length
-      ? `Connected successfully; ${models.length} models discovered`
-      : 'Connected successfully; the provider returned no model IDs';
-  } catch (modelsError) {
-    if (provider.kind !== 'XAIS') throw modelsError;
-    await providerGet(providerEndpoint(provider.baseUrl, '/xais/userProfile'), secrets);
-    status = 'OK';
-    message = 'Connected successfully through XAIS userProfile';
+  const modelErrors: string[] = [];
+  let modelCatalogReachable = false;
+  let nativeImageCatalogReachable = false;
+  for (const candidate of providerModelProbeCandidates(provider, secrets.apiKey)) {
+    try {
+      const value = await providerGet(
+        providerEndpoint(provider.baseUrl, candidate.path),
+        secrets,
+        candidate.headers ? { headers: candidate.headers } : undefined,
+      );
+      modelCatalogReachable = true;
+      if (candidate.path === '/v1beta/models') nativeImageCatalogReachable = true;
+      models = Array.from(new Set([...models, ...modelIds(value)]));
+    } catch (error) {
+      modelErrors.push(`${candidate.name}: ${error instanceof Error ? error.message : 'request failed'}`);
+    }
+  }
+  if (provider.kind === 'MINIMAX') {
+    try {
+      await providerGet(
+        providerEndpoint(provider.baseUrl, '/api/minimax/v2/query/video_generation?task_id=probe'),
+        secrets,
+      );
+      modelCatalogReachable = true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '';
+      if (/HTTP (?:400|404|422):/i.test(message)) modelCatalogReachable = true;
+      else modelErrors.push(`MiniMax video endpoint: ${message || 'request failed'}`);
+    }
+  }
+  let xaisProfileReachable = false;
+  if (provider.kind === 'XAIS' && models.length === 0) {
+    try {
+      await providerGet(providerEndpoint(provider.baseUrl, '/xais/userProfile'), secrets);
+      xaisProfileReachable = true;
+    } catch (error) {
+      modelErrors.push(`XAIS /xais/userProfile: ${error instanceof Error ? error.message : 'request failed'}`);
+    }
+  }
+
+  const needsTextProbe = provider.capabilities.includes('LLM') || provider.capabilities.includes('VISION');
+  const needsNativeImageProbe = provider.kind === 'BIGMODEL'
+    && provider.capabilities.some(isNativeBigmodelImageCapability);
+  if (needsNativeImageProbe && !nativeImageCatalogReachable) {
+    throw new Error(
+      `Bigmodel image protocol is unavailable: ${modelErrors.join(' | ').slice(0, 1_000)}`,
+    );
+  }
+  let probeModel = '';
+  if (needsTextProbe) {
+    const configured = provider.defaultModel?.trim() ?? '';
+    probeModel = configured && isLikelyTextModel(configured)
+      ? configured
+      : models.find(isLikelyTextModel) ?? '';
+    if (!probeModel) {
+      throw new Error(
+        modelErrors.length
+          ? `Unable to discover an OpenAI-compatible text model: ${modelErrors.join(' | ').slice(0, 1_000)}`
+          : 'Configure a text/LLM model before testing this provider',
+      );
+    }
+    const value = await providerPost(
+      providerEndpoint(provider.baseUrl, '/v1/chat/completions'),
+      secrets,
+      buildProviderProbeBody(probeModel, provider.capabilities.includes('VISION')),
+    );
+    if (!completionHasOutput(value, provider.capabilities.includes('VISION'))) {
+      throw new Error('OpenAI-compatible probe returned no completion content');
+    }
+  }
+
+  if (!needsTextProbe && !modelCatalogReachable && !xaisProfileReachable) {
+    throw new Error(modelErrors.join(' | ').slice(0, 1_000) || 'Provider model catalog is unavailable');
+  }
+  status = 'OK';
+  if (provider.kind === 'MINIMAX') {
+    message = '连接成功；MiniMax H3 视频接口可访问';
+  } else {
+    const details = [
+      modelCatalogReachable
+        ? models.length ? `${models.length} models discovered` : 'model catalog returned no model IDs'
+        : xaisProfileReachable ? 'connected through XAIS userProfile' : 'model catalog unavailable',
+      ...(probeModel
+        ? [`${provider.capabilities.includes('VISION') ? 'Vision' : 'LLM'} probe passed (${probeModel})`]
+        : []),
+    ];
+    message = `Connected successfully; ${details.join('; ')}`;
   }
 
   const testedAt = new Date();

@@ -12,7 +12,8 @@ import { mkdir, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { env } from '../../config/env.js';
-import { ossUploadService } from './oss-uploader.js';
+import { getClientEngineAsset } from './client-assets.js';
+import { storageService } from '../storage/service.js';
 import { getImageReference } from './reference-store.js';
 import { isVideoResultKey } from './video-result-store.js';
 import { getImageResult, imageResultMimeForKey } from './image-result-store.js';
@@ -60,15 +61,21 @@ const isSeedance20VideoModel = (model: string) => {
     || token === 'sourcemix20fast';
 };
 
+const isMiniMaxH3VideoModel = (model: string) => (
+  model.trim().toLowerCase().replace(/[\s_.-]+/g, '') === 'minimaxh3'
+);
+
 const imageSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
-  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'bigmodel', 'openai-compatible', 'custom']).nullish()
+  clientPlatform: z.literal('tablet').optional(),
+  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'bigmodel', 'uselg', 'openai-compatible', 'custom']).nullish()
     .transform((value) => value ?? undefined),
   providerChannelId: z.string().trim().min(1).max(128).nullish()
     .transform((value) => value ?? undefined),
   model: z.string().trim().min(1).max(200),
   prompt: z.string().trim().min(1).max(50_000),
   negativePrompt: optionalString(20_000),
+  preserveReferenceIdentity: z.boolean().default(false),
   inputImages: z.array(z.string().min(1).max(12_000_000)).max(9).default([]),
   aspectRatio: z.enum(['1:1', '3:4', '4:3', '9:16', '16:9']).default('1:1'),
   resolution: optionalString(20),
@@ -80,7 +87,7 @@ const imageSchema = z.object({
 
 const videoSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
-  provider: z.enum(['new-api', 'xais-chat', 'mikoto']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'minimax']).nullish()
     .transform((value) => value ?? undefined),
   providerChannelId: z.string().trim().min(1).max(128).nullish()
     .transform((value) => value ?? undefined),
@@ -95,20 +102,23 @@ const videoSchema = z.object({
   inputMode: z.enum(['REF', 'FLF']).nullish().transform((value) => value ?? undefined),
   count: z.number().int().min(1).max(4).default(1),
 }).strict().superRefine((value, context) => {
-  if (!isSeedance20VideoModel(value.model)) return;
+  const isSeedance = isSeedance20VideoModel(value.model);
+  const isMinimax = isMiniMaxH3VideoModel(value.model);
+  if (!isSeedance && !isMinimax) return;
+  const label = isSeedance ? 'Seedance 2.0' : 'MiniMax H3';
   if (value.inputImages.length > 9) {
-    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 9, inclusive: true, path: ['inputImages'], message: 'Seedance 2.0 supports at most 9 reference images' });
+    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 9, inclusive: true, path: ['inputImages'], message: `${label} supports at most 9 reference images` });
   }
   if (value.inputVideos.length > 3) {
-    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 3, inclusive: true, path: ['inputVideos'], message: 'Seedance 2.0 supports at most 3 reference videos' });
+    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 3, inclusive: true, path: ['inputVideos'], message: `${label} supports at most 3 reference videos` });
   }
   if (value.inputAudios.length > 3) {
-    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 3, inclusive: true, path: ['inputAudios'], message: 'Seedance 2.0 supports at most 3 reference audios' });
+    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 3, inclusive: true, path: ['inputAudios'], message: `${label} supports at most 3 reference audios` });
   }
 });
 
 const videoStatusSchema = z.object({
-  provider: z.enum(['new-api', 'xais-chat', 'mikoto']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'minimax']).nullish()
     .transform((value) => value ?? undefined),
   providerChannelId: z.string().trim().min(1).max(128).nullish()
     .transform((value) => value ?? undefined),
@@ -118,7 +128,7 @@ const videoStatusSchema = z.object({
 }).strict();
 
 const imageModelsQuerySchema = z.object({
-  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'bigmodel', 'openai-compatible', 'custom']).nullish()
+  provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'bigmodel', 'uselg', 'openai-compatible', 'custom']).nullish()
     .transform((value) => value ?? undefined),
 }).strict();
 
@@ -240,6 +250,38 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
   );
 
   app.get(
+    '/client-assets/:asset',
+    { config: { rateLimit: { max: 120, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const rawAsset = (request.params as { asset?: unknown }).asset;
+      const asset = getClientEngineAsset(typeof rawAsset === 'string' ? rawAsset.trim() : '');
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found', message: 'Client asset not found' });
+      }
+      try {
+        if (!await storageService.exists(asset.objectName)) {
+          return reply.code(404).send({ error: 'not_found', message: 'Client asset is not available' });
+        }
+        const url = storageService.getDownloadUrl(asset.objectName);
+        return reply
+          .header('Cache-Control', 'public, max-age=300')
+          .header('X-Asset-SHA256', asset.sha256)
+          .header('X-Asset-Size', String(asset.size))
+          .redirect(url);
+      } catch (error) {
+        request.log.error(
+          { asset: asset.name, errorName: error instanceof Error ? error.name : 'unknown' },
+          'client asset signing failed',
+        );
+        return reply.code(503).send({
+          error: 'oss_signing_failed',
+          message: 'Client asset temporary URL could not be created',
+        });
+      }
+    },
+  );
+
+  app.get(
     '/image-results/:key',
     { config: { rateLimit: { max: 600, timeWindow: '1 minute' } } },
     async (request, reply) => {
@@ -256,11 +298,11 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       }
       let objectName = `generated-images/${key}`;
       try {
-        if (!await ossUploadService.exists(objectName)) {
+        if (!await storageService.exists(objectName)) {
           if (!result) {
             return reply.code(404).send({ error: 'not_found', message: 'Image result not found or expired' });
           }
-          objectName = await ossUploadService.upload({
+          objectName = await storageService.uploadMedia({
             namespace: 'generated-images',
             source: result.path,
             filename: key,
@@ -275,7 +317,7 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
         });
       }
       try {
-        if (!await ossUploadService.exists(objectName)) {
+        if (!await storageService.exists(objectName)) {
           return reply.code(502).send({
             error: 'oss_object_missing',
             message: 'Generated image was uploaded but could not be verified',
@@ -289,15 +331,11 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
         });
       }
       try {
-        const url = ossUploadService.getPublicUrl(objectName, {
-          mime: resultMime,
-          filename: key,
-          download: false,
-        });
+        const url = storageService.getDownloadUrl(objectName);
         if (query.data.redirect === '0') {
           return {
             url,
-            expiresAt: Date.now() + 24 * 60 * 60 * 1_000,
+            expiresAt: Date.now() + env.STORAGE_SIGNED_URL_EXPIRES_SECONDS * 1_000,
           };
         }
         return reply.redirect(url);
@@ -326,12 +364,12 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       }
       const objectName = `generated-videos/${key}`;
       try {
-        if (!await ossUploadService.exists(objectName)) {
+        if (!await storageService.exists(objectName)) {
           return reply.code(404).send({ error: 'not_found', message: 'Video result not found or expired' });
         }
-        const url = ossUploadService.getPublicUrl(objectName, { filename: key, download: false });
+        const url = storageService.getDownloadUrl(objectName);
         if (query.data.redirect === '0') {
-          return { url, expiresAt: Date.now() + 24 * 60 * 60 * 1_000 };
+          return { url, expiresAt: Date.now() + env.STORAGE_SIGNED_URL_EXPIRES_SECONDS * 1_000 };
         }
         return reply.redirect(url);
       } catch (error) {
@@ -372,21 +410,21 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
           const filename = `${shareId}-${index}.${extension}`;
           const localPath = join(cacheDir, filename);
           await writeFile(localPath, bytes, { flag: 'wx' });
-          const name = await ossUploadService.upload({
+          const name = await storageService.uploadMedia({
             namespace: 'reference-images',
             filename,
             source: localPath,
             mime: image.mime,
           });
           names.push(name);
-          const url = ossUploadService.getPublicUrl(name, { mime: image.mime, filename });
-          await ossUploadService.verifyPublicImageUrl(name, url);
+          const url = storageService.getDownloadUrl(name);
+          await storageService.verifyImageUrl(name, url);
           urls.push(url);
         }
         referenceShares.set(shareId, names);
         return { shareId, urls };
       } catch (error) {
-        await Promise.all(names.map(name => ossUploadService.delete(name).catch(() => false)));
+        await Promise.all(names.map(name => storageService.delete(name).catch(() => false)));
         request.log.error({ err: error }, 'OSS reference image upload failed');
         return reply.code(503).send({ error: 'image_delivery_unavailable', message: 'Reference image upload is temporarily unavailable' });
       }
@@ -397,10 +435,11 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
     '/reference-images/:shareId',
     { preHandler: app.authenticateAccessToken },
     async (request, reply) => {
-      const shareId = String((request.params as { shareId?: unknown }).shareId || '');
+      const rawShareId = (request.params as { shareId?: unknown }).shareId;
+      const shareId = typeof rawShareId === 'string' ? rawShareId : '';
       const names = referenceShares.get(shareId) || [];
       referenceShares.delete(shareId);
-      await Promise.all(names.map(name => ossUploadService.delete(name).catch(() => false)));
+      await Promise.all(names.map(name => storageService.delete(name).catch(() => false)));
       return reply.code(204).send();
     },
   );
