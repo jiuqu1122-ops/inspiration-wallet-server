@@ -113,6 +113,11 @@ enum InspirationShareStatus {
   REJECTED
 }
 
+enum ReferenceUploadStatus {
+  ISSUED
+  UPLOADED
+}
+
 model User {
   id                   String                       @id @default(cuid())
   email                String?                      @unique
@@ -133,8 +138,26 @@ model User {
   adminOperations      AdminOperation[]
   emailChallenges      EmailVerificationChallenge[]
   creditRedemptions    CreditRedemption[]
+  referenceUploads     ReferenceUpload[]
 
   @@index([status])
+}
+
+model ReferenceUpload {
+  id          String               @id @default(cuid())
+  userId      String
+  objectKey   String               @unique
+  contentType String
+  sizeBytes   Int
+  status      ReferenceUploadStatus @default(ISSUED)
+  expiresAt   DateTime
+  uploadedAt  DateTime?
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+  user        User                 @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, expiresAt])
+  @@index([userId, status, createdAt])
 }
 
 model AiTask {

@@ -19,6 +19,12 @@ import { isVideoResultKey } from './video-result-store.js';
 import { getImageResult, imageResultMimeForKey } from './image-result-store.js';
 import { createAiTaskSchema } from './task-schema.js';
 import {
+  ReferenceUploadError,
+  issueReferenceUploadTicket,
+  recordLegacyReferenceUpload,
+  referenceUploadInputSchema,
+} from './reference-upload-service.js';
+import {
   cancelUserAiTask,
   createAiTask,
   findUserAiTask,
@@ -164,6 +170,9 @@ export const normalizeVideoRequestBody = (body: unknown) => videoSchema.parse(bo
 
 function knownError(reply: FastifyReply, error: unknown) {
   if (error instanceof CloudAiError) {
+    return reply.code(error.statusCode).send({ error: error.code, message: error.message });
+  }
+  if (error instanceof ReferenceUploadError) {
     return reply.code(error.statusCode).send({ error: error.code, message: error.message });
   }
   throw error;
@@ -383,6 +392,29 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
   );
 
   app.post(
+    '/reference-images/upload-ticket',
+    {
+      preHandler: app.authenticateAccessToken,
+      config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
+    },
+    async (request, reply) => {
+      const parsed = referenceUploadInputSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'invalid_request', message: 'Reference image upload ticket is invalid' });
+      }
+      try {
+        return await issueReferenceUploadTicket(app.prisma, request.user.sub, parsed.data);
+      } catch (error) {
+        if (error instanceof ReferenceUploadError) {
+          return reply.code(error.statusCode).send({ error: error.code, message: error.message });
+        }
+        request.log.error({ err: error }, 'reference image upload ticket failed');
+        return reply.code(503).send({ error: 'image_delivery_unavailable', message: 'Reference image upload is temporarily unavailable' });
+      }
+    },
+  );
+
+  app.post(
     '/reference-images',
     {
       preHandler: app.authenticateAccessToken,
@@ -419,6 +451,10 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
           names.push(name);
           const url = storageService.getDownloadUrl(name);
           await storageService.verifyImageUrl(name, url);
+          const referenceUploadDelegate = (app.prisma as typeof app.prisma & { referenceUpload?: unknown }).referenceUpload;
+          if (referenceUploadDelegate) {
+            await recordLegacyReferenceUpload(app.prisma, request.user.sub, name, image.mime, bytes.byteLength);
+          }
           urls.push(url);
         }
         referenceShares.set(shareId, names);

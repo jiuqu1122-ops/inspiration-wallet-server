@@ -27,6 +27,7 @@ import {
 } from './image-result-store.js';
 import { storageService } from '../storage/service.js';
 import { mirrorGeneratedVideoResultToStorage } from './video-result-store.js';
+import { resolveReferenceImageSources } from './reference-upload-service.js';
 
 export const IMAGE_GENERATION_TIMEOUT_MS = 15 * 60_000;
 const longImageRequestDispatcher = new Agent({
@@ -3385,15 +3386,19 @@ async function generateImagesFromProvider(
 }
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
+  const validatedInput: ImageInput = {
+    ...input,
+    inputImages: await resolveReferenceImageSources(prisma, input.userId, input.inputImages),
+  };
   const providers = await selectImageProviders(
     prisma,
-    input.providerChannelId,
-    input.model,
-    input.resolution,
-    input.clientPlatform,
+    validatedInput.providerChannelId,
+    validatedInput.model,
+    validatedInput.resolution,
+    validatedInput.clientPlatform,
   );
   const primaryProvider = providers[0]!;
-  const reservationInput = effectiveImageInputForProvider(primaryProvider, input);
+  const reservationInput = effectiveImageInputForProvider(primaryProvider, validatedInput);
   await assertPublicProviderUrl(primaryProvider.baseUrl);
   const reservation = await reserveImageCredits(
     prisma,
@@ -3407,7 +3412,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       activeProvider = providers[index]!;
       activeInput = index === 0
         ? reservationInput
-        : effectiveImageInputForProvider(activeProvider, input);
+        : effectiveImageInputForProvider(activeProvider, validatedInput);
       if (index > 0) await assertPublicProviderUrl(activeProvider.baseUrl);
       try {
         const images = await generateImagesFromProvider(activeProvider, activeInput);
@@ -3436,7 +3441,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         };
       } catch (error) {
         const nextProvider = providers[index + 1];
-        const canFailOver = input.clientPlatform === 'tablet'
+        const canFailOver = validatedInput.clientPlatform === 'tablet'
           ? isTabletImageProviderFailoverStatus(error instanceof UpstreamImageError ? error.status : -1)
           : isImageProviderFailoverStatus(error instanceof UpstreamImageError ? error.status : -1);
         if (!(error instanceof UpstreamImageError)
@@ -4053,6 +4058,10 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
     && (input.inputImages.length > 9 || input.inputVideos.length > 3 || input.inputAudios.length > 3)) {
     throw new CloudAiError('invalid_request', 'MiniMax H3 supports 9 images, 3 videos, and 3 audios at most', 400);
   }
+  input = {
+    ...input,
+    inputImages: await resolveReferenceImageSources(prisma, input.userId, input.inputImages),
+  };
   const reservation = await reserveVideo(prisma, input);
   try {
     const provider = await selectVideoProvider(prisma, input.provider, input.providerChannelId);

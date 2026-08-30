@@ -7,6 +7,8 @@ import {
   type ObjectStorageProvider,
   type StorageProviderName,
   type StorageSignedUrlOptions,
+  type StorageUploadUrl,
+  type StorageUploadUrlOptions,
   type StorageUploadInput,
 } from './types.js';
 
@@ -147,6 +149,13 @@ export class ObjectStorageService {
       expiresSeconds: options.expiresSeconds ?? this.config.signedUrlExpiresSeconds,
       ...(options.download !== undefined ? { download: options.download } : {}),
       ...(options.filename !== undefined ? { filename: options.filename } : {}),
+    });
+  }
+
+  createUploadUrl(objectKey: string, options: StorageUploadUrlOptions): StorageUploadUrl {
+    return this.provider.createUploadUrl(validateObjectKey(objectKey), {
+      ...options,
+      expiresSeconds: options.expiresSeconds ?? this.config.signedUrlExpiresSeconds,
     });
   }
 

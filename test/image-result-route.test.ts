@@ -9,6 +9,11 @@ const bridgeMocks = vi.hoisted(() => ({
     + '?token=a%2Bb%3D'
   )),
   verifyImageUrl: vi.fn(async () => true),
+  createUploadUrl: vi.fn(() => ({
+    url: 'https://inspiration-drawer-prod.oss-cn-hongkong.aliyuncs.com/reference-images/new.png?signature=temp',
+    method: 'PUT',
+    headers: { 'Content-Type': 'image/png' },
+  })),
   delete: vi.fn(async () => true),
   rewriteStoredUrls: vi.fn((value: unknown) => value),
 }));
@@ -29,9 +34,9 @@ vi.mock('../src/modules/storage/service.js', () => ({
 import { aiRoutes } from '../src/modules/ai/routes.js';
 import { getImageResult } from '../src/modules/ai/image-result-store.js';
 
-async function makeApp() {
+async function makeApp(prisma: unknown = {}) {
   const app = Fastify();
-  app.decorate('prisma', {});
+  app.decorate('prisma', prisma);
   app.decorate('authenticateAccessToken', async (request: { user?: unknown }) => {
     request.user = { sub: 'user-1' };
   });
@@ -45,6 +50,7 @@ describe('generated image OSS delivery route', () => {
     bridgeMocks.exists.mockClear();
     bridgeMocks.getDownloadUrl.mockClear();
     bridgeMocks.verifyImageUrl.mockClear();
+    bridgeMocks.createUploadUrl.mockClear();
     bridgeMocks.delete.mockClear();
     bridgeMocks.exists.mockResolvedValue(true);
     bridgeMocks.uploadMedia.mockImplementation(async (input: { namespace: string; filename: string }) => (
@@ -236,6 +242,34 @@ describe('generated image OSS delivery route', () => {
       expect.stringMatching(/^reference-images\//),
       expect.stringContaining('/reference-images/'),
     );
+    await app.close();
+  });
+
+  it('issues a short-lived direct upload ticket without returning a server secret', async () => {
+    const prisma = {
+      referenceUpload: {
+        create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({ id: 'upload-1', ...data })),
+      },
+    };
+    const app = await makeApp(prisma);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/ai/reference-images/upload-ticket',
+      payload: { filename: 'reference.png', mime: 'image/png', sizeBytes: 5 },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      objectKey: expect.stringMatching(/^reference-images\//),
+      uploadUrl: expect.stringContaining('oss-cn-hongkong.aliyuncs.com'),
+      method: 'PUT',
+      headers: { 'Content-Type': 'image/png' },
+      expiresAt: expect.any(String),
+    });
+    expect(JSON.stringify(response.json())).not.toContain('accessKeySecret');
+    expect(JSON.stringify(response.json())).not.toContain('secretKey');
+    expect(prisma.referenceUpload.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ userId: 'user-1', status: 'ISSUED' }),
+    });
     await app.close();
   });
 

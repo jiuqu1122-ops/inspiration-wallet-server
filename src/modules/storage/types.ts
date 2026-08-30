@@ -29,6 +29,17 @@ export type StorageSignedUrlOptions = {
   filename?: string;
 };
 
+export type StorageUploadUrlOptions = {
+  expiresSeconds?: number;
+  contentType: string;
+};
+
+export type StorageUploadUrl = {
+  url: string;
+  method: 'PUT';
+  headers: Record<string, string>;
+};
+
 export type StorageObjectStream = {
   stream: Readable;
   statusCode: number;
@@ -45,6 +56,7 @@ export interface ObjectStorageProvider {
   getPublicUrl(objectKey: string): string;
   getSignedUrl(objectKey: string, options?: StorageSignedUrlOptions): string;
   getDownloadUrl(objectKey: string, options?: StorageSignedUrlOptions): string;
+  createUploadUrl(objectKey: string, options: StorageUploadUrlOptions): StorageUploadUrl;
   getObjectStream(objectKey: string): Promise<StorageObjectStream>;
   extractObjectKey(url: string): string | null;
   validateSignedUrl(objectKey: string, url: string): string;

@@ -9,6 +9,8 @@ import {
   type ObjectStorageProvider,
   type StorageObjectMetadata,
   type StorageSignedUrlOptions,
+  type StorageUploadUrl,
+  type StorageUploadUrlOptions,
   type StorageUploadInput,
 } from '../types.js';
 
@@ -155,6 +157,22 @@ export class AliyunOssProvider implements ObjectStorageProvider {
 
   getDownloadUrl(objectKey: string, options: StorageSignedUrlOptions = {}) {
     return this.getSignedUrl(objectKey, options);
+  }
+
+  createUploadUrl(value: string, options: StorageUploadUrlOptions): StorageUploadUrl {
+    const objectKey = validateObjectKey(value);
+    const contentType = options.contentType.trim().toLowerCase();
+    if (!contentType) throw new Error('Upload content type is required');
+    const url = this.requireClient().signatureUrl(objectKey, {
+      method: 'PUT',
+      ...(options.expiresSeconds !== undefined ? { expires: options.expiresSeconds } : {}),
+      'Content-Type': contentType,
+    });
+    return {
+      url: this.validateSignedUrl(objectKey, url),
+      method: 'PUT',
+      headers: { 'Content-Type': contentType },
+    };
   }
 
   async getObjectStream(value: string) {
