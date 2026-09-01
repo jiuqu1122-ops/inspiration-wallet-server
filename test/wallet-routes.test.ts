@@ -32,7 +32,7 @@ describe('wallet usage route', () => {
       where: {
         userId: 'user-1',
         type: 'CHARGE',
-        amount: { not: 0n },
+        amount: { not: 0 },
       },
       take: 51,
     }));
@@ -41,8 +41,8 @@ describe('wallet usage route', () => {
         id: 'ledger-1',
         requestId: 'request-1',
         type: 'CHARGE',
-        amount: '16',
-        balanceAfter: '84',
+        amount: '16.000000',
+        balanceAfter: '84.000000',
         description: '生图结算 1 张',
         createdAt: '2026-08-27T10:00:00.000Z',
       }],

@@ -1,4 +1,5 @@
 import type { Wallet } from '@prisma/client';
+import { serializeCredit } from './credit-amount.js';
 
 type WalletBalance = Pick<
   Wallet,
@@ -7,9 +8,9 @@ type WalletBalance = Pick<
 
 export function serializeWalletBalance(wallet: WalletBalance) {
   return {
-    availableCredits: wallet.availableCredits.toString(),
-    reservedCredits: wallet.reservedCredits.toString(),
-    lifetimeGranted: wallet.lifetimeGranted.toString(),
-    lifetimeConsumed: wallet.lifetimeConsumed.toString(),
+    availableCredits: serializeCredit(wallet.availableCredits),
+    reservedCredits: serializeCredit(wallet.reservedCredits),
+    lifetimeGranted: serializeCredit(wallet.lifetimeGranted),
+    lifetimeConsumed: serializeCredit(wallet.lifetimeConsumed),
   };
 }

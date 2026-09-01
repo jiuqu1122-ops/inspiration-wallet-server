@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { resolveLicenseIdentity } from '../auth/service.js';
 import { verifySignedLicenseForProvision } from '../auth/license-verifier.js';
 import { serializeWalletBalance } from '../wallets/serialization.js';
+import { creditDecimal, serializeCredit } from '../wallets/credit-amount.js';
 
 export class AdminServiceError extends Error {
   constructor(
@@ -57,10 +58,10 @@ export async function getAdminOverview(prisma: PrismaClient) {
     users: { total: users, active: activeUsers },
     licenses: { active: activeLicenses },
     credits: {
-      available: (walletTotals._sum.availableCredits ?? 0n).toString(),
-      reserved: (walletTotals._sum.reservedCredits ?? 0n).toString(),
-      lifetimeGranted: (walletTotals._sum.lifetimeGranted ?? 0n).toString(),
-      lifetimeConsumed: (walletTotals._sum.lifetimeConsumed ?? 0n).toString(),
+      available: serializeCredit(walletTotals._sum.availableCredits ?? 0),
+      reserved: serializeCredit(walletTotals._sum.reservedCredits ?? 0),
+      lifetimeGranted: serializeCredit(walletTotals._sum.lifetimeGranted ?? 0),
+      lifetimeConsumed: serializeCredit(walletTotals._sum.lifetimeConsumed ?? 0),
     },
   };
 }
@@ -190,8 +191,8 @@ export async function getAdminUser(prisma: PrismaClient, userId: string) {
     licenses: user.licenses.map(serializeLicense),
     ledger: user.ledger.map((entry) => ({
       ...entry,
-      amount: entry.amount.toString(),
-      balanceAfter: entry.balanceAfter.toString(),
+      amount: serializeCredit(entry.amount),
+      balanceAfter: serializeCredit(entry.balanceAfter),
       createdAt: entry.createdAt.toISOString(),
     })),
   };
@@ -250,6 +251,7 @@ export async function grantAdminCredits(
   prisma: PrismaClient,
   input: { userId: string; amount: bigint; description: string; idempotencyKey: string },
 ) {
+  const amount = creditDecimal(input.amount);
   const replayed = await replayOperation(prisma, input.idempotencyKey);
   if (replayed) return { replayed: true, result: replayed };
 
@@ -268,28 +270,28 @@ export async function grantAdminCredits(
         const updated = await transaction.wallet.update({
           where: { userId: input.userId },
           data: {
-            availableCredits: { increment: input.amount },
-            lifetimeGranted: { increment: input.amount },
+            availableCredits: { increment: amount },
+            lifetimeGranted: { increment: amount },
           },
         });
         const ledger = await transaction.walletLedger.create({
           data: {
             userId: input.userId,
             type: 'GRANT',
-            amount: input.amount,
+            amount,
             balanceAfter: updated.availableCredits,
             description: input.description,
           },
         });
         const operationResult = {
           userId: input.userId,
-          grantedCredits: input.amount.toString(),
+          grantedCredits: serializeCredit(amount),
           wallet: serializeWalletBalance(updated),
           ledger: {
             id: ledger.id,
             type: ledger.type,
-            amount: ledger.amount.toString(),
-            balanceAfter: ledger.balanceAfter.toString(),
+            amount: serializeCredit(ledger.amount),
+            balanceAfter: serializeCredit(ledger.balanceAfter),
             description: ledger.description,
             createdAt: ledger.createdAt.toISOString(),
           },
@@ -299,7 +301,7 @@ export async function grantAdminCredits(
             idempotencyKey: input.idempotencyKey,
             type: 'GRANT_CREDITS',
             userId: input.userId,
-            amount: input.amount,
+            amount,
             description: input.description,
             result: operationResult,
           },

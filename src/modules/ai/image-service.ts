@@ -28,6 +28,7 @@ import {
 import { storageService } from '../storage/service.js';
 import { mirrorGeneratedVideoResultToStorage } from './video-result-store.js';
 import { resolveReferenceImageSources } from './reference-upload-service.js';
+import { creditDecimal, serializeCredit } from '../wallets/credit-amount.js';
 
 export const IMAGE_GENERATION_TIMEOUT_MS = 15 * 60_000;
 const longImageRequestDispatcher = new Agent({
@@ -3166,6 +3167,7 @@ async function reserveImageCredits(
     capabilities,
   );
   const estimated = unitCredits * BigInt(input.count);
+  const estimatedCredits = creditDecimal(estimated);
   const requestId = await prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({
       where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } },
@@ -3176,8 +3178,8 @@ async function reserveImageCredits(
     if (reusableRequest) existing = null;
     if (existing) throw new CloudAiError('duplicate_request', '该生图请求已经提交过', 409);
     const updated = await transaction.wallet.updateMany({
-      where: { userId: input.userId, availableCredits: { gte: estimated } },
-      data: { availableCredits: { decrement: estimated }, reservedCredits: { increment: estimated } },
+      where: { userId: input.userId, availableCredits: { gte: estimatedCredits } },
+      data: { availableCredits: { decrement: estimatedCredits }, reservedCredits: { increment: estimatedCredits } },
     });
     if (updated.count !== 1) throw new CloudAiError('insufficient_credits', '授权钱包余额不足', 402);
     const wallet = await transaction.wallet.findUniqueOrThrow({ where: { userId: input.userId } });
@@ -3187,8 +3189,8 @@ async function reserveImageCredits(
         data: {
           status: 'RESERVED',
           logicalModel: input.model,
-          estimatedCredits: estimated,
-          chargedCredits: 0n,
+          estimatedCredits,
+          chargedCredits: creditDecimal(0),
           result: Prisma.DbNull,
           completedAt: null,
         },
@@ -3198,7 +3200,7 @@ async function reserveImageCredits(
           userId: input.userId,
           requestId: request.id,
           type: 'RESERVE',
-          amount: -estimated,
+          amount: estimatedCredits.negated(),
           balanceAfter: wallet.availableCredits,
           description: '生图重试预扣',
         },
@@ -3212,7 +3214,7 @@ async function reserveImageCredits(
         capability: 'IMAGE',
         logicalModel: input.model,
         status: 'RESERVED',
-        estimatedCredits: estimated,
+        estimatedCredits,
       },
     });
     await transaction.walletLedger.create({
@@ -3220,7 +3222,7 @@ async function reserveImageCredits(
         userId: input.userId,
         requestId: request.id,
         type: 'RESERVE',
-        amount: -estimated,
+        amount: estimatedCredits.negated(),
         balanceAfter: wallet.availableCredits,
         description: `生图预扣 ${input.count} 张`,
       },
@@ -3241,23 +3243,26 @@ async function settleImageCredits(
 ) {
   const charged = unitCredits * BigInt(generatedCount);
   const refund = estimated - charged;
+  const estimatedCredits = creditDecimal(estimated);
+  const chargedCredits = creditDecimal(charged);
+  const refundCredits = creditDecimal(refund);
   await prisma.$transaction(async (transaction) => {
     const wallet = await transaction.wallet.update({
       where: { userId: input.userId },
       data: {
-        reservedCredits: { decrement: estimated },
-        ...(refund > 0n ? { availableCredits: { increment: refund } } : {}),
-        lifetimeConsumed: { increment: charged },
+        reservedCredits: { decrement: estimatedCredits },
+        ...(refund > 0n ? { availableCredits: { increment: refundCredits } } : {}),
+        lifetimeConsumed: { increment: chargedCredits },
       },
     });
     await transaction.aiRequest.update({
       where: { id: requestId },
       data: {
         status: 'SUCCEEDED',
-        chargedCredits: charged,
+        chargedCredits,
         result: {
           ...result,
-          chargedCredits: charged.toString(),
+          chargedCredits: serializeCredit(chargedCredits),
         } satisfies Prisma.InputJsonValue,
         completedAt: new Date(),
       },
@@ -3267,7 +3272,7 @@ async function settleImageCredits(
         userId: input.userId,
         requestId,
         type: 'CHARGE',
-        amount: charged,
+        amount: chargedCredits,
         balanceAfter: wallet.availableCredits,
         description: `生图结算 ${generatedCount} 张`,
       },
@@ -3278,7 +3283,7 @@ async function settleImageCredits(
           userId: input.userId,
           requestId,
           type: 'RELEASE',
-          amount: refund,
+          amount: refundCredits,
           balanceAfter: wallet.availableCredits,
           description: '生图未返回完整数量，释放剩余额度',
         },
@@ -3294,12 +3299,13 @@ async function releaseImageCredits(
   requestId: string,
   estimated: bigint,
 ) {
+  const estimatedCredits = creditDecimal(estimated);
   await prisma.$transaction(async (transaction) => {
     const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
     if (!request || request.userId !== input.userId || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
     const wallet = await transaction.wallet.update({
       where: { userId: input.userId },
-      data: { availableCredits: { increment: estimated }, reservedCredits: { decrement: estimated } },
+      data: { availableCredits: { increment: estimatedCredits }, reservedCredits: { decrement: estimatedCredits } },
     });
     await transaction.aiRequest.update({
       where: { id: requestId },
@@ -3310,7 +3316,7 @@ async function releaseImageCredits(
         userId: input.userId,
         requestId,
         type: 'RELEASE',
-        amount: estimated,
+        amount: estimatedCredits,
         balanceAfter: wallet.availableCredits,
         description: '生图失败，释放预扣额度',
       },
@@ -3437,7 +3443,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
           providerChannelId: activeProvider.id,
           providerChannelName: activeProvider.name,
           model: activeInput.model,
-          chargedCredits: charged.toString(),
+          chargedCredits: serializeCredit(creditDecimal(charged)),
         };
       } catch (error) {
         const nextProvider = providers[index + 1];
@@ -3949,6 +3955,7 @@ async function reserveVideo(prisma: PrismaClient, input: VideoInput) {
       videoCount: input.inputVideos.length,
     },
   );
+  const estimatedCredits = creditDecimal(estimated);
   return prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({ where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } } });
     const reusableRequest = existing && (existing.status === 'FAILED' || existing.status === 'REFUNDED')
@@ -3957,34 +3964,36 @@ async function reserveVideo(prisma: PrismaClient, input: VideoInput) {
     if (reusableRequest) existing = null;
     if (existing) throw new CloudAiError('duplicate_request', '该视频请求已经提交过', 409);
     const updated = await transaction.wallet.updateMany({
-      where: { userId: input.userId, availableCredits: { gte: estimated } },
-      data: { availableCredits: { decrement: estimated }, reservedCredits: { increment: estimated } },
+      where: { userId: input.userId, availableCredits: { gte: estimatedCredits } },
+      data: { availableCredits: { decrement: estimatedCredits }, reservedCredits: { increment: estimatedCredits } },
     });
     if (updated.count !== 1) throw new CloudAiError('insufficient_credits', '授权钱包余额不足', 402);
     const wallet = await transaction.wallet.findUniqueOrThrow({ where: { userId: input.userId } });
     const request = reusableRequest
-      ? await transaction.aiRequest.update({ where: { id: reusableRequest.id }, data: { status: 'RESERVED', logicalModel: input.model, estimatedCredits: estimated, chargedCredits: 0n, completedAt: null } })
-      : await transaction.aiRequest.create({ data: { userId: input.userId, clientRequestId: input.clientRequestId, capability: 'VIDEO', logicalModel: input.model, status: 'RESERVED', estimatedCredits: estimated } });
-    await transaction.walletLedger.create({ data: { userId: input.userId, requestId: request.id, type: 'RESERVE', amount: -estimated, balanceAfter: wallet.availableCredits, description: '视频请求预扣' } });
+      ? await transaction.aiRequest.update({ where: { id: reusableRequest.id }, data: { status: 'RESERVED', logicalModel: input.model, estimatedCredits, chargedCredits: creditDecimal(0), completedAt: null } })
+      : await transaction.aiRequest.create({ data: { userId: input.userId, clientRequestId: input.clientRequestId, capability: 'VIDEO', logicalModel: input.model, status: 'RESERVED', estimatedCredits } });
+    await transaction.walletLedger.create({ data: { userId: input.userId, requestId: request.id, type: 'RESERVE', amount: estimatedCredits.negated(), balanceAfter: wallet.availableCredits, description: '视频请求预扣' } });
     return { requestId: request.id, estimated };
   });
 }
 
 async function settleVideo(prisma: PrismaClient, userId: string, requestId: string, charged: bigint) {
+  const chargedCredits = creditDecimal(charged);
   await prisma.$transaction(async (transaction) => {
-    const wallet = await transaction.wallet.update({ where: { userId }, data: { reservedCredits: { decrement: charged }, lifetimeConsumed: { increment: charged } } });
-    await transaction.aiRequest.update({ where: { id: requestId }, data: { status: 'SUCCEEDED', chargedCredits: charged, completedAt: new Date() } });
-    await transaction.walletLedger.create({ data: { userId, requestId, type: 'CHARGE', amount: charged, balanceAfter: wallet.availableCredits, description: '视频请求结算' } });
+    const wallet = await transaction.wallet.update({ where: { userId }, data: { reservedCredits: { decrement: chargedCredits }, lifetimeConsumed: { increment: chargedCredits } } });
+    await transaction.aiRequest.update({ where: { id: requestId }, data: { status: 'SUCCEEDED', chargedCredits, completedAt: new Date() } });
+    await transaction.walletLedger.create({ data: { userId, requestId, type: 'CHARGE', amount: chargedCredits, balanceAfter: wallet.availableCredits, description: '视频请求结算' } });
   });
 }
 
 async function releaseVideo(prisma: PrismaClient, userId: string, requestId: string, released: bigint) {
+  const releasedCredits = creditDecimal(released);
   await prisma.$transaction(async (transaction) => {
     const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
     if (!request || request.userId !== userId || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
-    const wallet = await transaction.wallet.update({ where: { userId }, data: { availableCredits: { increment: released }, reservedCredits: { decrement: released } } });
+    const wallet = await transaction.wallet.update({ where: { userId }, data: { availableCredits: { increment: releasedCredits }, reservedCredits: { decrement: releasedCredits } } });
     await transaction.aiRequest.update({ where: { id: requestId }, data: { status: 'FAILED', completedAt: new Date() } });
-    await transaction.walletLedger.create({ data: { userId, requestId, type: 'RELEASE', amount: released, balanceAfter: wallet.availableCredits, description: '视频请求失败，释放额度' } });
+    await transaction.walletLedger.create({ data: { userId, requestId, type: 'RELEASE', amount: releasedCredits, balanceAfter: wallet.availableCredits, description: '视频请求失败，释放额度' } });
   });
 }
 
@@ -3997,7 +4006,7 @@ async function refundVideoRequest(prisma: PrismaClient, userId: string, clientRe
 
     if (request.status === 'SUCCEEDED') {
       const refund = request.chargedCredits;
-      if (refund <= 0n) return false;
+      if (refund.lte(0)) return false;
       const wallet = await transaction.wallet.update({
         where: { userId },
         data: {
@@ -4158,7 +4167,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       ));
     }
     await settleVideo(prisma, input.userId, reservation.requestId, reservation.estimated);
-    return { results, provider: provider.kind, model: input.model, chargedCredits: reservation.estimated.toString() };
+    return { results, provider: provider.kind, model: input.model, chargedCredits: serializeCredit(creditDecimal(reservation.estimated)) };
   } catch (error) {
     await releaseVideo(prisma, input.userId, reservation.requestId, reservation.estimated);
     if (error instanceof CloudAiError) throw error;

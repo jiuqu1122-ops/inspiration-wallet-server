@@ -1,4 +1,5 @@
 import type { PrismaClient } from '@prisma/client';
+import { serializeWalletBalance } from '../wallets/serialization.js';
 
 export async function getAccountSnapshot(
   prisma: PrismaClient,
@@ -60,13 +61,6 @@ export async function getAccountSnapshot(
       features: license.features,
       expiresAt: license.expiresAt,
     },
-    wallet: user.wallet
-      ? {
-          availableCredits: user.wallet.availableCredits.toString(),
-          reservedCredits: user.wallet.reservedCredits.toString(),
-          lifetimeGranted: user.wallet.lifetimeGranted.toString(),
-          lifetimeConsumed: user.wallet.lifetimeConsumed.toString(),
-        }
-      : null,
+    wallet: user.wallet ? serializeWalletBalance(user.wallet) : null,
   };
 }

@@ -99,14 +99,16 @@ npm run build
 - `GET /v1/wallet/transactions?limit=50&cursor=...`：需要 Access Token，按游标分页返回额度流水。
 - `GET /v1/wallet/usage?limit=50&cursor=...`：需要 Access Token，按游标分页返回非零的最终积分消耗记录，不包含预扣和失败释放记录。
 - `POST /v1/wallet/redeem`：需要 Access Token，提交一次性或多次可用的额度兑换码。
-- 钱包数值均返回字符串，例如 `"availableCredits": "10000"`。
+- 钱包数值均以固定 6 位小数的字符串返回，例如 `"availableCredits": "10000.000000"`；客户端可按界面需要显示 2 位小数。
 - 客户端没有“直接扣款”或“直接加款”接口。AI 接口由服务器计算价格并在事务中预扣、结算或释放。
 
 ### Agent 钱包模式
 
 Agent 与灵感分析使用 PostgreSQL 持久化异步任务。`POST /v1/ai/tasks` 接受 `type`、`requestId` 和 `payload`，立即返回 HTTP 202 与 `taskId`；`GET /v1/ai/tasks/:taskId` 查询进度和最终结果，`DELETE /v1/ai/tasks/:taskId` 取消任务。相同用户、类型和 `requestId` 会返回原任务，桌面端断线或重启后可以继续查询。兼容入口 `POST /v1/ai/chat/completions` 和 `POST /v1/ai/inspirations/analyze` 也只负责入队，不再等待模型完成。
 
-独立 `worker` 进程从数据库安全领取任务，持续更新心跳、阶段和进度。上游仍使用 `stream: true`，但由 worker 按分片增量解析 SSE 并聚合最终 JSON；桌面端每 2 秒轮询任务，成功后继续使用旧版 `content/toolCalls/finishReason` 处理逻辑。每次 Agent 请求由服务端按 `AGENT_REQUEST_CREDITS=10` 预扣，成功后结算，失败或取消后释放；客户端不提交也不能覆盖扣费额度。画布工具仍在桌面端执行，服务器不会执行或重放有副作用的工具调用。
+独立 `worker` 进程从数据库安全领取任务，持续更新心跳、阶段和进度。上游仍使用 `stream: true`，但由 worker 按分片增量解析 SSE 并聚合最终 JSON；桌面端每 2 秒轮询任务，成功后继续使用旧版 `content/toolCalls/finishReason` 处理逻辑。每次 Chat 请求先按 `AGENT_REQUEST_CREDITS=10` 预扣，成功后改按上游返回的实际 Token 用量结算，少用自动释放、多用补扣，失败或取消则释放全部预扣；客户端不提交也不能覆盖扣费额度。画布工具仍在桌面端执行，服务器不会执行或重放有副作用的工具调用。
+
+Chat 定价由独立 `ChatPricingConfig` 管理。GPT-5.6 Terra / Sol 按正常输入、缓存读取、输出和缓存写入四项计费，正常输入等于总输入减缓存读取；输入上下文超过 272K 后使用高上下文档。所有 Token 单价均为每 1M Token 的积分价，四项合计后保留 6 位小数，例如 `1.284735` 积分。GPT-5.6 Luna 按请求次数计费。上游不返回 usage 或实际模型没有配置价格时，才回退到预扣的固定 Agent 价格。
 
 生产必须同时启动 API 和 worker：
 

@@ -242,10 +242,10 @@ model AuthSession {
 
 model Wallet {
   userId           String   @id
-  availableCredits BigInt   @default(0)
-  reservedCredits  BigInt   @default(0)
-  lifetimeGranted  BigInt   @default(0)
-  lifetimeConsumed BigInt   @default(0)
+  availableCredits Decimal  @default(0) @db.Decimal(24, 6)
+  reservedCredits  Decimal  @default(0) @db.Decimal(24, 6)
+  lifetimeGranted  Decimal  @default(0) @db.Decimal(24, 6)
+  lifetimeConsumed Decimal  @default(0) @db.Decimal(24, 6)
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
   user             User     @relation(fields: [userId], references: [id], onDelete: Restrict)
@@ -256,8 +256,8 @@ model WalletLedger {
   userId       String
   requestId    String?
   type         WalletLedgerType
-  amount       BigInt
-  balanceAfter BigInt
+  amount       Decimal          @db.Decimal(24, 6)
+  balanceAfter Decimal          @db.Decimal(24, 6)
   description  String?
   createdAt    DateTime         @default(now())
   user         User             @relation(fields: [userId], references: [id], onDelete: Restrict)
@@ -271,7 +271,7 @@ model CreditRedemptionCode {
   id             String                     @id @default(cuid())
   codeHash       String                     @unique
   codeHint       String
-  credits        BigInt
+  credits        Decimal                    @db.Decimal(24, 6)
   maxRedemptions Int                        @default(1)
   redeemedCount  Int                        @default(0)
   status         CreditRedemptionCodeStatus @default(ACTIVE)
@@ -288,7 +288,7 @@ model CreditRedemption {
   id        String               @id @default(cuid())
   codeId    String
   userId    String
-  credits   BigInt
+  credits   Decimal              @db.Decimal(24, 6)
   createdAt DateTime             @default(now())
   code      CreditRedemptionCode @relation(fields: [codeId], references: [id], onDelete: Restrict)
   user      User                 @relation(fields: [userId], references: [id], onDelete: Restrict)
@@ -304,8 +304,8 @@ model AiRequest {
   capability       AiCapability
   logicalModel     String
   status           AiRequestStatus @default(PENDING)
-  estimatedCredits BigInt          @default(0)
-  chargedCredits   BigInt          @default(0)
+  estimatedCredits Decimal         @default(0) @db.Decimal(24, 6)
+  chargedCredits   Decimal         @default(0) @db.Decimal(24, 6)
   result           Json?
   createdAt        DateTime        @default(now())
   completedAt      DateTime?
@@ -322,7 +322,7 @@ model AdminOperation {
   idempotencyKey String             @unique
   type           AdminOperationType
   userId         String?
-  amount         BigInt?
+  amount         Decimal?           @db.Decimal(24, 6)
   description    String?
   result         Json
   createdAt      DateTime           @default(now())
@@ -366,6 +366,13 @@ model AiPricingConfig {
   videoModelPrices           Json
   createdAt                  DateTime @default(now())
   updatedAt                  DateTime @updatedAt
+}
+
+model ChatPricingConfig {
+  id          String   @id @default("default")
+  modelPrices Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 }
 
 model InspirationShare {

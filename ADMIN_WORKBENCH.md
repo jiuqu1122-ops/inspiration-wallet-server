@@ -90,6 +90,10 @@ POST /v1/admin/providers
 PATCH /v1/admin/providers/:providerId
 POST /v1/admin/providers/:providerId/test
 POST /v1/admin/providers/:providerId/balance
+GET  /v1/admin/pricing
+PATCH /v1/admin/pricing
+GET  /v1/admin/chat-pricing
+PATCH /v1/admin/chat-pricing
 ```
 
 客户端不应调用这些接口；它们只供你的私有 Tauri 运营工作台使用。

@@ -1,4 +1,4 @@
-import type { AiCapability, AiProviderChannel, PrismaClient } from '@prisma/client';
+import type { AiCapability, AiProviderChannel, Prisma, PrismaClient } from '@prisma/client';
 import { env } from '../../config/env.js';
 import { decryptProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
@@ -7,6 +7,8 @@ import {
   configuredAgentRequestCredits,
   configuredInspirationAnalysisCredits,
 } from './pricing.js';
+import { configuredChatCharge, type ChatChargeBreakdown } from './chat-pricing.js';
+import { creditDecimal } from '../wallets/credit-amount.js';
 
 const REQUEST_CREDITS = BigInt(env.AGENT_REQUEST_CREDITS);
 
@@ -821,13 +823,28 @@ async function requestStreamingCompletion(
     // Bigmodel/Mikoto/USELG use the OpenAI-compatible text route here. Their
     // native image protocols are isolated in image-service.ts and never share
     // this body.
-    response = await fetch(providerEndpoint(provider.baseUrl, '/v1/chat/completions'), {
+    const endpoint = providerEndpoint(provider.baseUrl, '/v1/chat/completions');
+    const send = (includeUsage: boolean) => fetch(endpoint, {
       method: 'POST',
       headers: upstreamHeaders(secrets.apiKey, secrets.headers),
-      body: JSON.stringify({ ...body, model, stream: true }),
+      body: JSON.stringify({
+        ...body,
+        model,
+        stream: true,
+        ...(includeUsage ? { stream_options: { include_usage: true } } : {}),
+      }),
       redirect: 'error',
       signal: controller.signal,
     });
+    response = await send(true);
+    // Some older OpenAI-compatible gateways reject stream_options entirely.
+    // A rejected 400/422 request has not generated output, so retrying once
+    // without this optional field preserves compatibility; billing then uses
+    // the configured fixed fallback if the gateway omits usage.
+    if (response.status === 400 || response.status === 422) {
+      await response.body?.cancel().catch(() => undefined);
+      response = await send(false);
+    }
   } finally {
     clearTimeout(connectTimeout);
   }
@@ -1013,6 +1030,7 @@ async function reserveCredits(
     description: string;
   },
 ) {
+  const credits = creditDecimal(input.credits);
   return prisma.$transaction(async (transaction) => {
     const existing = await transaction.aiRequest.findUnique({
       where: {
@@ -1026,10 +1044,10 @@ async function reserveCredits(
       throw new CloudAiError('duplicate_request', '该 Agent 请求已经提交过', 409);
     }
     const updated = await transaction.wallet.updateMany({
-      where: { userId: input.userId, availableCredits: { gte: input.credits } },
+      where: { userId: input.userId, availableCredits: { gte: credits } },
       data: {
-        availableCredits: { decrement: input.credits },
-        reservedCredits: { increment: input.credits },
+        availableCredits: { decrement: credits },
+        reservedCredits: { increment: credits },
       },
     });
     if (updated.count !== 1) {
@@ -1043,7 +1061,7 @@ async function reserveCredits(
         capability: input.capability,
         logicalModel: input.logicalModel,
         status: 'RESERVED',
-        estimatedCredits: input.credits,
+        estimatedCredits: credits,
       },
     });
     await transaction.walletLedger.create({
@@ -1051,7 +1069,7 @@ async function reserveCredits(
         userId: input.userId,
         requestId: request.id,
         type: 'RESERVE',
-        amount: -input.credits,
+        amount: credits.negated(),
         balanceAfter: wallet.availableCredits,
         description: input.description,
       },
@@ -1060,27 +1078,49 @@ async function reserveCredits(
   });
 }
 
-async function settleCredits(prisma: PrismaClient, userId: string, requestId: string) {
+type CreditSettlement = {
+  chargedCredits: string;
+  logicalModel?: string | undefined;
+  billingResult?: ChatChargeBreakdown | undefined;
+  description?: string | undefined;
+};
+
+async function settleCredits(
+  prisma: PrismaClient,
+  userId: string,
+  requestId: string,
+  settlement?: CreditSettlement,
+) {
   await prisma.$transaction(async (transaction) => {
     const request = await transaction.aiRequest.findFirst({
       where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
     });
     if (!request) return;
-    const credits = request.estimatedCredits;
+    const reserved = creditDecimal(request.estimatedCredits);
+    const charged = creditDecimal(settlement?.chargedCredits ?? reserved);
+    const release = reserved.gt(charged) ? reserved.minus(charged) : creditDecimal(0);
+    const extra = charged.gt(reserved) ? charged.minus(reserved) : creditDecimal(0);
+    const requestUpdate: Prisma.AiRequestUpdateManyMutationInput = {
+      status: 'SUCCEEDED',
+      chargedCredits: charged,
+      completedAt: new Date(),
+      ...(settlement?.logicalModel ? { logicalModel: settlement.logicalModel } : {}),
+      ...(settlement?.billingResult
+        ? { result: settlement.billingResult }
+        : {}),
+    };
     const claimed = await transaction.aiRequest.updateMany({
       where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
-      data: {
-        status: 'SUCCEEDED',
-        chargedCredits: credits,
-        completedAt: new Date(),
-      },
+      data: requestUpdate,
     });
     if (claimed.count !== 1) return;
     const wallet = await transaction.wallet.update({
       where: { userId },
       data: {
-        reservedCredits: { decrement: credits },
-        lifetimeConsumed: { increment: credits },
+        reservedCredits: { decrement: reserved },
+        ...(release.gt(0) ? { availableCredits: { increment: release } } : {}),
+        ...(extra.gt(0) ? { availableCredits: { decrement: extra } } : {}),
+        lifetimeConsumed: { increment: charged },
       },
     });
     await transaction.walletLedger.create({
@@ -1088,11 +1128,24 @@ async function settleCredits(prisma: PrismaClient, userId: string, requestId: st
         userId,
         requestId,
         type: 'CHARGE',
-        amount: credits,
+        amount: charged,
         balanceAfter: wallet.availableCredits,
-        description: request.capability === 'VISION' ? '图片分析结算' : 'Agent 请求结算',
+        description: settlement?.description
+          ?? (request.capability === 'VISION' ? '图片分析结算' : 'Agent 请求结算'),
       },
     });
+    if (release.gt(0)) {
+      await transaction.walletLedger.create({
+        data: {
+          userId,
+          requestId,
+          type: 'RELEASE',
+          amount: release,
+          balanceAfter: wallet.availableCredits,
+          description: 'Chat Token 结算，释放多余预扣额度',
+        },
+      });
+    }
   });
 }
 
@@ -1265,7 +1318,17 @@ export async function executeWalletAgentChat(
     if (result === undefined) {
       throw new CloudAiError('provider_request_failed', '全部 Agent 渠道请求失败', 502);
     }
-    await settleCredits(prisma, input.userId, requestId);
+    const billing = await configuredChatCharge(prisma, result, input.model, credits);
+    const usage = billing.usage;
+    const description = usage
+      ? `Chat Token 结算 · ${billing.model} · 输入 ${usage.normalInputTokens} · 缓存读 ${usage.cachedInputTokens} · 缓存写 ${usage.cacheWriteTokens} · 输出 ${usage.outputTokens}`
+      : `Chat 请求结算 · ${billing.model}`;
+    await settleCredits(prisma, input.userId, requestId, {
+      chargedCredits: billing.chargedCredits,
+      logicalModel: billing.model,
+      billingResult: billing,
+      description,
+    });
     return result;
   } catch (error) {
     await releaseCredits(prisma, input.userId, requestId);

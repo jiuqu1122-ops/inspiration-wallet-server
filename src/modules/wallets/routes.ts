@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { redeemCredits, RedemptionError } from './redemption.js';
+import { serializeCredit } from './credit-amount.js';
 
 const transactionsQuerySchema = z.object({
   cursor: z.string().min(1).max(64).optional(),
@@ -79,8 +80,8 @@ export const walletRoutes: FastifyPluginAsync = async (app) => {
       return {
         items: page.map((entry) => ({
           ...entry,
-          amount: entry.amount.toString(),
-          balanceAfter: entry.balanceAfter.toString(),
+          amount: serializeCredit(entry.amount),
+          balanceAfter: serializeCredit(entry.balanceAfter),
         })),
         nextCursor: hasMore ? page.at(-1)?.id ?? null : null,
       };
@@ -104,7 +105,7 @@ export const walletRoutes: FastifyPluginAsync = async (app) => {
         where: {
           userId: request.user.sub,
           type: 'CHARGE',
-          amount: { not: 0n },
+          amount: { not: 0 },
         },
         ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
@@ -125,8 +126,8 @@ export const walletRoutes: FastifyPluginAsync = async (app) => {
       return {
         items: page.map((entry) => ({
           ...entry,
-          amount: entry.amount.toString(),
-          balanceAfter: entry.balanceAfter.toString(),
+          amount: serializeCredit(entry.amount),
+          balanceAfter: serializeCredit(entry.balanceAfter),
         })),
         nextCursor: hasMore ? page.at(-1)?.id ?? null : null,
       };

@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { serializeWalletBalance } from './serialization.js';
+import { creditDecimal, serializeCredit } from './credit-amount.js';
 
 const CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
@@ -45,6 +46,7 @@ export async function createRedemptionCodes(
     note?: string | null;
   },
 ) {
+  const credits = creditDecimal(input.credits);
   const generated: Array<{ code: string; codeHint: string; id: string }> = [];
   for (let index = 0; index < input.quantity; index += 1) {
     for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -55,7 +57,7 @@ export async function createRedemptionCodes(
           data: {
             codeHash: hashRedemptionCode(code),
             codeHint: `••••-${compact.slice(-5)}`,
-            credits: input.credits,
+            credits,
             maxRedemptions: input.maxRedemptions,
             expiresAt: input.expiresAt ?? null,
             note: input.note ?? null,
@@ -97,7 +99,7 @@ export async function listRedemptionCodes(prisma: PrismaClient, limit = 100) {
   });
   return codes.map((code) => ({
     ...code,
-    credits: code.credits.toString(),
+    credits: serializeCredit(code.credits),
   }));
 }
 
@@ -165,7 +167,7 @@ export async function redeemCredits(
       });
 
       return {
-        redeemedCredits: code.credits.toString(),
+        redeemedCredits: serializeCredit(code.credits),
         wallet: serializeWalletBalance(wallet),
       };
     },

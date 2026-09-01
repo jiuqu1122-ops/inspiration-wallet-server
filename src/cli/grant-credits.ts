@@ -1,4 +1,5 @@
 import { PrismaClient } from '@prisma/client';
+import { creditDecimal, serializeCredit } from '../modules/wallets/credit-amount.js';
 
 function argument(name: string) {
   const prefix = `--${name}=`;
@@ -21,14 +22,15 @@ if (amount <= 0n || description.length > 500) {
 }
 
 const prisma = new PrismaClient();
+const decimalAmount = creditDecimal(amount);
 
 try {
   const result = await prisma.$transaction(async (transaction) => {
     const wallet = await transaction.wallet.update({
       where: { userId },
       data: {
-        availableCredits: { increment: amount },
-        lifetimeGranted: { increment: amount },
+        availableCredits: { increment: decimalAmount },
+        lifetimeGranted: { increment: decimalAmount },
       },
       select: { availableCredits: true },
     });
@@ -36,7 +38,7 @@ try {
       data: {
         userId,
         type: 'GRANT',
-        amount,
+        amount: decimalAmount,
         balanceAfter: wallet.availableCredits,
         description,
       },
@@ -49,8 +51,8 @@ try {
     `${JSON.stringify({
       status: 'ok',
       userId,
-      grantedCredits: amount.toString(),
-      balanceAfter: result.wallet.availableCredits.toString(),
+      grantedCredits: serializeCredit(decimalAmount),
+      balanceAfter: serializeCredit(result.wallet.availableCredits),
       ledgerId: result.ledger.id,
       createdAt: result.ledger.createdAt,
     })}\n`,

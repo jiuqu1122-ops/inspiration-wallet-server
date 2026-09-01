@@ -17,6 +17,11 @@ import {
   getAiPricingConfig,
   updateAiPricingConfig,
 } from '../ai/pricing.js';
+import {
+  chatPricingModelToken,
+  getChatPricingConfig,
+  updateChatPricingConfig,
+} from '../ai/chat-pricing.js';
 import { inspirationSpaceAdminRoutes } from '../inspiration-space/admin-routes.js';
 
 const listUsersSchema = z.object({
@@ -108,6 +113,41 @@ const pricingSchema = z.object({
   }
 });
 
+const chatTokenRatesSchema = z.object({
+  inputCreditsPerMillion: pricingCreditsSchema,
+  outputCreditsPerMillion: pricingCreditsSchema,
+  cachedInputCreditsPerMillion: pricingCreditsSchema,
+  cacheWriteCreditsPerMillion: pricingCreditsSchema,
+}).strict();
+
+const chatModelPriceSchema = z.discriminatedUnion('billingMode', [
+  z.object({
+    model: z.string().trim().min(1).max(200),
+    billingMode: z.literal('token'),
+    contextThresholdTokens: z.number().int().min(1).max(10_000_000),
+    standard: chatTokenRatesSchema,
+    extended: chatTokenRatesSchema,
+  }).strict(),
+  z.object({
+    model: z.string().trim().min(1).max(200),
+    billingMode: z.literal('request'),
+    creditsPerRequest: pricingCreditsSchema,
+  }).strict(),
+]);
+
+const chatPricingSchema = z.object({
+  models: z.array(chatModelPriceSchema).min(1).max(100),
+}).strict().superRefine((value, context) => {
+  const normalized = value.models.map(item => chatPricingModelToken(item.model));
+  if (new Set(normalized).size !== normalized.length) {
+    context.addIssue({
+      code: 'custom',
+      path: ['models'],
+      message: 'Chat 模型积分配置包含重复模型',
+    });
+  }
+});
+
 function invalid(reply: FastifyReply, message: string) {
   return reply.code(400).send({ error: 'invalid_request', message });
 }
@@ -129,6 +169,20 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
         return invalid(reply, parsed.error.issues[0]?.message ?? 'AI pricing is invalid');
       }
       return updateAiPricingConfig(app.prisma, parsed.data);
+    },
+  );
+
+  app.get('/chat-pricing', async () => getChatPricingConfig(app.prisma));
+
+  app.patch(
+    '/chat-pricing',
+    { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const parsed = chatPricingSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return invalid(reply, parsed.error.issues[0]?.message ?? 'Chat pricing is invalid');
+      }
+      return updateChatPricingConfig(app.prisma, parsed.data);
     },
   );
 
