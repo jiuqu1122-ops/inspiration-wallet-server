@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Readable } from 'node:stream';
 
 const storageMocks = vi.hoisted(() => ({
   createUploadUrl: vi.fn(() => ({
@@ -15,13 +16,20 @@ const storageMocks = vi.hoisted(() => ({
   })),
   getDownloadUrl: vi.fn((key: string) => `https://storage.example/${key}?signed=1`),
   tryResolveObjectKeyFromUrl: vi.fn(() => null as string | null),
+  getObjectStream: vi.fn(async () => ({
+    stream: Readable.from([Buffer.from('test')]),
+    statusCode: 200,
+    headers: { 'content-length': '4', 'content-type': 'image/png' },
+  })),
 }));
 
 vi.mock('../src/modules/storage/service.js', () => ({ storageService: storageMocks }));
 
 import {
   ReferenceUploadError,
+  getReferenceImageContent,
   issueReferenceUploadTicket,
+  proxyAgentChatReferenceImages,
   resolveReferenceImageSources,
   validateReferenceObjectKey,
 } from '../src/modules/ai/reference-upload-service.js';
@@ -30,10 +38,10 @@ function fakePrisma() {
   return {
     referenceUpload: {
       create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({ id: 'upload-1', ...data })),
-      findFirst: vi.fn(async () => ({
+      findFirst: vi.fn(async ({ where }: { where: Record<string, unknown> }) => ({
         id: 'upload-1',
         userId: 'user-1',
-        objectKey: 'reference-images/new.png',
+        objectKey: String(where.objectKey || 'reference-images/new.png'),
         contentType: 'image/png',
         sizeBytes: 4,
         status: 'ISSUED',
@@ -50,6 +58,7 @@ describe('reference image direct upload ownership', () => {
     storageMocks.getDownloadUrl.mockClear();
     storageMocks.tryResolveObjectKeyFromUrl.mockReset();
     storageMocks.tryResolveObjectKeyFromUrl.mockReturnValue(null);
+    storageMocks.getObjectStream.mockClear();
   });
 
   it('issues a short-lived ticket for a server-generated reference object key', async () => {
@@ -179,5 +188,73 @@ describe('reference image direct upload ownership', () => {
       code: 'reference_image_invalid',
     });
     expect(storageMocks.getDownloadUrl).not.toHaveBeenCalled();
+  });
+
+  it('rewrites owned chat image keys to the API proxy without exposing storage URLs', async () => {
+    const prisma = fakePrisma();
+    const externalUrl = 'https://images.example.org/reference.png';
+    const objectKey = 'reference-images/12d2e7bb-6e3f-4ba0-bdb0-b82023a67e23.png';
+    const messages = [{
+      role: 'user',
+      content: [
+        { type: 'text', text: '分析图片' },
+        { type: 'image_url', image_url: { url: objectKey, detail: 'low' } },
+        { type: 'image_url', image_url: { url: externalUrl, detail: 'high' } },
+      ],
+    }];
+
+    await expect(proxyAgentChatReferenceImages(
+      prisma as never,
+      'user-1',
+      messages,
+    )).resolves.toEqual([{
+      role: 'user',
+      content: [
+        { type: 'text', text: '分析图片' },
+        {
+          type: 'image_url',
+          image_url: {
+            url: 'https://api.example.test/v1/ai/reference-images/content/12d2e7bb-6e3f-4ba0-bdb0-b82023a67e23.png',
+            detail: 'low',
+          },
+        },
+        { type: 'image_url', image_url: { url: externalUrl, detail: 'high' } },
+      ],
+    }]);
+    expect(storageMocks.getDownloadUrl).not.toHaveBeenCalled();
+  });
+
+  it('rejects a chat image key owned by another user before calling the provider', async () => {
+    const prisma = fakePrisma();
+    prisma.referenceUpload.findFirst.mockResolvedValueOnce(null);
+    await expect(proxyAgentChatReferenceImages(prisma as never, 'other-user', [{
+      role: 'user',
+      content: [{
+        type: 'image_url',
+        image_url: { url: 'reference-images/12d2e7bb-6e3f-4ba0-bdb0-b82023a67e23.png' },
+      }],
+    }])).rejects.toMatchObject({ code: 'invalid_reference_image' });
+    expect(storageMocks.getDownloadUrl).not.toHaveBeenCalled();
+  });
+
+  it('opens only an unexpired recorded reference object for proxy streaming', async () => {
+    const prisma = fakePrisma();
+    const filename = '12d2e7bb-6e3f-4ba0-bdb0-b82023a67e23.png';
+    storageMocks.getObjectStream.mockResolvedValueOnce({
+      stream: Readable.from([Buffer.from('test')]),
+      statusCode: 200,
+      headers: { 'content-length': '4', 'content-type': 'image/png' },
+    });
+    const image = await getReferenceImageContent(prisma as never, filename);
+    expect(image).toMatchObject({
+      objectKey: `reference-images/${filename}`,
+      contentType: 'image/png',
+      contentLength: 4,
+    });
+    expect(storageMocks.getObjectStream).toHaveBeenCalledWith(`reference-images/${filename}`);
+
+    prisma.referenceUpload.findFirst.mockResolvedValueOnce(null);
+    await expect(getReferenceImageContent(prisma as never, filename))
+      .rejects.toMatchObject({ code: 'reference_image_not_found', statusCode: 404 });
   });
 });

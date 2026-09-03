@@ -9,6 +9,7 @@ import {
 } from './pricing.js';
 import { configuredChatCharge, type ChatChargeBreakdown } from './chat-pricing.js';
 import { creditDecimal } from '../wallets/credit-amount.js';
+import { proxyAgentChatReferenceImages } from './reference-upload-service.js';
 
 const REQUEST_CREDITS = BigInt(env.AGENT_REQUEST_CREDITS);
 
@@ -1216,6 +1217,10 @@ export async function executeWalletAgentChat(
     description: 'Agent 请求预扣',
   });
   try {
+    const providerInput = {
+      ...input,
+      messages: await proxyAgentChatReferenceImages(prisma, input.userId, input.messages),
+    };
     const providers = await listProviders(prisma);
     if (providers.length === 0) {
       throw new CloudAiError('provider_unavailable', '当前没有可用的 Agent 渠道', 503);
@@ -1228,7 +1233,7 @@ export async function executeWalletAgentChat(
         requestAttempt += 1;
         result = await requestAgentCompletionFromProvider(
           provider,
-          input,
+          providerInput,
           index > 0,
           options,
           requestAttempt,
@@ -1276,7 +1281,7 @@ export async function executeWalletAgentChat(
               requestAttempt += 1;
               result = await requestAgentCompletionFromProvider(
                 provider,
-                retryModel ? { ...input, model: retryModel } : input,
+                retryModel ? { ...providerInput, model: retryModel } : providerInput,
                 false,
                 options,
                 requestAttempt,

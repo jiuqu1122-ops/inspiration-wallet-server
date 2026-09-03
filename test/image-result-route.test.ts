@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Readable } from 'node:stream';
 
 const bridgeMocks = vi.hoisted(() => ({
   uploadMedia: vi.fn(async () => 'generated-images/result.png'),
@@ -16,6 +17,13 @@ const bridgeMocks = vi.hoisted(() => ({
   })),
   delete: vi.fn(async () => true),
   rewriteStoredUrls: vi.fn((value: unknown) => value),
+  getObjectStream: vi.fn(async () => ({
+    stream: Readable.from([Buffer.from('image')]),
+    statusCode: 200,
+    headers: { 'content-length': '5', 'content-type': 'image/png' },
+  })),
+  headObject: vi.fn(async () => null),
+  tryResolveObjectKeyFromUrl: vi.fn(() => null),
 }));
 
 vi.mock('../src/modules/ai/image-result-store.js', () => ({
@@ -52,6 +60,7 @@ describe('generated image OSS delivery route', () => {
     bridgeMocks.verifyImageUrl.mockClear();
     bridgeMocks.createUploadUrl.mockClear();
     bridgeMocks.delete.mockClear();
+    bridgeMocks.getObjectStream.mockClear();
     bridgeMocks.exists.mockResolvedValue(true);
     bridgeMocks.uploadMedia.mockImplementation(async (input: { namespace: string; filename: string }) => (
       `${input.namespace}/${input.filename}`
@@ -270,6 +279,45 @@ describe('generated image OSS delivery route', () => {
     expect(prisma.referenceUpload.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ userId: 'user-1', status: 'ISSUED' }),
     });
+    await app.close();
+  });
+
+  it('streams an unexpired reference image through the public API proxy', async () => {
+    const prisma = {
+      referenceUpload: {
+        findFirst: vi.fn(async () => ({
+          objectKey: 'reference-images/12d2e7bb-6e3f-4ba0-bdb0-b82023a67e23.png',
+          contentType: 'image/png',
+          sizeBytes: 5,
+          status: 'UPLOADED',
+        })),
+      },
+    };
+    const app = await makeApp(prisma);
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/ai/reference-images/content/12d2e7bb-6e3f-4ba0-bdb0-b82023a67e23.png',
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toBe('image/png');
+    expect(response.headers['content-length']).toBe('5');
+    expect(response.headers['x-content-type-options']).toBe('nosniff');
+    expect(response.body).toBe('image');
+    expect(bridgeMocks.getObjectStream).toHaveBeenCalledWith(
+      'reference-images/12d2e7bb-6e3f-4ba0-bdb0-b82023a67e23.png',
+    );
+    await app.close();
+  });
+
+  it('does not expose expired or unrecorded reference objects', async () => {
+    const prisma = { referenceUpload: { findFirst: vi.fn(async () => null) } };
+    const app = await makeApp(prisma);
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/ai/reference-images/content/12d2e7bb-6e3f-4ba0-bdb0-b82023a67e23.png',
+    });
+    expect(response.statusCode).toBe(404);
+    expect(bridgeMocks.getObjectStream).not.toHaveBeenCalled();
     await app.close();
   });
 

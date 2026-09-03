@@ -20,6 +20,7 @@ import { getImageResult, imageResultMimeForKey } from './image-result-store.js';
 import { createAiTaskSchema } from './task-schema.js';
 import {
   ReferenceUploadError,
+  getReferenceImageContent,
   issueReferenceUploadTicket,
   recordLegacyReferenceUpload,
   referenceUploadInputSchema,
@@ -410,6 +411,34 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
         }
         request.log.error({ err: error }, 'reference image upload ticket failed');
         return reply.code(503).send({ error: 'image_delivery_unavailable', message: 'Reference image upload is temporarily unavailable' });
+      }
+    },
+  );
+
+  app.get(
+    '/reference-images/content/:filename',
+    { config: { rateLimit: { max: 240, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const rawFilename = (request.params as { filename?: unknown }).filename;
+      const filename = typeof rawFilename === 'string' ? rawFilename.trim() : '';
+      try {
+        const image = await getReferenceImageContent(app.prisma, filename);
+        return reply
+          .header('content-type', image.contentType)
+          .header('content-length', String(image.contentLength))
+          .header('cache-control', 'public, max-age=120, immutable')
+          .header('cross-origin-resource-policy', 'cross-origin')
+          .header('x-content-type-options', 'nosniff')
+          .send(image.response.stream);
+      } catch (error) {
+        if (error instanceof ReferenceUploadError) {
+          return reply.code(error.statusCode).send({ error: error.code, message: error.message });
+        }
+        request.log.error({ err: error }, 'reference image proxy failed');
+        return reply.code(503).send({
+          error: 'image_delivery_unavailable',
+          message: 'Reference image is temporarily unavailable',
+        });
       }
     },
   );
