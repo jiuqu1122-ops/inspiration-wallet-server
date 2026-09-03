@@ -176,9 +176,10 @@ export function resolveConfiguredAgentModel(
     ? ''
     : requestedModel?.trim() ?? '';
   const configured = provider.defaultModel?.trim() ?? '';
-  return preferProviderDefault
-    ? configured || requested || null
-    : requested || configured || null;
+  // An explicit client selection is authoritative on every channel. Provider
+  // defaults are only used for automatic requests.
+  if (preferProviderDefault && !requested) return configured || null;
+  return requested || configured || null;
 }
 
 const NON_AGENT_TEXT_MODEL_PATTERN = /(?:^|[-_/.\s])(?:embeddings?|embed|rerank|re-rank|image|images|imagen|img2|flux|sdxl|stable[-_.\s]?diffusion|dall[-_.\s]?e|recraft|ideogram|midjourney|seedream|nano[-_.\s]?banana|hidream|kolors|jimeng|video|sora|veo|kling|seedance|tts|speech|whisper|transcrib(?:e|er)|transcription|moderation)(?:$|[-_/.\s\d])/i;
@@ -194,20 +195,31 @@ export function buildAgentModelCandidates(
   provider: { defaultModel: string | null },
   requestedModel: string | null | undefined,
   discoveredModels: string[],
-  preferProviderDefault = false,
 ) {
   const requested = isDefaultAgentModelSentinel(requestedModel) ? '' : requestedModel?.trim() ?? '';
-  const configured = provider.defaultModel?.trim() ?? '';
-  const preferred = preferProviderDefault
-    ? [configured, requested]
-    : [requested, configured];
-  return Array.from(new Set([
-    ...preferred,
-    ...discoveredModels.filter(isLikelyAgentTextModel),
-  ].filter(Boolean)));
-}
+  if (requested) return [requested];
 
-const MAX_SINGLE_PROVIDER_AGENT_RETRIES = 3;
+  const configured = provider.defaultModel?.trim() ?? '';
+  const discovered = Array.from(new Set(discoveredModels.filter(isLikelyAgentTextModel)));
+  const numericParts = (model: string) => (
+    (model.match(/\d+(?:\.\d+)*/)?.[0] || '')
+      .split('.')
+      .filter(Boolean)
+      .map(part => Number(part))
+  );
+  const sorted = discovered
+    .map((model, index) => ({ model, index, numericParts: numericParts(model) }))
+    .sort((left, right) => {
+      const length = Math.max(left.numericParts.length, right.numericParts.length);
+      for (let index = 0; index < length; index += 1) {
+        const difference = (right.numericParts[index] || 0) - (left.numericParts[index] || 0);
+        if (difference !== 0) return difference;
+      }
+      return left.index - right.index;
+    })
+    .map(item => item.model);
+  return sorted.length > 0 ? sorted : [configured].filter(Boolean);
+}
 
 export function buildSingleProviderAgentRetryModels(
   provider: { defaultModel: string | null },
@@ -224,7 +236,7 @@ export function buildSingleProviderAgentRetryModels(
   return Array.from(new Set([
     ...(retryFailedModel && failedModel ? [failedModel] : []),
     ...alternatives,
-  ])).slice(0, MAX_SINGLE_PROVIDER_AGENT_RETRIES);
+  ]));
 }
 
 const AGENT_PROTOCOL_FALLBACK_STATUSES = new Set([400, 401, 403, 404, 405, 422, 429]);
@@ -707,7 +719,7 @@ function canTryAlternativeAgentModel(error: unknown) {
   if (error instanceof AgentUpstreamHttpError) {
     return error.status !== 401
       && error.status !== 403
-      && (isAgentProviderRetryStatus(error.status) || [404, 405, 429].includes(error.status));
+      && isAgentProviderFallbackStatus(error.status);
   }
   if (error instanceof CloudAiError) {
     return [
@@ -1228,13 +1240,28 @@ export async function executeWalletAgentChat(
     const failures: string[] = [];
     let result: unknown;
     let requestAttempt = 0;
+    const automaticModelSelection = isDefaultAgentModelSentinel(input.model);
     for (const [index, provider] of providers.entries()) {
+      let discoveredModels: string[] = [];
+      if (automaticModelSelection) {
+        try {
+          const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+          discoveredModels = await readProviderModels(provider, secrets.apiKey, secrets.headers);
+        } catch {
+          discoveredModels = [];
+        }
+      }
+      const modelCandidates = buildAgentModelCandidates(provider, input.model, discoveredModels);
+      const initialModel = modelCandidates[0];
+      const providerAttemptInput = initialModel
+        ? { ...providerInput, model: initialModel }
+        : providerInput;
       try {
         requestAttempt += 1;
         result = await requestAgentCompletionFromProvider(
           provider,
-          providerInput,
-          index > 0,
+          providerAttemptInput,
+          false,
           options,
           requestAttempt,
         );
@@ -1247,24 +1274,19 @@ export async function executeWalletAgentChat(
         }
         let finalError = error;
         const retriedModels: string[] = [];
-        if (providers.length === 1
-          && (canTryAlternativeAgentModel(error) || canRetrySingleAgentProvider(error))) {
-          const failedModel = resolveConfiguredAgentModel(provider, input.model, index > 0) || '';
-          let discoveredModels: string[] = [];
-          try {
-            const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-            discoveredModels = await readProviderModels(provider, secrets.apiKey, secrets.headers);
-          } catch {
-            discoveredModels = [];
-          }
-
-          const retryModels = buildSingleProviderAgentRetryModels(
-            provider,
-            input.model,
-            discoveredModels,
-            failedModel || discoveredModels[0] || '',
-            canRetrySingleAgentProvider(error),
-          );
+        if (canTryAlternativeAgentModel(error) || canRetrySingleAgentProvider(error)) {
+          const failedModel = resolveConfiguredAgentModel(provider, providerAttemptInput.model) || '';
+          const retryModels = automaticModelSelection
+            ? buildSingleProviderAgentRetryModels(
+              provider,
+              input.model,
+              discoveredModels,
+              failedModel || discoveredModels[0] || '',
+              canRetrySingleAgentProvider(error),
+            )
+            : canRetrySingleAgentProvider(error) && failedModel
+              ? [failedModel]
+              : [];
           const attempts: Array<string | null> = retryModels.length > 0
             ? retryModels
             : canRetrySingleAgentProvider(error) ? [null] : [];
@@ -1281,7 +1303,7 @@ export async function executeWalletAgentChat(
               requestAttempt += 1;
               result = await requestAgentCompletionFromProvider(
                 provider,
-                retryModel ? { ...providerInput, model: retryModel } : providerInput,
+                retryModel ? { ...providerAttemptInput, model: retryModel } : providerAttemptInput,
                 false,
                 options,
                 requestAttempt,

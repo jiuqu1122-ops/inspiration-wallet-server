@@ -43,12 +43,12 @@ describe('Agent provider fallback policy', () => {
     expect(isDefaultAgentModelSentinel('gpt-5.6-sol')).toBe(false);
   });
 
-  it('keeps the selected model on the primary channel and uses fallback channel defaults', () => {
+  it('keeps an explicitly selected model on every provider channel', () => {
     const primary = { defaultModel: 'primary-default' };
     const fallback = { defaultModel: 'fallback-default' };
 
     expect(resolveConfiguredAgentModel(primary, 'selected-model')).toBe('selected-model');
-    expect(resolveConfiguredAgentModel(fallback, 'selected-model', true)).toBe('fallback-default');
+    expect(resolveConfiguredAgentModel(fallback, 'selected-model', true)).toBe('selected-model');
     expect(resolveConfiguredAgentModel({ defaultModel: null }, 'selected-model', true)).toBe('selected-model');
   });
 
@@ -69,7 +69,7 @@ describe('Agent provider fallback policy', () => {
     expect(isAgentProviderRetryStatus(401)).toBe(false);
   });
 
-  it('selects another text model from the same channel after a model failure', () => {
+  it('does not switch models after the user explicitly selected one', () => {
     expect(buildAgentModelCandidates(
       { defaultModel: 'claude-sonnet-4-5' },
       'gemini-2.5-pro',
@@ -79,10 +79,25 @@ describe('Agent provider fallback policy', () => {
         'gemini-2.5-flash',
         'claude-sonnet-4-5',
       ],
+    )).toEqual(['gemini-2.5-pro']);
+  });
+
+  it('sorts discovered automatic models by numeric version and preserves equal-version order', () => {
+    expect(buildAgentModelCandidates(
+      { defaultModel: 'provider-default' },
+      'auto',
+      [
+        'gpt-5.5',
+        'gpt-image-2',
+        'gpt-5.6-terra',
+        'gpt-5.6-luna',
+        'gpt-5.4',
+      ],
     )).toEqual([
-      'gemini-2.5-pro',
-      'claude-sonnet-4-5',
-      'gemini-2.5-flash',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-5.5',
+      'gpt-5.4',
     ]);
   });
 
