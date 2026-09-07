@@ -118,6 +118,7 @@ nano .env
 - `AI_UPSTREAM_CONNECT_TIMEOUT_MS`、`AI_UPSTREAM_IDLE_TIMEOUT_MS`：上游连接建立与流读取空闲超时。
 - `WORKER_HEALTH_FILE`：容器内 liveness 文件路径，通常保持默认值。
 - `STORAGE_PROVIDER`：对象存储实现，生产环境必须显式设置为 `tencent-cos`，应用缺省值也是 `tencent-cos`。`aliyun-oss` 只保留为显式选择的历史兼容实现。
+- `BACKEND_IMAGE`：低内存生产机应在执行部署脚本时传入 GitHub Actions 生成的不可变 `sha-*` GHCR 镜像；未设置时部署脚本才会在服务器本地构建。
 - `STORAGE_SIGNED_URL_EXPIRES_SECONDS`：私有对象下载 URL 有效期，建议 `3600`。
 - 当 `STORAGE_PROVIDER=aliyun-oss` 时，必须配置 `OSS_REGION`、`OSS_BUCKET`、`OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`。
 - 当 `STORAGE_PROVIDER=tencent-cos` 时，必须配置 `COS_REGION`、`COS_BUCKET`、`COS_SECRET_ID`、`COS_SECRET_KEY`。`COS_BUCKET` 必须使用控制台显示的完整 `BucketName-APPID`，例如 `inspirationdrawer-1475663212`，不要另写 AppId。
