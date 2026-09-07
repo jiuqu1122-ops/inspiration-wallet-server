@@ -29,6 +29,22 @@ import { storageService } from '../storage/service.js';
 import { mirrorGeneratedVideoResultToStorage } from './video-result-store.js';
 import { resolveReferenceImageSources } from './reference-upload-service.js';
 import { creditDecimal, serializeCredit } from '../wallets/credit-amount.js';
+import { ensureAiCatalogSeeded } from './catalog-seed.js';
+import {
+  catalogDelegateAvailable,
+  catalogAliasKey,
+  explicitCanonicalModelKey,
+  legacyUpstreamModelForCanonical,
+  resolveCatalogModel,
+} from './model-catalog.js';
+import {
+  calculateSnapshotCharge,
+  capturePricingSnapshot,
+  estimateSnapshotCredits,
+  type PricingSnapshot,
+  legacyPricingFromCatalog,
+  toInputJson,
+} from './pricing-center.js';
 
 export const IMAGE_GENERATION_TIMEOUT_MS = 15 * 60_000;
 const longImageRequestDispatcher = new Agent({
@@ -565,14 +581,48 @@ function publicWalletImageProviderKind(provider: Pick<AiProviderChannel, 'kind'>
 export async function listWalletImageModels(
   prisma: PrismaClient,
 ) {
-  const [providers, videoProviders, pricing] = await Promise.all([
+  await ensureAiCatalogSeeded(prisma);
+  const [providers, videoProviders, legacyPricing, catalogPricing, publicModels, aliases, routes] = await Promise.all([
     listImageProviders(prisma),
     listVideoProviders(prisma),
     getAiPricingConfig(prisma),
+    catalogDelegateAvailable(prisma) ? legacyPricingFromCatalog(prisma) : null,
+    catalogDelegateAvailable(prisma) ? prisma.aiModel.findMany({
+      where: { enabled: true, visible: true, status: 'PUBLISHED', modality: { in: ['image', 'video'] } },
+      select: { id: true, canonicalModelKey: true, modality: true },
+    }) : [],
+    catalogDelegateAvailable(prisma) ? prisma.aiModelAlias.findMany({
+      where: { confirmed: true, modality: { in: ['image', 'video'] } },
+      select: { aliasKey: true, canonicalModel: { select: { canonicalModelKey: true, enabled: true, visible: true, status: true, modality: true } } },
+    }) : [],
+    catalogDelegateAvailable(prisma) ? prisma.aiModelRoute.findMany({
+      where: { enabled: true, upstreamAvailable: true },
+      select: { channelId: true, upstreamModelId: true, canonicalModel: { select: { canonicalModelKey: true, enabled: true, visible: true, status: true, modality: true } } },
+    }) : [],
   ]);
   if (!providers.length) {
     throw new CloudAiError('provider_unavailable', '当前没有可用的生图渠道', 503);
   }
+  const publicKeys = new Set(publicModels.map(model => `${model.modality}:${model.canonicalModelKey}`));
+  const aliasMap = new Map(aliases.map(alias => [
+    `${alias.canonicalModel.modality}:${alias.aliasKey}`,
+    alias.canonicalModel,
+  ]));
+  const canonicalForUpstream = (provider: AiProviderChannel, upstreamModelId: string, modality: 'image' | 'video') => {
+    const explicit = explicitCanonicalModelKey(modality, upstreamModelId, provider.capabilities);
+    if (explicit && publicKeys.has(`${modality}:${explicit}`)) return explicit;
+    const aliased = aliasMap.get(`${modality}:${catalogAliasKey(upstreamModelId)}`);
+    return aliased?.enabled && aliased.visible && aliased.status === 'PUBLISHED'
+      ? aliased.canonicalModelKey
+      : null;
+  };
+  const routeModelsForChannel = (channelId: string, modality: 'image' | 'video') => routes
+    .filter(route => route.channelId === channelId
+      && route.canonicalModel.modality === modality
+      && route.canonicalModel.enabled
+      && route.canonicalModel.visible
+      && route.canonicalModel.status === 'PUBLISHED')
+    .map(route => route.canonicalModel.canonicalModelKey);
   const channels = await Promise.all(providers.map(async (provider) => {
     try {
       await assertPublicProviderUrl(provider.baseUrl);
@@ -580,16 +630,18 @@ export async function listWalletImageModels(
       const value = provider.kind === 'BIGMODEL'
         ? undefined
         : await providerRequest(provider, secrets, '/v1/models', undefined, 15_000);
-      const models = provider.kind === 'BIGMODEL'
+      const upstreamModels = provider.kind === 'BIGMODEL'
         ? bigmodelConfiguredImageModels(provider)
         : provider.kind === 'USELG'
           ? uselgConfiguredImageModels(provider, collectProviderModelIds(value))
           : filterProviderImageModels(provider, collectProviderModelIds(value));
+      const models = Array.from(new Set([
+        ...routeModelsForChannel(provider.id, 'image'),
+        ...upstreamModels.map(model => canonicalForUpstream(provider, model, 'image')).filter((model): model is string => Boolean(model)),
+      ]));
       const defaultModel = provider.defaultModel
         && providerSupportsImageModel(provider, provider.defaultModel)
-        ? provider.kind === 'USELG'
-          ? resolveUselgImageModel(provider.defaultModel)
-          : provider.defaultModel
+        ? canonicalForUpstream(provider, provider.defaultModel, 'image')
         : null;
       return {
         id: provider.id,
@@ -612,7 +664,17 @@ export async function listWalletImageModels(
       };
     }
   }));
-  const firstAvailable = channels.find((channel) => !channel.error) ?? channels[0]!;
+  const firstAvailable = channels.find((channel) => !channel.error && channel.models.length > 0)
+    ?? channels.find(channel => !channel.error)
+    ?? channels[0]!;
+  const pricing = catalogPricing
+    ? {
+      ...legacyPricing,
+      imageModels: catalogPricing.imageModels,
+      videoModels: catalogPricing.videoModels,
+      updatedAt: catalogPricing.updatedAt ?? legacyPricing.updatedAt,
+    }
+    : legacyPricing;
   return {
     provider: firstAvailable.provider,
     defaultModel: firstAvailable.defaultModel,
@@ -623,9 +685,12 @@ export async function listWalletImageModels(
       name: provider.name,
       provider: provider.kind,
       defaultModel: provider.defaultModel,
-      // Video model IDs are resolved by the provider-specific request adapter;
-      // the client only needs the channel and capability to choose the route.
-      models: [],
+      models: Array.from(new Set([
+        ...routeModelsForChannel(provider.id, 'video'),
+        ...(provider.defaultModel
+          ? [canonicalForUpstream(provider, provider.defaultModel, 'video')].filter((model): model is string => Boolean(model))
+          : []),
+      ])),
       capabilities: provider.capabilities,
       error: null,
     })),
@@ -3159,20 +3224,27 @@ async function reserveImageCredits(
   prisma: PrismaClient,
   input: ImageInput,
   capabilities?: readonly string[],
+  pricingSnapshot?: PricingSnapshot,
+  canonicalModelKey?: string,
 ) {
-  const unitCredits = await configuredImageUnitCredits(
-    prisma,
-    input.model,
-    input.resolution,
-    capabilities,
-  );
-  const estimated = unitCredits * BigInt(input.count);
+  const legacyUnitCredits = pricingSnapshot ? null : await configuredImageUnitCredits(
+      prisma,
+      canonicalModelKey ?? input.model,
+      input.resolution,
+      capabilities,
+    );
+  const estimated = pricingSnapshot
+    ? estimateSnapshotCredits(pricingSnapshot)
+    : (legacyUnitCredits! * BigInt(input.count)).toString();
+  const unitCredits = pricingSnapshot
+    ? calculateSnapshotCharge({ ...pricingSnapshot, request: { ...pricingSnapshot.request, count: 1 } }).totalCredits
+    : legacyUnitCredits!.toString();
   const estimatedCredits = creditDecimal(estimated);
   const requestId = await prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({
       where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } },
     });
-    const reusableRequest = existing && (existing.status === 'FAILED' || existing.status === 'REFUNDED')
+    const reusableRequest = existing?.status === 'FAILED'
       ? existing
       : null;
     if (reusableRequest) existing = null;
@@ -3188,10 +3260,17 @@ async function reserveImageCredits(
         where: { id: reusableRequest.id },
         data: {
           status: 'RESERVED',
-          logicalModel: input.model,
+          logicalModel: canonicalModelKey ?? input.model,
+          ...(pricingSnapshot ? {
+            canonicalModelId: pricingSnapshot.canonicalModelId,
+            routeId: pricingSnapshot.routeId,
+            priceVersionId: pricingSnapshot.priceVersionId,
+            pricingSnapshot: toInputJson(pricingSnapshot),
+          } : {}),
           estimatedCredits,
           chargedCredits: creditDecimal(0),
           result: Prisma.DbNull,
+          chargeBreakdown: Prisma.DbNull,
           completedAt: null,
         },
       });
@@ -3212,7 +3291,13 @@ async function reserveImageCredits(
         userId: input.userId,
         clientRequestId: input.clientRequestId,
         capability: 'IMAGE',
-        logicalModel: input.model,
+        logicalModel: canonicalModelKey ?? input.model,
+        ...(pricingSnapshot ? {
+          canonicalModelId: pricingSnapshot.canonicalModelId,
+          routeId: pricingSnapshot.routeId,
+          priceVersionId: pricingSnapshot.priceVersionId,
+          pricingSnapshot: toInputJson(pricingSnapshot),
+        } : {}),
         status: 'RESERVED',
         estimatedCredits,
       },
@@ -3236,35 +3321,68 @@ async function settleImageCredits(
   prisma: PrismaClient,
   input: ImageInput,
   requestId: string,
-  estimated: bigint,
-  unitCredits: bigint,
+  estimated: string,
+  unitCredits: string,
   generatedCount: number,
   result: Omit<WalletImageGenerationResult, 'chargedCredits'>,
+  pricingSnapshot?: PricingSnapshot,
+  actualRouteId?: string | null,
 ) {
-  const charged = unitCredits * BigInt(generatedCount);
-  const refund = estimated - charged;
+  const billingSnapshot = pricingSnapshot && actualRouteId !== undefined
+    ? { ...pricingSnapshot, routeId: actualRouteId }
+    : pricingSnapshot;
+  const breakdown = billingSnapshot
+    ? calculateSnapshotCharge(billingSnapshot, { generatedCount })
+    : {
+      schemaVersion: 1 as const,
+      model: input.model,
+      modality: 'image' as const,
+      route: null,
+      priceVersion: 0,
+      billingType: 'legacy',
+      quantity: String(generatedCount),
+      baseCharge: creditDecimal(unitCredits).mul(generatedCount).toFixed(6),
+      surcharges: [],
+      totalCredits: creditDecimal(unitCredits).mul(generatedCount).toFixed(6),
+      details: { resolution: input.resolution ?? '2k', generatedCount },
+    };
   const estimatedCredits = creditDecimal(estimated);
-  const chargedCredits = creditDecimal(charged);
-  const refundCredits = creditDecimal(refund);
+  const chargedCredits = creditDecimal(breakdown.totalCredits);
+  const refundCredits = estimatedCredits.minus(chargedCredits);
   await prisma.$transaction(async (transaction) => {
-    const wallet = await transaction.wallet.update({
-      where: { userId: input.userId },
-      data: {
-        reservedCredits: { decrement: estimatedCredits },
-        ...(refund > 0n ? { availableCredits: { increment: refundCredits } } : {}),
-        lifetimeConsumed: { increment: chargedCredits },
-      },
-    });
-    await transaction.aiRequest.update({
-      where: { id: requestId },
+    const claimed = await transaction.aiRequest.updateMany({
+      where: { id: requestId, userId: input.userId, status: { in: ['RESERVED', 'PROCESSING'] } },
       data: {
         status: 'SUCCEEDED',
         chargedCredits,
+        ...(actualRouteId !== undefined ? { routeId: actualRouteId } : {}),
+        chargeBreakdown: toInputJson(breakdown),
         result: {
           ...result,
           chargedCredits: serializeCredit(chargedCredits),
         } satisfies Prisma.InputJsonValue,
         completedAt: new Date(),
+      },
+    });
+    if (claimed.count !== 1) return;
+    if (billingSnapshot && catalogDelegateAvailable(prisma)) {
+      await transaction.aiBillingSettlement.create({
+        data: {
+          requestId,
+          canonicalModelId: billingSnapshot.canonicalModelId,
+          routeId: billingSnapshot.routeId,
+          priceVersionId: billingSnapshot.priceVersionId,
+          chargedCredits,
+          breakdown: toInputJson(breakdown),
+        },
+      });
+    }
+    const wallet = await transaction.wallet.update({
+      where: { userId: input.userId },
+      data: {
+        reservedCredits: { decrement: estimatedCredits },
+        ...(refundCredits.gt(0) ? { availableCredits: { increment: refundCredits } } : {}),
+        lifetimeConsumed: { increment: chargedCredits },
       },
     });
     await transaction.walletLedger.create({
@@ -3277,7 +3395,7 @@ async function settleImageCredits(
         description: `生图结算 ${generatedCount} 张`,
       },
     });
-    if (refund > 0n) {
+    if (refundCredits.gt(0)) {
       await transaction.walletLedger.create({
         data: {
           userId: input.userId,
@@ -3290,26 +3408,27 @@ async function settleImageCredits(
       });
     }
   });
-  return charged;
+  return serializeCredit(chargedCredits);
 }
 
 async function releaseImageCredits(
   prisma: PrismaClient,
   input: ImageInput,
   requestId: string,
-  estimated: bigint,
+  estimated: string,
 ) {
   const estimatedCredits = creditDecimal(estimated);
   await prisma.$transaction(async (transaction) => {
     const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
     if (!request || request.userId !== input.userId || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
+    const claimed = await transaction.aiRequest.updateMany({
+      where: { id: requestId, userId: input.userId, status: { in: ['RESERVED', 'PROCESSING'] } },
+      data: { status: 'FAILED', result: Prisma.DbNull, completedAt: new Date() },
+    });
+    if (claimed.count !== 1) return;
     const wallet = await transaction.wallet.update({
       where: { userId: input.userId },
       data: { availableCredits: { increment: estimatedCredits }, reservedCredits: { decrement: estimatedCredits } },
-    });
-    await transaction.aiRequest.update({
-      where: { id: requestId },
-      data: { status: 'FAILED', result: Prisma.DbNull, completedAt: new Date() },
     });
     await transaction.walletLedger.create({
       data: {
@@ -3392,33 +3511,74 @@ async function generateImagesFromProvider(
 }
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
+  await ensureAiCatalogSeeded(prisma);
+  const catalogResolution = catalogDelegateAvailable(prisma)
+    ? await resolveCatalogModel(prisma, input.model, 'image', {
+      requireEnabled: true,
+      ...(input.providerChannelId ? { providerChannelId: input.providerChannelId } : {}),
+    })
+    : null;
+  const canonicalModelKey = catalogResolution?.model.canonicalModelKey ?? input.model;
   const validatedInput: ImageInput = {
     ...input,
     inputImages: await resolveReferenceImageSources(prisma, input.userId, input.inputImages),
   };
-  const providers = await selectImageProviders(
-    prisma,
-    validatedInput.providerChannelId,
-    validatedInput.model,
-    validatedInput.resolution,
-    validatedInput.clientPlatform,
-  );
+  const routeProviders = catalogResolution?.enabledRoutes.flatMap(route => (
+    route.channel ? [route.channel] : []
+  )) ?? [];
+  const uniqueRouteProviders = Array.from(new Map(routeProviders.map(provider => [provider.id, provider])).values());
+  const preferredRouteChannelId = validatedInput.providerChannelId
+    ?? catalogResolution?.route?.channelId
+    ?? undefined;
+  const preferredRouteProvider = preferredRouteChannelId
+    ? uniqueRouteProviders.find(provider => provider.id === preferredRouteChannelId)
+    : undefined;
+  const providers = uniqueRouteProviders.length > 0
+    ? [
+      ...(preferredRouteProvider ? [preferredRouteProvider] : []),
+      ...uniqueRouteProviders.filter(provider => provider.id !== preferredRouteProvider?.id),
+    ]
+    : await selectImageProviders(
+      prisma,
+      preferredRouteChannelId,
+      validatedInput.model,
+      validatedInput.resolution,
+      validatedInput.clientPlatform,
+    );
   const primaryProvider = providers[0]!;
-  const reservationInput = effectiveImageInputForProvider(primaryProvider, validatedInput);
+  const primaryRoute = catalogResolution?.enabledRoutes.find(route => route.channelId === primaryProvider.id)
+    ?? (catalogResolution?.route?.channelId === null ? catalogResolution.route : null)
+    ?? null;
+  const reservationInput = {
+    ...effectiveImageInputForProvider(primaryProvider, validatedInput),
+    ...(primaryRoute ? { model: primaryRoute.upstreamModelId } : {}),
+  };
+  const pricingSnapshot = catalogResolution
+    ? await capturePricingSnapshot(prisma, catalogResolution.model, primaryRoute?.id ?? null, {
+      resolution: validatedInput.resolution ?? '2k',
+      count: validatedInput.count,
+    })
+    : undefined;
   await assertPublicProviderUrl(primaryProvider.baseUrl);
   const reservation = await reserveImageCredits(
     prisma,
     reservationInput,
     primaryProvider.capabilities,
+    pricingSnapshot,
+    canonicalModelKey,
   );
   let activeProvider = primaryProvider;
   let activeInput = reservationInput;
   try {
     for (let index = 0; index < providers.length; index += 1) {
       activeProvider = providers[index]!;
+      const activeRoute = catalogResolution?.enabledRoutes.find(route => route.channelId === activeProvider.id);
       activeInput = index === 0
         ? reservationInput
-        : effectiveImageInputForProvider(activeProvider, validatedInput);
+        : {
+          ...effectiveImageInputForProvider(activeProvider, validatedInput),
+          ...(activeRoute ? { model: activeRoute.upstreamModelId } : {}),
+        };
       if (index > 0) await assertPublicProviderUrl(activeProvider.baseUrl);
       try {
         const images = await generateImagesFromProvider(activeProvider, activeInput);
@@ -3434,16 +3594,18 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
             provider: publicWalletImageProviderKind(activeProvider),
             providerChannelId: activeProvider.id,
             providerChannelName: activeProvider.name,
-            model: activeInput.model,
+            model: canonicalModelKey,
           },
+          pricingSnapshot,
+          activeRoute?.id ?? null,
         );
         return {
           images,
           provider: publicWalletImageProviderKind(activeProvider),
           providerChannelId: activeProvider.id,
           providerChannelName: activeProvider.name,
-          model: activeInput.model,
-          chargedCredits: serializeCredit(creditDecimal(charged)),
+          model: canonicalModelKey,
+          chargedCredits: charged,
         };
       } catch (error) {
         const nextProvider = providers[index + 1];
@@ -3943,22 +4105,29 @@ function shouldTryMikotoVideoModel(error: unknown) {
   return /(?:503|temporarily unavailable|no available channel|model.+(?:not found|unavailable))/i.test(message);
 }
 
-async function reserveVideo(prisma: PrismaClient, input: VideoInput) {
-  const estimated = await configuredVideoRequestCredits(
-    prisma,
-    input.model,
-    input.duration,
-    input.resolution,
-    input.count,
-    {
-      imageCount: input.inputImages.length,
-      videoCount: input.inputVideos.length,
-    },
-  );
+async function reserveVideo(
+  prisma: PrismaClient,
+  input: VideoInput,
+  pricingSnapshot?: PricingSnapshot,
+  canonicalModelKey?: string,
+) {
+  const estimated = pricingSnapshot
+    ? estimateSnapshotCredits(pricingSnapshot)
+    : (await configuredVideoRequestCredits(
+      prisma,
+      canonicalModelKey ?? input.model,
+      input.duration,
+      input.resolution,
+      input.count,
+      {
+        imageCount: input.inputImages.length,
+        videoCount: input.inputVideos.length,
+      },
+    )).toString();
   const estimatedCredits = creditDecimal(estimated);
   return prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({ where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } } });
-    const reusableRequest = existing && (existing.status === 'FAILED' || existing.status === 'REFUNDED')
+    const reusableRequest = existing?.status === 'FAILED'
       ? existing
       : null;
     if (reusableRequest) existing = null;
@@ -3970,29 +4139,92 @@ async function reserveVideo(prisma: PrismaClient, input: VideoInput) {
     if (updated.count !== 1) throw new CloudAiError('insufficient_credits', '授权钱包余额不足', 402);
     const wallet = await transaction.wallet.findUniqueOrThrow({ where: { userId: input.userId } });
     const request = reusableRequest
-      ? await transaction.aiRequest.update({ where: { id: reusableRequest.id }, data: { status: 'RESERVED', logicalModel: input.model, estimatedCredits, chargedCredits: creditDecimal(0), completedAt: null } })
-      : await transaction.aiRequest.create({ data: { userId: input.userId, clientRequestId: input.clientRequestId, capability: 'VIDEO', logicalModel: input.model, status: 'RESERVED', estimatedCredits } });
+      ? await transaction.aiRequest.update({ where: { id: reusableRequest.id }, data: {
+        status: 'RESERVED',
+        logicalModel: canonicalModelKey ?? input.model,
+        ...(pricingSnapshot ? {
+          canonicalModelId: pricingSnapshot.canonicalModelId,
+          routeId: pricingSnapshot.routeId,
+          priceVersionId: pricingSnapshot.priceVersionId,
+          pricingSnapshot: toInputJson(pricingSnapshot),
+        } : {}),
+        estimatedCredits,
+        chargedCredits: creditDecimal(0),
+        result: Prisma.DbNull,
+        chargeBreakdown: Prisma.DbNull,
+        completedAt: null,
+      } })
+      : await transaction.aiRequest.create({ data: {
+        userId: input.userId,
+        clientRequestId: input.clientRequestId,
+        capability: 'VIDEO',
+        logicalModel: canonicalModelKey ?? input.model,
+        ...(pricingSnapshot ? {
+          canonicalModelId: pricingSnapshot.canonicalModelId,
+          routeId: pricingSnapshot.routeId,
+          priceVersionId: pricingSnapshot.priceVersionId,
+          pricingSnapshot: toInputJson(pricingSnapshot),
+        } : {}),
+        status: 'RESERVED',
+        estimatedCredits,
+      } });
     await transaction.walletLedger.create({ data: { userId: input.userId, requestId: request.id, type: 'RESERVE', amount: estimatedCredits.negated(), balanceAfter: wallet.availableCredits, description: '视频请求预扣' } });
     return { requestId: request.id, estimated };
   });
 }
 
-async function settleVideo(prisma: PrismaClient, userId: string, requestId: string, charged: bigint) {
+async function settleVideo(
+  prisma: PrismaClient,
+  userId: string,
+  requestId: string,
+  charged: string,
+  breakdown?: ReturnType<typeof calculateSnapshotCharge>,
+  pricingSnapshot?: PricingSnapshot,
+) {
   const chargedCredits = creditDecimal(charged);
   await prisma.$transaction(async (transaction) => {
+    const request = await transaction.aiRequest.findFirst({
+      where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
+    });
+    if (!request) return;
+    const claimed = await transaction.aiRequest.updateMany({
+      where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
+      data: {
+        status: 'SUCCEEDED',
+        chargedCredits,
+        ...(breakdown ? { chargeBreakdown: toInputJson(breakdown) } : {}),
+        completedAt: new Date(),
+      },
+    });
+    if (claimed.count !== 1) return;
+    if (breakdown && pricingSnapshot && catalogDelegateAvailable(prisma)) {
+      await transaction.aiBillingSettlement.create({
+        data: {
+          requestId,
+          canonicalModelId: pricingSnapshot.canonicalModelId,
+          routeId: pricingSnapshot.routeId,
+          priceVersionId: pricingSnapshot.priceVersionId,
+          chargedCredits,
+          breakdown: toInputJson(breakdown),
+        },
+      });
+    }
     const wallet = await transaction.wallet.update({ where: { userId }, data: { reservedCredits: { decrement: chargedCredits }, lifetimeConsumed: { increment: chargedCredits } } });
-    await transaction.aiRequest.update({ where: { id: requestId }, data: { status: 'SUCCEEDED', chargedCredits, completedAt: new Date() } });
     await transaction.walletLedger.create({ data: { userId, requestId, type: 'CHARGE', amount: chargedCredits, balanceAfter: wallet.availableCredits, description: '视频请求结算' } });
   });
 }
 
-async function releaseVideo(prisma: PrismaClient, userId: string, requestId: string, released: bigint) {
+async function releaseVideo(prisma: PrismaClient, userId: string, requestId: string, released: string) {
   const releasedCredits = creditDecimal(released);
   await prisma.$transaction(async (transaction) => {
     const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
     if (!request || request.userId !== userId || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
+    const claimed = await transaction.aiRequest.updateMany({
+      where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
+      data: { status: 'FAILED', completedAt: new Date() },
+    });
+    if (claimed.count !== 1) return;
     const wallet = await transaction.wallet.update({ where: { userId }, data: { availableCredits: { increment: releasedCredits }, reservedCredits: { decrement: releasedCredits } } });
-    await transaction.aiRequest.update({ where: { id: requestId }, data: { status: 'FAILED', completedAt: new Date() } });
     await transaction.walletLedger.create({ data: { userId, requestId, type: 'RELEASE', amount: releasedCredits, balanceAfter: wallet.availableCredits, description: '视频请求失败，释放额度' } });
   });
 }
@@ -4007,16 +4239,17 @@ async function refundVideoRequest(prisma: PrismaClient, userId: string, clientRe
     if (request.status === 'SUCCEEDED') {
       const refund = request.chargedCredits;
       if (refund.lte(0)) return false;
+      const claimed = await transaction.aiRequest.updateMany({
+        where: { id: request.id, userId, status: 'SUCCEEDED' },
+        data: { status: 'REFUNDED', completedAt: new Date() },
+      });
+      if (claimed.count !== 1) return false;
       const wallet = await transaction.wallet.update({
         where: { userId },
         data: {
           availableCredits: { increment: refund },
           lifetimeConsumed: { decrement: refund },
         },
-      });
-      await transaction.aiRequest.update({
-        where: { id: request.id },
-        data: { status: 'REFUNDED', completedAt: new Date() },
       });
       await transaction.walletLedger.create({
         data: {
@@ -4033,16 +4266,17 @@ async function refundVideoRequest(prisma: PrismaClient, userId: string, clientRe
 
     if (request.status !== 'RESERVED' && request.status !== 'PROCESSING') return false;
     const release = request.estimatedCredits;
+    const claimed = await transaction.aiRequest.updateMany({
+      where: { id: request.id, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
+      data: { status: 'FAILED', completedAt: new Date() },
+    });
+    if (claimed.count !== 1) return false;
     const wallet = await transaction.wallet.update({
       where: { userId },
       data: {
         availableCredits: { increment: release },
         reservedCredits: { decrement: release },
       },
-    });
-    await transaction.aiRequest.update({
-      where: { id: request.id },
-      data: { status: 'FAILED', completedAt: new Date() },
     });
     await transaction.walletLedger.create({
       data: {
@@ -4059,6 +4293,14 @@ async function refundVideoRequest(prisma: PrismaClient, userId: string, clientRe
 }
 
 export async function executeWalletVideoGeneration(prisma: PrismaClient, input: VideoInput) {
+  await ensureAiCatalogSeeded(prisma);
+  const catalogResolution = catalogDelegateAvailable(prisma)
+    ? await resolveCatalogModel(prisma, input.model, 'video', {
+      requireEnabled: true,
+      ...(input.providerChannelId ? { providerChannelId: input.providerChannelId } : {}),
+    })
+    : null;
+  const canonicalModelKey = catalogResolution?.model.canonicalModelKey ?? input.model;
   if (isSeedance20VideoModel(input.model)
     && (input.inputImages.length > 9 || input.inputVideos.length > 3 || input.inputAudios.length > 3)) {
     throw new CloudAiError('invalid_request', 'Seedance 2.0 supports 9 images, 3 videos, and 3 audios at most', 400);
@@ -4071,22 +4313,46 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
     ...input,
     inputImages: await resolveReferenceImageSources(prisma, input.userId, input.inputImages),
   };
-  const reservation = await reserveVideo(prisma, input);
+  const provider = await selectVideoProvider(
+    prisma,
+    input.provider,
+    input.providerChannelId ?? catalogResolution?.route?.channelId ?? undefined,
+  );
+  const route = catalogResolution?.enabledRoutes.find(candidate => candidate.channelId === provider.id)
+    ?? (catalogResolution?.route?.channelId === null ? catalogResolution.route : null)
+    ?? null;
+  const upstreamInput = {
+    ...input,
+    model: route?.upstreamModelId
+      ?? (catalogResolution ? legacyUpstreamModelForCanonical(canonicalModelKey, 'video') : input.model),
+  };
+  const pricingSnapshot = catalogResolution
+    ? await capturePricingSnapshot(prisma, catalogResolution.model, route?.id ?? null, {
+      duration: input.duration ?? 15,
+      resolution: input.resolution ?? '720p',
+      count: input.count,
+      inputMode: input.inputMode ?? 'REF',
+      referenceImageCount: input.inputImages.length,
+      referenceVideoCount: input.inputVideos.length,
+      referenceVideoSeconds: (input.duration ?? 15) * input.inputVideos.length,
+      referenceVideoResolution: input.resolution ?? '720p',
+    })
+    : undefined;
+  const reservation = await reserveVideo(prisma, upstreamInput, pricingSnapshot, canonicalModelKey);
   try {
-    const provider = await selectVideoProvider(prisma, input.provider, input.providerChannelId);
-    if (provider.kind === 'MIKOTO' && isKlingVideoModel(input.model)) {
-      const maxImages = /omni/i.test(input.model) ? 3 : 2;
-      if (input.inputImages.length > maxImages || input.inputVideos.length > 0 || input.inputAudios.length > 0) {
+    if (provider.kind === 'MIKOTO' && isKlingVideoModel(upstreamInput.model)) {
+      const maxImages = /omni/i.test(upstreamInput.model) ? 3 : 2;
+      if (upstreamInput.inputImages.length > maxImages || upstreamInput.inputVideos.length > 0 || upstreamInput.inputAudios.length > 0) {
         throw new CloudAiError(
           'invalid_request',
-          `Mikoto ${/omni/i.test(input.model) ? 'Kling Omni' : 'Kling'} 最多支持 ${maxImages} 张参考图，且不支持参考视频或参考音频`,
+          `Mikoto ${/omni/i.test(upstreamInput.model) ? 'Kling Omni' : 'Kling'} 最多支持 ${maxImages} 张参考图，且不支持参考视频或参考音频`,
           400,
         );
       }
     }
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
     let mikotoVideoModels: string[] = [];
-    if (provider.kind === 'MIKOTO' && isKlingVideoModel(input.model)) {
+    if (provider.kind === 'MIKOTO' && isKlingVideoModel(upstreamInput.model)) {
       try {
         const value = await providerRequest(provider, secrets, '/v1/models', undefined, 15_000);
         mikotoVideoModels = collectProviderModelIds(value);
@@ -4098,17 +4364,17 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       }
     }
     const results: unknown[] = [];
-    for (let index = 0; index < input.count; index += 1) {
+    for (let index = 0; index < upstreamInput.count; index += 1) {
       const path = provider.kind === 'XAIS'
         ? '/xais/workerTaskStart'
         : provider.kind === 'MIKOTO' ? '/v1/videos'
           : provider.kind === 'MINIMAX' ? '/api/minimax/v2/video_generation'
           : '/v1/video/generations';
       const mikotoModels = provider.kind === 'MIKOTO'
-        ? isSeedance20VideoModel(input.model)
-          ? mikotoSeedanceModelCandidates(input, provider.defaultModel)
-          : isKlingVideoModel(input.model)
-            ? mikotoKlingModelCandidates(input, provider.defaultModel, mikotoVideoModels)
+          ? isSeedance20VideoModel(upstreamInput.model)
+          ? mikotoSeedanceModelCandidates(upstreamInput, provider.defaultModel)
+          : isKlingVideoModel(upstreamInput.model)
+            ? mikotoKlingModelCandidates(upstreamInput, provider.defaultModel, mikotoVideoModels)
             : []
         : [];
       const modelAttempts = mikotoModels.length > 0 ? mikotoModels : [undefined];
@@ -4116,19 +4382,19 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       let lastError: unknown = null;
       for (let modelIndex = 0; modelIndex < modelAttempts.length; modelIndex += 1) {
         const modelOverride = modelAttempts[modelIndex];
-        const body = provider.kind === 'XAIS' ? xaisVideoBody(input) : provider.kind === 'MIKOTO' ? mikotoVideoBody(input, modelOverride) : provider.kind === 'MINIMAX' ? minimaxVideoBody(input) : {
-          model: input.model,
-          prompt: input.prompt,
+        const body = provider.kind === 'XAIS' ? xaisVideoBody(upstreamInput) : provider.kind === 'MIKOTO' ? mikotoVideoBody(upstreamInput, modelOverride) : provider.kind === 'MINIMAX' ? minimaxVideoBody(upstreamInput) : {
+          model: upstreamInput.model,
+          prompt: upstreamInput.prompt,
           n: 1,
-          ...(input.inputImages.length ? { images: input.inputImages } : {}),
-          ...(input.inputVideos.length ? { videos: input.inputVideos } : {}),
-          ...(input.inputAudios.length ? { audios: input.inputAudios } : {}),
-          ...(isSeedance20VideoModel(input.model)
-            ? { ref: [...input.inputImages, ...input.inputVideos, ...input.inputAudios] }
+          ...(upstreamInput.inputImages.length ? { images: upstreamInput.inputImages } : {}),
+          ...(upstreamInput.inputVideos.length ? { videos: upstreamInput.inputVideos } : {}),
+          ...(upstreamInput.inputAudios.length ? { audios: upstreamInput.inputAudios } : {}),
+          ...(isSeedance20VideoModel(upstreamInput.model)
+            ? { ref: [...upstreamInput.inputImages, ...upstreamInput.inputVideos, ...upstreamInput.inputAudios] }
             : {}),
-          ...(input.aspectRatio ? { aspect_ratio: input.aspectRatio, ratio: input.aspectRatio } : {}),
-          ...(input.resolution ? { resolution: input.resolution } : {}),
-          ...(input.duration ? { duration: input.duration } : {}),
+          ...(upstreamInput.aspectRatio ? { aspect_ratio: upstreamInput.aspectRatio, ratio: upstreamInput.aspectRatio } : {}),
+          ...(upstreamInput.resolution ? { resolution: upstreamInput.resolution } : {}),
+          ...(upstreamInput.duration ? { duration: upstreamInput.duration } : {}),
         };
         try {
           result = await providerRequest(provider, secrets, path, body);
@@ -4136,7 +4402,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
           if (failure) {
             lastError = new Error(failure);
             if (provider.kind === 'MIKOTO'
-              && (isSeedance20VideoModel(input.model) || isKlingVideoModel(input.model))
+               && (isSeedance20VideoModel(upstreamInput.model) || isKlingVideoModel(upstreamInput.model))
               && modelIndex < modelAttempts.length - 1
               && shouldTryMikotoVideoModel(lastError)) {
               continue;
@@ -4148,7 +4414,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
         } catch (error) {
           lastError = error;
           if (provider.kind === 'MIKOTO'
-            && (isSeedance20VideoModel(input.model) || isKlingVideoModel(input.model))
+             && (isSeedance20VideoModel(upstreamInput.model) || isKlingVideoModel(upstreamInput.model))
             && modelIndex < modelAttempts.length - 1
             && shouldTryMikotoVideoModel(error)) {
             continue;
@@ -4166,8 +4432,9 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
           : mirrorGeneratedVideoResultToStorage,
       ));
     }
-    await settleVideo(prisma, input.userId, reservation.requestId, reservation.estimated);
-    return { results, provider: provider.kind, model: input.model, chargedCredits: serializeCredit(creditDecimal(reservation.estimated)) };
+    const breakdown = pricingSnapshot ? calculateSnapshotCharge(pricingSnapshot) : undefined;
+    await settleVideo(prisma, input.userId, reservation.requestId, reservation.estimated, breakdown, pricingSnapshot);
+    return { results, provider: provider.kind, model: canonicalModelKey, chargedCredits: serializeCredit(creditDecimal(reservation.estimated)) };
   } catch (error) {
     await releaseVideo(prisma, input.userId, reservation.requestId, reservation.estimated);
     if (error instanceof CloudAiError) throw error;

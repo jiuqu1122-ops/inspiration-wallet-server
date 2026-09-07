@@ -18,6 +18,8 @@ import { getImageReference } from './reference-store.js';
 import { isVideoResultKey } from './video-result-store.js';
 import { getImageResult, imageResultMimeForKey } from './image-result-store.js';
 import { createAiTaskSchema } from './task-schema.js';
+import { ensureAiCatalogSeeded } from './catalog-seed.js';
+import { getPublicAiCatalog, ModelCatalogError } from './model-catalog.js';
 import {
   ReferenceUploadError,
   getReferenceImageContent,
@@ -170,6 +172,9 @@ export const normalizeImageRequestBody = (body: unknown) => imageSchema.parse(bo
 export const normalizeVideoRequestBody = (body: unknown) => videoSchema.parse(body);
 
 function knownError(reply: FastifyReply, error: unknown) {
+  if (error instanceof ModelCatalogError) {
+    return reply.code(error.statusCode).send({ error: error.code, message: error.message });
+  }
   if (error instanceof CloudAiError) {
     return reply.code(error.statusCode).send({ error: error.code, message: error.message });
   }
@@ -180,6 +185,21 @@ function knownError(reply: FastifyReply, error: unknown) {
 }
 
 export const aiRoutes: FastifyPluginAsync = async (app) => {
+  app.get(
+    '/catalog',
+    {
+      preHandler: app.authenticateAccessToken,
+      config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    },
+    async (_request, reply) => {
+      try {
+        await ensureAiCatalogSeeded(app.prisma);
+        return await getPublicAiCatalog(app.prisma);
+      } catch (error) {
+        return knownError(reply, error);
+      }
+    },
+  );
   app.post(
     '/tasks',
     {

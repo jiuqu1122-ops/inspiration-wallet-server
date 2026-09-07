@@ -374,6 +374,7 @@ describe('wallet image provider normalization', () => {
         findUnique: vi.fn(async () => null),
         create: vi.fn(async () => requestRow),
         update: vi.fn(async () => requestRow),
+        updateMany: vi.fn(async () => ({ count: 1 })),
       },
       wallet: {
         updateMany: vi.fn(async () => ({ count: 1 })),
@@ -461,6 +462,7 @@ describe('wallet image provider normalization', () => {
         findUnique: vi.fn(async () => null),
         create: vi.fn(async () => requestRow),
         update: vi.fn(async () => requestRow),
+        updateMany: vi.fn(async () => ({ count: 1 })),
       },
       wallet: {
         updateMany: vi.fn(async () => ({ count: 1 })),

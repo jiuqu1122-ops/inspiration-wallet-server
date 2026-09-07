@@ -15,14 +15,17 @@ import { createRedemptionCodes, listRedemptionCodes } from '../wallets/redemptio
 import {
   aiPricingModelToken,
   getAiPricingConfig,
-  updateAiPricingConfig,
 } from '../ai/pricing.js';
 import {
   chatPricingModelToken,
   getChatPricingConfig,
-  updateChatPricingConfig,
 } from '../ai/chat-pricing.js';
 import { inspirationSpaceAdminRoutes } from '../inspiration-space/admin-routes.js';
+import { aiModelAdminRoutes } from '../ai/model-admin-routes.js';
+import {
+  updateLegacyAiPricingAndPublish,
+  updateLegacyChatPricingAndPublish,
+} from '../ai/catalog-seed.js';
 
 const listUsersSchema = z.object({
   query: z.string().trim().max(200).optional(),
@@ -157,6 +160,7 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
 
   await app.register(providerAdminRoutes, { prefix: '/providers' });
   await app.register(inspirationSpaceAdminRoutes, { prefix: '/inspiration-space' });
+  await app.register(aiModelAdminRoutes, { prefix: '/ai-models' });
 
   app.get('/pricing', async () => getAiPricingConfig(app.prisma));
 
@@ -168,7 +172,7 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
       if (!parsed.success) {
         return invalid(reply, parsed.error.issues[0]?.message ?? 'AI pricing is invalid');
       }
-      return updateAiPricingConfig(app.prisma, parsed.data);
+      return updateLegacyAiPricingAndPublish(app.prisma, parsed.data);
     },
   );
 
@@ -182,7 +186,7 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
       if (!parsed.success) {
         return invalid(reply, parsed.error.issues[0]?.message ?? 'Chat pricing is invalid');
       }
-      return updateChatPricingConfig(app.prisma, parsed.data);
+      return updateLegacyChatPricingAndPublish(app.prisma, parsed.data);
     },
   );
 

@@ -7,9 +7,24 @@ import {
   configuredAgentRequestCredits,
   configuredInspirationAnalysisCredits,
 } from './pricing.js';
-import { configuredChatCharge, type ChatChargeBreakdown } from './chat-pricing.js';
+import { extractChatTokenUsage } from './chat-pricing.js';
 import { creditDecimal } from '../wallets/credit-amount.js';
 import { proxyAgentChatReferenceImages } from './reference-upload-service.js';
+import { ensureAiCatalogSeeded } from './catalog-seed.js';
+import {
+  catalogDelegateAvailable,
+  legacyUpstreamModelForCanonical,
+  resolveAutomaticChatModel,
+  resolveCatalogModel,
+} from './model-catalog.js';
+import {
+  calculateSnapshotCharge,
+  capturePricingSnapshot,
+  estimateSnapshotCredits,
+  toInputJson,
+  type ChargeBreakdown,
+  type PricingSnapshot,
+} from './pricing-center.js';
 
 const REQUEST_CREDITS = BigInt(env.AGENT_REQUEST_CREDITS);
 
@@ -1021,6 +1036,18 @@ async function readProviderModels(
 }
 
 export async function listWalletAgentModels(prisma: PrismaClient) {
+  if (catalogDelegateAvailable(prisma)) {
+    await ensureAiCatalogSeeded(prisma);
+    const models = await prisma.aiModel.findMany({
+      where: { modality: 'chat', enabled: true, visible: true, status: 'PUBLISHED' },
+      orderBy: [{ sortOrder: 'asc' }, { canonicalModelKey: 'asc' }],
+      select: { canonicalModelKey: true },
+    });
+    return {
+      models: models.map(model => model.canonicalModelKey),
+      defaultModel: models[0]?.canonicalModelKey ?? null,
+    };
+  }
   const provider = await selectProvider(prisma);
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
   const models = (await readProviderModels(provider, secrets.apiKey, secrets.headers))
@@ -1037,10 +1064,11 @@ async function reserveCredits(
   input: {
     userId: string;
     clientRequestId: string;
-    credits: bigint;
+    credits: bigint | string;
     capability: AiCapability;
     logicalModel: string;
     description: string;
+    pricingSnapshot?: PricingSnapshot | undefined;
   },
 ) {
   const credits = creditDecimal(input.credits);
@@ -1073,6 +1101,12 @@ async function reserveCredits(
         clientRequestId: input.clientRequestId,
         capability: input.capability,
         logicalModel: input.logicalModel,
+        ...(input.pricingSnapshot ? {
+          canonicalModelId: input.pricingSnapshot.canonicalModelId,
+          routeId: input.pricingSnapshot.routeId,
+          priceVersionId: input.pricingSnapshot.priceVersionId,
+          pricingSnapshot: toInputJson(input.pricingSnapshot),
+        } : {}),
         status: 'RESERVED',
         estimatedCredits: credits,
       },
@@ -1094,7 +1128,8 @@ async function reserveCredits(
 type CreditSettlement = {
   chargedCredits: string;
   logicalModel?: string | undefined;
-  billingResult?: ChatChargeBreakdown | undefined;
+  billingResult?: ChargeBreakdown | undefined;
+  actualRouteId?: string | null | undefined;
   description?: string | undefined;
 };
 
@@ -1118,8 +1153,9 @@ async function settleCredits(
       chargedCredits: charged,
       completedAt: new Date(),
       ...(settlement?.logicalModel ? { logicalModel: settlement.logicalModel } : {}),
+      ...(settlement?.actualRouteId !== undefined ? { routeId: settlement.actualRouteId } : {}),
       ...(settlement?.billingResult
-        ? { result: settlement.billingResult }
+        ? { result: toInputJson(settlement.billingResult), chargeBreakdown: toInputJson(settlement.billingResult) }
         : {}),
     };
     const claimed = await transaction.aiRequest.updateMany({
@@ -1127,6 +1163,18 @@ async function settleCredits(
       data: requestUpdate,
     });
     if (claimed.count !== 1) return;
+    if (settlement?.billingResult && catalogDelegateAvailable(prisma)) {
+      await transaction.aiBillingSettlement.create({
+        data: {
+          requestId,
+          canonicalModelId: request.canonicalModelId,
+          routeId: settlement.actualRouteId ?? request.routeId,
+          priceVersionId: request.priceVersionId,
+          chargedCredits: charged,
+          breakdown: toInputJson(settlement.billingResult),
+        },
+      });
+    }
     const wallet = await transaction.wallet.update({
       where: { userId },
       data: {
@@ -1219,27 +1267,52 @@ export async function executeWalletAgentChat(
   },
   options?: AgentExecutionOptions,
 ) {
-  const credits = await configuredAgentRequestCredits(prisma);
+  const fallbackCredits = await configuredAgentRequestCredits(prisma);
+  await ensureAiCatalogSeeded(prisma);
+  const resolved = catalogDelegateAvailable(prisma)
+    ? isDefaultAgentModelSentinel(input.model)
+      ? await resolveAutomaticChatModel(prisma)
+      : await resolveCatalogModel(prisma, input.model ?? '', 'chat', { requireEnabled: true })
+    : null;
+  const canonicalModel = resolved?.model ?? null;
+  const route = resolved?.route ?? null;
+  const canonicalModelKey = canonicalModel?.canonicalModelKey ?? (input.model?.trim() || 'unmind-agent');
+  const pricingSnapshot = canonicalModel
+    ? await capturePricingSnapshot(prisma, canonicalModel, route?.id ?? null, {
+      fallbackCredits: fallbackCredits.toString(),
+    })
+    : undefined;
+  const credits = pricingSnapshot ? estimateSnapshotCredits(pricingSnapshot) : fallbackCredits;
   const requestId = await reserveCredits(prisma, {
     userId: input.userId,
     clientRequestId: input.clientRequestId,
     credits,
     capability: 'LLM',
-    logicalModel: input.model?.trim() || 'unmind-agent',
+    logicalModel: canonicalModelKey,
     description: 'Agent 请求预扣',
+    pricingSnapshot,
   });
   try {
     const providerInput = {
       ...input,
       messages: await proxyAgentChatReferenceImages(prisma, input.userId, input.messages),
     };
-    const providers = await listProviders(prisma);
+    const allProviders = await listProviders(prisma);
+    const providersById = new Map(allProviders.map(provider => [provider.id, provider]));
+    const routedProviders = resolved?.enabledRoutes.flatMap(candidate => {
+      const provider = candidate.channelId ? providersById.get(candidate.channelId) : undefined;
+      return provider ? [provider] : [];
+    }) ?? [];
+    const providers = routedProviders.length > 0
+      ? Array.from(new Map(routedProviders.map(provider => [provider.id, provider])).values())
+      : allProviders;
     if (providers.length === 0) {
       throw new CloudAiError('provider_unavailable', '当前没有可用的 Agent 渠道', 503);
     }
     const failures: string[] = [];
     let result: unknown;
     let requestAttempt = 0;
+    let successfulRouteId = route?.id ?? null;
     const automaticModelSelection = isDefaultAgentModelSentinel(input.model);
     for (const [index, provider] of providers.entries()) {
       let discoveredModels: string[] = [];
@@ -1251,7 +1324,10 @@ export async function executeWalletAgentChat(
           discoveredModels = [];
         }
       }
-      const modelCandidates = buildAgentModelCandidates(provider, input.model, discoveredModels);
+      const providerRoute = resolved?.enabledRoutes.find(candidate => candidate.channelId === provider.id);
+      const requestedUpstreamModel = providerRoute?.upstreamModelId
+        ?? (canonicalModel ? legacyUpstreamModelForCanonical(canonicalModelKey, 'chat') : input.model);
+      const modelCandidates = buildAgentModelCandidates(provider, requestedUpstreamModel, discoveredModels);
       const initialModel = modelCandidates[0];
       const providerAttemptInput = initialModel
         ? { ...providerInput, model: initialModel }
@@ -1265,6 +1341,7 @@ export async function executeWalletAgentChat(
           options,
           requestAttempt,
         );
+        successfulRouteId = providerRoute?.id ?? null;
         break;
       } catch (error) {
         if (options?.signal?.aborted) {
@@ -1308,6 +1385,7 @@ export async function executeWalletAgentChat(
                 options,
                 requestAttempt,
               );
+              successfulRouteId = providerRoute?.id ?? null;
               break;
             } catch (retryError) {
               if (options?.signal?.aborted) {
@@ -1345,15 +1423,33 @@ export async function executeWalletAgentChat(
     if (result === undefined) {
       throw new CloudAiError('provider_request_failed', '全部 Agent 渠道请求失败', 502);
     }
-    const billing = await configuredChatCharge(prisma, result, input.model, credits);
-    const usage = billing.usage;
+    const billingSnapshot = pricingSnapshot
+      ? { ...pricingSnapshot, routeId: successfulRouteId }
+      : undefined;
+    const billing = billingSnapshot
+      ? calculateSnapshotCharge(billingSnapshot, { usage: extractChatTokenUsage(result) })
+      : {
+        schemaVersion: 1 as const,
+        model: canonicalModelKey,
+        modality: 'chat' as const,
+        route: null,
+        priceVersion: 0,
+        billingType: 'fallback',
+        quantity: '1',
+        baseCharge: creditDecimal(credits).toFixed(6),
+        surcharges: [],
+        totalCredits: creditDecimal(credits).toFixed(6),
+        details: { fallbackReason: 'catalog_unavailable' },
+      };
+    const usage = billing.details.usage as Record<string, string> | null | undefined;
     const description = usage
       ? `Chat Token 结算 · ${billing.model} · 输入 ${usage.normalInputTokens} · 缓存读 ${usage.cachedInputTokens} · 缓存写 ${usage.cacheWriteTokens} · 输出 ${usage.outputTokens}`
       : `Chat 请求结算 · ${billing.model}`;
     await settleCredits(prisma, input.userId, requestId, {
-      chargedCredits: billing.chargedCredits,
-      logicalModel: billing.model,
+      chargedCredits: billing.totalCredits,
+      logicalModel: canonicalModelKey,
       billingResult: billing,
+      actualRouteId: successfulRouteId,
       description,
     });
     return result;

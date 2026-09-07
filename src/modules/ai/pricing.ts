@@ -52,20 +52,6 @@ const DEFAULT_IMAGE_REQUEST_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
 const DEFAULT_VIDEO_REQUEST_CREDITS = BigInt(env.VIDEO_REQUEST_CREDITS);
 const DEFAULT_INSPIRATION_ANALYSIS_CREDITS = 0n;
 
-const KNOWN_IMAGE_MODELS = [
-  'gemini-3-pro-image',
-  'gemini-3.1-flash-image',
-  'gpt-image-2',
-  'Xais Nano Pro_2K',
-  'Xais Nano Pro_4K',
-  'Xais Nano2_2K',
-  'Xais Nano2_4K',
-  'Xais Img2_2K',
-  'Xais Img2_4K',
-  'Xais Img2_2K(高画质)',
-  'Xais Img2_4K(高画质)',
-] as const;
-
 const KNOWN_VIDEO_MODELS = [
   'seedance2',
   'seedance2fast',

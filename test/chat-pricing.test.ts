@@ -23,7 +23,7 @@ const prismaWithoutStoredPricing = () => ({
 }) as unknown as PrismaClient;
 
 describe('Chat token pricing', () => {
-  it('ships the requested Terra, Sol, and Luna prices as defaults', () => {
+  it('ships the requested Terra, Sol, Luna, and Astra prices as defaults', () => {
     const pricing = defaultChatPricingConfig();
     expect(pricing.models).toEqual([
       expect.objectContaining({
@@ -60,6 +60,23 @@ describe('Chat token pricing', () => {
         },
       }),
       { model: 'gpt-5.6-luna', billingMode: 'request', creditsPerRequest: '2' },
+      expect.objectContaining({
+        model: 'gpt-6-astra',
+        billingMode: 'token',
+        contextThresholdTokens: 272_000,
+        standard: {
+          inputCreditsPerMillion: '300',
+          outputCreditsPerMillion: '1500',
+          cachedInputCreditsPerMillion: '30',
+          cacheWriteCreditsPerMillion: '375',
+        },
+        extended: {
+          inputCreditsPerMillion: '600',
+          outputCreditsPerMillion: '2250',
+          cachedInputCreditsPerMillion: '60',
+          cacheWriteCreditsPerMillion: '750',
+        },
+      }),
     ]);
   });
 
@@ -189,7 +206,7 @@ describe('Chat token pricing', () => {
       },
     } as unknown as PrismaClient;
     const pricing = await getChatPricingConfig(prisma);
-    expect(pricing.models).toHaveLength(3);
+    expect(pricing.models).toHaveLength(4);
     expect(pricing.models.find(item => item.model === 'gpt-5.6-luna')).toMatchObject({
       creditsPerRequest: '3',
     });

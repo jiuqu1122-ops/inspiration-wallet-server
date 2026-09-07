@@ -144,17 +144,17 @@ model User {
 }
 
 model ReferenceUpload {
-  id          String               @id @default(cuid())
+  id          String                @id @default(cuid())
   userId      String
-  objectKey   String               @unique
+  objectKey   String                @unique
   contentType String
   sizeBytes   Int
   status      ReferenceUploadStatus @default(ISSUED)
   expiresAt   DateTime
   uploadedAt  DateTime?
-  createdAt   DateTime             @default(now())
-  updatedAt   DateTime             @updatedAt
-  user        User                 @relation(fields: [userId], references: [id], onDelete: Restrict)
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+  user        User                  @relation(fields: [userId], references: [id], onDelete: Restrict)
 
   @@index([userId, expiresAt])
   @@index([userId, status, createdAt])
@@ -298,23 +298,35 @@ model CreditRedemption {
 }
 
 model AiRequest {
-  id               String          @id @default(cuid())
-  userId           String
-  clientRequestId  String
-  capability       AiCapability
-  logicalModel     String
-  status           AiRequestStatus @default(PENDING)
-  estimatedCredits Decimal         @default(0) @db.Decimal(24, 6)
-  chargedCredits   Decimal         @default(0) @db.Decimal(24, 6)
-  result           Json?
-  createdAt        DateTime        @default(now())
-  completedAt      DateTime?
-  user             User            @relation(fields: [userId], references: [id], onDelete: Restrict)
-  ledgerEntries    WalletLedger[]
+  id                String               @id @default(cuid())
+  userId            String
+  clientRequestId   String
+  capability        AiCapability
+  logicalModel      String
+  canonicalModelId  String?
+  routeId           String?
+  priceVersionId    String?
+  pricingSnapshot   Json?
+  chargeBreakdown   Json?
+  status            AiRequestStatus      @default(PENDING)
+  estimatedCredits  Decimal              @default(0) @db.Decimal(24, 6)
+  chargedCredits    Decimal              @default(0) @db.Decimal(24, 6)
+  result            Json?
+  createdAt         DateTime             @default(now())
+  completedAt       DateTime?
+  user              User                 @relation(fields: [userId], references: [id], onDelete: Restrict)
+  ledgerEntries     WalletLedger[]
+  canonicalModel    AiModel?             @relation(fields: [canonicalModelId], references: [id], onDelete: SetNull)
+  route             AiModelRoute?        @relation(fields: [routeId], references: [id], onDelete: SetNull)
+  priceVersion      AiPriceVersion?      @relation(fields: [priceVersionId], references: [id], onDelete: SetNull)
+  billingSettlement AiBillingSettlement?
 
   @@unique([userId, clientRequestId])
   @@index([userId, createdAt])
   @@index([status, createdAt])
+  @@index([canonicalModelId, createdAt])
+  @@index([routeId, createdAt])
+  @@index([priceVersionId])
 }
 
 model AdminOperation {
@@ -333,14 +345,14 @@ model AdminOperation {
 }
 
 model AiProviderChannel {
-  id                 String           @id @default(cuid())
-  name               String           @unique
+  id                 String                @id @default(cuid())
+  name               String                @unique
   kind               AiProviderKind
-  status             AiProviderStatus @default(ACTIVE)
-  priority           Int              @default(100)
+  status             AiProviderStatus      @default(ACTIVE)
+  priority           Int                   @default(100)
   baseUrl            String
   defaultModel       String?
-  allowInsecureHttp  Boolean          @default(false)
+  allowInsecureHttp  Boolean               @default(false)
   encryptedSecrets   String
   apiKeyLast4        String
   capabilities       AiCapability[]
@@ -348,8 +360,10 @@ model AiProviderChannel {
   lastTestMessage    String?
   lastTestModelCount Int?
   lastTestedAt       DateTime?
-  createdAt          DateTime         @default(now())
-  updatedAt          DateTime         @updatedAt
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
+  modelRoutes        AiModelRoute[]
+  modelDiscoveries   AiUpstreamDiscovery[]
 
   @@index([kind, status])
   @@index([status, priority])
@@ -368,6 +382,174 @@ model AiPricingConfig {
   updatedAt                  DateTime @updatedAt
 }
 
+/// User-facing, provider-independent AI product identity.
+model AiModel {
+  id                 String                @id @default(cuid())
+  canonicalModelKey  String                @unique
+  displayName        String
+  modality           String
+  enabled            Boolean               @default(false)
+  visible            Boolean               @default(false)
+  sortOrder          Int                   @default(100)
+  billingType        String
+  routingMode        String                @default("LEGACY")
+  capabilities       Json                  @default("{}")
+  defaultRouteId     String?               @unique
+  status             String                @default("DRAFT")
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
+  defaultRoute       AiModelRoute?         @relation("DefaultAiModelRoute", fields: [defaultRouteId], references: [id], onDelete: SetNull)
+  routes             AiModelRoute[]        @relation("AiModelRoutes")
+  aliases            AiModelAlias[]
+  pricing            AiModelPricing?
+  priceVersions      AiPriceVersion[]
+  requests           AiRequest[]
+  billingSettlements AiBillingSettlement[]
+
+  @@index([modality, enabled, visible, sortOrder])
+  @@index([status, modality])
+}
+
+/// Provider/channel-specific route and upstream purchasing cost.
+model AiModelRoute {
+  id                   String                @id @default(cuid())
+  canonicalModelId     String
+  provider             String
+  channelId            String?
+  upstreamModelId      String
+  enabled              Boolean               @default(false)
+  priority             Int                   @default(100)
+  healthStatus         String                @default("UNKNOWN")
+  upstreamAvailable    Boolean               @default(false)
+  lastSyncedAt         DateTime?
+  costProfile          Json?
+  capabilitiesOverride Json?
+  metadata             Json?
+  pricingSyncStatus    String                @default("UNKNOWN")
+  costUpdatedAt        DateTime?
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+  canonicalModel       AiModel               @relation("AiModelRoutes", fields: [canonicalModelId], references: [id], onDelete: Restrict)
+  channel              AiProviderChannel?    @relation(fields: [channelId], references: [id], onDelete: SetNull)
+  defaultForModel      AiModel?              @relation("DefaultAiModelRoute")
+  requests             AiRequest[]
+  costHistory          AiRouteCostHistory[]
+  billingSettlements   AiBillingSettlement[]
+
+  @@unique([provider, channelId, upstreamModelId])
+  @@index([canonicalModelId, enabled, priority])
+  @@index([channelId, enabled, priority])
+  @@index([provider, upstreamModelId])
+}
+
+/// Explicitly confirmed compatibility alias. Alias normalization is lookup-only;
+/// it never creates mappings by fuzzy matching.
+model AiModelAlias {
+  id               String   @id @default(cuid())
+  canonicalModelId String
+  modality         String
+  alias            String
+  aliasKey         String
+  source           String   @default("ADMIN")
+  confirmed        Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  canonicalModel   AiModel  @relation(fields: [canonicalModelId], references: [id], onDelete: Cascade)
+
+  @@unique([modality, aliasKey])
+  @@index([canonicalModelId])
+}
+
+/// Immutable user sell-price version for one canonical model.
+model AiPriceVersion {
+  id                 String                @id @default(cuid())
+  canonicalModelId   String
+  version            Int
+  pricing            Json
+  source             String                @default("MANUAL")
+  publishedBy        String?
+  createdAt          DateTime              @default(now())
+  publishedAt        DateTime              @default(now())
+  canonicalModel     AiModel               @relation(fields: [canonicalModelId], references: [id], onDelete: Restrict)
+  currentFor         AiModelPricing?       @relation("CurrentAiPriceVersion")
+  requests           AiRequest[]
+  billingSettlements AiBillingSettlement[]
+
+  @@unique([canonicalModelId, version])
+  @@index([canonicalModelId, publishedAt])
+}
+
+/// Mutable pricing workspace. Only currentVersionId is used for live billing.
+model AiModelPricing {
+  canonicalModelId String          @id
+  currentVersionId String?         @unique
+  pendingPrice     Json?
+  suggestedPrice   Json?
+  pricingMode      String          @default("MANUAL")
+  markupMultiplier Decimal         @default(1.32) @db.Decimal(12, 6)
+  updatedAt        DateTime        @updatedAt
+  canonicalModel   AiModel         @relation(fields: [canonicalModelId], references: [id], onDelete: Cascade)
+  currentVersion   AiPriceVersion? @relation("CurrentAiPriceVersion", fields: [currentVersionId], references: [id], onDelete: SetNull)
+}
+
+/// Upstream models awaiting an explicit administrator mapping decision.
+model AiUpstreamDiscovery {
+  id                String            @id @default(cuid())
+  provider          String
+  channelId         String
+  upstreamModelId   String
+  suggestedModality String?
+  availability      String            @default("UNKNOWN")
+  capabilities      Json?
+  context           Json?
+  resolution        Json?
+  duration          Json?
+  discoveredCost    Json?
+  metadata          Json?
+  status            String            @default("UNMAPPED")
+  suggestedModelId  String?
+  lastSyncedAt      DateTime          @default(now())
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  channel           AiProviderChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, upstreamModelId])
+  @@index([status, lastSyncedAt])
+  @@index([provider, upstreamModelId])
+}
+
+model AiRouteCostHistory {
+  id                String       @id @default(cuid())
+  routeId           String
+  costProfile       Json
+  pricingSyncStatus String       @default("OK")
+  observedAt        DateTime     @default(now())
+  route             AiModelRoute @relation(fields: [routeId], references: [id], onDelete: Cascade)
+
+  @@index([routeId, observedAt])
+}
+
+/// One authoritative charge per logical AI request. This table supplies a new
+/// uniqueness boundary without rewriting historical wallet ledger rows.
+model AiBillingSettlement {
+  id               String          @id @default(cuid())
+  requestId        String          @unique
+  canonicalModelId String?
+  routeId          String?
+  priceVersionId   String?
+  chargedCredits   Decimal         @db.Decimal(24, 6)
+  breakdown        Json
+  createdAt        DateTime        @default(now())
+  request          AiRequest       @relation(fields: [requestId], references: [id], onDelete: Restrict)
+  canonicalModel   AiModel?        @relation(fields: [canonicalModelId], references: [id], onDelete: SetNull)
+  route            AiModelRoute?   @relation(fields: [routeId], references: [id], onDelete: SetNull)
+  priceVersion     AiPriceVersion? @relation(fields: [priceVersionId], references: [id], onDelete: SetNull)
+
+  @@index([canonicalModelId, createdAt])
+  @@index([routeId, createdAt])
+  @@index([priceVersionId])
+}
+
 model ChatPricingConfig {
   id          String   @id @default("default")
   modelPrices Json
@@ -376,18 +558,18 @@ model ChatPricingConfig {
 }
 
 model InspirationShare {
-  id            String                 @id
+  id            String                    @id
   kind          InspirationShareKind
-  status        InspirationShareStatus @default(PENDING)
+  status        InspirationShareStatus    @default(PENDING)
   title         String
   description   String?
   authorName    String
-  tags          String[]               @default([])
+  tags          String[]                  @default([])
   fileName      String
   jsonPayload   Json
-  downloadCount Int                    @default(0)
-  createdAt     DateTime               @default(now())
-  updatedAt     DateTime               @updatedAt
+  downloadCount Int                       @default(0)
+  createdAt     DateTime                  @default(now())
+  updatedAt     DateTime                  @updatedAt
   publishedAt   DateTime?
   previews      InspirationSharePreview[]
 
@@ -396,16 +578,16 @@ model InspirationShare {
 }
 
 model InspirationSharePreview {
-  id         String           @id
-  shareId    String
-  objectKey  String           @unique
-  mimeType   String
-  width      Int
-  height     Int
-  sizeBytes  Int
-  sortOrder  Int
-  createdAt  DateTime         @default(now())
-  share      InspirationShare @relation(fields: [shareId], references: [id], onDelete: Cascade)
+  id        String           @id
+  shareId   String
+  objectKey String           @unique
+  mimeType  String
+  width     Int
+  height    Int
+  sizeBytes Int
+  sortOrder Int
+  createdAt DateTime         @default(now())
+  share     InspirationShare @relation(fields: [shareId], references: [id], onDelete: Cascade)
 
   @@index([shareId, sortOrder])
 }

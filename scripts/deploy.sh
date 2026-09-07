@@ -41,9 +41,9 @@ log 'Building the shared API/worker image...'
 source_revision="$(git rev-parse HEAD 2>/dev/null || date +%s)"
 docker compose build --build-arg "SOURCE_REV=$source_revision" api
 
-log 'Ensuring immutable client engine archives are present and verified in OSS...'
+log 'Ensuring immutable client engine archives are present and verified in object storage...'
 if ! docker compose run --rm --no-deps api npm run client-assets:upload -- --download; then
-  fail 'Client engine assets could not be verified in OSS. Deployment stopped before updating the running services.'
+  fail 'Client engine assets could not be verified in object storage. Deployment stopped before updating the running services.'
 fi
 
 log 'Starting PostgreSQL...'

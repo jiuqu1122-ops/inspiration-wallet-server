@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { Prisma, type PrismaClient } from '@prisma/client';
+import type { Prisma, PrismaClient } from '@prisma/client';
 import { env } from '../../config/env.js';
 import {
   deleteInspirationPreview,
@@ -131,7 +131,7 @@ export function validateInspirationSubmission(input: {
 function safeJsonFilename(value: string) {
   const stem = value
     .replace(/\.json$/i, '')
-    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+    .replace(/[<>:"/\\|?*\p{Cc}]/gu, '-')
     .trim()
     .slice(0, 120) || 'inspiration-share';
   return `${stem}.json`;

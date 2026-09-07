@@ -98,6 +98,23 @@ const DEFAULT_CHAT_MODELS: ChatModelCreditPrice[] = [
     billingMode: 'request',
     creditsPerRequest: '2',
   },
+  {
+    model: 'gpt-6-astra',
+    billingMode: 'token',
+    contextThresholdTokens: CHAT_CONTEXT_THRESHOLD_TOKENS,
+    standard: {
+      inputCreditsPerMillion: '300',
+      outputCreditsPerMillion: '1500',
+      cachedInputCreditsPerMillion: '30',
+      cacheWriteCreditsPerMillion: '375',
+    },
+    extended: {
+      inputCreditsPerMillion: '600',
+      outputCreditsPerMillion: '2250',
+      cachedInputCreditsPerMillion: '60',
+      cacheWriteCreditsPerMillion: '750',
+    },
+  },
 ];
 
 const validCreditString = (value: unknown): value is string => (
