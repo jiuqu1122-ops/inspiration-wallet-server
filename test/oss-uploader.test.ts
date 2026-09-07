@@ -22,6 +22,7 @@ vi.mock('ali-oss', () => ({
 
 describe('OSS public bridge service', () => {
   beforeAll(() => {
+    process.env.STORAGE_PROVIDER = 'aliyun-oss';
     process.env.OSS_REGION = 'oss-cn-hongkong';
     process.env.OSS_BUCKET = 'test-bucket';
     process.env.OSS_ACCESS_KEY_ID = 'test-access-key';
@@ -30,6 +31,7 @@ describe('OSS public bridge service', () => {
 
   afterAll(() => {
     vi.unstubAllGlobals();
+    delete process.env.STORAGE_PROVIDER;
     delete process.env.OSS_REGION;
     delete process.env.OSS_BUCKET;
     delete process.env.OSS_ACCESS_KEY_ID;

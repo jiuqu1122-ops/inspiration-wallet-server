@@ -81,7 +81,7 @@ const envSchema = z
     IMAGE_RESULT_STORE_DIR: z.string().min(1).default(join(tmpdir(), 'inspiration-image-results')),
     IMAGE_RESULT_TTL_MINUTES: z.coerce.number().int().min(30).max(10_080).default(1_440),
     IMAGE_RESULT_STORE_MAX_MB: z.coerce.number().int().min(128).max(32_768).default(4_096),
-    STORAGE_PROVIDER: z.enum(['aliyun-oss', 'tencent-cos']).default('aliyun-oss'),
+    STORAGE_PROVIDER: z.enum(['aliyun-oss', 'tencent-cos']).default('tencent-cos'),
     STORAGE_SIGNED_URL_EXPIRES_SECONDS: z.coerce.number().int().min(60).max(604_800).default(3_600),
     OSS_REGION: z.string().trim().default(''),
     OSS_BUCKET: z.string().trim().default(''),

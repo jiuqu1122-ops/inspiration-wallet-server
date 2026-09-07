@@ -26,6 +26,10 @@ cd "$PROJECT_DIR" || fail "Cannot enter $PROJECT_DIR."
 if grep -Eq '^[A-Z0-9_]+=.*CHANGE_ME' .env; then
   fail '.env still contains a CHANGE_ME placeholder.'
 fi
+storage_provider="$(grep -E '^[[:space:]]*STORAGE_PROVIDER[[:space:]]*=' .env | tr -d '\r' || true)"
+if [[ "$storage_provider" != 'STORAGE_PROVIDER=tencent-cos' ]]; then
+  fail 'Production storage must explicitly set STORAGE_PROVIDER=tencent-cos in .env.'
+fi
 
 if [[ -d .git ]] && git remote get-url origin >/dev/null 2>&1; then
   log 'Pulling the latest code with fast-forward only...'

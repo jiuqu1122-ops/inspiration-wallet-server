@@ -11,6 +11,19 @@ function productionEnv() {
 }
 
 describe('object storage environment validation', () => {
+  it('defaults to Tencent COS when the provider is omitted', () => {
+    const value = parseEnvironment({
+      ...productionEnv(),
+      STORAGE_PROVIDER: undefined,
+      COS_REGION: 'ap-singapore',
+      COS_BUCKET: 'inspirationdrawer-1475663212',
+      COS_SECRET_ID: 'cos-id',
+      COS_SECRET_KEY: 'cos-secret',
+    });
+
+    expect(value.STORAGE_PROVIDER).toBe('tencent-cos');
+  });
+
   it('requires only the selected Tencent COS credentials in production', () => {
     const value = parseEnvironment({
       ...productionEnv(),
