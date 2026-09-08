@@ -1,8 +1,19 @@
 import { z } from 'zod';
 
+export const agentToolChoiceSchema = z.union([
+  z.enum(['auto', 'none', 'required']),
+  z.object({
+    type: z.literal('function'),
+    function: z.object({
+      name: z.string().trim().min(1).max(200),
+    }).strict(),
+  }).strict(),
+]);
+
 export const agentTaskPayloadSchema = z.object({
   messages: z.array(z.unknown()).min(1).max(200),
   tools: z.array(z.unknown()).max(100).optional(),
+  toolChoice: agentToolChoiceSchema.optional(),
   model: z.string().trim().min(1).max(200).optional(),
 }).strict();
 
@@ -28,5 +39,6 @@ export const createAiTaskSchema = z.discriminatedUnion('type', [
 ]);
 
 export type AgentTaskPayload = z.infer<typeof agentTaskPayloadSchema>;
+export type AgentToolChoice = z.infer<typeof agentToolChoiceSchema>;
 export type InspirationTaskPayload = z.infer<typeof inspirationTaskPayloadSchema>;
 export type CreateAiTaskInput = z.infer<typeof createAiTaskSchema>;

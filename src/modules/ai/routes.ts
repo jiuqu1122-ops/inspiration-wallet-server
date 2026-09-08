@@ -17,7 +17,7 @@ import { storageService } from '../storage/service.js';
 import { getImageReference } from './reference-store.js';
 import { isVideoResultKey } from './video-result-store.js';
 import { getImageResult, imageResultMimeForKey } from './image-result-store.js';
-import { createAiTaskSchema } from './task-schema.js';
+import { agentToolChoiceSchema, createAiTaskSchema } from './task-schema.js';
 import { ensureAiCatalogSeeded } from './catalog-seed.js';
 import { getPublicAiCatalog, ModelCatalogError } from './model-catalog.js';
 import {
@@ -39,6 +39,7 @@ const chatSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
   messages: z.array(z.unknown()).min(1).max(200),
   tools: z.array(z.unknown()).max(100).optional(),
+  toolChoice: agentToolChoiceSchema.optional(),
   model: z.string().trim().min(1).max(200).optional(),
 }).strict();
 

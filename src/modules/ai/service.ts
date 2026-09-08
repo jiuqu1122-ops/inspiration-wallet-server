@@ -966,11 +966,28 @@ async function requestStreamingCompletion(
   return { result, model, byteCount };
 }
 
+export function buildAgentProviderRequestBody(input: {
+  messages: unknown[];
+  tools?: unknown[] | undefined;
+  toolChoice?: unknown;
+}) {
+  return {
+    messages: input.messages,
+    ...(input.tools?.length
+      ? {
+          tools: input.tools,
+          tool_choice: input.toolChoice ?? 'auto',
+        }
+      : {}),
+  };
+}
+
 async function requestAgentCompletionFromProvider(
   provider: AiProviderChannel,
   input: {
     messages: unknown[];
     tools?: unknown[] | undefined;
+    toolChoice?: unknown;
     model?: string | undefined;
   },
   preferProviderDefault = false,
@@ -987,10 +1004,13 @@ async function requestAgentCompletionFromProvider(
     preferredModel,
     preferProviderDefault,
   );
-  const { result } = await requestStreamingCompletion(provider, model, {
-    messages: input.messages,
-    ...(input.tools?.length ? { tools: input.tools, tool_choice: 'auto' } : {}),
-  }, options, attempt);
+  const { result } = await requestStreamingCompletion(
+    provider,
+    model,
+    buildAgentProviderRequestBody(input),
+    options,
+    attempt,
+  );
   const providerFailure = providerFailureMessage(result);
   if (providerFailure) {
     throw new CloudAiError(
@@ -1263,6 +1283,7 @@ export async function executeWalletAgentChat(
     clientRequestId: string;
     messages: unknown[];
     tools?: unknown[] | undefined;
+    toolChoice?: unknown;
     model?: string | undefined;
   },
   options?: AgentExecutionOptions,
