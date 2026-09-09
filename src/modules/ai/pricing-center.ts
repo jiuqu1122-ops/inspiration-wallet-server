@@ -508,11 +508,16 @@ export async function publishPendingPriceAndSyncLegacy(
   prisma: PrismaClient,
   canonicalModelKey: string,
   publishedBy?: string,
+  onPublished?: (
+    transaction: Prisma.TransactionClient,
+    result: Awaited<ReturnType<typeof publishPendingPriceTransaction>>,
+  ) => Promise<void>,
 ) {
   return prisma.$transaction(
     async (transaction) => {
       const result = await publishPendingPriceTransaction(transaction, canonicalModelKey, publishedBy);
       await syncLegacyPricingTablesFromCatalog(transaction as unknown as PrismaClient);
+      if (onPublished) await onPublished(transaction, result);
       return result;
     },
     { maxWait: 5_000, timeout: 30_000 },

@@ -618,11 +618,12 @@ export async function listWalletImageModels(
   };
   const routeModelsForChannel = (channelId: string, modality: 'image' | 'video') => routes
     .filter(route => route.channelId === channelId
+      && route.canonicalModel !== null
       && route.canonicalModel.modality === modality
       && route.canonicalModel.enabled
       && route.canonicalModel.visible
       && route.canonicalModel.status === 'PUBLISHED')
-    .map(route => route.canonicalModel.canonicalModelKey);
+    .map(route => route.canonicalModel!.canonicalModelKey);
   const channels = await Promise.all(providers.map(async (provider) => {
     try {
       await assertPublicProviderUrl(provider.baseUrl);

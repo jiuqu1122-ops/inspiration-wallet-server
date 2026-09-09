@@ -224,29 +224,33 @@ describe('canonical model mapping', () => {
   });
 
   it('switches a model to managed routing when an admin enables a route', async () => {
-    const updateRoute = vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({
-      id: 'route-a',
-      ...data,
-    }));
+    const updatedAt = new Date('2026-09-09T00:00:00.000Z');
+    const updateRoute = vi.fn(async () => ({ count: 1 }));
     const updateModel = vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({
       id: 'model-a',
       ...data,
     }));
-    const prisma = {
+    const transaction = {
       aiModelRoute: {
         findUnique: vi.fn(async () => ({
           id: 'route-a',
           canonicalModelId: 'model-a',
           costProfile: null,
+          enabled: false,
+          updatedAt,
         })),
-        update: updateRoute,
+        updateMany: updateRoute,
+        findUniqueOrThrow: vi.fn(async () => ({ id: 'route-a', canonicalModelId: 'model-a', enabled: true })),
       },
       aiModel: { update: updateModel },
+    };
+    const prisma = {
+      $transaction: vi.fn(async (callback: (tx: typeof transaction) => unknown) => callback(transaction)),
     } as unknown as PrismaClient;
 
     await updateAdminAiRoute(prisma, 'route-a', { enabled: true });
     expect(updateRoute).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: 'route-a' },
+      where: { id: 'route-a', updatedAt },
       data: { enabled: true },
     }));
     expect(updateModel).toHaveBeenCalledWith({
@@ -583,13 +587,20 @@ describe('catalog exposure and upstream discovery safety', () => {
       aiModelRoute: { findFirst: vi.fn(async () => null), create: routeCreate },
       aiModel: { findUnique: vi.fn(async () => null) },
       aiModelAlias: { findUnique: vi.fn(async () => null) },
-      aiUpstreamDiscovery: { upsert: discoveryUpsert },
+      aiUpstreamDiscovery: { findUnique: vi.fn(async () => null), upsert: discoveryUpsert },
     } as unknown as PrismaClient;
-    await expect(syncUpstreamModels(prisma, provider.id)).resolves.toMatchObject({
+    const result = await syncUpstreamModels(prisma, provider.id);
+    expect(result).toMatchObject({
       discovered: 1,
       mapped: 0,
       unmapped: 1,
     });
+    expect(result.changes).toContainEqual(expect.objectContaining({
+      kind: 'NEW_MODEL',
+      providerId: provider.id,
+      upstreamModelId: 'brand-new-chat-model',
+      canonicalModelId: null,
+    }));
     expect(routeCreate).not.toHaveBeenCalled();
     expect(discoveryUpsert).toHaveBeenCalledWith(expect.objectContaining({
       create: expect.objectContaining({
@@ -635,7 +646,10 @@ describe('catalog exposure and upstream discovery safety', () => {
         )),
       },
       aiModelAlias: { findUnique: vi.fn(async () => null) },
-      aiUpstreamDiscovery: { upsert: vi.fn(async (input: unknown) => input) },
+      aiUpstreamDiscovery: {
+        findUnique: vi.fn(async () => null),
+        upsert: vi.fn(async (input: unknown) => input),
+      },
     } as unknown as PrismaClient;
     await expect(syncUpstreamModels(prisma, provider.id)).resolves.toMatchObject({ mapped: 1, unmapped: 0 });
     expect(routeCreate).toHaveBeenCalledWith(expect.objectContaining({
@@ -683,6 +697,7 @@ describe('catalog exposure and upstream discovery safety', () => {
         update,
       },
       aiRouteCostHistory: { create: vi.fn() },
+      aiUpstreamDiscovery: { findUnique: vi.fn(async () => null) },
     } as unknown as PrismaClient;
     await expect(syncUpstreamModels(prisma, provider.id)).resolves.toMatchObject({ mapped: 1 });
     expect(update).toHaveBeenCalledWith(expect.objectContaining({

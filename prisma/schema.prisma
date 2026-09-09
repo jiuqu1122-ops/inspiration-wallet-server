@@ -80,6 +80,16 @@ enum AdminOperationType {
   UPDATE_PROVIDER
   DELETE_PROVIDER
   UPDATE_AUTHORIZATION
+  ROUTE_REMAPPED
+  ROUTE_UNMAPPED
+  ROUTE_DISABLED
+  DEFAULT_ROUTE_CHANGED
+  MODEL_VISIBILITY_CHANGED
+  MODEL_ENABLED_CHANGED
+  PRICING_PENDING_UPDATED
+  PRICING_PUBLISHED
+  MODEL_ALIAS_CREATED
+  MODEL_ALIAS_DELETED
 }
 
 enum AiProviderKind {
@@ -413,7 +423,7 @@ model AiModel {
 /// Provider/channel-specific route and upstream purchasing cost.
 model AiModelRoute {
   id                   String                @id @default(cuid())
-  canonicalModelId     String
+  canonicalModelId     String?
   provider             String
   channelId            String?
   upstreamModelId      String
@@ -429,7 +439,7 @@ model AiModelRoute {
   costUpdatedAt        DateTime?
   createdAt            DateTime              @default(now())
   updatedAt            DateTime              @updatedAt
-  canonicalModel       AiModel               @relation("AiModelRoutes", fields: [canonicalModelId], references: [id], onDelete: Restrict)
+  canonicalModel       AiModel?              @relation("AiModelRoutes", fields: [canonicalModelId], references: [id], onDelete: Restrict)
   channel              AiProviderChannel?    @relation(fields: [channelId], references: [id], onDelete: SetNull)
   defaultForModel      AiModel?              @relation("DefaultAiModelRoute")
   requests             AiRequest[]

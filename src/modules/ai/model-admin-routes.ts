@@ -1,21 +1,27 @@
-import type { FastifyPluginAsync, FastifyReply } from 'fastify';
+import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { ensureAiCatalogSeeded } from './catalog-seed.js';
 import {
+  AiModelAdminError,
+  clearAdminPendingPrice,
+  createAdminAiModelAlias,
   createCanonicalFromDiscovery,
+  deleteAdminAiModelAlias,
   getAdminAiModel,
   ignoreDiscovery,
   listAdminAiModels,
   listUnmappedModels,
   mapDiscoveryToCanonical,
   publishAdminPendingPrice,
+  remapAdminAiRoute,
+  setAdminPendingPrice,
+  unmapAdminAiRoute,
   updateAdminAiModel,
   updateAdminAiRoute,
   updatePricingPolicy,
 } from './model-admin.js';
-import { setPendingPrice } from './pricing-center.js';
 import { toInputJson } from './pricing-center.js';
-import { syncUpstreamModels } from './upstream-sync.js';
+import { syncAllUpstreamModels, syncUpstreamModels } from './upstream-sync.js';
 
 const modalitySchema = z.enum(['chat', 'image', 'video']);
 const jsonObjectSchema = z.record(z.string(), z.unknown());
@@ -41,6 +47,7 @@ const updateModelSchema = z.object({
   routingMode: z.enum(['LEGACY', 'MANAGED']).optional(),
   capabilities: jsonObjectSchema.optional(),
   defaultRouteId: idSchema.nullable().optional(),
+  expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
 }).strict().refine(value => Object.keys(value).length > 0, 'No model changes were supplied');
 
 const updateRouteSchema = z.object({
@@ -50,6 +57,7 @@ const updateRouteSchema = z.object({
   upstreamAvailable: z.boolean().optional(),
   costProfile: jsonObjectSchema.nullable().optional(),
   capabilitiesOverride: jsonObjectSchema.nullable().optional(),
+  expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
 }).strict().refine(value => Object.keys(value).length > 0, 'No route changes were supplied');
 
 const createCanonicalSchema = z.object({
@@ -69,6 +77,29 @@ const createCanonicalSchema = z.object({
   ]),
   capabilities: jsonObjectSchema.optional(),
   pendingPrice: jsonObjectSchema.optional(),
+  visible: z.boolean().optional(),
+  enabled: z.boolean().optional(),
+  expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
+}).strict();
+
+const remapRouteSchema = z.object({
+  canonicalModelKey: modelKeySchema,
+  currentCanonicalModelId: idSchema,
+  expectedUpdatedAt: z.string().datetime({ offset: true }),
+}).strict();
+
+const unmapRouteSchema = z.object({
+  currentCanonicalModelId: idSchema,
+  expectedUpdatedAt: z.string().datetime({ offset: true }),
+}).strict();
+
+const aliasSchema = z.object({
+  alias: z.string().trim().min(1).max(200),
+}).strict();
+
+const aliasParamsSchema = z.object({
+  modelKey: modelKeySchema,
+  aliasId: idSchema,
 }).strict();
 
 const pricingPolicySchema = z.object({
@@ -85,13 +116,20 @@ async function adminOperation<T>(reply: FastifyReply, operation: () => Promise<T
     return await operation();
   } catch (error) {
     const message = error instanceof Error ? error.message : 'AI Model Center operation failed';
-    const notFound = /not found/i.test(message);
-    return reply.code(notFound ? 404 : 400).send({
-      error: notFound ? 'not_found' : 'invalid_request',
+    const status = error instanceof AiModelAdminError
+      ? error.statusCode
+      : /not found/i.test(message) ? 404 : 400;
+    return reply.code(status).send({
+      error: status === 409 ? 'conflict' : status === 404 ? 'not_found' : 'invalid_request',
       message,
     });
   }
 }
+
+const mutationContext = (request: FastifyRequest) => ({
+  actor: 'admin-api',
+  requestId: request.id,
+});
 
 export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', async () => {
@@ -107,6 +145,12 @@ export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
   app.get('/unmapped', async () => ({ items: await listUnmappedModels(app.prisma) }));
 
   app.post(
+    '/sync',
+    { config: { rateLimit: { max: 3, timeWindow: '1 minute' } } },
+    async (_request, reply) => adminOperation(reply, () => syncAllUpstreamModels(app.prisma)),
+  );
+
+  app.post(
     '/sync/:providerId',
     { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
     async (request, reply) => {
@@ -118,12 +162,17 @@ export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/unmapped/:discoveryId/map', async (request, reply) => {
     const params = discoveryParamsSchema.safeParse(request.params);
-    const body = z.object({ canonicalModelKey: modelKeySchema }).strict().safeParse(request.body);
+    const body = z.object({
+      canonicalModelKey: modelKeySchema,
+      expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
+    }).strict().safeParse(request.body);
     if (!params.success || !body.success) return invalid(reply, 'Canonical mapping is invalid');
     return adminOperation(reply, () => mapDiscoveryToCanonical(
       app.prisma,
       params.data.discoveryId,
       body.data.canonicalModelKey,
+      body.data.expectedUpdatedAt,
+      mutationContext(request),
     ));
   });
 
@@ -138,8 +187,16 @@ export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
       ...(body.data.displayName ? { displayName: body.data.displayName } : {}),
       ...(body.data.capabilities ? { capabilities: toInputJson(body.data.capabilities) } : {}),
       ...(body.data.pendingPrice ? { pendingPrice: toInputJson(body.data.pendingPrice) } : {}),
+      ...(body.data.visible !== undefined ? { visible: body.data.visible } : {}),
+      ...(body.data.enabled !== undefined ? { enabled: body.data.enabled } : {}),
+      ...(body.data.expectedUpdatedAt ? { expectedUpdatedAt: body.data.expectedUpdatedAt } : {}),
     };
-    return adminOperation(reply, () => createCanonicalFromDiscovery(app.prisma, params.data.discoveryId, input));
+    return adminOperation(reply, () => createCanonicalFromDiscovery(
+      app.prisma,
+      params.data.discoveryId,
+      input,
+      mutationContext(request),
+    ));
   });
 
   app.post('/unmapped/:discoveryId/ignore', async (request, reply) => {
@@ -163,15 +220,60 @@ export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
       ...(body.data.capabilitiesOverride !== undefined ? {
         capabilitiesOverride: body.data.capabilitiesOverride === null ? null : toInputJson(body.data.capabilitiesOverride),
       } : {}),
+      ...(body.data.expectedUpdatedAt ? { expectedUpdatedAt: body.data.expectedUpdatedAt } : {}),
     };
-    return adminOperation(reply, () => updateAdminAiRoute(app.prisma, params.data.routeId, input));
+    return adminOperation(reply, () => updateAdminAiRoute(
+      app.prisma,
+      params.data.routeId,
+      input,
+      mutationContext(request),
+    ));
+  });
+
+  app.post('/routes/:routeId/remap', async (request, reply) => {
+    const params = routeParamsSchema.safeParse(request.params);
+    const body = remapRouteSchema.safeParse(request.body);
+    if (!params.success || !body.success) return invalid(reply, 'Route remap is invalid');
+    return adminOperation(reply, () => remapAdminAiRoute(
+      app.prisma,
+      params.data.routeId,
+      body.data,
+      mutationContext(request),
+    ));
+  });
+
+  app.post('/routes/:routeId/unmap', async (request, reply) => {
+    const params = routeParamsSchema.safeParse(request.params);
+    const body = unmapRouteSchema.safeParse(request.body);
+    if (!params.success || !body.success) return invalid(reply, 'Route unmap is invalid');
+    return adminOperation(reply, () => unmapAdminAiRoute(
+      app.prisma,
+      params.data.routeId,
+      body.data,
+      mutationContext(request),
+    ));
   });
 
   app.put('/:modelKey/pricing/pending', async (request, reply) => {
     const params = modelParamsSchema.safeParse(request.params);
     const body = jsonObjectSchema.safeParse(request.body);
     if (!params.success || !body.success) return invalid(reply, 'Pending price is invalid');
-    return adminOperation(reply, () => setPendingPrice(app.prisma, params.data.modelKey, toInputJson(body.data)));
+    return adminOperation(reply, () => setAdminPendingPrice(
+      app.prisma,
+      params.data.modelKey,
+      toInputJson(body.data),
+      mutationContext(request),
+    ));
+  });
+
+  app.delete('/:modelKey/pricing/pending', async (request, reply) => {
+    const params = modelParamsSchema.safeParse(request.params);
+    if (!params.success) return invalid(reply, 'Model key is invalid');
+    return adminOperation(reply, () => clearAdminPendingPrice(
+      app.prisma,
+      params.data.modelKey,
+      mutationContext(request),
+    ));
   });
 
   app.patch('/:modelKey/pricing/policy', async (request, reply) => {
@@ -188,6 +290,30 @@ export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
       app.prisma,
       params.data.modelKey,
       'admin-api',
+      mutationContext(request),
+    ));
+  });
+
+  app.post('/:modelKey/aliases', async (request, reply) => {
+    const params = modelParamsSchema.safeParse(request.params);
+    const body = aliasSchema.safeParse(request.body);
+    if (!params.success || !body.success) return invalid(reply, 'Alias data is invalid');
+    return adminOperation(reply, () => createAdminAiModelAlias(
+      app.prisma,
+      params.data.modelKey,
+      body.data.alias,
+      mutationContext(request),
+    ));
+  });
+
+  app.delete('/:modelKey/aliases/:aliasId', async (request, reply) => {
+    const params = aliasParamsSchema.safeParse(request.params);
+    if (!params.success) return invalid(reply, 'Alias data is invalid');
+    return adminOperation(reply, () => deleteAdminAiModelAlias(
+      app.prisma,
+      params.data.modelKey,
+      params.data.aliasId,
+      mutationContext(request),
     ));
   });
 
@@ -211,7 +337,13 @@ export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
       ...(body.data.routingMode !== undefined ? { routingMode: body.data.routingMode } : {}),
       ...(body.data.capabilities !== undefined ? { capabilities: toInputJson(body.data.capabilities) } : {}),
       ...(body.data.defaultRouteId !== undefined ? { defaultRouteId: body.data.defaultRouteId } : {}),
+      ...(body.data.expectedUpdatedAt ? { expectedUpdatedAt: body.data.expectedUpdatedAt } : {}),
     };
-    return adminOperation(reply, () => updateAdminAiModel(app.prisma, params.data.modelKey, input));
+    return adminOperation(reply, () => updateAdminAiModel(
+      app.prisma,
+      params.data.modelKey,
+      input,
+      mutationContext(request),
+    ));
   });
 };
