@@ -493,6 +493,7 @@ describe('catalog exposure and upstream discovery safety', () => {
           billingType: 'image_resolution',
           capabilities: { supportedResolutions: ['2k', '4k'] },
           pricing: { currentVersion: { version: 3, pricing: { billingType: 'image_resolution' } } },
+          aliases: [{ alias: 'vendor-image-pro' }],
           routes: [{ costProfile: { secretCost: 1 }, channel: { encryptedSecrets: 'secret' } }],
         }]),
       },
@@ -501,7 +502,12 @@ describe('catalog exposure and upstream discovery safety', () => {
     const serialized = JSON.stringify(catalog);
     expect(serialized).not.toContain('secretCost');
     expect(serialized).not.toContain('encryptedSecrets');
-    expect(catalog.models[0]).toMatchObject({ id: 'nano-banana-pro', priceVersion: 3 });
+    expect(catalog.models[0]).toMatchObject({
+      id: 'nano-banana-pro',
+      priceVersion: 3,
+      aliases: ['vendor-image-pro'],
+      capabilities: { resolutions: ['2k', '4k'] },
+    });
   });
 
   it('keeps the legacy Chat and Image/Video model response shapes available', async () => {

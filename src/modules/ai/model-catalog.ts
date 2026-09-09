@@ -188,6 +188,63 @@ export function defaultModelCapabilities(key: string, modality: AiModality): Pri
   return {};
 }
 
+export function normalizePublicModelCapabilities(value: unknown) {
+  const source = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const stringArray = (...keys: string[]) => {
+    for (const key of keys) {
+      if (Array.isArray(source[key])) {
+        return source[key]
+          .filter((item): item is string => typeof item === 'string')
+          .map(item => item.trim())
+          .filter(Boolean);
+      }
+    }
+    return undefined;
+  };
+  const numberArray = (...keys: string[]) => {
+    for (const key of keys) {
+      if (Array.isArray(source[key])) {
+        return source[key]
+          .map(Number)
+          .filter(item => Number.isFinite(item));
+      }
+    }
+    return undefined;
+  };
+  const numberValue = (...keys: string[]) => {
+    for (const key of keys) {
+      const candidate = source[key];
+      if (typeof candidate === 'number' && Number.isFinite(candidate)) return candidate;
+    }
+    return undefined;
+  };
+  const booleanValue = (...keys: string[]) => {
+    for (const key of keys) {
+      if (typeof source[key] === 'boolean') return source[key];
+    }
+    return undefined;
+  };
+  return Object.fromEntries(Object.entries({
+    resolutions: stringArray('resolutions', 'supportedResolutions'),
+    aspectRatios: stringArray('aspectRatios', 'supportedAspectRatios'),
+    durations: numberArray('durations', 'supportedDurations'),
+    maxReferenceImages: numberValue('maxReferenceImages'),
+    maxReferenceVideos: numberValue('maxReferenceVideos'),
+    maxReferenceAudios: numberValue('maxReferenceAudios'),
+    minReferenceImages: numberValue('minReferenceImages'),
+    supportsReferenceImages: booleanValue('supportsReferenceImages', 'supportsReferenceImage'),
+    supportsReferenceVideo: booleanValue('supportsReferenceVideo', 'supportsVideoReference'),
+    supportsAudioReference: booleanValue('supportsAudioReference'),
+    supportsFirstLastFrame: booleanValue('supportsFirstLastFrame'),
+    supportedInputModes: stringArray('supportedInputModes'),
+    supportedOutputFormats: stringArray('supportedOutputFormats'),
+    supportsTransparentBackground: booleanValue('supportsTransparentBackground'),
+    maxOutputs: numberValue('maxOutputs'),
+  }).filter((entry): entry is [string, Exclude<typeof entry[1], undefined>] => entry[1] !== undefined));
+}
+
 export function catalogDelegateAvailable(prisma: PrismaClient) {
   return Boolean((prisma as PrismaClient & { aiModel?: unknown }).aiModel);
 }
@@ -195,7 +252,10 @@ export function catalogDelegateAvailable(prisma: PrismaClient) {
 export async function getPublicAiCatalog(prisma: PrismaClient) {
   const models = await prisma.aiModel.findMany({
     where: { enabled: true, visible: true, status: 'PUBLISHED' },
-    include: { pricing: { include: { currentVersion: true } } },
+    include: {
+      pricing: { include: { currentVersion: true } },
+      aliases: { where: { confirmed: true }, orderBy: { createdAt: 'asc' } },
+    },
     orderBy: [{ modality: 'asc' }, { sortOrder: 'asc' }, { canonicalModelKey: 'asc' }],
   });
   // A per-model price version is not a catalog revision: publishing version 2
@@ -216,7 +276,8 @@ export async function getPublicAiCatalog(prisma: PrismaClient) {
       displayName: model.displayName,
       modality: model.modality,
       billingType: model.billingType,
-      capabilities: model.capabilities,
+      aliases: (model.aliases ?? []).map(alias => alias.alias),
+      capabilities: normalizePublicModelCapabilities(model.capabilities),
       priceVersion: model.pricing?.currentVersion?.version ?? null,
       pricing: model.pricing?.currentVersion?.pricing ?? null,
     })),

@@ -7,6 +7,7 @@ import {
   createAdminAiModelAlias,
   createCanonicalFromDiscovery,
   deleteAdminAiModelAlias,
+  deleteAdminAiModel,
   getAdminAiModel,
   ignoreDiscovery,
   listAdminAiModels,
@@ -34,6 +35,9 @@ const listSchema = z.object({
 }).strict();
 
 const modelParamsSchema = z.object({ modelKey: modelKeySchema }).strict();
+const deleteModelSchema = z.object({
+  expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
+}).strict();
 const routeParamsSchema = z.object({ routeId: idSchema }).strict();
 const providerParamsSchema = z.object({ providerId: idSchema }).strict();
 const discoveryParamsSchema = z.object({ discoveryId: idSchema }).strict();
@@ -343,6 +347,18 @@ export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
       app.prisma,
       params.data.modelKey,
       input,
+      mutationContext(request),
+    ));
+  });
+
+  app.delete('/:modelKey', async (request, reply) => {
+    const params = modelParamsSchema.safeParse(request.params);
+    const body = deleteModelSchema.safeParse(request.body ?? {});
+    if (!params.success || !body.success) return invalid(reply, 'Model deletion request is invalid');
+    return adminOperation(reply, () => deleteAdminAiModel(
+      app.prisma,
+      params.data.modelKey,
+      body.data.expectedUpdatedAt,
       mutationContext(request),
     ));
   });

@@ -163,8 +163,59 @@ export async function getAdminAiModel(prisma: PrismaClient, canonicalModelKey: s
       },
       pricing: { include: { currentVersion: true } },
       priceVersions: { orderBy: { version: 'desc' }, take: 50 },
+      _count: { select: { routes: true, priceVersions: true, requests: true, billingSettlements: true } },
     },
   });
+}
+
+export async function deleteAdminAiModel(
+  prisma: PrismaClient,
+  canonicalModelKey: string,
+  expectedUpdatedAt: string | undefined,
+  context: AdminMutationContext = { actor: 'admin-api', requestId: randomUUID() },
+) {
+  return prisma.$transaction(async (transaction) => {
+    const model = await transaction.aiModel.findUnique({
+      where: { canonicalModelKey },
+      include: {
+        _count: { select: { routes: true, priceVersions: true, requests: true, billingSettlements: true } },
+      },
+    });
+    if (!model) throw new AiModelAdminError('NOT_FOUND', 'Canonical model was not found', 404);
+    if (expectedUpdatedAt && asIso(model.updatedAt) !== asIso(expectedUpdatedAt)) {
+      throw new AiModelAdminError('CONFLICT', 'Model configuration was modified by another administrator', 409);
+    }
+    if (model.status !== 'DRAFT' || model.enabled || model.visible) {
+      throw new AiModelAdminError(
+        'INVALID_REQUEST',
+        'Only a hidden, disabled draft model can be deleted',
+        400,
+      );
+    }
+    if (model._count.routes > 0) {
+      throw new AiModelAdminError('INVALID_REQUEST', 'Remove all upstream route mappings before deleting this model', 400);
+    }
+    if (model._count.priceVersions > 0) {
+      throw new AiModelAdminError('INVALID_REQUEST', 'A model with published price history cannot be deleted', 400);
+    }
+    if (model._count.requests > 0 || model._count.billingSettlements > 0) {
+      throw new AiModelAdminError('INVALID_REQUEST', 'A model with request or billing history cannot be deleted', 400);
+    }
+    const deleted = await transaction.aiModel.deleteMany({
+      where: { id: model.id, updatedAt: model.updatedAt },
+    });
+    if (deleted.count !== 1) {
+      throw new AiModelAdminError('CONFLICT', 'Model configuration was modified by another administrator', 409);
+    }
+    await recordAdminOperation(transaction, AdminOperationType.MODEL_DELETED, context, {
+      schemaVersion: 1,
+      modelId: model.id,
+      modelKey: model.canonicalModelKey,
+      displayName: model.displayName,
+      modality: model.modality,
+    });
+    return { deleted: true, modelKey: model.canonicalModelKey };
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 }
 
 export async function updateAdminAiModel(

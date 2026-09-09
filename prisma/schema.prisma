@@ -90,6 +90,7 @@ enum AdminOperationType {
   PRICING_PUBLISHED
   MODEL_ALIAS_CREATED
   MODEL_ALIAS_DELETED
+  MODEL_DELETED
 }
 
 enum AiProviderKind {

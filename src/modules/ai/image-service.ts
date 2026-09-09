@@ -34,7 +34,9 @@ import {
   catalogDelegateAvailable,
   catalogAliasKey,
   explicitCanonicalModelKey,
+  getPublicAiCatalog,
   legacyUpstreamModelForCanonical,
+  normalizePublicModelCapabilities,
   resolveCatalogModel,
 } from './model-catalog.js';
 import {
@@ -168,6 +170,16 @@ export function imageCapabilityForModel(model: string, resolution?: string): AiC
     if (requestedResolution === '1k' || token.includes('1k')) return 'IMAGE_GPT_1K';
     return 'IMAGE_GPT';
   }
+  if ((token.includes('nanobanana2')
+    || token.includes('gemini31flashimage')
+    || token.includes('gemini3flashimage')
+    || token.includes('nano2'))
+    && token.includes('fast')) {
+    return 'IMAGE_NANO_BANANA_2_FAST';
+  }
+  if (isNanoBananaProModelToken(token) && token.includes('fast')) {
+    return 'IMAGE_NANO_BANANA_PRO_FAST';
+  }
   if (token.includes('nanobanana2')
     || token.includes('gemini31flashimage')
     || token.includes('gemini3flashimage')
@@ -200,15 +212,15 @@ export function providerSupportsImageModel(
   const capability = imageCapabilityForModel(model, resolution);
   const modelToken = imageModelToken(model);
   const requestedResolution = String(resolution || '').trim().toLowerCase();
-  if (provider.capabilities.includes('IMAGE')) return true;
+  const specificCapabilities = provider.capabilities.filter(candidate => (
+    candidate !== 'IMAGE' && IMAGE_PROVIDER_CAPABILITIES.includes(candidate)
+  ));
+  if (provider.capabilities.includes('IMAGE') && specificCapabilities.length === 0) return true;
   const modelResolution = modelToken.includes('4k')
     ? '4k'
     : modelToken.includes('2k') ? '2k' : modelToken.includes('1k') ? '1k' : '';
   const hasBananaDual2K = provider.capabilities.includes('IMAGE_NANO_BANANA_DUAL_2K')
     || provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K');
-  const hasFastBananaPro = provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_FAST')
-    && isNanoBananaProModelToken(modelToken);
-  const hasFastBanana2 = provider.capabilities.includes('IMAGE_NANO_BANANA_2_FAST');
   if (hasBananaDual2K
     && (!requestedResolution || requestedResolution === '2k')
     && (!modelResolution || modelResolution === '2k')
@@ -224,17 +236,43 @@ export function providerSupportsImageModel(
     // requested resolution is checked again when a generation is started.
     return true;
   }
-  if (capability === 'IMAGE_NANO_BANANA' && hasFastBananaPro) return true;
-  if (capability === 'IMAGE_NANO_BANANA_2' && hasFastBanana2) return true;
-  return provider.capabilities.includes(capability)
-    || (capability === 'IMAGE_GPT_1K' && provider.capabilities.includes('IMAGE_GPT'));
+  return provider.capabilities.includes(capability);
+}
+
+export function imageRouteSupportsRequest<T extends {
+  channel: { capabilities: readonly AiCapability[] } | null;
+  capabilitiesOverride?: unknown;
+}>(route: T, model: string, resolution?: string) {
+  if (!route.channel || !providerSupportsImageModel(route.channel, model, resolution)) return false;
+  const requestedResolution = String(resolution || '').trim().toLowerCase();
+  if (!requestedResolution) return true;
+  const routeCapabilities = normalizePublicModelCapabilities(route.capabilitiesOverride);
+  const supportedResolutions = Array.isArray(routeCapabilities.resolutions)
+    ? routeCapabilities.resolutions.map(item => String(item).trim().toLowerCase())
+    : [];
+  return supportedResolutions.length === 0 || supportedResolutions.includes(requestedResolution);
+}
+
+export function catalogModelSupportsImageRequest(capabilities: unknown, resolution?: string) {
+  const requestedResolution = String(resolution || '').trim().toLowerCase();
+  if (!requestedResolution) return true;
+  const normalized = normalizePublicModelCapabilities(capabilities);
+  const supportedResolutions = Array.isArray(normalized.resolutions)
+    ? normalized.resolutions.map(item => String(item).trim().toLowerCase())
+    : [];
+  return supportedResolutions.length === 0 || supportedResolutions.includes(requestedResolution);
 }
 
 export function filterProviderImageModels(
   provider: { capabilities: readonly AiCapability[] },
   models: string[],
 ) {
-  return models.filter((model) => providerSupportsImageModel(provider, model));
+  return models.filter((model) => {
+    if (providerSupportsImageModel(provider, model)) return true;
+    const canonical = explicitCanonicalModelKey('image', model, provider.capabilities);
+    return (canonical === 'nano-banana-pro-fast' && provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_FAST'))
+      || (canonical === 'nano-banana-2-fast' && provider.capabilities.includes('IMAGE_NANO_BANANA_2_FAST'));
+  });
 }
 
 export type ImageInput = {
@@ -578,43 +616,98 @@ function publicWalletImageProviderKind(provider: Pick<AiProviderChannel, 'kind'>
   return provider.kind === 'USELG' ? 'NEW_API' as const : provider.kind;
 }
 
+export function buildWalletCatalogMetadata(
+  publicModels: Array<{
+    id: string;
+    displayName: string;
+    modality: string;
+    aliases: string[];
+    capabilities: Record<string, unknown>;
+  }>,
+  channels: Array<{ models: string[] }>,
+  videoChannels: Array<{ models: string[] }>,
+) {
+  const defaultImageModel = publicModels.find(model => (
+    model.modality === 'image' && channels.some(channel => channel.models.includes(model.id))
+  ))?.id ?? publicModels.find(model => model.modality === 'image')?.id ?? null;
+  const defaultVideoModel = publicModels.find(model => (
+    model.modality === 'video' && videoChannels.some(channel => channel.models.includes(model.id))
+  ))?.id ?? publicModels.find(model => model.modality === 'video')?.id ?? null;
+  const catalog = publicModels.map(model => ({
+    id: model.id,
+    displayName: model.displayName,
+    modality: model.modality,
+    aliases: model.aliases,
+    capabilities: model.capabilities,
+    enabled: true,
+    visible: true,
+    isDefault: model.id === (model.modality === 'image' ? defaultImageModel : defaultVideoModel),
+  }));
+  return {
+    defaultImageModel,
+    defaultVideoModel,
+    catalog,
+    capabilities: Object.fromEntries(catalog.map(model => [model.id, model.capabilities])),
+  };
+}
+
 export async function listWalletImageModels(
   prisma: PrismaClient,
 ) {
   await ensureAiCatalogSeeded(prisma);
-  const [providers, videoProviders, legacyPricing, catalogPricing, publicModels, aliases, routes] = await Promise.all([
+  const [providers, videoProviders, legacyPricing, catalogPricing, publicCatalog, routes] = await Promise.all([
     listImageProviders(prisma),
     listVideoProviders(prisma),
     getAiPricingConfig(prisma),
     catalogDelegateAvailable(prisma) ? legacyPricingFromCatalog(prisma) : null,
-    catalogDelegateAvailable(prisma) ? prisma.aiModel.findMany({
-      where: { enabled: true, visible: true, status: 'PUBLISHED', modality: { in: ['image', 'video'] } },
-      select: { id: true, canonicalModelKey: true, modality: true },
-    }) : [],
-    catalogDelegateAvailable(prisma) ? prisma.aiModelAlias.findMany({
-      where: { confirmed: true, modality: { in: ['image', 'video'] } },
-      select: { aliasKey: true, canonicalModel: { select: { canonicalModelKey: true, enabled: true, visible: true, status: true, modality: true } } },
-    }) : [],
+    catalogDelegateAvailable(prisma) ? getPublicAiCatalog(prisma) : null,
     catalogDelegateAvailable(prisma) ? prisma.aiModelRoute.findMany({
       where: { enabled: true, upstreamAvailable: true },
-      select: { channelId: true, upstreamModelId: true, canonicalModel: { select: { canonicalModelKey: true, enabled: true, visible: true, status: true, modality: true } } },
+      select: {
+        channelId: true,
+        upstreamModelId: true,
+        capabilitiesOverride: true,
+        canonicalModel: {
+          select: {
+            canonicalModelKey: true,
+            enabled: true,
+            visible: true,
+            status: true,
+            modality: true,
+            capabilities: true,
+          },
+        },
+      },
     }) : [],
   ]);
   if (!providers.length) {
     throw new CloudAiError('provider_unavailable', '当前没有可用的生图渠道', 503);
   }
-  const publicKeys = new Set(publicModels.map(model => `${model.modality}:${model.canonicalModelKey}`));
-  const aliasMap = new Map(aliases.map(alias => [
-    `${alias.canonicalModel.modality}:${alias.aliasKey}`,
-    alias.canonicalModel,
-  ]));
+  const publicModels = (publicCatalog?.models ?? []).filter(model => (
+    model.modality === 'image' || model.modality === 'video'
+  ));
+  const publicKeys = new Set(publicModels.map(model => `${model.modality}:${model.id}`));
+  const aliasMap = new Map(publicModels.flatMap(model => model.aliases.map(alias => ([
+    `${model.modality}:${catalogAliasKey(alias)}`,
+    model,
+  ] as const))));
   const canonicalForUpstream = (provider: AiProviderChannel, upstreamModelId: string, modality: 'image' | 'video') => {
     const explicit = explicitCanonicalModelKey(modality, upstreamModelId, provider.capabilities);
     if (explicit && publicKeys.has(`${modality}:${explicit}`)) return explicit;
     const aliased = aliasMap.get(`${modality}:${catalogAliasKey(upstreamModelId)}`);
-    return aliased?.enabled && aliased.visible && aliased.status === 'PUBLISHED'
-      ? aliased.canonicalModelKey
-      : null;
+    return aliased?.id ?? null;
+  };
+  const providerById = new Map([...providers, ...videoProviders].map(provider => [provider.id, provider]));
+  const routeMatchesChannelCapability = (route: typeof routes[number], modality: 'image' | 'video') => {
+    if (!route.channelId || !route.canonicalModel) return false;
+    const channel = providerById.get(route.channelId);
+    if (!channel) return false;
+    return modality === 'image'
+      ? imageRouteSupportsRequest(
+        { channel, capabilitiesOverride: route.capabilitiesOverride },
+        route.canonicalModel.canonicalModelKey,
+      )
+      : providerSupportsVideoModel(channel, route.canonicalModel.canonicalModelKey);
   };
   const routeModelsForChannel = (channelId: string, modality: 'image' | 'video') => routes
     .filter(route => route.channelId === channelId
@@ -622,8 +715,21 @@ export async function listWalletImageModels(
       && route.canonicalModel.modality === modality
       && route.canonicalModel.enabled
       && route.canonicalModel.visible
-      && route.canonicalModel.status === 'PUBLISHED')
+      && route.canonicalModel.status === 'PUBLISHED'
+      && routeMatchesChannelCapability(route, modality))
     .map(route => route.canonicalModel!.canonicalModelKey);
+  const modelCapabilitiesForChannel = (channelId: string, modality: 'image' | 'video') => Object.fromEntries(routes
+    .filter(route => route.channelId === channelId
+      && route.canonicalModel !== null
+      && route.canonicalModel.modality === modality
+      && route.canonicalModel.enabled
+      && route.canonicalModel.visible
+      && route.canonicalModel.status === 'PUBLISHED'
+      && routeMatchesChannelCapability(route, modality))
+    .map(route => [
+      route.canonicalModel!.canonicalModelKey,
+      normalizePublicModelCapabilities(route.capabilitiesOverride ?? route.canonicalModel!.capabilities),
+    ]));
   const channels = await Promise.all(providers.map(async (provider) => {
     try {
       await assertPublicProviderUrl(provider.baseUrl);
@@ -651,6 +757,7 @@ export async function listWalletImageModels(
         defaultModel,
         models,
         capabilities: provider.capabilities,
+        modelCapabilities: modelCapabilitiesForChannel(provider.id, 'image'),
         error: null,
       };
     } catch (error) {
@@ -661,6 +768,7 @@ export async function listWalletImageModels(
         defaultModel: provider.defaultModel,
         models: [] as string[],
         capabilities: provider.capabilities,
+        modelCapabilities: {},
         error: error instanceof Error ? error.message.slice(0, 800) : '读取模型失败',
       };
     }
@@ -676,25 +784,40 @@ export async function listWalletImageModels(
       updatedAt: catalogPricing.updatedAt ?? legacyPricing.updatedAt,
     }
     : legacyPricing;
+  const videoChannels = videoProviders.map((provider) => ({
+    id: provider.id,
+    name: provider.name,
+    provider: provider.kind,
+    defaultModel: provider.defaultModel,
+    models: Array.from(new Set([
+      ...routeModelsForChannel(provider.id, 'video'),
+      ...(provider.defaultModel
+        ? [canonicalForUpstream(provider, provider.defaultModel, 'video')].filter((model): model is string => Boolean(model))
+        : []),
+    ])),
+    capabilities: provider.capabilities,
+    modelCapabilities: modelCapabilitiesForChannel(provider.id, 'video'),
+    error: null,
+  }));
+  const availableModelIds = new Set([
+    ...channels.flatMap(channel => channel.models),
+    ...videoChannels.flatMap(channel => channel.models),
+  ]);
+  const catalogMetadata = buildWalletCatalogMetadata(
+    publicModels.filter(model => availableModelIds.has(model.id)),
+    channels,
+    videoChannels,
+  );
   return {
     provider: firstAvailable.provider,
-    defaultModel: firstAvailable.defaultModel,
+    defaultModel: firstAvailable.defaultModel ?? catalogMetadata.defaultImageModel,
+    defaultImageModel: catalogMetadata.defaultImageModel,
+    defaultVideoModel: catalogMetadata.defaultVideoModel,
     models: Array.from(new Set(channels.flatMap((channel) => channel.models))),
+    catalog: catalogMetadata.catalog,
+    capabilities: catalogMetadata.capabilities,
     channels,
-    videoChannels: videoProviders.map((provider) => ({
-      id: provider.id,
-      name: provider.name,
-      provider: provider.kind,
-      defaultModel: provider.defaultModel,
-      models: Array.from(new Set([
-        ...routeModelsForChannel(provider.id, 'video'),
-        ...(provider.defaultModel
-          ? [canonicalForUpstream(provider, provider.defaultModel, 'video')].filter((model): model is string => Boolean(model))
-          : []),
-      ])),
-      capabilities: provider.capabilities,
-      error: null,
-    })),
+    videoChannels,
     pricing,
   };
 }
@@ -816,10 +939,14 @@ function uselgConfiguredImageModels(
   const models = uselgPublicImageModels(discoveredModels);
   const hasBananaDual2K = provider.capabilities.includes('IMAGE_NANO_BANANA_DUAL_2K')
     || provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K');
-  if (provider.capabilities.includes('IMAGE_NANO_BANANA') || hasBananaDual2K) {
+  if (provider.capabilities.includes('IMAGE_NANO_BANANA')
+    || provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_FAST')
+    || hasBananaDual2K) {
     models.push('gemini-3-pro-image-preview');
   }
-  if (provider.capabilities.includes('IMAGE_NANO_BANANA_2') || hasBananaDual2K) {
+  if (provider.capabilities.includes('IMAGE_NANO_BANANA_2')
+    || provider.capabilities.includes('IMAGE_NANO_BANANA_2_FAST')
+    || hasBananaDual2K) {
     models.push('gemini-3.1-flash-image-preview');
   }
   if (provider.capabilities.includes('IMAGE_GPT')
@@ -1089,10 +1216,13 @@ function bigmodelConfiguredImageModels(provider: Pick<AiProviderChannel, 'capabi
   const hasBananaDual2K = provider.capabilities.includes('IMAGE_NANO_BANANA_DUAL_2K')
     || provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_1K');
   if (provider.capabilities.includes('IMAGE_NANO_BANANA')
+    || provider.capabilities.includes('IMAGE_NANO_BANANA_PRO_FAST')
     || hasBananaDual2K) {
     models.push('gemini-3-pro-image-preview');
   }
-  if (provider.capabilities.includes('IMAGE_NANO_BANANA_2') || hasBananaDual2K) {
+  if (provider.capabilities.includes('IMAGE_NANO_BANANA_2')
+    || provider.capabilities.includes('IMAGE_NANO_BANANA_2_FAST')
+    || hasBananaDual2K) {
     models.push('gemini-3.1-flash-image-preview');
   }
   if (provider.capabilities.includes('IMAGE_GPT')
@@ -3524,12 +3654,38 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     ...input,
     inputImages: await resolveReferenceImageSources(prisma, input.userId, input.inputImages),
   };
-  const routeProviders = catalogResolution?.enabledRoutes.flatMap(route => (
-    route.channel ? [route.channel] : []
+  if (catalogResolution
+    && !catalogModelSupportsImageRequest(catalogResolution.model.capabilities, validatedInput.resolution)) {
+    throw new CloudAiError('invalid_request', '所选模型不支持该请求分辨率', 400);
+  }
+  const compatibleCatalogRoutes = catalogResolution?.enabledRoutes.filter(route => (
+    imageRouteSupportsRequest(route, canonicalModelKey, validatedInput.resolution)
   )) ?? [];
+  if (validatedInput.providerChannelId
+    && catalogResolution
+    && !compatibleCatalogRoutes.some(route => route.channelId === validatedInput.providerChannelId)) {
+    throw new CloudAiError(
+      'provider_model_family_mismatch',
+      '所选渠道不支持该模型的请求分辨率',
+      400,
+    );
+  }
+  if (catalogResolution?.model.routingMode === 'MANAGED' && compatibleCatalogRoutes.length === 0) {
+    throw new CloudAiError(
+      'provider_unavailable',
+      '当前没有支持该模型请求分辨率的可用渠道',
+      503,
+    );
+  }
+  const routeProviders = compatibleCatalogRoutes.flatMap(route => (
+    route.channel ? [route.channel] : []
+  ));
   const uniqueRouteProviders = Array.from(new Map(routeProviders.map(provider => [provider.id, provider])).values());
+  const compatibleDefaultRoute = catalogResolution?.route
+    ? compatibleCatalogRoutes.find(route => route.id === catalogResolution.route?.id) ?? compatibleCatalogRoutes[0]
+    : compatibleCatalogRoutes[0];
   const preferredRouteChannelId = validatedInput.providerChannelId
-    ?? catalogResolution?.route?.channelId
+    ?? compatibleDefaultRoute?.channelId
     ?? undefined;
   const preferredRouteProvider = preferredRouteChannelId
     ? uniqueRouteProviders.find(provider => provider.id === preferredRouteChannelId)
@@ -3547,7 +3703,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       validatedInput.clientPlatform,
     );
   const primaryProvider = providers[0]!;
-  const primaryRoute = catalogResolution?.enabledRoutes.find(route => route.channelId === primaryProvider.id)
+  const primaryRoute = compatibleCatalogRoutes.find(route => route.channelId === primaryProvider.id)
     ?? (catalogResolution?.route?.channelId === null ? catalogResolution.route : null)
     ?? null;
   const reservationInput = {
@@ -3573,7 +3729,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
   try {
     for (let index = 0; index < providers.length; index += 1) {
       activeProvider = providers[index]!;
-      const activeRoute = catalogResolution?.enabledRoutes.find(route => route.channelId === activeProvider.id);
+      const activeRoute = compatibleCatalogRoutes.find(route => route.channelId === activeProvider.id);
       activeInput = index === 0
         ? reservationInput
         : {
@@ -3822,18 +3978,82 @@ function videoProviderKind(provider?: VideoInput['provider']) {
   return undefined;
 }
 
-export async function selectVideoProvider(prisma: PrismaClient, preference?: VideoInput['provider'], providerChannelId?: string) {
+export function videoCapabilityForModel(model: string): AiCapability {
+  return isMiniMaxH3VideoModel(model) ? 'VIDEO_MINIMAX' : 'VIDEO';
+}
+
+export function providerSupportsVideoModel(
+  provider: { capabilities: readonly AiCapability[] },
+  model: string,
+) {
+  return provider.capabilities.includes(videoCapabilityForModel(model));
+}
+
+export function videoRouteSupportsRequest<T extends {
+  channel: { capabilities: readonly AiCapability[] } | null;
+  capabilitiesOverride?: unknown;
+}>(route: T, model: string, resolution?: string, duration?: number) {
+  if (!route.channel || !providerSupportsVideoModel(route.channel, model)) return false;
+  const capabilities = normalizePublicModelCapabilities(route.capabilitiesOverride);
+  const requestedResolution = String(resolution || '').trim().toLowerCase();
+  const supportedResolutions = Array.isArray(capabilities.resolutions)
+    ? capabilities.resolutions.map(item => String(item).trim().toLowerCase())
+    : [];
+  if (requestedResolution
+    && supportedResolutions.length > 0
+    && !supportedResolutions.includes(requestedResolution)) return false;
+  const supportedDurations = Array.isArray(capabilities.durations)
+    ? capabilities.durations.map(Number).filter(item => Number.isFinite(item))
+    : [];
+  return duration === undefined
+    || supportedDurations.length === 0
+    || supportedDurations.includes(duration);
+}
+
+export function catalogModelSupportsVideoRequest(
+  capabilitiesValue: unknown,
+  resolution?: string,
+  duration?: number,
+) {
+  const capabilities = normalizePublicModelCapabilities(capabilitiesValue);
+  const requestedResolution = String(resolution || '').trim().toLowerCase();
+  const supportedResolutions = Array.isArray(capabilities.resolutions)
+    ? capabilities.resolutions.map(item => String(item).trim().toLowerCase())
+    : [];
+  if (requestedResolution
+    && supportedResolutions.length > 0
+    && !supportedResolutions.includes(requestedResolution)) return false;
+  const supportedDurations = Array.isArray(capabilities.durations)
+    ? capabilities.durations.map(Number).filter(item => Number.isFinite(item))
+    : [];
+  return duration === undefined
+    || supportedDurations.length === 0
+    || supportedDurations.includes(duration);
+}
+
+export async function selectVideoProvider(
+  prisma: PrismaClient,
+  preference?: VideoInput['provider'],
+  providerChannelId?: string,
+  requestedModel?: string,
+) {
   const kind = videoProviderKind(preference);
   const common = { status: 'ACTIVE' as const, capabilities: { hasSome: VIDEO_PROVIDER_CAPABILITIES } };
   if (providerChannelId) {
     const selected = await prisma.aiProviderChannel.findFirst({ where: { ...common, id: providerChannelId, ...(kind ? { kind } : {}) } });
     if (!selected) throw new CloudAiError('provider_unavailable', '所选视频渠道不可用或已被停用', 503);
+    if (requestedModel && !providerSupportsVideoModel(selected, requestedModel)) {
+      throw new CloudAiError('provider_model_family_mismatch', '所选视频渠道不支持该模型', 400);
+    }
     await assertPublicProviderUrl(selected.baseUrl);
     return selected;
   }
-  const preferred = kind
+  const preferredCandidates = kind
     ? await prisma.aiProviderChannel.findMany({ where: { ...common, kind }, orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }] })
     : [];
+  const preferred = requestedModel
+    ? preferredCandidates.filter(provider => providerSupportsVideoModel(provider, requestedModel))
+    : preferredCandidates;
   if (kind && preferred.length === 0) {
     throw new CloudAiError(
       'provider_unavailable',
@@ -3841,9 +4061,12 @@ export async function selectVideoProvider(prisma: PrismaClient, preference?: Vid
       503,
     );
   }
-  const fallback = preferred.length === 0
+  const fallbackCandidates = preferred.length === 0
     ? await prisma.aiProviderChannel.findMany({ where: common, orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'asc' }] })
     : [];
+  const fallback = requestedModel
+    ? fallbackCandidates.filter(provider => providerSupportsVideoModel(provider, requestedModel))
+    : fallbackCandidates;
   const provider = chooseProviderForCapability(preferred.length ? preferred : fallback, 'VIDEO');
   if (!provider) throw new CloudAiError('provider_unavailable', '当前没有可用的视频渠道', 503);
   await assertPublicProviderUrl(provider.baseUrl);
@@ -4310,16 +4533,39 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
     && (input.inputImages.length > 9 || input.inputVideos.length > 3 || input.inputAudios.length > 3)) {
     throw new CloudAiError('invalid_request', 'MiniMax H3 supports 9 images, 3 videos, and 3 audios at most', 400);
   }
+  if (catalogResolution
+    && !catalogModelSupportsVideoRequest(
+      catalogResolution.model.capabilities,
+      input.resolution,
+      input.duration,
+    )) {
+    throw new CloudAiError('invalid_request', '所选视频模型不支持该分辨率或时长', 400);
+  }
   input = {
     ...input,
     inputImages: await resolveReferenceImageSources(prisma, input.userId, input.inputImages),
   };
+  const compatibleCatalogRoutes = catalogResolution?.enabledRoutes.filter(route => (
+    videoRouteSupportsRequest(route, canonicalModelKey, input.resolution, input.duration)
+  )) ?? [];
+  if (input.providerChannelId
+    && catalogResolution
+    && !compatibleCatalogRoutes.some(route => route.channelId === input.providerChannelId)) {
+    throw new CloudAiError('provider_model_family_mismatch', '所选视频渠道不支持该模型能力', 400);
+  }
+  if (catalogResolution?.model.routingMode === 'MANAGED' && compatibleCatalogRoutes.length === 0) {
+    throw new CloudAiError('provider_unavailable', '当前没有支持该视频模型能力的可用渠道', 503);
+  }
+  const compatibleDefaultRoute = catalogResolution?.route
+    ? compatibleCatalogRoutes.find(route => route.id === catalogResolution.route?.id) ?? compatibleCatalogRoutes[0]
+    : compatibleCatalogRoutes[0];
   const provider = await selectVideoProvider(
     prisma,
     input.provider,
-    input.providerChannelId ?? catalogResolution?.route?.channelId ?? undefined,
+    input.providerChannelId ?? compatibleDefaultRoute?.channelId ?? undefined,
+    canonicalModelKey,
   );
-  const route = catalogResolution?.enabledRoutes.find(candidate => candidate.channelId === provider.id)
+  const route = compatibleCatalogRoutes.find(candidate => candidate.channelId === provider.id)
     ?? (catalogResolution?.route?.channelId === null ? catalogResolution.route : null)
     ?? null;
   const upstreamInput = {

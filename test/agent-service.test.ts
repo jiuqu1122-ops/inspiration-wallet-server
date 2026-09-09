@@ -10,6 +10,7 @@ import {
   isAgentProviderRetryStatus,
   isDefaultAgentModelSentinel,
   isLikelyAgentTextModel,
+  listInspirationProviders,
   looksLikeAgentSsePayload,
   getAgentRequestCredits,
   parseAgentCompletionResponseText,
@@ -30,6 +31,15 @@ describe('Agent provider fallback policy', () => {
     expect(providerSupportsInspirationAnalysis({
       capabilities: ['LLM'],
     })).toBe(false);
+  });
+
+  it('never falls back from Vision requests to an Agent-only channel', async () => {
+    const findMany = vi.fn(async () => []);
+    await expect(listInspirationProviders({ aiProviderChannel: { findMany } } as never)).resolves.toEqual([]);
+    expect(findMany).toHaveBeenCalledOnce();
+    expect(findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { status: 'ACTIVE', capabilities: { has: 'VISION' } },
+    }));
   });
 
   it('charges ten server-side credits for each Agent request', () => {

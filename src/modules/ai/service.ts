@@ -54,17 +54,9 @@ export function providerSupportsInspirationAnalysis(
   return provider.capabilities.includes('VISION');
 }
 
-async function listInspirationProviders(prisma: PrismaClient) {
-  const visionProviders = (await listProviders(prisma, 'VISION'))
+export async function listInspirationProviders(prisma: PrismaClient) {
+  return (await listProviders(prisma, 'VISION'))
     .filter(providerSupportsInspirationAnalysis);
-  // Existing installations only have LLM channels. Keep them working until a
-  // dedicated visual channel is configured in the manager. USELG is excluded
-  // from this legacy fallback so its independent LLM and Vision checkboxes keep
-  // their intended meaning.
-  if (visionProviders.length > 0) return visionProviders;
-  return (await listProviders(prisma)).filter(provider => (
-    provider.kind !== 'USELG'
-  ));
 }
 
 async function selectProvider(prisma: PrismaClient) {

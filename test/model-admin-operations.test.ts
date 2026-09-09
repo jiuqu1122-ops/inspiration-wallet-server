@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   AiModelAdminError,
   createCanonicalFromDiscovery,
+  deleteAdminAiModel,
   mapDiscoveryToCanonical,
   remapAdminAiRoute,
   unmapAdminAiRoute,
@@ -18,6 +19,69 @@ function withTransaction<T extends object>(transaction: T) {
 }
 
 describe('AI Model Center route operations', () => {
+  it('deletes only an unused hidden draft model and records the operation', async () => {
+    const model = {
+      id: 'model-unused',
+      canonicalModelKey: 'gpt-image-2-5-1k',
+      displayName: 'GPT Image 2.5 1K',
+      modality: 'image',
+      status: 'DRAFT',
+      enabled: false,
+      visible: false,
+      updatedAt,
+      _count: { routes: 0, priceVersions: 0, requests: 0, billingSettlements: 0 },
+    };
+    const deleteMany = vi.fn(async () => ({ count: 1 }));
+    const auditCreate = vi.fn(async () => ({}));
+    const transaction = {
+      aiModel: {
+        findUnique: vi.fn(async () => model),
+        deleteMany,
+      },
+      adminOperation: { create: auditCreate },
+    };
+
+    await expect(deleteAdminAiModel(
+      withTransaction(transaction),
+      model.canonicalModelKey,
+      updatedAt.toISOString(),
+      context,
+    )).resolves.toEqual({ deleted: true, modelKey: model.canonicalModelKey });
+    expect(deleteMany).toHaveBeenCalledWith({ where: { id: model.id, updatedAt } });
+    expect(auditCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ type: 'MODEL_DELETED' }),
+    }));
+  });
+
+  it('refuses to delete a model that still owns an upstream route', async () => {
+    const transaction = {
+      aiModel: {
+        findUnique: vi.fn(async () => ({
+          id: 'model-linked',
+          canonicalModelKey: 'linked-image',
+          displayName: 'Linked Image',
+          modality: 'image',
+          status: 'DRAFT',
+          enabled: false,
+          visible: false,
+          updatedAt,
+          _count: { routes: 1, priceVersions: 0, requests: 0, billingSettlements: 0 },
+        })),
+        deleteMany: vi.fn(),
+      },
+      adminOperation: { create: vi.fn() },
+    };
+
+    await expect(deleteAdminAiModel(
+      withTransaction(transaction),
+      'linked-image',
+      updatedAt.toISOString(),
+      context,
+    )).rejects.toMatchObject<AiModelAdminError>({ code: 'INVALID_REQUEST', statusCode: 400 });
+    expect(transaction.aiModel.deleteMany).not.toHaveBeenCalled();
+    expect(transaction.adminOperation.create).not.toHaveBeenCalled();
+  });
+
   it('creates a canonical model and maps its discovery in one transaction', async () => {
     const discovery = {
       id: 'discovery-create',

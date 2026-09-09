@@ -4,6 +4,9 @@ import sharp from 'sharp';
 import {
   IMAGE_GENERATION_TIMEOUT_MS,
   buildNewApiImageGenerationBody,
+  buildWalletCatalogMetadata,
+  catalogModelSupportsImageRequest,
+  catalogModelSupportsVideoRequest,
   buildUselgImage2VariationPrompt,
   chooseProviderForCapability,
   collectGeneratedVideoStrings,
@@ -18,6 +21,7 @@ import {
   generateNewApiImages,
   getWalletImageGenerationByRequest,
   imageCapabilityForModel,
+  imageRouteSupportsRequest,
   imageUnitCredits,
   isNewApiGeminiImageDecodeError,
   isNewApiParamOverrideCopyError,
@@ -36,6 +40,7 @@ import {
   providerSupportsImageModel,
   boundProviderImageResults,
   providerCanServeImageAlongsideAgent,
+  providerSupportsVideoModel,
   resolveBigmodelImageModel,
   resolveImageModel,
   resolveMikotoImageModel,
@@ -61,6 +66,8 @@ import {
   stageXaisPublicReference,
   uniqueImages,
   uselgImageRequestHeaders,
+  videoCapabilityForModel,
+  videoRouteSupportsRequest,
   xaisAttachmentRegistrationUrls,
 } from '../src/modules/ai/image-service.js';
 import { getImageResult } from '../src/modules/ai/image-result-store.js';
@@ -345,6 +352,33 @@ afterEach(() => {
 });
 
 describe('wallet image provider normalization', () => {
+  it('builds the dynamic desktop catalog fields from published server models', () => {
+    const metadata = buildWalletCatalogMetadata([{
+      id: 'gpt-image-medium',
+      displayName: 'GPT Image 2.5',
+      modality: 'image',
+      aliases: ['gpt-image-2.5'],
+      capabilities: { resolutions: ['1k', '2k', '4k'], supportsReferenceImages: true },
+    }, {
+      id: 'seedance-2',
+      displayName: 'Seedance 2.0',
+      modality: 'video',
+      aliases: ['seedance2'],
+      capabilities: { resolutions: ['1080p'], durations: [5, 10] },
+    }], [{ models: ['gpt-image-medium'] }], [{ models: ['seedance-2'] }]);
+
+    expect(metadata).toMatchObject({
+      defaultImageModel: 'gpt-image-medium',
+      defaultVideoModel: 'seedance-2',
+      capabilities: {
+        'gpt-image-medium': { resolutions: ['1k', '2k', '4k'] },
+      },
+    });
+    expect(metadata.catalog).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'gpt-image-medium', displayName: 'GPT Image 2.5', isDefault: true }),
+    ]));
+  });
+
   it('fails over to the next compatible image channel after an upstream 5xx response', async () => {
     const encryptedSecrets = encryptProviderSecrets({ apiKey: 'sk-image-test', headers: {} });
     const provider = (id: string, baseUrl: string, priority: number) => ({
@@ -689,22 +723,46 @@ describe('wallet image provider normalization', () => {
     expect(imageCapabilityForModel('Xais Nano Pro_2K')).toBe('IMAGE_NANO_BANANA');
     expect(imageCapabilityForModel('gemini-3.1-flash-image')).toBe('IMAGE_NANO_BANANA_2');
     expect(imageCapabilityForModel('Nano Banana 2')).toBe('IMAGE_NANO_BANANA_2');
+    expect(imageCapabilityForModel('Nano Banana Pro Fast')).toBe('IMAGE_NANO_BANANA_PRO_FAST');
+    expect(imageCapabilityForModel('Nano Banana 2 Fast')).toBe('IMAGE_NANO_BANANA_2_FAST');
     expect(imageCapabilityForModel('gpt-image-2')).toBe('IMAGE_GPT');
     expect(imageCapabilityForModel('Image2_4K')).toBe('IMAGE_GPT');
     expect(imageCapabilityForModel('Image2_1K')).toBe('IMAGE_GPT_1K');
     expect(providerSupportsImageModel(nano, 'gpt-image-2')).toBe(false);
     expect(providerSupportsImageModel(nano, 'Nano Banana 2')).toBe(false);
     expect(providerSupportsImageModel(nano2, 'Nano Banana 2')).toBe(true);
-    expect(providerSupportsImageModel(nanoProFast, 'gemini-3-pro-image', '2k')).toBe(true);
-    expect(providerSupportsImageModel(nanoProFast, 'gemini-3-pro-image', '4k')).toBe(true);
+    expect(providerSupportsImageModel(nanoProFast, 'gemini-3-pro-image', '2k')).toBe(false);
+    expect(providerSupportsImageModel(nanoProFast, 'nano-banana-pro-fast', '2k')).toBe(true);
+    expect(providerSupportsImageModel(nano, 'nano-banana-pro-fast', '2k')).toBe(false);
     expect(providerSupportsImageModel(nanoProFast, 'gemini-3.1-flash-image', '2k')).toBe(false);
-    expect(providerSupportsImageModel(nano2Fast, 'gemini-3.1-flash-image', '2k')).toBe(true);
+    expect(providerSupportsImageModel(nano2Fast, 'gemini-3.1-flash-image', '2k')).toBe(false);
+    expect(providerSupportsImageModel(nano2Fast, 'nano-banana-2-fast', '2k')).toBe(true);
+    expect(providerSupportsImageModel(nano2, 'nano-banana-2-fast', '2k')).toBe(false);
     expect(providerSupportsImageModel(nano2Fast, 'gemini-3-pro-image', '2k')).toBe(false);
     expect(providerSupportsImageModel(gpt, 'gemini-3.1-flash-image')).toBe(false);
     expect(providerSupportsImageModel({ capabilities: ['IMAGE_GPT_1K'] as const }, 'Image2_1K')).toBe(true);
     expect(providerSupportsImageModel({ capabilities: ['IMAGE_GPT_1K'] as const }, 'Image2_4K')).toBe(false);
     expect(providerSupportsImageModel({ capabilities: ['IMAGE_GPT_1K'] as const }, 'gpt-image-2', '1k')).toBe(true);
     expect(providerSupportsImageModel({ capabilities: ['IMAGE_GPT_1K'] as const }, 'gpt-image-2', '2k')).toBe(false);
+    expect(providerSupportsImageModel(gpt, 'gpt-image-2', '1k')).toBe(false);
+    expect(providerSupportsImageModel(gpt, 'gpt-image-2', '2k')).toBe(true);
+    expect(providerSupportsImageModel(
+      { capabilities: ['IMAGE', 'IMAGE_GPT'] as const },
+      'nano-banana-pro',
+      '2k',
+    )).toBe(false);
+    expect(imageRouteSupportsRequest({ channel: gpt }, 'gpt-image-2', '1k')).toBe(false);
+    expect(imageRouteSupportsRequest(
+      { channel: { capabilities: ['IMAGE_GPT_1K'] as const } },
+      'gpt-image-2',
+      '1k',
+    )).toBe(true);
+    expect(imageRouteSupportsRequest({
+      channel: gpt,
+      capabilitiesOverride: { supportedResolutions: ['4k'] },
+    }, 'gpt-image-2', '2k')).toBe(false);
+    expect(catalogModelSupportsImageRequest({ supportedResolutions: ['2k', '4k'] }, '1k')).toBe(false);
+    expect(catalogModelSupportsImageRequest({ supportedResolutions: ['2k', '4k'] }, '4k')).toBe(true);
     expect(providerSupportsImageModel(legacy, 'custom-image-model')).toBe(true);
     const bananaDual2k = { capabilities: ['IMAGE_NANO_BANANA_DUAL_2K'] as const };
     expect(providerSupportsImageModel(bananaDual2k, 'gemini-3-pro-image-preview')).toBe(true);
@@ -714,6 +772,8 @@ describe('wallet image provider normalization', () => {
     expect(providerSupportsImageModel(bananaDual2k, 'Xais Nano2_4K')).toBe(false);
     expect(providerSupportsImageModel(bananaDual2k, 'gemini-3-pro-image-preview', '1k')).toBe(false);
     expect(providerSupportsImageModel(bananaDual2k, 'gemini-3.1-flash-image-preview', '4k')).toBe(false);
+    expect(providerSupportsImageModel(bananaDual2k, 'nano-banana-pro-fast', '2k')).toBe(false);
+    expect(providerSupportsImageModel(bananaDual2k, 'nano-banana-2-fast', '2k')).toBe(false);
     expect(providerSupportsImageModel(
       { capabilities: ['IMAGE_NANO_BANANA_PRO_1K'] as const },
       'gemini-3-pro-image-preview',
@@ -829,12 +889,60 @@ describe('wallet image provider normalization', () => {
       .toBe('Xais Img2_2K(高画质)');
   });
 
-  it('keeps the shared desktop capability matcher unchanged', () => {
+  it('does not let a 2K/4K GPT Image channel receive a desktop 1K request', () => {
     expect(providerSupportsImageModel(
       { capabilities: ['IMAGE_GPT'] as const },
       'gpt-image-2',
       '1k',
-    )).toBe(true);
+    )).toBe(false);
+  });
+
+  it('keeps generic, fast, dual-resolution, GPT 1K, and Grok channels isolated', () => {
+    const requests = [
+      { model: 'nano-banana-pro', resolution: '2k', capability: 'IMAGE_NANO_BANANA' },
+      { model: 'nano-banana-pro-fast', resolution: '2k', capability: 'IMAGE_NANO_BANANA_PRO_FAST' },
+      { model: 'nano-banana-2', resolution: '4k', capability: 'IMAGE_NANO_BANANA_2' },
+      { model: 'nano-banana-2-fast', resolution: '4k', capability: 'IMAGE_NANO_BANANA_2_FAST' },
+      { model: 'gpt-image-2', resolution: '1k', capability: 'IMAGE_GPT_1K' },
+      { model: 'gpt-image-2', resolution: '4k', capability: 'IMAGE_GPT' },
+      { model: 'grok-imagine-image', resolution: '2k', capability: 'IMAGE_GROK' },
+    ] as const;
+    for (const request of requests) {
+      for (const candidate of requests) {
+        const supported = providerSupportsImageModel(
+          { capabilities: [candidate.capability] },
+          request.model,
+          request.resolution,
+        );
+        expect(supported, `${candidate.capability} unexpectedly matched ${request.model}/${request.resolution}`)
+          .toBe(candidate.capability === request.capability);
+      }
+    }
+    const dual = { capabilities: ['IMAGE_NANO_BANANA_DUAL_2K'] as const };
+    expect(providerSupportsImageModel(dual, 'nano-banana-pro', '2k')).toBe(true);
+    expect(providerSupportsImageModel(dual, 'nano-banana-2', '2k')).toBe(true);
+    expect(providerSupportsImageModel(dual, 'nano-banana-pro', '4k')).toBe(false);
+    expect(providerSupportsImageModel(dual, 'nano-banana-pro-fast', '2k')).toBe(false);
+  });
+
+  it('keeps MiniMax H3 and generic video channels isolated', async () => {
+    const generic = { id: 'video-generic', baseUrl: 'https://8.8.8.8', capabilities: ['VIDEO'] as const };
+    const minimax = { id: 'video-minimax', baseUrl: 'https://8.8.4.4', capabilities: ['VIDEO_MINIMAX'] as const };
+    expect(videoCapabilityForModel('MiniMax-H3')).toBe('VIDEO_MINIMAX');
+    expect(videoCapabilityForModel('seedance-2')).toBe('VIDEO');
+    expect(providerSupportsVideoModel(generic, 'MiniMax-H3')).toBe(false);
+    expect(providerSupportsVideoModel(minimax, 'seedance-2')).toBe(false);
+    expect(videoRouteSupportsRequest({ channel: minimax }, 'MiniMax-H3', '1080p', 5)).toBe(true);
+    expect(videoRouteSupportsRequest({
+      channel: minimax,
+      capabilitiesOverride: { supportedResolutions: ['768p'], supportedDurations: [5] },
+    }, 'MiniMax-H3', '1080p', 5)).toBe(false);
+    expect(catalogModelSupportsVideoRequest({ supportedResolutions: ['720p'], supportedDurations: [5, 10] }, '720p', 15)).toBe(false);
+
+    const findMany = vi.fn(async () => [minimax, generic]);
+    const prisma = { aiProviderChannel: { findMany } } as never;
+    await expect(selectVideoProvider(prisma, undefined, undefined, 'seedance-2')).resolves.toBe(generic);
+    await expect(selectVideoProvider(prisma, undefined, undefined, 'MiniMax-H3')).resolves.toBe(minimax);
   });
 
   it('calls Mikoto Gemini native endpoint with imageConfig', async () => {
