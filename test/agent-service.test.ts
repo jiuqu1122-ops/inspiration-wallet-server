@@ -15,6 +15,7 @@ import {
   canTryAlternativeAgentModel,
   isDefaultAgentModelSentinel,
   isLikelyAgentTextModel,
+  shouldFallbackCanvasTextAgentToAutomaticModel,
   listInspirationProviders,
   looksLikeAgentSsePayload,
   getAgentRequestCredits,
@@ -24,8 +25,29 @@ import {
   resolveConfiguredAgentModel,
   sanitizeAgentUpstreamDetail,
 } from '../src/modules/ai/service.js';
+import { ModelCatalogError } from '../src/modules/ai/model-catalog.js';
 
 describe('Agent provider fallback policy', () => {
+  it('falls stale canvas text selections back to the configured automatic route only', () => {
+    for (const code of ['MODEL_NOT_FOUND', 'MODEL_NOT_AVAILABLE', 'MODEL_ROUTE_NOT_AVAILABLE'] as const) {
+      expect(shouldFallbackCanvasTextAgentToAutomaticModel(
+        'canvas_text_agent',
+        false,
+        new ModelCatalogError(code, 'unavailable', 503),
+      )).toBe(true);
+    }
+    expect(shouldFallbackCanvasTextAgentToAutomaticModel(
+      'chat',
+      false,
+      new ModelCatalogError('MODEL_ROUTE_NOT_AVAILABLE', 'unavailable', 503),
+    )).toBe(false);
+    expect(shouldFallbackCanvasTextAgentToAutomaticModel(
+      'canvas_text_agent',
+      true,
+      new ModelCatalogError('MODEL_ROUTE_NOT_AVAILABLE', 'unavailable', 503),
+    )).toBe(false);
+  });
+
   it('keeps USELG LLM and Vision capabilities independent', () => {
     expect(providerSupportsInspirationAnalysis({
       capabilities: ['VISION'],

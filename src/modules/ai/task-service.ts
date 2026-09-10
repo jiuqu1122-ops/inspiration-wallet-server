@@ -169,6 +169,9 @@ export function sanitizeTaskError(error: unknown): PublicTaskError {
     ? error.message
     : typeof error === 'string' ? error : '任务执行失败';
   const knownCodes: Record<string, string> = {
+    MODEL_NOT_FOUND: 'MODEL_NOT_FOUND',
+    MODEL_NOT_AVAILABLE: 'MODEL_NOT_AVAILABLE',
+    MODEL_ROUTE_NOT_AVAILABLE: 'MODEL_ROUTE_NOT_AVAILABLE',
     provider_request_failed: 'UPSTREAM_UNAVAILABLE',
     provider_stream_interrupted: 'UPSTREAM_UNAVAILABLE',
     provider_invalid_response: 'UPSTREAM_INVALID_RESPONSE',

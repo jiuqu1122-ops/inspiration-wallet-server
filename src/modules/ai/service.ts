@@ -16,6 +16,7 @@ import { ensureAiCatalogSeeded } from './catalog-seed.js';
 import {
   catalogDelegateAvailable,
   legacyUpstreamModelForCanonical,
+  ModelCatalogError,
   resolveCatalogModel,
 } from './model-catalog.js';
 import {
@@ -196,6 +197,21 @@ export function resolveConfiguredAgentModel(
   // defaults are only used for automatic requests.
   if (preferProviderDefault && !requested) return configured || null;
   return requested || configured || null;
+}
+
+export function shouldFallbackCanvasTextAgentToAutomaticModel(
+  usageContext: string | undefined,
+  automaticModelSelection: boolean,
+  error: unknown,
+) {
+  return usageContext === 'canvas_text_agent'
+    && !automaticModelSelection
+    && error instanceof ModelCatalogError
+    && [
+      'MODEL_NOT_FOUND',
+      'MODEL_NOT_AVAILABLE',
+      'MODEL_ROUTE_NOT_AVAILABLE',
+    ].includes(error.code);
 }
 
 const NON_AGENT_TEXT_MODEL_PATTERN = /(?:^|[-_/.\s])(?:embeddings?|embed|rerank|re-rank|image|images|imagen|img2|flux|sdxl|stable[-_.\s]?diffusion|dall[-_.\s]?e|recraft|ideogram|midjourney|seedream|nano[-_.\s]?banana|hidream|kolors|jimeng|video|sora|veo|kling|seedance|tts|speech|whisper|transcrib(?:e|er)|transcription|moderation)(?:$|[-_/.\s\d])/i;
@@ -1369,14 +1385,39 @@ export async function executeWalletAgentChat(
       503,
     );
   }
-  const resolved = catalogDelegateAvailable(prisma)
-    ? automaticModelSelection
-      ? await resolveCatalogModel(prisma, automaticProviderModel, 'chat', {
+  let effectiveAutomaticModelSelection = automaticModelSelection;
+  let resolved = null;
+  if (catalogDelegateAvailable(prisma)) {
+    if (automaticModelSelection) {
+      resolved = await resolveCatalogModel(prisma, automaticProviderModel, 'chat', {
         requireEnabled: true,
         providerChannelId: automaticProvider.id,
-      })
-      : await resolveCatalogModel(prisma, input.model ?? '', 'chat', { requireEnabled: true })
-    : null;
+      });
+    } else {
+      try {
+        resolved = await resolveCatalogModel(prisma, input.model ?? '', 'chat', { requireEnabled: true });
+      } catch (error) {
+        if (!shouldFallbackCanvasTextAgentToAutomaticModel(
+          input.usageContext,
+          automaticModelSelection,
+          error,
+        )) throw error;
+        const fallbackModel = automaticProvider.defaultModel?.trim() ?? '';
+        if (!isLikelyAgentTextModel(fallbackModel)) {
+          throw new CloudAiError(
+            'provider_model_missing',
+            '已启用的首选 Agent 渠道未配置有效的默认文字模型',
+            503,
+          );
+        }
+        resolved = await resolveCatalogModel(prisma, fallbackModel, 'chat', {
+          requireEnabled: true,
+          providerChannelId: automaticProvider.id,
+        });
+        effectiveAutomaticModelSelection = true;
+      }
+    }
+  }
   const canonicalModel = resolved?.model ?? null;
   const route = resolved?.route ?? null;
   const canonicalModelKey = canonicalModel?.canonicalModelKey ?? (input.model?.trim() || 'unmind-agent');
@@ -1426,7 +1467,7 @@ export async function executeWalletAgentChat(
     let successfulRouteId = route?.id ?? null;
     for (const [index, provider] of providers.entries()) {
       let discoveredModels: string[] = [];
-      if (automaticModelSelection) {
+      if (effectiveAutomaticModelSelection) {
         try {
           const secrets = decryptProviderSecrets(provider.encryptedSecrets);
           discoveredModels = await readProviderModels(provider, secrets.apiKey, secrets.headers);
@@ -1463,7 +1504,7 @@ export async function executeWalletAgentChat(
         const retriedModels: string[] = [];
         if (canTryAlternativeAgentModel(error) || canRetrySingleAgentProvider(error)) {
           const failedModel = resolveConfiguredAgentModel(provider, providerAttemptInput.model) || '';
-          const retryModels = automaticModelSelection
+          const retryModels = effectiveAutomaticModelSelection
             ? buildSingleProviderAgentRetryModels(
               provider,
               requestedUpstreamModel,
