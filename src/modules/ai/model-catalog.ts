@@ -152,6 +152,44 @@ export function canonicalDisplayName(key: string, fallback?: string) {
   return known[key] ?? fallback?.trim() ?? key;
 }
 
+export const GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION = {
+  '2k': [
+    '2048x2048',
+    '2048x1152',
+    '1152x2048',
+    '2064x1376',
+    '1376x2064',
+    '2048x1536',
+    '1536x2048',
+    '2016x864',
+    '864x2016',
+    '2080x1664',
+    '1664x2080',
+    '2048x1024',
+    '2064x688',
+  ],
+  '4k': [
+    '2880x2880',
+    '3840x2160',
+    '2160x3840',
+    '3520x2352',
+    '2352x3520',
+    '3312x2480',
+    '2480x3312',
+    '3840x1648',
+    '1648x3840',
+    '3216x2576',
+    '2576x3216',
+    '3840x1920',
+    '3840x1280',
+    '1280x3840',
+  ],
+} as const;
+
+const isGptImage2CatalogKey = (key: string) => (
+  key === 'image2' || key === 'gpt-image-medium'
+);
+
 export function defaultModelCapabilities(key: string, modality: AiModality): Prisma.InputJsonValue {
   if (modality === 'chat') {
     return key === 'gpt-5.6-luna'
@@ -159,10 +197,14 @@ export function defaultModelCapabilities(key: string, modality: AiModality): Pri
       : { contextTiers: [{ maxInputTokens: 272000 }, { minInputTokens: 272001 }] };
   }
   if (modality === 'image') {
-    const supportsOneK = key === 'nano-banana-pro' || key === 'image2';
+    const gptImage2 = isGptImage2CatalogKey(key);
+    const supportsOneK = key === 'nano-banana-pro' || gptImage2;
     return {
       supportedResolutions: supportsOneK ? ['1k', '2k', '4k'] : ['2k', '4k'],
       supportedAspectRatios: ['1:1', '3:4', '4:3', '9:16', '16:9'],
+      ...(gptImage2 ? {
+        supportedAspectRatiosByResolution: GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION,
+      } : {}),
       minReferenceImages: 0,
       maxReferenceImages: 9,
       supportsReferenceImage: true,
@@ -226,9 +268,30 @@ export function normalizePublicModelCapabilities(value: unknown) {
     }
     return undefined;
   };
+  const stringArrayMap = (...keys: string[]) => {
+    for (const key of keys) {
+      const candidate = source[key];
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+      const normalized = Object.fromEntries(Object.entries(candidate)
+        .flatMap(([resolution, options]) => {
+          if (!Array.isArray(options)) return [];
+          const values = options
+            .filter((item): item is string => typeof item === 'string')
+            .map(item => item.trim())
+            .filter(Boolean);
+          return values.length > 0 ? [[resolution.trim().toLowerCase(), values] as const] : [];
+        }));
+      if (Object.keys(normalized).length > 0) return normalized;
+    }
+    return undefined;
+  };
   return Object.fromEntries(Object.entries({
     resolutions: stringArray('resolutions', 'supportedResolutions'),
     aspectRatios: stringArray('aspectRatios', 'supportedAspectRatios'),
+    aspectRatiosByResolution: stringArrayMap(
+      'aspectRatiosByResolution',
+      'supportedAspectRatiosByResolution',
+    ),
     durations: numberArray('durations', 'supportedDurations'),
     maxReferenceImages: numberValue('maxReferenceImages'),
     maxReferenceVideos: numberValue('maxReferenceVideos'),

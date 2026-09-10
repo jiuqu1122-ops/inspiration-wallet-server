@@ -31,6 +31,7 @@ import { resolveReferenceImageSources } from './reference-upload-service.js';
 import { creditDecimal, serializeCredit } from '../wallets/credit-amount.js';
 import { ensureAiCatalogSeeded } from './catalog-seed.js';
 import {
+  GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION,
   catalogDelegateAvailable,
   catalogAliasKey,
   explicitCanonicalModelKey,
@@ -242,25 +243,68 @@ export function providerSupportsImageModel(
 export function imageRouteSupportsRequest<T extends {
   channel: { capabilities: readonly AiCapability[] } | null;
   capabilitiesOverride?: unknown;
-}>(route: T, model: string, resolution?: string) {
+}>(route: T, model: string, resolution?: string, aspectRatio?: string) {
   if (!route.channel || !providerSupportsImageModel(route.channel, model, resolution)) return false;
   const requestedResolution = String(resolution || '').trim().toLowerCase();
-  if (!requestedResolution) return true;
   const routeCapabilities = normalizePublicModelCapabilities(route.capabilitiesOverride);
   const supportedResolutions = Array.isArray(routeCapabilities.resolutions)
     ? routeCapabilities.resolutions.map(item => String(item).trim().toLowerCase())
     : [];
-  return supportedResolutions.length === 0 || supportedResolutions.includes(requestedResolution);
+  if (requestedResolution
+    && supportedResolutions.length > 0
+    && !supportedResolutions.includes(requestedResolution)) return false;
+  return capabilitiesSupportImageAspectRatio(
+    routeCapabilities,
+    requestedResolution,
+    aspectRatio,
+    true,
+  );
 }
 
-export function catalogModelSupportsImageRequest(capabilities: unknown, resolution?: string) {
+function capabilitiesSupportImageAspectRatio(
+  capabilities: ReturnType<typeof normalizePublicModelCapabilities>,
+  requestedResolution: string,
+  aspectRatio?: string,
+  allowUnspecifiedExactDimensions = false,
+) {
+  const requested = String(aspectRatio || '').trim().replace(/×/g, 'x').toLowerCase();
+  if (!requested) return true;
+  const usesExactDimensions = /^\d+x\d+$/.test(requested);
+  const supportedAspectRatios = Array.isArray(capabilities.aspectRatios)
+    ? capabilities.aspectRatios.map(item => String(item).trim().replace(/×/g, 'x').toLowerCase())
+    : [];
+  const byResolution = capabilities.aspectRatiosByResolution;
+  const resolutionOptions = byResolution
+    && typeof byResolution === 'object'
+    && !Array.isArray(byResolution)
+    ? (byResolution as Record<string, string[]>)[requestedResolution]
+    : undefined;
+  if (Array.isArray(resolutionOptions) && resolutionOptions.length > 0) {
+    return resolutionOptions.some(item => String(item).trim().replace(/×/g, 'x').toLowerCase() === requested);
+  }
+  // Older route discovery data only advertised the five legacy ratios. The
+  // canonical model has already validated exact Image2 dimensions, so the
+  // absence of a route-level dimension table must not reject those requests.
+  // A route that explicitly supplies a per-resolution table remains narrower.
+  if (usesExactDimensions && allowUnspecifiedExactDimensions) return true;
+  if (supportedAspectRatios.includes(requested)) return true;
+  return supportedAspectRatios.length === 0;
+}
+
+export function catalogModelSupportsImageRequest(
+  capabilities: unknown,
+  resolution?: string,
+  aspectRatio?: string,
+) {
   const requestedResolution = String(resolution || '').trim().toLowerCase();
-  if (!requestedResolution) return true;
   const normalized = normalizePublicModelCapabilities(capabilities);
   const supportedResolutions = Array.isArray(normalized.resolutions)
     ? normalized.resolutions.map(item => String(item).trim().toLowerCase())
     : [];
-  return supportedResolutions.length === 0 || supportedResolutions.includes(requestedResolution);
+  if (requestedResolution
+    && supportedResolutions.length > 0
+    && !supportedResolutions.includes(requestedResolution)) return false;
+  return capabilitiesSupportImageAspectRatio(normalized, requestedResolution, aspectRatio);
 }
 
 export function filterProviderImageModels(
@@ -286,7 +330,7 @@ export type ImageInput = {
   negativePrompt?: string | undefined;
   preserveReferenceIdentity?: boolean | undefined;
   inputImages: string[];
-  aspectRatio: '1:1' | '3:4' | '4:3' | '9:16' | '16:9';
+  aspectRatio: string;
   resolution?: string | undefined;
   outputFormat: 'jpg' | 'jpeg' | 'png' | 'webp';
   background?: 'transparent' | undefined;
@@ -1298,11 +1342,12 @@ function normalizedImageResolution(resolution?: string): PricedImageResolution {
   return '2k';
 }
 
-function newApiExactImageSize(
-  ratio: ImageInput['aspectRatio'],
-  resolution?: string,
-) {
-  const sizes: Record<PricedImageResolution, Record<ImageInput['aspectRatio'], string>> = {
+function newApiExactImageSize(ratio: string, resolution?: string) {
+  const normalizedResolution = normalizedImageResolution(resolution);
+  const requested = ratio.trim().replace(/×/g, 'x');
+  const exactOptions = GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION[normalizedResolution as '2k' | '4k'];
+  if (exactOptions?.some(option => option.toLowerCase() === requested.toLowerCase())) return requested;
+  const sizes: Record<PricedImageResolution, Record<string, string>> = {
     '1k': {
       '1:1': '1024x1024',
       '3:4': '768x1024',
@@ -1325,7 +1370,7 @@ function newApiExactImageSize(
       '16:9': '3840x2160',
     },
   };
-  return sizes[normalizedImageResolution(resolution)][ratio];
+  return sizes[normalizedResolution][requested] ?? sizes[normalizedResolution]['1:1'];
 }
 
 export function newApiImageRequestParams(
@@ -1352,10 +1397,12 @@ export function newApiImageRequestParams(
   const size = family === 'gpt-image-2'
     ? newApiExactImageSize(ratio, resolution)
     : sizeFromRatio(ratio);
+  const usesExactGptImage2Size = family === 'gpt-image-2'
+    && /^\d+x\d+$/i.test(ratio.trim().replace(/×/g, 'x'));
   return {
     n: count,
     size,
-    aspect_ratio: ratio,
+    ...(!usesExactGptImage2Size ? { aspect_ratio: ratio } : {}),
     ...(family === 'gpt-image-2' ? { quality: 'medium' } : {}),
     ...(transparentPng ? {
       output_format: 'png',
@@ -1998,11 +2045,10 @@ async function uploadStoredImageResultToStorage(stableUrl: string) {
     source: stored.path,
     mime: stored.mime,
   });
-  if (!await storageService.exists(objectName)) {
-    throw new Error('generated image mirror object is missing after upload');
-  }
-  // Validate that the object key can be signed before publishing the stable
-  // API URL. Clients resolve that URL to a fresh provider-specific signed URL.
+  // A successful provider upload is already the commit acknowledgement. Avoid
+  // a second synchronous network round trip here: on a degraded COS route the
+  // redundant HEAD used to keep the desktop request waiting long after the
+  // upstream image was complete. Signing still validates the returned key.
   storageService.getDownloadUrl(objectName);
   return stableUrl;
 }
@@ -3619,6 +3665,7 @@ async function generateImagesFromProvider(
   provider: AiProviderChannel,
   effectiveInput: ImageInput,
 ) {
+  const startedAt = Date.now();
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
   const generateBatch = async (input: ImageInput) => provider.kind === 'XAIS'
     ? generateXaisImages(provider, secrets, input)
@@ -3633,10 +3680,23 @@ async function generateImagesFromProvider(
   for (const input of splitTabletImageProviderInputs(effectiveInput)) {
     providerImages.push(...await generateBatch(input));
   }
+  const upstreamCompletedAt = Date.now();
   const boundedProviderImages = boundProviderImageResults(providerImages, effectiveInput.count);
   const images = provider.kind === 'XAIS'
     ? await mirrorXaisImageResults(boundedProviderImages, provider.name)
     : await mirrorGeneratedImageResults(boundedProviderImages, provider.name);
+  const mirrorCompletedAt = Date.now();
+  console.info('[image_generation_timing]', {
+    clientRequestId: effectiveInput.clientRequestId,
+    providerId: provider.id,
+    provider: provider.name,
+    model: effectiveInput.model,
+    resolution: effectiveInput.resolution ?? '',
+    upstreamDurationMs: upstreamCompletedAt - startedAt,
+    mirrorDurationMs: mirrorCompletedAt - upstreamCompletedAt,
+    totalDurationMs: mirrorCompletedAt - startedAt,
+    resultCount: images.length,
+  });
   if (!images.length) throw new Error('渠道没有返回图片数据');
   return images;
 }
@@ -3655,11 +3715,20 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     inputImages: await resolveReferenceImageSources(prisma, input.userId, input.inputImages),
   };
   if (catalogResolution
-    && !catalogModelSupportsImageRequest(catalogResolution.model.capabilities, validatedInput.resolution)) {
+    && !catalogModelSupportsImageRequest(
+      catalogResolution.model.capabilities,
+      validatedInput.resolution,
+      validatedInput.aspectRatio,
+    )) {
     throw new CloudAiError('invalid_request', '所选模型不支持该请求分辨率', 400);
   }
   const compatibleCatalogRoutes = catalogResolution?.enabledRoutes.filter(route => (
-    imageRouteSupportsRequest(route, canonicalModelKey, validatedInput.resolution)
+    imageRouteSupportsRequest(
+      route,
+      canonicalModelKey,
+      validatedInput.resolution,
+      validatedInput.aspectRatio,
+    )
   )) ?? [];
   if (validatedInput.providerChannelId
     && catalogResolution

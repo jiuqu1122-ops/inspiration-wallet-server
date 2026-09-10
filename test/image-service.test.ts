@@ -726,6 +726,8 @@ describe('wallet image provider normalization', () => {
     expect(imageCapabilityForModel('Nano Banana Pro Fast')).toBe('IMAGE_NANO_BANANA_PRO_FAST');
     expect(imageCapabilityForModel('Nano Banana 2 Fast')).toBe('IMAGE_NANO_BANANA_2_FAST');
     expect(imageCapabilityForModel('gpt-image-2')).toBe('IMAGE_GPT');
+    expect(imageCapabilityForModel('gpt-image-2.5', '1k')).toBe('IMAGE_GPT_1K');
+    expect(imageCapabilityForModel('gpt-image-2.5', '2k')).toBe('IMAGE_GPT');
     expect(imageCapabilityForModel('Image2_4K')).toBe('IMAGE_GPT');
     expect(imageCapabilityForModel('Image2_1K')).toBe('IMAGE_GPT_1K');
     expect(providerSupportsImageModel(nano, 'gpt-image-2')).toBe(false);
@@ -747,6 +749,18 @@ describe('wallet image provider normalization', () => {
     expect(providerSupportsImageModel(gpt, 'gpt-image-2', '1k')).toBe(false);
     expect(providerSupportsImageModel(gpt, 'gpt-image-2', '2k')).toBe(true);
     expect(providerSupportsImageModel(
+      { capabilities: ['IMAGE_GPT_1K'] as const },
+      'gpt-image-2.5',
+      '1k',
+    )).toBe(true);
+    expect(providerSupportsImageModel(
+      { capabilities: ['IMAGE_GPT_1K'] as const },
+      'gpt-image-2.5',
+      '2k',
+    )).toBe(false);
+    expect(providerSupportsImageModel(gpt, 'gpt-image-2.5', '1k')).toBe(false);
+    expect(providerSupportsImageModel(gpt, 'gpt-image-2.5', '4k')).toBe(true);
+    expect(providerSupportsImageModel(
       { capabilities: ['IMAGE', 'IMAGE_GPT'] as const },
       'nano-banana-pro',
       '2k',
@@ -763,6 +777,31 @@ describe('wallet image provider normalization', () => {
     }, 'gpt-image-2', '2k')).toBe(false);
     expect(catalogModelSupportsImageRequest({ supportedResolutions: ['2k', '4k'] }, '1k')).toBe(false);
     expect(catalogModelSupportsImageRequest({ supportedResolutions: ['2k', '4k'] }, '4k')).toBe(true);
+    const exactDimensions = {
+      supportedResolutions: ['1k', '2k', '4k'],
+      supportedAspectRatios: ['1:1', '16:9'],
+      supportedAspectRatiosByResolution: {
+        '2k': ['2048x2048', '2048x1152'],
+        '4k': ['2880x2880', '3840x2160'],
+      },
+    };
+    expect(catalogModelSupportsImageRequest(exactDimensions, '2k', '2048x1152')).toBe(true);
+    expect(catalogModelSupportsImageRequest(exactDimensions, '4k', '2048x1152')).toBe(false);
+    expect(catalogModelSupportsImageRequest(exactDimensions, '4k', '3840x2160')).toBe(true);
+    expect(imageRouteSupportsRequest({
+      channel: gpt,
+      capabilitiesOverride: {
+        supportedResolutions: ['2k', '4k'],
+        supportedAspectRatios: ['1:1', '16:9'],
+      },
+    }, 'gpt-image-2.5', '2k', '2048x1152')).toBe(true);
+    expect(imageRouteSupportsRequest({
+      channel: gpt,
+      capabilitiesOverride: {
+        supportedResolutions: ['2k', '4k'],
+        supportedAspectRatiosByResolution: { '4k': ['3840x2160'] },
+      },
+    }, 'gpt-image-2.5', '4k', '3520x2352')).toBe(false);
     expect(providerSupportsImageModel(legacy, 'custom-image-model')).toBe(true);
     const bananaDual2k = { capabilities: ['IMAGE_NANO_BANANA_DUAL_2K'] as const };
     expect(providerSupportsImageModel(bananaDual2k, 'gemini-3-pro-image-preview')).toBe(true);
@@ -1357,6 +1396,16 @@ describe('wallet image provider normalization', () => {
       n: 1,
       size: '2048x1152',
       aspect_ratio: '16:9',
+      quality: 'medium',
+    });
+    expect(newApiImageRequestParams('gpt-image-2.5', 1, '3520x2352', '4K')).toEqual({
+      n: 1,
+      size: '3520x2352',
+      quality: 'medium',
+    });
+    expect(newApiImageRequestParams('gpt-image-2.5', 1, '2048x1152', '2K')).toEqual({
+      n: 1,
+      size: '2048x1152',
       quality: 'medium',
     });
   });

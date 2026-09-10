@@ -112,6 +112,22 @@ describe('object storage abstraction', () => {
     )).toThrow(/does not belong/i);
   });
 
+  it('enforces the per-upload timeout for Tencent COS', async () => {
+    const tencent = tencentClient();
+    tencent.putObject.mockImplementation(() => new Promise(() => {}));
+    const service = new ObjectStorageService(
+      { ...baseConfig, provider: 'tencent-cos' },
+      { tencent: tencent as never },
+    );
+
+    await expect(service.upload({
+      objectKey: 'generated-images/slow.png',
+      source: Buffer.from('image'),
+      contentType: 'image/png',
+      timeoutMs: 20,
+    })).rejects.toThrow('Tencent COS upload timed out after 20ms');
+  });
+
   it('recognizes internal URLs only for the active provider and the configured historical OSS bucket', () => {
     const ownCosUrl = (
       'https://inspirationdrawer-1475663212.cos.ap-singapore.myqcloud.com/'

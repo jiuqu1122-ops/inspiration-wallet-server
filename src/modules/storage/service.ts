@@ -116,7 +116,9 @@ export class ObjectStorageService {
       ...(input.metadata ? { metadata: input.metadata } : {}),
       timeoutMs: input.namespace === 'generated-videos' || input.namespace === 'client-assets'
         ? 10 * 60_000
-        : 30_000,
+        : input.namespace === 'generated-images'
+          ? 4 * 60_000
+          : 30_000,
     }).then(() => objectKey);
   }
 

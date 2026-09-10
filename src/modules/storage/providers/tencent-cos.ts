@@ -52,6 +52,26 @@ function headersOf(result: TencentCosResult) {
   return result.headers && typeof result.headers === 'object' ? result.headers : {};
 }
 
+async function withCosTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  operationName: string,
+  onTimeout?: () => void,
+) {
+  let timeout: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      onTimeout?.();
+      reject(new Error(`Tencent COS ${operationName} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([operation, timeoutPromise]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 export class TencentCosProvider implements ObjectStorageProvider {
   readonly name = 'tencent-cos' as const;
   readonly configured: boolean;
@@ -99,18 +119,19 @@ export class TencentCosProvider implements ObjectStorageProvider {
     const contentLength = typeof input.source === 'string'
       ? (await stat(input.source)).size
       : input.source.byteLength;
-    const body = typeof input.source === 'string' ? createReadStream(input.source) : input.source;
+    const fileStream = typeof input.source === 'string' ? createReadStream(input.source) : null;
+    const body = fileStream ?? input.source;
     const metadata = Object.fromEntries(
       Object.entries(input.metadata ?? {}).map(([key, value]) => [`x-cos-meta-${key}`, value]),
     ) as Record<`x-cos-meta-${string}`, string>;
-    const result = await this.requireClient().putObject({
+    const result = await withCosTimeout(this.requireClient().putObject({
       ...this.objectParams(objectKey),
       Body: body,
       ContentLength: contentLength,
       ContentType: input.contentType,
       ...(input.cacheControl ? { CacheControl: input.cacheControl } : {}),
       ...metadata,
-    });
+    }), input.timeoutMs ?? 10 * 60_000, 'upload', () => fileStream?.destroy());
     return {
       objectKey,
       contentLength,
@@ -123,7 +144,11 @@ export class TencentCosProvider implements ObjectStorageProvider {
   async headObject(value: string) {
     const objectKey = validateObjectKey(value);
     try {
-      const result = await this.requireClient().headObject(this.objectParams(objectKey));
+      const result = await withCosTimeout(
+        this.requireClient().headObject(this.objectParams(objectKey)),
+        15_000,
+        'HEAD',
+      );
       const headers = headersOf(result);
       const contentLength = Number(headerValue(headers, 'content-length'));
       return {
@@ -150,7 +175,11 @@ export class TencentCosProvider implements ObjectStorageProvider {
   async delete(value: string) {
     const objectKey = validateObjectKey(value);
     try {
-      await this.requireClient().deleteObject(this.objectParams(objectKey));
+      await withCosTimeout(
+        this.requireClient().deleteObject(this.objectParams(objectKey)),
+        15_000,
+        'delete',
+      );
       return true;
     } catch (error) {
       if (isNotFound(error)) return false;

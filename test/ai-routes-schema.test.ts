@@ -38,6 +38,29 @@ describe('wallet AI request compatibility', () => {
     expect(normalized.preserveReferenceIdentity).toBe(false);
   });
 
+  it('accepts exact Image2 pixel dimensions and rejects malformed sizes', () => {
+    expect(normalizeImageRequestBody({
+      clientRequestId: 'canvas-image-request-exact-size',
+      model: 'gpt-image-2.5',
+      prompt: 'render a projector',
+      inputImages: [],
+      aspectRatio: '3520x2352',
+      resolution: '4k',
+      outputFormat: 'jpg',
+      count: 1,
+    }).aspectRatio).toBe('3520x2352');
+    expect(() => normalizeImageRequestBody({
+      clientRequestId: 'canvas-image-request-bad-size',
+      model: 'gpt-image-2.5',
+      prompt: 'render a projector',
+      inputImages: [],
+      aspectRatio: '9000x2352',
+      resolution: '4k',
+      outputFormat: 'jpg',
+      count: 1,
+    })).toThrow();
+  });
+
   it('accepts an explicit product-consistency reference lock', () => {
     expect(normalizeImageRequestBody({
       clientRequestId: 'canvas-image-request-product-lock',

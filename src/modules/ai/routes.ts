@@ -75,6 +75,25 @@ const isMiniMaxH3VideoModel = (model: string) => (
   model.trim().toLowerCase().replace(/[\s_.-]+/g, '') === 'minimaxh3'
 );
 
+const imageAspectRatioSchema = z.string().trim().min(3).max(20).superRefine((value, context) => {
+  const normalized = value.replace(/×/g, 'x');
+  const match = normalized.match(/^([1-9]\d{0,4})(:|x)([1-9]\d{0,4})$/i);
+  if (!match) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Image aspect ratio must be a ratio or pixel dimension',
+    });
+    return;
+  }
+  if (match[2]?.toLowerCase() === 'x'
+    && (Number(match[1]) > 8192 || Number(match[3]) > 8192)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Image pixel dimensions must not exceed 8192',
+    });
+  }
+}).transform(value => value.replace(/×/g, 'x'));
+
 const imageSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
   clientPlatform: z.literal('tablet').optional(),
@@ -87,7 +106,7 @@ const imageSchema = z.object({
   negativePrompt: optionalString(20_000),
   preserveReferenceIdentity: z.boolean().default(false),
   inputImages: z.array(z.string().min(1).max(12_000_000)).max(9).default([]),
-  aspectRatio: z.enum(['1:1', '3:4', '4:3', '9:16', '16:9']).default('1:1'),
+  aspectRatio: imageAspectRatioSchema.default('1:1'),
   resolution: optionalString(20),
   outputFormat: z.enum(['jpg', 'jpeg', 'png', 'webp']).default('jpg'),
   background: z.enum(['transparent']).nullish()
