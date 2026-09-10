@@ -15,7 +15,6 @@ import { ensureAiCatalogSeeded } from './catalog-seed.js';
 import {
   catalogDelegateAvailable,
   legacyUpstreamModelForCanonical,
-  resolveAutomaticChatModel,
   resolveCatalogModel,
 } from './model-catalog.js';
 import {
@@ -1358,14 +1357,19 @@ export async function executeWalletAgentChat(
   const automaticProviderModel = automaticModelSelection
     ? automaticProvider.defaultModel?.trim() ?? ''
     : '';
+  if (automaticModelSelection && !isLikelyAgentTextModel(automaticProviderModel)) {
+    throw new CloudAiError(
+      'provider_model_missing',
+      '已启用的首选 Agent 渠道未配置有效的默认文字模型',
+      503,
+    );
+  }
   const resolved = catalogDelegateAvailable(prisma)
     ? automaticModelSelection
-      ? automaticProviderModel
-        ? await resolveCatalogModel(prisma, automaticProviderModel, 'chat', {
-          requireEnabled: true,
-          providerChannelId: automaticProvider.id,
-        })
-        : await resolveAutomaticChatModel(prisma)
+      ? await resolveCatalogModel(prisma, automaticProviderModel, 'chat', {
+        requireEnabled: true,
+        providerChannelId: automaticProvider.id,
+      })
       : await resolveCatalogModel(prisma, input.model ?? '', 'chat', { requireEnabled: true })
     : null;
   const canonicalModel = resolved?.model ?? null;
