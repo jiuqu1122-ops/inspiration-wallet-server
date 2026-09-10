@@ -686,6 +686,37 @@ describe('wallet image provider normalization', () => {
     });
   });
 
+  it('replays a completed image request instead of returning duplicate_request', async () => {
+    const result = {
+      images: ['https://provider.example/generated.png'],
+      provider: 'MIKOTO',
+      providerChannelId: 'channel-1',
+      providerChannelName: 'primary',
+      model: 'gpt-image-2',
+      chargedCredits: '18',
+    };
+    const findUnique = vi.fn(async () => ({
+      capability: 'IMAGE',
+      status: 'SUCCEEDED',
+      completedAt: new Date(1_725_000_000_000),
+      result,
+    }));
+    const prisma = { aiRequest: { findUnique } };
+
+    await expect(executeWalletImageGeneration(prisma as never, {
+      userId: 'user-1',
+      clientRequestId: 'replay-request-1',
+      model: 'gpt-image-2',
+      prompt: 'same request',
+      inputImages: [],
+      aspectRatio: '1:1',
+      resolution: '2k',
+      outputFormat: 'png',
+      count: 1,
+    })).resolves.toEqual(result);
+    expect(findUnique).toHaveBeenCalledTimes(1);
+  });
+
   it('extracts the image channel model IDs returned by /v1/models', () => {
     expect(collectProviderModelIds({
       data: [

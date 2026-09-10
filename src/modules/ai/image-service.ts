@@ -3430,10 +3430,16 @@ async function reserveImageCredits(
     ? calculateSnapshotCharge({ ...pricingSnapshot, request: { ...pricingSnapshot.request, count: 1 } }).totalCredits
     : legacyUnitCredits!.toString();
   const estimatedCredits = creditDecimal(estimated);
-  const requestId = await prisma.$transaction(async (transaction) => {
+  const reservation = await prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({
       where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } },
     });
+    if (existing?.status === 'SUCCEEDED') {
+      const result = parseWalletImageGenerationResult(
+        storageService.rewriteStoredUrls(existing.result) as Prisma.JsonValue | null,
+      );
+      if (result) return { replayResult: result } as const;
+    }
     const reusableRequest = existing?.status === 'FAILED'
       ? existing
       : null;
@@ -3504,7 +3510,8 @@ async function reserveImageCredits(
     });
     return request.id;
   });
-  return { requestId, estimated, unitCredits };
+  if (typeof reservation !== 'string') return reservation;
+  return { requestId: reservation, estimated, unitCredits };
 }
 
 async function settleImageCredits(
@@ -3715,6 +3722,51 @@ async function generateImagesFromProvider(
 }
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
+  const requestStartedAt = Date.now();
+
+  // A client may retry the POST after the upstream provider has completed but
+  // before the original response reached the desktop.  The request ID is the
+  // idempotency key, so a completed request must be replayable instead of
+  // turning into a 409 that leaves the client waiting forever.
+  const existingResult = typeof (prisma as PrismaClient & {
+    aiRequest?: { findUnique?: unknown };
+  }).aiRequest?.findUnique === 'function'
+    ? await getWalletImageGenerationByRequest(
+      prisma,
+      input.userId,
+      input.clientRequestId,
+    )
+    : null;
+  if (existingResult?.status === 'succeeded'
+    && existingResult.images?.length
+    && existingResult.provider
+    && existingResult.providerChannelId
+    && existingResult.providerChannelName
+    && existingResult.model
+    && existingResult.chargedCredits) {
+    console.info('[image_generation_replay]', {
+      clientRequestId: input.clientRequestId,
+      requestedModel: input.model,
+      requestedProvider: input.provider ?? '',
+      requestedProviderChannelId: input.providerChannelId ?? '',
+      requestedResolution: input.resolution ?? '',
+      requestedAspectRatio: input.aspectRatio,
+      actualProvider: existingResult.provider,
+      actualProviderChannelId: existingResult.providerChannelId,
+      actualModel: existingResult.model,
+      durationMs: Date.now() - requestStartedAt,
+      source: 'preflight',
+    });
+    return {
+      images: existingResult.images,
+      provider: existingResult.provider,
+      providerChannelId: existingResult.providerChannelId,
+      providerChannelName: existingResult.providerChannelName,
+      model: existingResult.model,
+      chargedCredits: existingResult.chargedCredits,
+    };
+  }
+
   await ensureAiCatalogSeeded(prisma);
   const catalogResolution = catalogDelegateAvailable(prisma)
     ? await resolveCatalogModel(prisma, input.model, 'image', {
@@ -3812,6 +3864,23 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     pricingSnapshot,
     canonicalModelKey,
   );
+  if ('replayResult' in reservation) {
+    console.info('[image_generation_replay]', {
+      clientRequestId: input.clientRequestId,
+      requestedModel: input.model,
+      requestedProvider: input.provider ?? '',
+      requestedProviderChannelId: input.providerChannelId ?? '',
+      requestedResolution: input.resolution ?? '',
+      requestedAspectRatio: input.aspectRatio,
+      actualProvider: reservation.replayResult.provider,
+      actualProviderChannelId: reservation.replayResult.providerChannelId,
+      actualModel: reservation.replayResult.model,
+      durationMs: Date.now() - requestStartedAt,
+      source: 'reservation-race',
+    });
+    return reservation.replayResult;
+  }
+  const reservedAt = Date.now();
   let activeProvider = primaryProvider;
   let activeInput = reservationInput;
   try {
@@ -3844,6 +3913,26 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
           pricingSnapshot,
           activeRoute?.id ?? null,
         );
+        console.info('[image_generation_complete]', {
+          clientRequestId: input.clientRequestId,
+          reservationRequestId: reservation.requestId,
+          requestedModel: input.model,
+          requestedProvider: input.provider ?? '',
+          requestedProviderChannelId: input.providerChannelId ?? '',
+          requestedResolution: input.resolution ?? '',
+          requestedAspectRatio: input.aspectRatio,
+          canonicalModelKey,
+          submittedUpstreamModel: activeInput.model,
+          initialUpstreamModel: reservationInput.model,
+          actualProvider: publicWalletImageProviderKind(activeProvider),
+          actualProviderChannelId: activeProvider.id,
+          actualProviderChannelName: activeProvider.name,
+          routeId: activeRoute?.id ?? '',
+          reservationDurationMs: reservedAt - requestStartedAt,
+          generationDurationMs: Date.now() - reservedAt,
+          totalDurationMs: Date.now() - requestStartedAt,
+          resultCount: images.length,
+        });
         return {
           images,
           provider: publicWalletImageProviderKind(activeProvider),
@@ -3873,6 +3962,22 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     }
     throw new Error('全部生图渠道请求失败');
   } catch (error) {
+    console.warn('[image_generation_failed]', {
+      clientRequestId: input.clientRequestId,
+      reservationRequestId: reservation.requestId,
+      requestedModel: input.model,
+      requestedProvider: input.provider ?? '',
+      requestedProviderChannelId: input.providerChannelId ?? '',
+      requestedResolution: input.resolution ?? '',
+      requestedAspectRatio: input.aspectRatio,
+      canonicalModelKey,
+      submittedUpstreamModel: activeInput.model,
+      initialUpstreamModel: reservationInput.model,
+      lastProviderId: activeProvider.id,
+      lastProviderName: activeProvider.name,
+      totalDurationMs: Date.now() - requestStartedAt,
+      error: error instanceof Error ? error.message : String(error),
+    });
     await releaseImageCredits(prisma, reservationInput, reservation.requestId, reservation.estimated);
     if (error instanceof CloudAiError) throw error;
     if (error instanceof UpstreamImageError) {
