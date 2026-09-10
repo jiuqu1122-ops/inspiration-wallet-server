@@ -1,4 +1,5 @@
 import type { AiCapability, AiProviderChannel, Prisma, PrismaClient } from '@prisma/client';
+import { Agent } from 'undici';
 import { env } from '../../config/env.js';
 import { decryptProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
@@ -27,6 +28,14 @@ import {
 } from './pricing-center.js';
 
 const REQUEST_CREDITS = BigInt(env.AGENT_REQUEST_CREDITS);
+const agentUpstreamDispatcher = new Agent({
+  connectTimeout: env.AI_UPSTREAM_CONNECT_TIMEOUT_MS,
+  // Application timers below provide the user-facing timeout classification.
+  // Keep Undici slightly behind them so an ambiguous accepted request is never
+  // misclassified as a retry-safe transport failure.
+  headersTimeout: env.AI_UPSTREAM_FIRST_RESPONSE_TIMEOUT_MS + 5_000,
+  bodyTimeout: env.AI_UPSTREAM_IDLE_TIMEOUT_MS + 5_000,
+});
 
 export const getAgentRequestCredits = () => REQUEST_CREDITS;
 
@@ -683,8 +692,28 @@ class AgentUpstreamHttpError extends Error {
   }
 }
 
+export type AgentUpstreamTimeoutPhase = 'first_response' | 'stream_idle';
+
+export class AgentUpstreamTimeoutError extends Error {
+  constructor(
+    public readonly phase: AgentUpstreamTimeoutPhase,
+    public readonly timeoutMs: number,
+  ) {
+    super(phase === 'first_response'
+      ? `Upstream Agent did not return response headers within ${timeoutMs}ms`
+      : `Upstream Agent stream was idle for ${timeoutMs}ms`);
+    this.name = 'AgentUpstreamTimeoutError';
+  }
+}
+
 function agentProviderFailureDetail(error: unknown) {
   if (error instanceof AgentUpstreamHttpError) return error.detail;
+  if (error instanceof AgentUpstreamTimeoutError) {
+    const seconds = Math.ceil(error.timeoutMs / 1_000);
+    return error.phase === 'first_response'
+      ? `请求已发出，且可能已被上游受理，但 ${seconds} 秒内未返回首个响应；为避免重复扣费，服务端未自动重试`
+      : `上游响应流连续 ${seconds} 秒没有新数据；为避免重复扣费，服务端未自动重试`;
+  }
   if (error instanceof CloudAiError) return sanitizeAgentUpstreamDetail(error.message) || error.code;
   if (error instanceof Error) {
     if (error.name === 'AbortError') return '上游 Agent 请求超时';
@@ -695,7 +724,8 @@ function agentProviderFailureDetail(error: unknown) {
     : '未知通道错误';
 }
 
-function canFallbackToNextAgentProvider(error: unknown) {
+export function canFallbackToNextAgentProvider(error: unknown) {
+  if (error instanceof AgentUpstreamTimeoutError) return false;
   if (error instanceof AgentUpstreamHttpError) {
     return isAgentProviderFallbackStatus(error.status);
   }
@@ -710,7 +740,8 @@ function canFallbackToNextAgentProvider(error: unknown) {
   return error instanceof Error;
 }
 
-function canRetrySingleAgentProvider(error: unknown) {
+export function canRetrySingleAgentProvider(error: unknown) {
+  if (error instanceof AgentUpstreamTimeoutError) return false;
   if (error instanceof AgentUpstreamHttpError) {
     return isAgentProviderRetryStatus(error.status);
   }
@@ -722,7 +753,8 @@ function canRetrySingleAgentProvider(error: unknown) {
   );
 }
 
-function canTryAlternativeAgentModel(error: unknown) {
+export function canTryAlternativeAgentModel(error: unknown) {
+  if (error instanceof AgentUpstreamTimeoutError) return false;
   if (error instanceof AgentUpstreamHttpError) {
     return error.status !== 401
       && error.status !== 403
@@ -773,10 +805,10 @@ async function readChunkWithIdleTimeout(
 ) {
   return new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => {
     const timer = setTimeout(() => {
-      const error = Object.assign(new Error('上游 Agent 流长时间没有返回数据'), {
-        name: 'AbortError',
-        code: 'UPSTREAM_IDLE_TIMEOUT',
-      });
+      const error = new AgentUpstreamTimeoutError(
+        'stream_idle',
+        env.AI_UPSTREAM_IDLE_TIMEOUT_MS,
+      );
       controller.abort(error);
       reject(error);
     }, env.AI_UPSTREAM_IDLE_TIMEOUT_MS);
@@ -828,9 +860,8 @@ async function requestStreamingCompletion(
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
   const controller = linkedAbortController(options?.signal);
   const startedAt = Date.now();
-  const connectTimeout = setTimeout(() => {
-    controller.abort(Object.assign(new Error('上游 Agent 连接超时'), { name: 'AbortError' }));
-  }, env.AI_UPSTREAM_CONNECT_TIMEOUT_MS);
+  let firstResponseTimeout: ReturnType<typeof setTimeout> | undefined;
+  let firstResponseTimeoutError: AgentUpstreamTimeoutError | undefined;
   let response: Response;
   try {
     await emitAgentProgress(options, {
@@ -855,18 +886,38 @@ async function requestStreamingCompletion(
       }),
       redirect: 'error',
       signal: controller.signal,
-    });
-    response = await send(true);
+      dispatcher: agentUpstreamDispatcher,
+    } as RequestInit & { dispatcher: Agent });
+    const sendAndWaitForFirstResponse = async (includeUsage: boolean) => {
+      firstResponseTimeoutError = undefined;
+      firstResponseTimeout = setTimeout(() => {
+        firstResponseTimeoutError = new AgentUpstreamTimeoutError(
+          'first_response',
+          env.AI_UPSTREAM_FIRST_RESPONSE_TIMEOUT_MS,
+        );
+        controller.abort(firstResponseTimeoutError);
+      }, env.AI_UPSTREAM_FIRST_RESPONSE_TIMEOUT_MS);
+      try {
+        return await send(includeUsage);
+      } catch (error) {
+        if (firstResponseTimeoutError) throw firstResponseTimeoutError;
+        throw error;
+      } finally {
+        if (firstResponseTimeout !== undefined) clearTimeout(firstResponseTimeout);
+        firstResponseTimeout = undefined;
+      }
+    };
+    response = await sendAndWaitForFirstResponse(true);
     // Some older OpenAI-compatible gateways reject stream_options entirely.
     // A rejected 400/422 request has not generated output, so retrying once
     // without this optional field preserves compatibility; billing then uses
     // the configured fixed fallback if the gateway omits usage.
     if (response.status === 400 || response.status === 422) {
       await response.body?.cancel().catch(() => undefined);
-      response = await send(false);
+      response = await sendAndWaitForFirstResponse(false);
     }
   } finally {
-    clearTimeout(connectTimeout);
+    if (firstResponseTimeout !== undefined) clearTimeout(firstResponseTimeout);
   }
 
   if (!response.ok) {

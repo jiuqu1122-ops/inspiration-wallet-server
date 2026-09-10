@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   drainAgentCompletionStreamAfterDone,
+  AgentUpstreamTimeoutError,
   buildAgentModelCandidates,
   buildSingleProviderAgentRetryModels,
   AgentCompletionResponseAccumulator,
@@ -8,6 +9,9 @@ import {
   isAgentProtocolFallbackStatus,
   isAgentProviderFallbackStatus,
   isAgentProviderRetryStatus,
+  canFallbackToNextAgentProvider,
+  canRetrySingleAgentProvider,
+  canTryAlternativeAgentModel,
   isDefaultAgentModelSentinel,
   isLikelyAgentTextModel,
   listInspirationProviders,
@@ -77,6 +81,15 @@ describe('Agent provider fallback policy', () => {
     expect(isAgentProviderRetryStatus(429)).toBe(false);
     expect(isAgentProviderRetryStatus(400)).toBe(false);
     expect(isAgentProviderRetryStatus(401)).toBe(false);
+  });
+
+  it('never retries or fails over after an ambiguous upstream timeout', () => {
+    for (const phase of ['first_response', 'stream_idle'] as const) {
+      const error = new AgentUpstreamTimeoutError(phase, 300_000);
+      expect(canRetrySingleAgentProvider(error)).toBe(false);
+      expect(canTryAlternativeAgentModel(error)).toBe(false);
+      expect(canFallbackToNextAgentProvider(error)).toBe(false);
+    }
   });
 
   it('does not switch models after the user explicitly selected one', () => {

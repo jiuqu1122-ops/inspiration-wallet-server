@@ -115,7 +115,7 @@ nano .env
 - `AI_TASK_POLL_INTERVAL_MS`、`AI_TASK_HEARTBEAT_INTERVAL_MS`：worker 取任务与心跳间隔。
 - `AI_TASK_STALE_AFTER_MS`、`AI_TASK_MAX_RUNTIME_MS`：失联 worker 判定和单任务总时限。前者必须明显大于心跳间隔。
 - `AI_TASK_RETENTION_DAYS`：完成、失败和取消任务的保留天数。
-- `AI_UPSTREAM_CONNECT_TIMEOUT_MS`、`AI_UPSTREAM_IDLE_TIMEOUT_MS`：上游连接建立与流读取空闲超时。
+- `AI_UPSTREAM_CONNECT_TIMEOUT_MS`、`AI_UPSTREAM_FIRST_RESPONSE_TIMEOUT_MS`、`AI_UPSTREAM_IDLE_TIMEOUT_MS`：上游连接建立、首个响应和流读取空闲超时。首个响应或流读取超时后不会自动重发请求，避免上游已经受理时产生重复扣费。
 - `WORKER_HEALTH_FILE`：容器内 liveness 文件路径，通常保持默认值。
 - `STORAGE_PROVIDER`：对象存储实现，生产环境必须显式设置为 `tencent-cos`，应用缺省值也是 `tencent-cos`。`aliyun-oss` 只保留为显式选择的历史兼容实现。
 - `BACKEND_IMAGE`：低内存生产机应在执行部署脚本时传入 GitHub Actions 生成的不可变 `sha-*` GHCR 镜像；未设置时部署脚本才会在服务器本地构建。
