@@ -861,7 +861,6 @@ async function requestStreamingCompletion(
   const controller = linkedAbortController(options?.signal);
   const startedAt = Date.now();
   let firstResponseTimeout: ReturnType<typeof setTimeout> | undefined;
-  let firstResponseTimeoutError: AgentUpstreamTimeoutError | undefined;
   let response: Response;
   try {
     await emitAgentProgress(options, {
@@ -889,18 +888,19 @@ async function requestStreamingCompletion(
       dispatcher: agentUpstreamDispatcher,
     } as RequestInit & { dispatcher: Agent });
     const sendAndWaitForFirstResponse = async (includeUsage: boolean) => {
-      firstResponseTimeoutError = undefined;
+      const timeoutError = new AgentUpstreamTimeoutError(
+        'first_response',
+        env.AI_UPSTREAM_FIRST_RESPONSE_TIMEOUT_MS,
+      );
+      let didTimeout = false;
       firstResponseTimeout = setTimeout(() => {
-        firstResponseTimeoutError = new AgentUpstreamTimeoutError(
-          'first_response',
-          env.AI_UPSTREAM_FIRST_RESPONSE_TIMEOUT_MS,
-        );
-        controller.abort(firstResponseTimeoutError);
+        didTimeout = true;
+        controller.abort(timeoutError);
       }, env.AI_UPSTREAM_FIRST_RESPONSE_TIMEOUT_MS);
       try {
         return await send(includeUsage);
       } catch (error) {
-        if (firstResponseTimeoutError instanceof Error) throw firstResponseTimeoutError;
+        if (didTimeout) throw timeoutError;
         throw error instanceof Error ? error : new Error(String(error));
       } finally {
         if (firstResponseTimeout !== undefined) clearTimeout(firstResponseTimeout);
