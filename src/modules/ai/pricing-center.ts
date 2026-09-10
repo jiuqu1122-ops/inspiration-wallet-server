@@ -357,6 +357,23 @@ function videoCharge(snapshot: PricingSnapshot): ChargeBreakdown {
 
 function chatCharge(snapshot: PricingSnapshot, usage?: ChatTokenUsage | null): ChargeBreakdown {
   const pricing = snapshot.pricing;
+  const usageContext = scalarText(snapshot.request.usageContext);
+  if (usageContext === 'canvas_text_agent') {
+    const total = creditMicros(snapshot.request.fallbackCredits ?? '0');
+    return {
+      schemaVersion: 1,
+      model: snapshot.canonicalModelKey,
+      modality: 'chat',
+      route: snapshot.routeId,
+      priceVersion: snapshot.priceVersion,
+      billingType: 'request_fixed',
+      quantity: '1',
+      baseCharge: microsToCredit(total),
+      surcharges: [],
+      totalCredits: microsToCredit(total),
+      details: { context: usageContext, usage: null },
+    };
+  }
   if (pricing.billingType === 'request') {
     const total = creditMicros(pricing.creditsPerRequest);
     return {
@@ -566,6 +583,7 @@ export async function syncLegacyPricingTablesFromCatalog(prisma: PrismaClient) {
       id: 'default',
       agentRequestCredits: BigInt(env.AGENT_REQUEST_CREDITS),
       inspirationAnalysisCredits: 0n,
+      canvasTextAgentCredits: 1n,
       imageDefaultCredits: BigInt(env.IMAGE_REQUEST_CREDITS),
       videoDefaultCredits: BigInt(env.VIDEO_REQUEST_CREDITS),
       imageModelPrices: legacy.imageModels,
@@ -578,6 +596,7 @@ export async function syncLegacyPricingTablesFromCatalog(prisma: PrismaClient) {
       ...(existing ? {} : {
         agentRequestCredits: BigInt(env.AGENT_REQUEST_CREDITS),
         inspirationAnalysisCredits: 0n,
+        canvasTextAgentCredits: 1n,
         imageDefaultCredits: BigInt(env.IMAGE_REQUEST_CREDITS),
         videoDefaultCredits: BigInt(env.VIDEO_REQUEST_CREDITS),
       }),

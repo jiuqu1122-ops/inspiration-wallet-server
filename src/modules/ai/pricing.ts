@@ -38,6 +38,7 @@ export type VideoReferenceCreditInput = {
 export type AiPricingConfigValue = {
   agentRequestCredits: string;
   inspirationAnalysisCredits: string;
+  canvasTextAgentCredits: string;
   imageDefaultCredits: string;
   videoDefaultCredits: string;
   imageModels: ImageModelCreditPrice[];
@@ -45,12 +46,15 @@ export type AiPricingConfigValue = {
   updatedAt: string | null;
 };
 
-export type AiPricingConfigInput = Omit<AiPricingConfigValue, 'updatedAt'>;
+export type AiPricingConfigInput = Omit<AiPricingConfigValue, 'updatedAt' | 'canvasTextAgentCredits'> & {
+  canvasTextAgentCredits?: string | undefined;
+};
 
 const DEFAULT_AGENT_REQUEST_CREDITS = BigInt(env.AGENT_REQUEST_CREDITS);
 const DEFAULT_IMAGE_REQUEST_CREDITS = BigInt(env.IMAGE_REQUEST_CREDITS);
 const DEFAULT_VIDEO_REQUEST_CREDITS = BigInt(env.VIDEO_REQUEST_CREDITS);
 const DEFAULT_INSPIRATION_ANALYSIS_CREDITS = 0n;
+const DEFAULT_CANVAS_TEXT_AGENT_CREDITS = 1n;
 
 const KNOWN_VIDEO_MODELS = [
   'seedance2',
@@ -192,6 +196,7 @@ export function defaultAiPricingConfig(): AiPricingConfigValue {
   return {
     agentRequestCredits: DEFAULT_AGENT_REQUEST_CREDITS.toString(),
     inspirationAnalysisCredits: DEFAULT_INSPIRATION_ANALYSIS_CREDITS.toString(),
+    canvasTextAgentCredits: DEFAULT_CANVAS_TEXT_AGENT_CREDITS.toString(),
     imageDefaultCredits: DEFAULT_IMAGE_REQUEST_CREDITS.toString(),
     videoDefaultCredits: DEFAULT_VIDEO_REQUEST_CREDITS.toString(),
     imageModels: defaultImageModelPrices(),
@@ -321,6 +326,7 @@ export async function getAiPricingConfig(prisma: PrismaClient): Promise<AiPricin
   return {
     agentRequestCredits: stored.agentRequestCredits.toString(),
     inspirationAnalysisCredits: stored.inspirationAnalysisCredits.toString(),
+    canvasTextAgentCredits: (stored.canvasTextAgentCredits ?? DEFAULT_CANVAS_TEXT_AGENT_CREDITS).toString(),
     imageDefaultCredits: stored.imageDefaultCredits.toString(),
     videoDefaultCredits: stored.videoDefaultCredits.toString(),
     imageModels: mergeKnownImageModels(
@@ -360,6 +366,7 @@ export async function updateAiPricingConfig(
       id: 'default',
       agentRequestCredits: BigInt(input.agentRequestCredits),
       inspirationAnalysisCredits: BigInt(input.inspirationAnalysisCredits),
+      canvasTextAgentCredits: BigInt(input.canvasTextAgentCredits ?? DEFAULT_CANVAS_TEXT_AGENT_CREDITS),
       imageDefaultCredits: BigInt(input.imageDefaultCredits),
       videoDefaultCredits: BigInt(input.videoDefaultCredits),
       imageModelPrices: imageModels,
@@ -368,6 +375,9 @@ export async function updateAiPricingConfig(
     update: {
       agentRequestCredits: BigInt(input.agentRequestCredits),
       inspirationAnalysisCredits: BigInt(input.inspirationAnalysisCredits),
+      ...(input.canvasTextAgentCredits !== undefined
+        ? { canvasTextAgentCredits: BigInt(input.canvasTextAgentCredits) }
+        : {}),
       imageDefaultCredits: BigInt(input.imageDefaultCredits),
       videoDefaultCredits: BigInt(input.videoDefaultCredits),
       imageModelPrices: imageModels,
@@ -383,6 +393,10 @@ export async function configuredAgentRequestCredits(prisma: PrismaClient) {
 
 export async function configuredInspirationAnalysisCredits(prisma: PrismaClient) {
   return BigInt((await getAiPricingConfig(prisma)).inspirationAnalysisCredits);
+}
+
+export async function configuredCanvasTextAgentCredits(prisma: PrismaClient) {
+  return BigInt((await getAiPricingConfig(prisma)).canvasTextAgentCredits);
 }
 
 export async function configuredImageUnitCredits(

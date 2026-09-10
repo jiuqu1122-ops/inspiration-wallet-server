@@ -385,6 +385,7 @@ model AiPricingConfig {
   id                         String   @id @default("default")
   agentRequestCredits        BigInt
   inspirationAnalysisCredits BigInt
+  canvasTextAgentCredits     BigInt
   imageDefaultCredits        BigInt
   videoDefaultCredits        BigInt
   imageModelPrices           Json

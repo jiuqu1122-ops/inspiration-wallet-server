@@ -5,6 +5,7 @@ import {
   configuredVideoUnitCredits,
   configuredVideoRequestCredits,
   calculateVideoRequestCredits,
+  configuredCanvasTextAgentCredits,
   defaultAiPricingConfig,
   defaultImageUnitCredits,
   getAiPricingConfig,
@@ -14,6 +15,7 @@ import {
 const prismaWithPricing = (pricing: {
   agentRequestCredits: bigint;
   inspirationAnalysisCredits: bigint;
+  canvasTextAgentCredits?: bigint;
   imageDefaultCredits: bigint;
   videoDefaultCredits: bigint;
   imageModelPrices: unknown;
@@ -42,6 +44,7 @@ describe('AI credit pricing', () => {
       'image2',
     ]);
     expect(defaultAiPricingConfig().inspirationAnalysisCredits).toBe('0');
+    expect(defaultAiPricingConfig().canvasTextAgentCredits).toBe('1');
   });
 
   it('normalizes provider model aliases to one pricing family', () => {
@@ -147,6 +150,8 @@ describe('AI credit pricing', () => {
     expect(await configuredVideoUnitCredits(prisma, 'SourceMix2.0')).toBe(44n);
     const resolved = await getAiPricingConfig(prisma);
     expect(resolved.agentRequestCredits).toBe('8');
+    expect(resolved.canvasTextAgentCredits).toBe('1');
+    expect(await configuredCanvasTextAgentCredits(prisma)).toBe(1n);
     expect(resolved.videoModels.map(item => item.model)).toEqual(expect.arrayContaining([
       'seedance2',
       'seedance2fast',

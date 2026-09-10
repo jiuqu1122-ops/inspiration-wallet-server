@@ -96,6 +96,7 @@ const videoModelPriceSchema = z.object({
 const pricingSchema = z.object({
   agentRequestCredits: pricingCreditsSchema,
   inspirationAnalysisCredits: pricingCreditsSchema,
+  canvasTextAgentCredits: pricingCreditsSchema.optional(),
   imageDefaultCredits: pricingCreditsSchema,
   videoDefaultCredits: pricingCreditsSchema,
   imageModels: z.array(imageModelPriceSchema).max(100),

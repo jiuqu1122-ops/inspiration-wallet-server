@@ -304,36 +304,30 @@ export async function resolveReferenceImageSources(
   userId: string,
   sources: string[],
 ) {
-  const resolved: string[] = [];
-  for (const source of sources) {
+  return Promise.all(sources.map(async (source) => {
     const trimmed = source.trim();
     if (!trimmed) throw new ReferenceUploadError('Reference image is empty');
     if (isDataImage(trimmed)) {
-      resolved.push(trimmed);
-      continue;
+      return trimmed;
     }
     if (isHttpUrl(trimmed)) {
       const objectKey = storageService.tryResolveObjectKeyFromUrl(trimmed);
       if (!objectKey) {
-        resolved.push(trimmed);
-        continue;
+        return trimmed;
       }
       // Existing generated media URLs are already handled by the storage-aware
       // provider paths in image-service. Only reference upload URLs participate
       // in the new ticket ownership protocol; do not reinterpret generated
       // objects as reference uploads.
       if (!objectKey.startsWith('reference-images/')) {
-        resolved.push(trimmed);
-        continue;
+        return trimmed;
       }
       const authorizedKey = await authorizeReferenceObject(prisma, userId, objectKey, false);
-      resolved.push(storageService.getDownloadUrl(authorizedKey));
-      continue;
+      return storageService.getDownloadUrl(authorizedKey);
     }
     const authorizedKey = await authorizeReferenceObject(prisma, userId, trimmed);
-    resolved.push(storageService.getDownloadUrl(authorizedKey));
-  }
-  return resolved;
+    return storageService.getDownloadUrl(authorizedKey);
+  }));
 }
 
 export function uploadUrlFromProvider(value: StorageUploadUrl) {

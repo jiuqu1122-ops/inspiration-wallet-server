@@ -3768,17 +3768,20 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
   }
 
   await ensureAiCatalogSeeded(prisma);
+  const catalogSeededAt = Date.now();
   const catalogResolution = catalogDelegateAvailable(prisma)
     ? await resolveCatalogModel(prisma, input.model, 'image', {
       requireEnabled: true,
       ...(input.providerChannelId ? { providerChannelId: input.providerChannelId } : {}),
     })
     : null;
+  const catalogResolvedAt = Date.now();
   const canonicalModelKey = catalogResolution?.model.canonicalModelKey ?? input.model;
   const validatedInput: ImageInput = {
     ...input,
     inputImages: await resolveReferenceImageSources(prisma, input.userId, input.inputImages),
   };
+  const referencesResolvedAt = Date.now();
   if (catalogResolution
     && !catalogModelSupportsImageRequest(
       withGptImage2DimensionCapabilities(
@@ -3864,6 +3867,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     pricingSnapshot,
     canonicalModelKey,
   );
+  const reservationReadyAt = Date.now();
   if ('replayResult' in reservation) {
     console.info('[image_generation_replay]', {
       clientRequestId: input.clientRequestId,
@@ -3895,6 +3899,19 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         };
       if (index > 0) await assertPublicProviderUrl(activeProvider.baseUrl);
       try {
+        console.info('[image_generation_upstream_dispatch]', {
+          clientRequestId: input.clientRequestId,
+          requestedModel: input.model,
+          canonicalModelKey,
+          provider: activeProvider.name,
+          providerId: activeProvider.id,
+          submittedUpstreamModel: activeInput.model,
+          catalogSeedMs: catalogSeededAt - requestStartedAt,
+          catalogResolveMs: catalogResolvedAt - catalogSeededAt,
+          referenceResolveMs: referencesResolvedAt - catalogResolvedAt,
+          reservationMs: reservationReadyAt - referencesResolvedAt,
+          preflightDurationMs: reservationReadyAt - requestStartedAt,
+        });
         const images = await generateImagesFromProvider(activeProvider, activeInput);
         const charged = await settleImageCredits(
           prisma,

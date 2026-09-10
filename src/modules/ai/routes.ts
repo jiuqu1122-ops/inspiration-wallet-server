@@ -41,6 +41,15 @@ const chatSchema = z.object({
   tools: z.array(z.unknown()).max(100).optional(),
   toolChoice: agentToolChoiceSchema.optional(),
   model: z.string().trim().min(1).max(200).optional(),
+  usageContext: z.enum([
+    'chat',
+    'canvas_text_agent',
+    'workflow',
+    'inspiration_analysis',
+    'three_scene_analysis',
+    'prompt_optimization',
+    'system_internal',
+  ]).optional(),
 }).strict();
 
 const inspirationAnalysisSchema = z.object({
