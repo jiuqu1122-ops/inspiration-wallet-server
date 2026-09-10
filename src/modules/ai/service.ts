@@ -900,8 +900,8 @@ async function requestStreamingCompletion(
       try {
         return await send(includeUsage);
       } catch (error) {
-        if (firstResponseTimeoutError) throw firstResponseTimeoutError;
-        throw error;
+        if (firstResponseTimeoutError instanceof Error) throw firstResponseTimeoutError;
+        throw error instanceof Error ? error : new Error(String(error));
       } finally {
         if (firstResponseTimeout !== undefined) clearTimeout(firstResponseTimeout);
         firstResponseTimeout = undefined;
