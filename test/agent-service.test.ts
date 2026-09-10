@@ -6,6 +6,7 @@ import {
   buildSingleProviderAgentRetryModels,
   AgentCompletionResponseAccumulator,
   AgentCompletionSseParser,
+  isAgentAmbiguousUpstreamStatus,
   isAgentProtocolFallbackStatus,
   isAgentProviderFallbackStatus,
   isAgentProviderRetryStatus,
@@ -67,7 +68,8 @@ describe('Agent provider fallback policy', () => {
   });
 
   it('falls back for gateway failures and protocol-specific channel errors', () => {
-    expect(isAgentProviderFallbackStatus(524)).toBe(true);
+    expect(isAgentProviderFallbackStatus(524)).toBe(false);
+    expect(isAgentProviderFallbackStatus(504)).toBe(false);
     expect(isAgentProviderFallbackStatus(502)).toBe(true);
     expect(isAgentProviderFallbackStatus(429)).toBe(true);
     expect(isAgentProtocolFallbackStatus(404)).toBe(true);
@@ -75,12 +77,18 @@ describe('Agent provider fallback policy', () => {
   });
 
   it('retries transient gateway errors without retrying protocol failures', () => {
-    expect(isAgentProviderRetryStatus(504)).toBe(true);
-    expect(isAgentProviderRetryStatus(524)).toBe(true);
+    expect(isAgentProviderRetryStatus(504)).toBe(false);
+    expect(isAgentProviderRetryStatus(524)).toBe(false);
     expect(isAgentProviderRetryStatus(503)).toBe(true);
     expect(isAgentProviderRetryStatus(429)).toBe(false);
     expect(isAgentProviderRetryStatus(400)).toBe(false);
     expect(isAgentProviderRetryStatus(401)).toBe(false);
+  });
+
+  it('treats HTTP 504 and 524 as ambiguous accepted-request timeouts', () => {
+    expect(isAgentAmbiguousUpstreamStatus(504)).toBe(true);
+    expect(isAgentAmbiguousUpstreamStatus(524)).toBe(true);
+    expect(isAgentAmbiguousUpstreamStatus(503)).toBe(false);
   });
 
   it('never retries or fails over after an ambiguous upstream timeout', () => {
@@ -107,7 +115,7 @@ describe('Agent provider fallback policy', () => {
 
   it('sorts discovered automatic models by numeric version and preserves equal-version order', () => {
     expect(buildAgentModelCandidates(
-      { defaultModel: 'provider-default' },
+      { defaultModel: null },
       'auto',
       [
         'gpt-5.5',
@@ -124,14 +132,22 @@ describe('Agent provider fallback policy', () => {
     ]);
   });
 
-  it('retries a transient model before trying multiple same-channel alternatives', () => {
+  it('uses the configured channel default for automatic requests without leaking to discovered GPT models', () => {
+    expect(buildAgentModelCandidates(
+      { defaultModel: 'grok-4.6' },
+      'default',
+      ['gpt-6-astra', 'gpt-5.6-terra', 'grok-4.6'],
+    )).toEqual(['grok-4.6']);
+  });
+
+  it('retries only the configured model instead of unrelated models exposed by the same channel', () => {
     expect(buildSingleProviderAgentRetryModels(
       { defaultModel: 'gpt-5.6-sol' },
       'unmind-agent',
       ['gpt-5.6-sol', 'gpt-5.4', 'gemini-2.5-pro', 'gpt-image-2'],
       'gpt-5.6-sol',
       true,
-    )).toEqual(['gpt-5.6-sol', 'gpt-5.4', 'gemini-2.5-pro']);
+    )).toEqual(['gpt-5.6-sol']);
   });
 
   it('filters non-Agent models discovered on a mixed-capability channel', () => {

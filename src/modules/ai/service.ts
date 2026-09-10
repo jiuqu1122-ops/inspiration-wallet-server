@@ -216,6 +216,10 @@ export function buildAgentModelCandidates(
   if (requested) return [requested];
 
   const configured = provider.defaultModel?.trim() ?? '';
+  // The channel default is an operator decision. Automatic requests must not
+  // replace it with an unrelated model merely because /v1/models exposes a
+  // numerically newer model (for example GPT on a Grok-configured channel).
+  if (configured && isLikelyAgentTextModel(configured)) return [configured];
   const discovered = Array.from(new Set(discoveredModels.filter(isLikelyAgentTextModel)));
   const numericParts = (model: string) => (
     (model.match(/\d+(?:\.\d+)*/)?.[0] || '')
@@ -234,7 +238,7 @@ export function buildAgentModelCandidates(
       return left.index - right.index;
     })
     .map(item => item.model);
-  return sorted.length > 0 ? sorted : [configured].filter(Boolean);
+  return sorted;
 }
 
 export function buildSingleProviderAgentRetryModels(
@@ -261,11 +265,18 @@ export function isAgentProtocolFallbackStatus(status: number) {
   return AGENT_PROTOCOL_FALLBACK_STATUSES.has(status);
 }
 
-export function isAgentProviderFallbackStatus(status: number) {
-  return status >= 500 || isAgentProtocolFallbackStatus(status);
+const AGENT_AMBIGUOUS_UPSTREAM_STATUSES = new Set([504, 524]);
+
+export function isAgentAmbiguousUpstreamStatus(status: number) {
+  return AGENT_AMBIGUOUS_UPSTREAM_STATUSES.has(status);
 }
 
-const AGENT_PROVIDER_RETRY_STATUSES = new Set([502, 503, 504, 520, 521, 522, 523, 524]);
+export function isAgentProviderFallbackStatus(status: number) {
+  return !isAgentAmbiguousUpstreamStatus(status)
+    && (status >= 500 || isAgentProtocolFallbackStatus(status));
+}
+
+const AGENT_PROVIDER_RETRY_STATUSES = new Set([502, 503, 520, 521, 522, 523]);
 
 export function isAgentProviderRetryStatus(status: number) {
   return AGENT_PROVIDER_RETRY_STATUSES.has(status);
@@ -707,7 +718,12 @@ export class AgentUpstreamTimeoutError extends Error {
 }
 
 function agentProviderFailureDetail(error: unknown) {
-  if (error instanceof AgentUpstreamHttpError) return error.detail;
+  if (error instanceof AgentUpstreamHttpError) {
+    if (isAgentAmbiguousUpstreamStatus(error.status)) {
+      return `上游返回 HTTP ${error.status} 超时；请求可能已经被处理，为避免重复扣费，服务端未自动重试或切换模型`;
+    }
+    return error.detail;
+  }
   if (error instanceof AgentUpstreamTimeoutError) {
     const seconds = Math.ceil(error.timeoutMs / 1_000);
     return error.phase === 'first_response'
@@ -1333,9 +1349,23 @@ export async function executeWalletAgentChat(
 ) {
   const fallbackCredits = await configuredAgentRequestCredits(prisma);
   await ensureAiCatalogSeeded(prisma);
+  const allProviders = await listProviders(prisma);
+  if (allProviders.length === 0) {
+    throw new CloudAiError('provider_unavailable', '当前没有可用的 Agent 渠道', 503);
+  }
+  const automaticModelSelection = isDefaultAgentModelSentinel(input.model);
+  const automaticProvider = allProviders[0]!;
+  const automaticProviderModel = automaticModelSelection
+    ? automaticProvider.defaultModel?.trim() ?? ''
+    : '';
   const resolved = catalogDelegateAvailable(prisma)
-    ? isDefaultAgentModelSentinel(input.model)
-      ? await resolveAutomaticChatModel(prisma)
+    ? automaticModelSelection
+      ? automaticProviderModel
+        ? await resolveCatalogModel(prisma, automaticProviderModel, 'chat', {
+          requireEnabled: true,
+          providerChannelId: automaticProvider.id,
+        })
+        : await resolveAutomaticChatModel(prisma)
       : await resolveCatalogModel(prisma, input.model ?? '', 'chat', { requireEnabled: true })
     : null;
   const canonicalModel = resolved?.model ?? null;
@@ -1361,12 +1391,17 @@ export async function executeWalletAgentChat(
       ...input,
       messages: await proxyAgentChatReferenceImages(prisma, input.userId, input.messages),
     };
-    const allProviders = await listProviders(prisma);
     const providersById = new Map(allProviders.map(provider => [provider.id, provider]));
-    const routedProviders = resolved?.enabledRoutes.flatMap(candidate => {
+    const prioritizedRoutes = resolved
+      ? [
+        ...(resolved.route ? [resolved.route] : []),
+        ...resolved.enabledRoutes.filter(candidate => candidate.id !== resolved.route?.id),
+      ]
+      : [];
+    const routedProviders = prioritizedRoutes.flatMap(candidate => {
       const provider = candidate.channelId ? providersById.get(candidate.channelId) : undefined;
       return provider ? [provider] : [];
-    }) ?? [];
+    });
     const providers = routedProviders.length > 0
       ? Array.from(new Map(routedProviders.map(provider => [provider.id, provider])).values())
       : allProviders;
@@ -1377,7 +1412,6 @@ export async function executeWalletAgentChat(
     let result: unknown;
     let requestAttempt = 0;
     let successfulRouteId = route?.id ?? null;
-    const automaticModelSelection = isDefaultAgentModelSentinel(input.model);
     for (const [index, provider] of providers.entries()) {
       let discoveredModels: string[] = [];
       if (automaticModelSelection) {
@@ -1420,7 +1454,7 @@ export async function executeWalletAgentChat(
           const retryModels = automaticModelSelection
             ? buildSingleProviderAgentRetryModels(
               provider,
-              input.model,
+              requestedUpstreamModel,
               discoveredModels,
               failedModel || discoveredModels[0] || '',
               canRetrySingleAgentProvider(error),
