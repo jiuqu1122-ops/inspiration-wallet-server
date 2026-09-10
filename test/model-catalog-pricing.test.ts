@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { encryptProviderSecrets } from '../src/lib/provider-secrets.js';
 import {
   ModelCatalogError,
+  defaultModelCapabilities,
   explicitCanonicalModelKey,
   getPublicAiCatalog,
   resolveAutomaticChatModel,
@@ -67,6 +68,15 @@ afterEach(() => {
 });
 
 describe('canonical model mapping', () => {
+  it('gives administrator-created GPT Image 2.5 variants exact pixel dimensions', () => {
+    expect(defaultModelCapabilities('gpt-image-2.5-high', 'image')).toMatchObject({
+      supportedAspectRatiosByResolution: {
+        '2k': expect.arrayContaining(['2048x1152', '2064x1376']),
+        '4k': expect.arrayContaining(['3840x2160', '3520x2352']),
+      },
+    });
+  });
+
   it('maps explicitly confirmed provider aliases to one canonical image SKU', () => {
     expect(explicitCanonicalModelKey('image', 'gemini-3.1-pro-image-preview')).toBe('nano-banana-pro');
     expect(explicitCanonicalModelKey('image', 'xais-nano-pro')).toBe('nano-banana-pro');
@@ -483,6 +493,40 @@ describe('versioned server-side pricing', () => {
 });
 
 describe('catalog exposure and upstream discovery safety', () => {
+  it('replaces legacy ratios with exact dimensions for a named GPT Image 2.5 variant', async () => {
+    const prisma = {
+      aiModel: {
+        findMany: vi.fn(async () => [{
+          canonicalModelKey: 'custom-image-high',
+          displayName: 'GPT Image22.5 high',
+          modality: 'image',
+          billingType: 'image_resolution',
+          capabilities: {
+            supportedResolutions: ['2k', '4k'],
+            supportedAspectRatios: ['1:1', '16:9'],
+            aspectRatiosByResolution: {
+              '2k': ['16:9'],
+              '4k': ['16:9'],
+            },
+          },
+          pricing: null,
+          aliases: [],
+          updatedAt: new Date('2026-09-10T10:00:00.000Z'),
+        }]),
+      },
+    } as unknown as PrismaClient;
+
+    const catalog = await getPublicAiCatalog(prisma);
+
+    expect(catalog.models[0]?.capabilities).toMatchObject({
+      resolutions: ['2k', '4k'],
+      aspectRatiosByResolution: {
+        '2k': expect.arrayContaining(['2048x1152', '2064x1376']),
+        '4k': expect.arrayContaining(['3840x2160', '3520x2352']),
+      },
+    });
+  });
+
   it('never exposes route cost or provider credentials in the public catalog', async () => {
     const prisma = {
       aiModel: {

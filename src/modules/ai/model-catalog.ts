@@ -186,9 +186,33 @@ export const GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION = {
   ],
 } as const;
 
-const isGptImage2CatalogKey = (key: string) => (
-  key === 'image2' || key === 'gpt-image-medium'
+export const isGptImage2CatalogIdentity = (...values: Array<string | null | undefined>) => (
+  values.some(value => {
+    const token = catalogAliasKey(String(value || ''));
+    return token === 'image2'
+      || token === 'gptimagemedium'
+      || token.includes('gptimage2')
+      || /^image2(?:\d|h|high|medium)/.test(token);
+  })
 );
+
+export function withGptImage2DimensionCapabilities(
+  capabilities: unknown,
+  ...identityValues: Array<string | null | undefined>
+) {
+  const source = capabilities && typeof capabilities === 'object' && !Array.isArray(capabilities)
+    ? capabilities as Record<string, unknown>
+    : {};
+  if (!isGptImage2CatalogIdentity(...identityValues)) return source;
+  return {
+    ...source,
+    // Administrators may have created the model before exact dimensions were
+    // supported, leaving a legacy ratio map here. Image 2 family dimensions
+    // are part of the upstream contract, so replace both accepted aliases.
+    aspectRatiosByResolution: GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION,
+    supportedAspectRatiosByResolution: GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION,
+  };
+}
 
 export function defaultModelCapabilities(key: string, modality: AiModality): Prisma.InputJsonValue {
   if (modality === 'chat') {
@@ -197,7 +221,7 @@ export function defaultModelCapabilities(key: string, modality: AiModality): Pri
       : { contextTiers: [{ maxInputTokens: 272000 }, { minInputTokens: 272001 }] };
   }
   if (modality === 'image') {
-    const gptImage2 = isGptImage2CatalogKey(key);
+    const gptImage2 = isGptImage2CatalogIdentity(key);
     const supportsOneK = key === 'nano-banana-pro' || gptImage2;
     return {
       supportedResolutions: supportsOneK ? ['1k', '2k', '4k'] : ['2k', '4k'],
@@ -334,16 +358,26 @@ export async function getPublicAiCatalog(prisma: PrismaClient) {
   ), 0);
   return {
     version,
-    models: models.map(model => ({
-      id: model.canonicalModelKey,
-      displayName: model.displayName,
-      modality: model.modality,
-      billingType: model.billingType,
-      aliases: (model.aliases ?? []).map(alias => alias.alias),
-      capabilities: normalizePublicModelCapabilities(model.capabilities),
-      priceVersion: model.pricing?.currentVersion?.version ?? null,
-      pricing: model.pricing?.currentVersion?.pricing ?? null,
-    })),
+    models: models.map(model => {
+      const aliases = (model.aliases ?? []).map(alias => alias.alias);
+      return {
+        id: model.canonicalModelKey,
+        displayName: model.displayName,
+        modality: model.modality,
+        billingType: model.billingType,
+        aliases,
+        capabilities: normalizePublicModelCapabilities(model.modality === 'image'
+          ? withGptImage2DimensionCapabilities(
+            model.capabilities,
+            model.canonicalModelKey,
+            model.displayName,
+            ...aliases,
+          )
+          : model.capabilities),
+        priceVersion: model.pricing?.currentVersion?.version ?? null,
+        pricing: model.pricing?.currentVersion?.pricing ?? null,
+      };
+    }),
   };
 }
 

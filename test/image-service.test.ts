@@ -788,6 +788,7 @@ describe('wallet image provider normalization', () => {
     expect(catalogModelSupportsImageRequest(exactDimensions, '2k', '2048x1152')).toBe(true);
     expect(catalogModelSupportsImageRequest(exactDimensions, '4k', '2048x1152')).toBe(false);
     expect(catalogModelSupportsImageRequest(exactDimensions, '4k', '3840x2160')).toBe(true);
+    expect(catalogModelSupportsImageRequest(exactDimensions, '2k', '16:9')).toBe(true);
     expect(imageRouteSupportsRequest({
       channel: gpt,
       capabilitiesOverride: {
@@ -1406,6 +1407,11 @@ describe('wallet image provider normalization', () => {
     expect(newApiImageRequestParams('gpt-image-2.5', 1, '2048x1152', '2K')).toEqual({
       n: 1,
       size: '2048x1152',
+      quality: 'medium',
+    });
+    expect(newApiImageRequestParams('gpt-image-2.5-high', 1, '3520x2352', '4K')).toEqual({
+      n: 1,
+      size: '3520x2352',
       quality: 'medium',
     });
   });

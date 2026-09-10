@@ -36,9 +36,11 @@ import {
   catalogAliasKey,
   explicitCanonicalModelKey,
   getPublicAiCatalog,
+  isGptImage2CatalogIdentity,
   legacyUpstreamModelForCanonical,
   normalizePublicModelCapabilities,
   resolveCatalogModel,
+  withGptImage2DimensionCapabilities,
 } from './model-catalog.js';
 import {
   calculateSnapshotCharge,
@@ -280,7 +282,13 @@ function capabilitiesSupportImageAspectRatio(
     ? (byResolution as Record<string, string[]>)[requestedResolution]
     : undefined;
   if (Array.isArray(resolutionOptions) && resolutionOptions.length > 0) {
-    return resolutionOptions.some(item => String(item).trim().replace(/×/g, 'x').toLowerCase() === requested);
+    if (resolutionOptions.some(item => (
+      String(item).trim().replace(/×/g, 'x').toLowerCase() === requested
+    ))) return true;
+    // Keep ratio requests from older clients valid after the catalog starts
+    // advertising exact Image 2 dimensions. Exact pixel requests remain
+    // strictly constrained to the selected resolution's allow-list.
+    if (usesExactDimensions) return false;
   }
   // Older route discovery data only advertised the five legacy ratios. The
   // canonical model has already validated exact Image2 dimensions, so the
@@ -714,6 +722,7 @@ export async function listWalletImageModels(
         canonicalModel: {
           select: {
             canonicalModelKey: true,
+            displayName: true,
             enabled: true,
             visible: true,
             status: true,
@@ -772,7 +781,12 @@ export async function listWalletImageModels(
       && routeMatchesChannelCapability(route, modality))
     .map(route => [
       route.canonicalModel!.canonicalModelKey,
-      normalizePublicModelCapabilities(route.capabilitiesOverride ?? route.canonicalModel!.capabilities),
+      normalizePublicModelCapabilities(withGptImage2DimensionCapabilities(
+        route.capabilitiesOverride ?? route.canonicalModel!.capabilities,
+        route.canonicalModel!.canonicalModelKey,
+        route.canonicalModel!.displayName,
+        route.upstreamModelId,
+      )),
     ]));
   const channels = await Promise.all(providers.map(async (provider) => {
     try {
@@ -1251,7 +1265,7 @@ function newApiImageFamily(model: string) {
     || token.includes('gemini31proimage')
     || token.includes('gemini31flashimage')
     || token.includes('gemini3flashimage')) return 'nano-banana';
-  if (token.includes('gptimage2')) return 'gpt-image-2';
+  if (isGptImage2CatalogIdentity(model)) return 'gpt-image-2';
   return 'legacy';
 }
 
@@ -3716,7 +3730,13 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
   };
   if (catalogResolution
     && !catalogModelSupportsImageRequest(
-      catalogResolution.model.capabilities,
+      withGptImage2DimensionCapabilities(
+        catalogResolution.model.capabilities,
+        catalogResolution.model.canonicalModelKey,
+        catalogResolution.model.displayName,
+        input.model,
+        ...catalogResolution.enabledRoutes.map(route => route.upstreamModelId),
+      ),
       validatedInput.resolution,
       validatedInput.aspectRatio,
     )) {

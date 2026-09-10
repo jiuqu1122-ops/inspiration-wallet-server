@@ -4,7 +4,9 @@ import {
   canonicalDisplayName,
   catalogAliasKey,
   defaultModelCapabilities,
+  isGptImage2CatalogIdentity,
   safeCanonicalModelKey,
+  withGptImage2DimensionCapabilities,
   type AiModality,
 } from './model-catalog.js';
 import {
@@ -257,7 +259,18 @@ export async function updateAdminAiModel(
     if (input.sortOrder !== undefined) data.sortOrder = input.sortOrder;
     if (input.status !== undefined) data.status = input.status;
     if (input.routingMode !== undefined) data.routingMode = input.routingMode;
-    if (input.capabilities !== undefined) data.capabilities = input.capabilities;
+    const nextDisplayName = input.displayName ?? current.displayName;
+    if (input.capabilities !== undefined
+      || (current.modality === 'image'
+        && isGptImage2CatalogIdentity(current.canonicalModelKey, nextDisplayName))) {
+      data.capabilities = (current.modality === 'image'
+        ? withGptImage2DimensionCapabilities(
+          input.capabilities ?? current.capabilities,
+          current.canonicalModelKey,
+          nextDisplayName,
+        )
+        : input.capabilities) as Prisma.InputJsonValue;
+    }
     if (input.defaultRouteId !== undefined) data.defaultRouteId = input.defaultRouteId;
     const updated = await transaction.aiModel.updateMany({
       where: { id: current.id, updatedAt: current.updatedAt },
@@ -732,14 +745,26 @@ export async function createCanonicalFromDiscovery(
     }
     const canonicalModelKey = input.canonicalModelKey?.trim().toLowerCase()
       || safeCanonicalModelKey(discovery.upstreamModelId, input.modality);
+    const displayName = input.displayName?.trim()
+      || canonicalDisplayName(canonicalModelKey, discovery.upstreamModelId);
+    const initialCapabilities = input.capabilities
+      ?? defaultModelCapabilities(canonicalModelKey, input.modality);
+    const capabilities = (input.modality === 'image'
+      ? withGptImage2DimensionCapabilities(
+        initialCapabilities,
+        canonicalModelKey,
+        displayName,
+        discovery.upstreamModelId,
+      )
+      : initialCapabilities) as Prisma.InputJsonValue;
     const model = await transaction.aiModel.create({
       data: {
         canonicalModelKey,
-        displayName: input.displayName?.trim() || canonicalDisplayName(canonicalModelKey, discovery.upstreamModelId),
+        displayName,
         modality: input.modality,
         billingType: input.billingType,
         routingMode: 'MANAGED',
-        capabilities: input.capabilities ?? defaultModelCapabilities(canonicalModelKey, input.modality),
+        capabilities,
         // New upstream products stay hidden and disabled until explicitly published.
         visible: input.visible ?? false,
         enabled: input.enabled ?? false,
