@@ -2060,11 +2060,10 @@ async function uploadStoredImageResultToStorage(stableUrl: string) {
     mime: stored.mime,
   });
   // A successful provider upload is already the commit acknowledgement. Avoid
-  // a second synchronous network round trip here: on a degraded COS route the
-  // redundant HEAD used to keep the desktop request waiting long after the
-  // upstream image was complete. Signing still validates the returned key.
-  storageService.getDownloadUrl(objectName);
-  return stableUrl;
+  // routing the freshly generated image back through /image-results, where
+  // another one or two COS HEAD requests can delay the first desktop preview.
+  // Recovery lookups re-sign this provider URL before returning it again.
+  return storageService.getDownloadUrl(objectName);
 }
 
 async function mirrorPublicGeneratedImageResultToStorage(source: string, index: number) {

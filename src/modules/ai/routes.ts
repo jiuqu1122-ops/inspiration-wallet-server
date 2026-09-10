@@ -367,20 +367,6 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
         });
       }
       try {
-        if (!await storageService.exists(objectName)) {
-          return reply.code(502).send({
-            error: 'oss_object_missing',
-            message: 'Generated image was uploaded but could not be verified',
-          });
-        }
-      } catch (error) {
-        request.log.error({ key, errorName: error instanceof Error ? error.name : 'unknown' }, 'temporary OSS image verification failed');
-        return reply.code(503).send({
-          error: 'oss_verification_failed',
-          message: 'Generated image upload could not be verified',
-        });
-      }
-      try {
         const url = storageService.getDownloadUrl(objectName);
         if (query.data.redirect === '0') {
           return {

@@ -75,15 +75,17 @@ describe('generated image OSS delivery route', () => {
     });
   });
 
-  it('uses the same object key for upload, verification, and signing', async () => {
-    bridgeMocks.exists.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+  it('uses the same object key for availability, upload, and signing', async () => {
+    bridgeMocks.exists.mockResolvedValueOnce(false);
     const app = await makeApp();
-    await app.inject({ method: 'GET', url: '/v1/ai/image-results/result.png?redirect=0' });
+    const response = await app.inject({ method: 'GET', url: '/v1/ai/image-results/result.png?redirect=0' });
+    expect(response.statusCode).toBe(200);
     expect(bridgeMocks.uploadMedia).toHaveBeenCalledWith(expect.objectContaining({
       namespace: 'generated-images',
       filename: 'result.png',
     }));
     expect(bridgeMocks.exists).toHaveBeenCalledWith('generated-images/result.png');
+    expect(bridgeMocks.exists).toHaveBeenCalledTimes(1);
     expect(bridgeMocks.getDownloadUrl).toHaveBeenCalledWith('generated-images/result.png');
     await app.close();
   });
@@ -93,6 +95,7 @@ describe('generated image OSS delivery route', () => {
     const response = await app.inject({ method: 'GET', url: '/v1/ai/image-results/result.png?redirect=0' });
     expect(response.statusCode).toBe(200);
     expect(bridgeMocks.exists).toHaveBeenCalledWith('generated-images/result.png');
+    expect(bridgeMocks.exists).toHaveBeenCalledTimes(1);
     expect(bridgeMocks.uploadMedia).not.toHaveBeenCalled();
     await app.close();
   });
@@ -212,13 +215,14 @@ describe('generated image OSS delivery route', () => {
     await app.close();
   });
 
-  it('rejects a missing uploaded object before signing', async () => {
-    bridgeMocks.exists.mockResolvedValueOnce(false).mockResolvedValueOnce(false);
+  it('does not issue a redundant verification request after a successful upload', async () => {
+    bridgeMocks.exists.mockResolvedValueOnce(false);
     const app = await makeApp();
     const response = await app.inject({ method: 'GET', url: '/v1/ai/image-results/result.png?redirect=0' });
-    expect(response.statusCode).toBe(502);
-    expect(response.json().error).toBe('oss_object_missing');
-    expect(bridgeMocks.getDownloadUrl).not.toHaveBeenCalled();
+    expect(response.statusCode).toBe(200);
+    expect(bridgeMocks.exists).toHaveBeenCalledTimes(1);
+    expect(bridgeMocks.uploadMedia).toHaveBeenCalledOnce();
+    expect(bridgeMocks.getDownloadUrl).toHaveBeenCalledWith('generated-images/result.png');
     await app.close();
   });
 
