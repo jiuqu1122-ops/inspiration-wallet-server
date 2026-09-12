@@ -189,6 +189,69 @@ export async function bindReferralForUser(
   );
 }
 
+/**
+ * Apply the one-time referral reward for a qualifying invitee recharge.
+ * Redemption codes are currently the wallet's recharge mechanism; payment
+ * integrations can call this helper with their own idempotent event key.
+ */
+export async function rewardReferralOnRecharge(
+  transaction: TransactionClient,
+  input: { inviteeId: string; rechargeCredits: Prisma.Decimal | string | number; eventKey: string },
+) {
+  const existing = await transaction.referralRewardEvent.findUnique({ where: { eventKey: input.eventKey } });
+  if (existing) {
+    return {
+      id: existing.id,
+      inviterCredits: serializeCredit(existing.inviterCredits),
+      inviteeCredits: serializeCredit(existing.inviteeCredits),
+    };
+  }
+  const relation = await transaction.referralRelation.findUnique({ where: { inviteeId: input.inviteeId } });
+  if (!relation) return null;
+  const rule = await transaction.referralRewardRule.findUnique({ where: { eventType: 'RECHARGE' } });
+  if (!rule || !rule.active) return null;
+  const rechargeCredits = new Prisma.Decimal(input.rechargeCredits);
+  if (rule.minRecharge && rechargeCredits.lt(rule.minRecharge)) return null;
+  if (rule.inviterCredits.isZero() && rule.inviteeCredits.isZero()) return null;
+
+  const event = await transaction.referralRewardEvent.create({
+    data: {
+      eventKey: input.eventKey,
+      ruleId: rule.id,
+      relationId: relation.id,
+      inviterId: relation.inviterId,
+      inviteeId: relation.inviteeId,
+      inviterCredits: rule.inviterCredits,
+      inviteeCredits: rule.inviteeCredits,
+    },
+  });
+  for (const [userId, amount, description] of [
+    [relation.inviterId, rule.inviterCredits, 'Referral recharge reward'] as const,
+    [relation.inviteeId, rule.inviteeCredits, 'Recharge referral bonus'] as const,
+  ]) {
+    if (amount.isZero()) continue;
+    const wallet = await transaction.wallet.upsert({
+      where: { userId },
+      create: { userId, availableCredits: amount, lifetimeGranted: amount },
+      update: { availableCredits: { increment: amount }, lifetimeGranted: { increment: amount } },
+    });
+    await transaction.walletLedger.create({
+      data: {
+        userId,
+        type: 'GRANT',
+        amount,
+        balanceAfter: wallet.availableCredits,
+        description,
+      },
+    });
+  }
+  return {
+    id: event.id,
+    inviterCredits: serializeCredit(event.inviterCredits),
+    inviteeCredits: serializeCredit(event.inviteeCredits),
+  };
+}
+
 export class ReferralServiceError extends Error {
   constructor(
     public readonly code: string,

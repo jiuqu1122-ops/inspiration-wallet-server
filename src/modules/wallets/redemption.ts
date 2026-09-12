@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { serializeWalletBalance } from './serialization.js';
 import { creditDecimal, serializeCredit } from './credit-amount.js';
+import { rewardReferralOnRecharge } from '../membership/service.js';
 
 const CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
@@ -146,7 +147,7 @@ export async function redeemCredits(
         throw new RedemptionError('code_exhausted', '兑换码已被使用完', 409);
       }
 
-      await transaction.creditRedemption.create({
+      const redemption = await transaction.creditRedemption.create({
         data: { codeId: code.id, userId: input.userId, credits: code.credits },
       });
       const wallet = await transaction.wallet.update({
@@ -165,10 +166,19 @@ export async function redeemCredits(
           description: `兑换码充值 ${code.codeHint}`,
         },
       });
+      const referralReward = await rewardReferralOnRecharge(transaction, {
+        inviteeId: input.userId,
+        rechargeCredits: code.credits,
+        eventKey: `recharge:redemption:${redemption.id}`,
+      });
+      const finalWallet = referralReward
+        ? await transaction.wallet.findUniqueOrThrow({ where: { userId: input.userId } })
+        : wallet;
 
       return {
         redeemedCredits: serializeCredit(code.credits),
-        wallet: serializeWalletBalance(wallet),
+        wallet: serializeWalletBalance(finalWallet),
+        ...(referralReward ? { referralReward } : {}),
       };
     },
     { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },

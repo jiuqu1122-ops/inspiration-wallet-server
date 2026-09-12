@@ -618,6 +618,44 @@ describe('catalog exposure and upstream discovery safety', () => {
     expect(calculateSnapshotCharge(captured).totalCredits).toBe('7.000000');
   });
 
+  it('applies the other-module fold to fixed canvas/workflow pricing', async () => {
+    const prisma = {
+      userMembership: {
+        findFirst: vi.fn(async () => ({
+          plan: { versions: [{ prices: { discounts: { other: '0' } } }] },
+        })),
+      },
+    } as unknown as PrismaClient;
+    await expect(resolveMembershipContextCredits(prisma, 'user-1', 'canvas_text_agent', 1n)).resolves.toBe(0n);
+  });
+
+  it('applies membership folds by billing module, including free GPT Image 1K', async () => {
+    const prisma = {
+      aiModelPricing: {
+        findUnique: vi.fn(async () => ({
+          currentVersion: { id: 'price-fold', version: 1, pricing: {
+            billingType: 'image_resolution',
+            creditsPerImageByResolution: { '1k': '10', '2k': '20', '4k': '40' },
+          } },
+        })),
+      },
+      userMembership: {
+        findFirst: vi.fn(async () => ({
+          planId: 'plan-fold',
+          plan: { versions: [{ id: 'version-fold', prices: { discounts: { gptImage1K: '0', other: '5' } } }] },
+        })),
+      },
+    } as unknown as PrismaClient;
+    const freeOneK = await capturePricingSnapshot(prisma, {
+      id: 'image-2', canonicalModelKey: 'image2', modality: 'image', billingType: 'image_resolution',
+    }, null, { resolution: '1k', count: 1 }, 'user-fold');
+    expect(calculateSnapshotCharge(freeOneK).totalCredits).toBe('0.000000');
+    const halfPriceTwoK = await capturePricingSnapshot(prisma, {
+      id: 'image-2', canonicalModelKey: 'image2', modality: 'image', billingType: 'image_resolution',
+    }, null, { resolution: '2k', count: 1 }, 'user-fold');
+    expect(calculateSnapshotCharge(halfPriceTwoK).totalCredits).toBe('10.000000');
+  });
+
   it('never exposes route cost or provider credentials in the public catalog', async () => {
     const prisma = {
       aiModel: {

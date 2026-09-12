@@ -6,7 +6,7 @@ import type {
   ChatTokenUsage,
 } from './chat-pricing.js';
 import type { ImageModelCreditPrice, VideoModelCreditPrice } from './pricing.js';
-import { catalogDelegateAvailable, type AiModality } from './model-catalog.js';
+import { catalogDelegateAvailable, isGptImage2CatalogIdentity, type AiModality } from './model-catalog.js';
 import { env } from '../../config/env.js';
 import { isFixedCanvasLlmUsageContext } from './usage-context.js';
 
@@ -73,6 +73,69 @@ const membershipPriceKeys: Record<string, readonly string[]> = {
   chat: ['agentRequest', 'agent', 'llm'],
 };
 
+type MembershipDiscountCategory = 'gptImage1K' | 'chat' | 'video' | 'other';
+
+const membershipDiscountKeys: Record<MembershipDiscountCategory, readonly string[]> = {
+  gptImage1K: ['gptImage1K', 'gpt_image_1k', 'gptImageOneK'],
+  chat: ['chat'],
+  video: ['video'],
+  other: ['other'],
+};
+
+/**
+ * Membership folds are represented as "折": 10 means the catalog price,
+ * 5 means half price, and 0 means free.  Keep the value as fixed-point
+ * credits so discounts never go through floating point arithmetic.
+ */
+function membershipDiscountFold(prices: Record<string, unknown> | null, category: MembershipDiscountCategory) {
+  const discounts = plainObject(prices?.discounts);
+  if (!discounts) return null;
+  const value = membershipDiscountKeys[category]
+    .map(key => scalarText(discounts[key]))
+    .find(item => item.length > 0);
+  if (value === undefined || !/^(?:0|[1-9](?:\.\d{1,6})?|10(?:\.0{1,6})?)$/.test(value)) return null;
+  return creditMicros(value);
+}
+
+function applyMembershipFold(value: unknown, foldMicros: bigint) {
+  const amount = creditMicros(value);
+  return microsToCredit(amount * foldMicros / (10n * CREDIT_SCALE));
+}
+
+function scaleMembershipCredits(value: unknown, foldMicros: bigint, parentKey = '', creditContext = false): unknown {
+  const nestedCreditContext = creditContext || /(?:credit|price)/i.test(parentKey);
+  if (Array.isArray(value)) return value.map(item => scaleMembershipCredits(item, foldMicros, parentKey, nestedCreditContext));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+      key,
+      scaleMembershipCredits(item, foldMicros, key, nestedCreditContext),
+    ]));
+  }
+  if (nestedCreditContext) {
+    const text = scalarText(value);
+    if (creditPattern.test(text)) return applyMembershipFold(text, foldMicros);
+  }
+  return value;
+}
+
+function membershipCategory(
+  context: string | undefined,
+  modality: AiModality,
+  modelKey: string,
+  request: Record<string, unknown>,
+): MembershipDiscountCategory {
+  if (context === 'canvas_text_agent' || context === 'workflow' || context === 'inspiration_analysis') return 'other';
+  if (modality === 'chat') return 'chat';
+  if (modality === 'video') return 'video';
+  const resolution = scalarText(request.resolution).toLowerCase();
+  const modelToken = modelKey.trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+  const isGptImageFamily = isGptImage2CatalogIdentity(modelKey)
+    || modelToken.includes('gptimage')
+    || modelToken.includes('image2');
+  if (modality === 'image' && resolution === '1k' && isGptImageFamily) return 'gptImage1K';
+  return 'other';
+}
+
 /** Resolve a plan-level fixed price for non-catalog agent tasks. */
 export async function resolveMembershipContextCredits(
   prisma: PrismaClient,
@@ -89,7 +152,9 @@ export async function resolveMembershipContextCredits(
   });
   const prices = plainObject(membership?.plan.versions[0]?.prices);
   const value = membershipPriceKeys[context]?.map((key) => scalarText(prices?.[key])).find((item) => creditPattern.test(item));
-  return value === undefined ? fallback : creditMicros(value);
+  const base = value === undefined ? creditMicros(fallback) : creditMicros(value);
+  const fold = membershipDiscountFold(prices, membershipCategory(context, 'chat', '', {}));
+  return fold === null ? base : base * fold / (10n * CREDIT_SCALE);
 }
 
 export function creditMicros(value: unknown) {
@@ -327,6 +392,25 @@ export async function capturePricingSnapshot(
           }
         } catch {
           // A malformed membership override must never make the base catalog unusable.
+        }
+      }
+      const fold = membershipDiscountFold(
+        rawPrices,
+        membershipCategory(
+          scalarText(request.usageContext),
+          model.modality as AiModality,
+          model.canonicalModelKey,
+          request,
+        ),
+      );
+      if (fold !== null) {
+        try {
+          const discounted = scaleMembershipCredits(profile, fold) as CatalogPricingProfile;
+          profile = validatePricingProfile(model.modality as AiModality, discounted);
+          membershipPlanId = membership?.planId;
+          membershipPlanVersionId = version?.id;
+        } catch {
+          // A malformed membership discount must never make the base catalog unusable.
         }
       }
     }

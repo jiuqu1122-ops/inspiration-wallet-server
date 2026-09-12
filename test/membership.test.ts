@@ -4,6 +4,7 @@ import {
   getMembershipForUser,
   getReferralBindingEligibility,
   normalizeInviteCode,
+  rewardReferralOnRecharge,
   validateReferralCode,
 } from '../src/modules/membership/service.js';
 
@@ -58,5 +59,51 @@ describe('membership and referral helpers', () => {
       allowed: true,
       reason: null,
     });
+  });
+
+  it('rewards the inviter when an invitee redeems a qualifying recharge', async () => {
+    const wallets = new Map<string, { availableCredits: Prisma.Decimal }>();
+    const transaction = {
+      referralRewardEvent: {
+        findUnique: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockResolvedValue({
+          id: 'reward-1',
+          inviterCredits: new Prisma.Decimal('25'),
+          inviteeCredits: new Prisma.Decimal('5'),
+        }),
+      },
+      referralRelation: {
+        findUnique: vi.fn().mockResolvedValue({ id: 'relation-1', inviterId: 'inviter', inviteeId: 'invitee' }),
+      },
+      referralRewardRule: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: 'rule-1',
+          active: true,
+          minRecharge: new Prisma.Decimal('100'),
+          inviterCredits: new Prisma.Decimal('25'),
+          inviteeCredits: new Prisma.Decimal('5'),
+        }),
+      },
+      wallet: {
+        upsert: vi.fn(async ({ where, create, update }: any) => {
+          const current = wallets.get(where.userId);
+          if (current) {
+            current.availableCredits = current.availableCredits.plus(update.availableCredits.increment);
+            return current;
+          }
+          const next = { availableCredits: new Prisma.Decimal(create.availableCredits) };
+          wallets.set(where.userId, next);
+          return next;
+        }),
+      },
+      walletLedger: { create: vi.fn().mockResolvedValue({}) },
+    } as any;
+    const result = await rewardReferralOnRecharge(transaction, {
+      inviteeId: 'invitee',
+      rechargeCredits: '100',
+      eventKey: 'recharge:test-1',
+    });
+    expect(result).toEqual({ id: 'reward-1', inviterCredits: '25.000000', inviteeCredits: '5.000000' });
+    expect(transaction.walletLedger.create).toHaveBeenCalledTimes(2);
   });
 });
