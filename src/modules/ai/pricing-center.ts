@@ -125,7 +125,7 @@ function membershipCategory(
   request: Record<string, unknown>,
 ): MembershipDiscountCategory {
   if (context === 'canvas_text_agent' || context === 'workflow' || context === 'inspiration_analysis') return 'other';
-  if (modality === 'chat') return 'chat';
+  if (modality === 'chat' && (!context || context === 'chat')) return 'chat';
   if (modality === 'video') return 'video';
   const resolution = scalarText(request.resolution).toLowerCase();
   const modelToken = modelKey.trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
