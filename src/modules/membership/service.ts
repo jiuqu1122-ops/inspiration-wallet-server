@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { Prisma, type PrismaClient } from '@prisma/client';
+import { Prisma, type AiCapability, type PrismaClient } from '@prisma/client';
 import { serializeCredit } from '../wallets/credit-amount.js';
 
 const inviteAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -51,6 +51,43 @@ export async function validateReferralCode(
 }
 
 type TransactionClient = Prisma.TransactionClient;
+type PrismaLike = PrismaClient | TransactionClient;
+
+const referralImageCapabilities: AiCapability[] = [
+  'IMAGE',
+  'IMAGE_NANO_BANANA',
+  'IMAGE_NANO_BANANA_2',
+  'IMAGE_NANO_BANANA_PRO_FAST',
+  'IMAGE_NANO_BANANA_2_FAST',
+  'IMAGE_NANO_BANANA_PRO_1K',
+  'IMAGE_NANO_BANANA_DUAL_2K',
+  'IMAGE_GPT',
+  'IMAGE_GPT_1K',
+  'IMAGE_GROK',
+];
+
+export type ReferralBindingEligibility = {
+  allowed: boolean;
+  reason: 'image_generated' | 'credits_received' | null;
+};
+
+export async function getReferralBindingEligibility(
+  prisma: PrismaLike,
+  userId: string,
+): Promise<ReferralBindingEligibility> {
+  const [wallet, imageRequest] = await Promise.all([
+    prisma.wallet.findUnique({ where: { userId }, select: { lifetimeGranted: true } }),
+    prisma.aiRequest.findFirst({
+      where: { userId, capability: { in: referralImageCapabilities }, status: 'SUCCEEDED' },
+      select: { id: true },
+    }),
+  ]);
+  if (imageRequest) return { allowed: false, reason: 'image_generated' };
+  if (wallet && new Prisma.Decimal(wallet.lifetimeGranted).gt(0)) {
+    return { allowed: false, reason: 'credits_received' };
+  }
+  return { allowed: true, reason: null };
+}
 
 export async function bindReferralOnRegistration(
   transaction: TransactionClient,
@@ -127,6 +164,29 @@ export async function bindReferralOnRegistration(
       inviteeCredits: serializeCredit(event.inviteeCredits),
     },
   };
+}
+
+export async function bindReferralForUser(
+  prisma: PrismaClient,
+  input: { inviteeId: string; inviteCode: string },
+) {
+  return prisma.$transaction(
+    async (transaction) => {
+      const existing = await transaction.referralRelation.findUnique({ where: { inviteeId: input.inviteeId } });
+      if (existing) {
+        throw new ReferralServiceError('referral_already_bound', 'Referral has already been bound', 409);
+      }
+      const eligibility = await getReferralBindingEligibility(transaction, input.inviteeId);
+      if (!eligibility.allowed) {
+        const message = eligibility.reason === 'image_generated'
+          ? 'Invite codes can no longer be bound after image generation'
+          : 'Invite codes can no longer be bound after credits are received';
+        throw new ReferralServiceError(`referral_not_eligible_${eligibility.reason}`, message, 409);
+      }
+      return bindReferralOnRegistration(transaction, input);
+    },
+    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+  );
 }
 
 export class ReferralServiceError extends Error {

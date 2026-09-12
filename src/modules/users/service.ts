@@ -1,6 +1,6 @@
 import type { PrismaClient } from '@prisma/client';
 import { serializeWalletBalance } from '../wallets/serialization.js';
-import { getMembershipForUser, ensureReferralProfile } from '../membership/service.js';
+import { ensureReferralProfile, getMembershipForUser, getReferralBindingEligibility } from '../membership/service.js';
 
 export async function getAccountSnapshot(
   prisma: PrismaClient,
@@ -47,8 +47,12 @@ export async function getAccountSnapshot(
     ? license.expiresAt !== null && license.expiresAt < new Date() ? 'EXPIRED' : license.status
     : null;
 
-  const membership = await getMembershipForUser(prisma, user.id);
-  const referral = await ensureReferralProfile(prisma, user.id);
+  const [membership, referral, relation, eligibility] = await Promise.all([
+    getMembershipForUser(prisma, user.id),
+    ensureReferralProfile(prisma, user.id),
+    prisma.referralRelation.findUnique({ where: { inviteeId: user.id }, select: { id: true } }),
+    getReferralBindingEligibility(prisma, user.id),
+  ]);
   return {
     user: {
       id: user.id,
@@ -66,7 +70,12 @@ export async function getAccountSnapshot(
       expiresAt: license.expiresAt,
     } : null,
     membership,
-    referral: { inviteCode: referral.inviteCode },
+    referral: {
+      inviteCode: referral.inviteCode,
+      bound: Boolean(relation),
+      canBind: !relation && eligibility.allowed,
+      bindBlockedReason: relation ? 'already_bound' : eligibility.reason,
+    },
     wallet: user.wallet ? serializeWalletBalance(user.wallet) : null,
   };
 }
