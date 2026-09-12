@@ -1431,7 +1431,7 @@ export async function executeWalletAgentChat(
     ? await capturePricingSnapshot(prisma, canonicalModel, route?.id ?? null, {
       fallbackCredits: fallbackCredits.toString(),
       usageContext,
-    })
+    }, input.userId)
     : undefined;
   const credits = pricingSnapshot ? estimateSnapshotCredits(pricingSnapshot) : fallbackCredits;
   const requestId = await reserveCredits(prisma, {

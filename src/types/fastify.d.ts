@@ -15,13 +15,13 @@ declare module '@fastify/jwt' {
       sub: string;
       tokenType: 'access' | 'refresh';
       sessionId: string;
-      licenseId: string;
+      licenseId?: string;
     };
     user: {
       sub: string;
       tokenType: 'access' | 'refresh';
       sessionId: string;
-      licenseId: string;
+      licenseId?: string;
     };
   }
 }

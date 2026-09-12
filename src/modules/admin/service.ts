@@ -110,6 +110,13 @@ export async function listAdminUsers(
           updatedAt: true,
         },
       },
+      referralProfile: { select: { inviteCode: true } },
+      memberships: {
+        where: { status: 'ACTIVE', expiresAt: { gt: new Date() } },
+        orderBy: { expiresAt: 'desc' },
+        take: 1,
+        select: { id: true, status: true, startsAt: true, expiresAt: true, plan: { select: { id: true, code: true, name: true } } },
+      },
     },
   });
   const hasMore = users.length > input.limit;
@@ -128,6 +135,12 @@ export async function listAdminUsers(
       updatedAt: user.updatedAt.toISOString(),
       wallet: user.wallet ? serializeWalletBalance(user.wallet) : null,
       license: user.licenses[0] ? serializeLicense(user.licenses[0]) : null,
+      membership: user.memberships[0] ? {
+        ...user.memberships[0],
+        startsAt: user.memberships[0].startsAt.toISOString(),
+        expiresAt: user.memberships[0].expiresAt.toISOString(),
+      } : null,
+      referral: user.referralProfile,
     })),
     nextCursor: hasMore ? page.at(-1)?.id ?? null : null,
   };
@@ -161,6 +174,13 @@ export async function getAdminUser(prisma: PrismaClient, userId: string) {
           updatedAt: true,
         },
       },
+      referralProfile: { select: { inviteCode: true } },
+      memberships: {
+        where: { status: 'ACTIVE', expiresAt: { gt: new Date() } },
+        orderBy: { expiresAt: 'desc' },
+        take: 1,
+        select: { id: true, status: true, startsAt: true, expiresAt: true, plan: { select: { id: true, code: true, name: true } } },
+      },
       ledger: {
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         take: 100,
@@ -189,6 +209,12 @@ export async function getAdminUser(prisma: PrismaClient, userId: string) {
     updatedAt: user.updatedAt.toISOString(),
     wallet: user.wallet ? serializeWalletBalance(user.wallet) : null,
     licenses: user.licenses.map(serializeLicense),
+    membership: user.memberships[0] ? {
+      ...user.memberships[0],
+      startsAt: user.memberships[0].startsAt.toISOString(),
+      expiresAt: user.memberships[0].expiresAt.toISOString(),
+    } : null,
+    referral: user.referralProfile,
     ledger: user.ledger.map((entry) => ({
       ...entry,
       amount: serializeCredit(entry.amount),

@@ -129,6 +129,11 @@ enum ReferenceUploadStatus {
   UPLOADED
 }
 
+enum MembershipStatus {
+  ACTIVE
+  REVOKED
+}
+
 model User {
   id                   String                       @id @default(cuid())
   email                String?                      @unique
@@ -150,8 +155,114 @@ model User {
   emailChallenges      EmailVerificationChallenge[]
   creditRedemptions    CreditRedemption[]
   referenceUploads     ReferenceUpload[]
+  memberships          UserMembership[]
+  referralProfile      ReferralProfile?
+  sentReferrals        ReferralRelation[]       @relation("ReferralInviter")
+  receivedReferral     ReferralRelation?        @relation("ReferralInvitee")
+  sentReferralRewards  ReferralRewardEvent[]    @relation("ReferralRewardInviter")
+  receivedReferralRewards ReferralRewardEvent[] @relation("ReferralRewardInvitee")
 
   @@index([status])
+}
+
+model MembershipPlan {
+  id          String                    @id @default(cuid())
+  code        String                    @unique
+  name        String
+  description String?
+  active      Boolean                   @default(true)
+  createdAt   DateTime                  @default(now())
+  updatedAt   DateTime                  @updatedAt
+  versions    MembershipPlanVersion[]
+  memberships UserMembership[]
+
+  @@index([active, updatedAt])
+}
+
+model MembershipPlanVersion {
+  id          String         @id @default(cuid())
+  planId      String
+  version     Int
+  prices      Json
+  freeQuota   Json?
+  publishedAt DateTime       @default(now())
+  createdAt   DateTime       @default(now())
+  plan        MembershipPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@unique([planId, version])
+  @@index([planId, publishedAt])
+}
+
+model UserMembership {
+  id        String           @id @default(cuid())
+  userId    String
+  planId    String
+  status    MembershipStatus @default(ACTIVE)
+  startsAt  DateTime
+  expiresAt DateTime
+  source    String           @default("ADMIN")
+  note      String?
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  user      User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  plan      MembershipPlan   @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  @@index([userId, status, expiresAt])
+  @@index([planId, status, expiresAt])
+}
+
+model ReferralProfile {
+  userId     String   @id
+  inviteCode String   @unique
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model ReferralRelation {
+  id         String   @id @default(cuid())
+  inviterId  String
+  inviteeId  String   @unique
+  inviteCode String
+  boundAt    DateTime @default(now())
+  inviter    User     @relation("ReferralInviter", fields: [inviterId], references: [id], onDelete: Restrict)
+  invitee    User     @relation("ReferralInvitee", fields: [inviteeId], references: [id], onDelete: Restrict)
+  rewards    ReferralRewardEvent[]
+
+  @@index([inviterId, boundAt])
+  @@index([inviteCode, boundAt])
+}
+
+model ReferralRewardRule {
+  id             String   @id @default(cuid())
+  eventType      String   @unique
+  inviterCredits Decimal  @default(0) @db.Decimal(24, 6)
+  inviteeCredits Decimal  @default(0) @db.Decimal(24, 6)
+  minRecharge    Decimal? @db.Decimal(24, 6)
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  events         ReferralRewardEvent[]
+}
+
+model ReferralRewardEvent {
+  id             String              @id @default(cuid())
+  eventKey       String              @unique
+  ruleId         String?
+  relationId     String?
+  inviterId      String
+  inviteeId      String
+  inviterCredits Decimal              @default(0) @db.Decimal(24, 6)
+  inviteeCredits Decimal              @default(0) @db.Decimal(24, 6)
+  createdAt      DateTime            @default(now())
+  rule           ReferralRewardRule? @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+  relation       ReferralRelation?   @relation(fields: [relationId], references: [id], onDelete: SetNull)
+  inviter        User                @relation("ReferralRewardInviter", fields: [inviterId], references: [id], onDelete: Restrict)
+  invitee        User                @relation("ReferralRewardInvitee", fields: [inviteeId], references: [id], onDelete: Restrict)
+
+  @@index([inviterId, createdAt])
+  @@index([inviteeId, createdAt])
+  @@index([relationId, createdAt])
 }
 
 model ReferenceUpload {
@@ -236,7 +347,7 @@ model License {
 model AuthSession {
   id               String    @id
   userId           String
-  licenseId        String
+  licenseId        String?
   refreshTokenHash String    @unique
   expiresAt        DateTime
   revokedAt        DateTime?
@@ -244,7 +355,7 @@ model AuthSession {
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
   user             User      @relation(fields: [userId], references: [id], onDelete: Restrict)
-  license          License   @relation(fields: [licenseId], references: [id], onDelete: Restrict)
+  license          License?  @relation(fields: [licenseId], references: [id], onDelete: Restrict)
 
   @@index([userId, revokedAt])
   @@index([licenseId, revokedAt])

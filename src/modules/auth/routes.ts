@@ -36,6 +36,7 @@ const emailCodeVerifySchema = z
     code: z.string().regex(/^\d{6}$/),
     machineId: z.string().regex(/^[a-fA-F0-9]{64}$/),
     displayName: z.string().trim().min(2).max(32).optional(),
+    inviteCode: z.string().trim().min(6).max(32).optional(),
     legacyLicense: z.string().min(1).max(350_000).optional(),
     appVersion: z.string().trim().min(1).max(64).optional(),
   })

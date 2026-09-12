@@ -562,6 +562,30 @@ describe('catalog exposure and upstream discovery safety', () => {
     });
   });
 
+  it('uses an active membership price override without changing the base catalog version', async () => {
+    const prisma = {
+      aiModelPricing: {
+        findUnique: vi.fn(async () => ({
+          currentVersion: { id: 'price-10', version: 10, pricing: {
+            billingType: 'image_resolution',
+            creditsPerImageByResolution: { '1k': '10', '2k': '16', '4k': '20' },
+          } },
+        })),
+      },
+      userMembership: {
+        findFirst: vi.fn(async () => ({
+          planId: 'plan-pro',
+          plan: { versions: [{ id: 'plan-price-2', prices: { models: { 'nano-banana-pro': { image1K: '1', image2K: '2', image4K: '3' } } } }] },
+        })),
+      },
+    } as unknown as PrismaClient;
+    const captured = await capturePricingSnapshot(prisma, {
+      id: 'model-1', canonicalModelKey: 'nano-banana-pro', modality: 'image', billingType: 'image_resolution',
+    }, null, { resolution: '2k', count: 1 }, 'user-1');
+    expect(captured.membershipPlanId).toBe('plan-pro');
+    expect(calculateSnapshotCharge(captured).totalCredits).toBe('2.000000');
+  });
+
   it('never exposes route cost or provider credentials in the public catalog', async () => {
     const prisma = {
       aiModel: {

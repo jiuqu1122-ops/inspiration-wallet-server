@@ -40,4 +40,15 @@ describe('token pairs', () => {
     expect(() => app.jwt.verify(pair.refreshToken)).toThrow();
     expect(() => verifyRefreshToken(pair.accessToken)).toThrow();
   });
+
+  it('supports account sessions that do not carry a legacy license claim', async () => {
+    const app = Fastify({ logger: false });
+    apps.push(app);
+    await app.register(jwtPlugin);
+    await app.ready();
+
+    const pair = createTokenPair(app, userId, sessionId, null);
+    expect(app.jwt.verify(pair.accessToken)).not.toHaveProperty('licenseId');
+    expect(verifyRefreshToken(pair.refreshToken)).not.toHaveProperty('licenseId');
+  });
 });

@@ -22,7 +22,7 @@ const refreshPayloadSchema = z.object({
   sub: z.string().min(1),
   tokenType: z.literal('refresh'),
   sessionId: z.string().uuid(),
-  licenseId: z.string().min(1),
+  licenseId: z.string().min(1).optional(),
 });
 
 export function durationToMilliseconds(value: string): number {
@@ -39,9 +39,9 @@ export function createTokenPair(
   app: FastifyInstance,
   userId: string,
   sessionId: string,
-  licenseId: string,
+  licenseId?: string | null,
 ) {
-  const claims = { sub: userId, sessionId, licenseId };
+  const claims = { sub: userId, sessionId, ...(licenseId ? { licenseId } : {}) };
   const accessToken = app.jwt.sign({ ...claims, tokenType: 'access' });
   const refreshToken = signRefreshToken({ ...claims, tokenType: 'refresh' });
   return { accessToken, refreshToken };

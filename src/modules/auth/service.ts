@@ -25,11 +25,11 @@ export class AuthFlowError extends Error {
   }
 }
 
-function sessionExpiration(licenseExpiration: Date) {
+function sessionExpiration(licenseExpiration: Date | null) {
   const refreshExpiration = new Date(
     Date.now() + durationToMilliseconds(env.JWT_REFRESH_EXPIRES_IN),
   );
-  return refreshExpiration < licenseExpiration ? refreshExpiration : licenseExpiration;
+  return licenseExpiration && refreshExpiration < licenseExpiration ? refreshExpiration : licenseExpiration ?? refreshExpiration;
 }
 
 function assertActiveIdentity(identity: {
@@ -121,8 +121,8 @@ export async function resolveLicenseIdentity(
 async function createSession(
   app: FastifyInstance,
   userId: string,
-  licenseId: string,
-  licenseExpiresAt: Date,
+  licenseId: string | null,
+  licenseExpiresAt: Date | null,
 ) {
   const sessionId = randomUUID();
   const tokens = createTokenPair(app, userId, sessionId, licenseId);
@@ -130,7 +130,7 @@ async function createSession(
     data: {
       id: sessionId,
       userId,
-      licenseId,
+      ...(licenseId ? { licenseId } : {}),
       refreshTokenHash: hashRefreshToken(tokens.refreshToken),
       expiresAt: sessionExpiration(licenseExpiresAt),
     },
@@ -183,6 +183,21 @@ export async function exchangeLicense(
   };
 }
 
+/** New account authentication path. License remains optional for old clients. */
+export async function createAccountSession(app: FastifyInstance, userId: string) {
+  const tokens = await createSession(app, userId, null, null);
+  const account = await getAccountSnapshot(app.prisma, userId);
+  if (!account) throw new Error('Account snapshot could not be created');
+  return {
+    tokenType: 'Bearer' as const,
+    accessToken: tokens.accessToken,
+    refreshToken: tokens.refreshToken,
+    accessTokenExpiresIn: env.JWT_ACCESS_EXPIRES_IN,
+    refreshTokenExpiresIn: env.JWT_REFRESH_EXPIRES_IN,
+    account,
+  };
+}
+
 function secureHashMatches(expected: string, actual: string) {
   const expectedBytes = Buffer.from(expected, 'hex');
   const actualBytes = Buffer.from(actual, 'hex');
@@ -208,24 +223,25 @@ export async function rotateRefreshToken(app: FastifyInstance, refreshToken: str
   if (
     !session ||
     session.userId !== claims.sub ||
-    session.licenseId !== claims.licenseId ||
+    (claims.licenseId !== undefined && session.licenseId !== claims.licenseId) ||
     !secureHashMatches(session.refreshTokenHash, presentedHash)
   ) {
     throw new AuthFlowError('invalid_refresh_token', 'Refresh token is invalid', 401);
   }
-  assertActiveIdentity({
-    user: session.user,
-    status: session.license.status,
-    expiresAt: session.license.expiresAt,
-  });
+  if (session.license) {
+    assertActiveIdentity({
+      user: session.user,
+      status: session.license.status,
+      expiresAt: session.license.expiresAt,
+    });
+  } else if (session.user.status !== 'ACTIVE') {
+    throw new AuthFlowError('account_disabled', 'The account is disabled', 403);
+  }
   const now = new Date();
   if (session.revokedAt !== null || session.expiresAt <= now) {
     throw new AuthFlowError('refresh_token_expired', 'Refresh token is expired or revoked', 401);
   }
-  const licenseExpiresAt = session.license.expiresAt;
-  if (licenseExpiresAt === null) {
-    throw new AuthFlowError('license_invalid', 'License expiration is not configured', 403);
-  }
+  const licenseExpiresAt = session.license?.expiresAt ?? null;
 
   const nextSessionId = randomUUID();
   const nextTokens = createTokenPair(
@@ -250,7 +266,7 @@ export async function rotateRefreshToken(app: FastifyInstance, refreshToken: str
       data: {
         id: nextSessionId,
         userId: session.userId,
-        licenseId: session.licenseId,
+        ...(session.licenseId ? { licenseId: session.licenseId } : {}),
         refreshTokenHash: hashRefreshToken(nextTokens.refreshToken),
         expiresAt: sessionExpiration(licenseExpiresAt),
       },
@@ -273,7 +289,7 @@ export async function revokeRefreshToken(app: FastifyInstance, refreshToken: str
       where: {
         id: claims.sessionId,
         userId: claims.sub,
-        licenseId: claims.licenseId,
+        ...(claims.licenseId ? { licenseId: claims.licenseId } : {}),
         refreshTokenHash: hashRefreshToken(refreshToken),
         revokedAt: null,
       },

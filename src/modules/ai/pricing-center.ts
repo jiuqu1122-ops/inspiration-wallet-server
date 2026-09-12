@@ -31,6 +31,8 @@ export type PricingSnapshot = {
   pricing: CatalogPricingProfile;
   request: Prisma.InputJsonObject;
   capturedAt: string;
+  membershipPlanId?: string;
+  membershipPlanVersionId?: string;
 };
 
 export type ChargeBreakdown = {
@@ -241,15 +243,59 @@ export async function capturePricingSnapshot(
   model: { id: string; canonicalModelKey: string; modality: string; billingType: string },
   routeId: string | null,
   request: Prisma.InputJsonObject,
+  userId?: string,
 ): Promise<PricingSnapshot> {
   const pricing = await prisma.aiModelPricing.findUnique({
     where: { canonicalModelId: model.id },
     include: { currentVersion: true },
   });
   if (!pricing?.currentVersion) throw new Error(`Published pricing is missing for ${model.canonicalModelKey}`);
-  const profile = validatePricingProfile(model.modality as AiModality, pricing.currentVersion.pricing);
+  let profile = validatePricingProfile(model.modality as AiModality, pricing.currentVersion.pricing);
   if (profile.billingType !== model.billingType) {
     throw new Error(`Published billing type does not match ${model.canonicalModelKey}`);
+  }
+  let membershipPlanId: string | undefined;
+  let membershipPlanVersionId: string | undefined;
+  if (userId) {
+    const membership = await prisma.userMembership.findFirst({
+      where: { userId, status: 'ACTIVE', startsAt: { lte: new Date() }, expiresAt: { gt: new Date() } },
+      orderBy: { expiresAt: 'desc' },
+      include: { plan: { include: { versions: { orderBy: { version: 'desc' }, take: 1 } } } },
+    });
+    const version = membership?.plan.versions[0];
+    const rawPrices = plainObject(version?.prices);
+    if (rawPrices) {
+      const models = plainObject(rawPrices.models);
+      const direct = models?.[model.canonicalModelKey] ?? models?.[model.id] ?? rawPrices[model.canonicalModelKey];
+      const candidate = plainObject(direct) ?? rawPrices;
+      let override: Record<string, unknown> | null = null;
+      if (candidate.billingType || candidate.creditsPerRequest || candidate.creditsPerImage || candidate.creditsPerImageByResolution) {
+        override = candidate;
+      } else if (model.modality === 'image' && ['image1K', 'image2K', 'image4K', '1k', '2k', '4k'].some(key => candidate[key] !== undefined)) {
+        const base = plainObject(profile.creditsPerImageByResolution) ?? {};
+        override = {
+          ...profile,
+          creditsPerImageByResolution: {
+            ...base,
+            ...(candidate.image1K !== undefined || candidate['1k'] !== undefined ? { '1k': candidate.image1K ?? candidate['1k'] } : {}),
+            ...(candidate.image2K !== undefined || candidate['2k'] !== undefined ? { '2k': candidate.image2K ?? candidate['2k'] } : {}),
+            ...(candidate.image4K !== undefined || candidate['4k'] !== undefined ? { '4k': candidate.image4K ?? candidate['4k'] } : {}),
+          },
+        };
+      }
+      if (override) {
+        try {
+          const validated = validatePricingProfile(model.modality as AiModality, override);
+          if (validated.billingType === model.billingType) {
+            profile = validated;
+            membershipPlanId = membership?.planId;
+            membershipPlanVersionId = version?.id;
+          }
+        } catch {
+          // A malformed membership override must never make the base catalog unusable.
+        }
+      }
+    }
   }
   return {
     schemaVersion: 1,
@@ -263,6 +309,8 @@ export async function capturePricingSnapshot(
     pricing: structuredClone(profile),
     request: structuredClone(request),
     capturedAt: new Date().toISOString(),
+    ...(membershipPlanId ? { membershipPlanId } : {}),
+    ...(membershipPlanVersionId ? { membershipPlanVersionId } : {}),
   };
 }
 

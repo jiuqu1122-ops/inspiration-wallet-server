@@ -1,4 +1,5 @@
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
+import type { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { LicenseVerificationError } from '../auth/license-verifier.js';
 import {
@@ -26,6 +27,17 @@ import {
   updateLegacyAiPricingAndPublish,
   updateLegacyChatPricingAndPublish,
 } from '../ai/catalog-seed.js';
+import {
+  createMembershipPlan,
+  extendMembership,
+  grantMembership,
+  listMembershipPlansAdmin,
+  listReferralRules,
+  ReferralServiceError,
+  revokeMembership,
+  updateMembershipPlan,
+  upsertReferralRule,
+} from '../membership/service.js';
 
 const listUsersSchema = z.object({
   query: z.string().trim().max(200).optional(),
@@ -177,7 +189,79 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
+const membershipPlanCreateSchema = z.object({
+  code: z.string().trim().min(2).max(64).regex(/^[a-zA-Z0-9_-]+$/),
+  name: z.string().trim().min(1).max(100),
+  description: z.string().trim().max(500).nullable().optional(),
+  prices: z.record(z.string(), z.unknown()),
+  freeQuota: z.record(z.string(), z.unknown()).nullable().optional(),
+}).strict();
+const membershipPlanUpdateSchema = z.object({
+  name: z.string().trim().min(1).max(100).optional(),
+  description: z.string().trim().max(500).nullable().optional(),
+  active: z.boolean().optional(),
+  prices: z.record(z.string(), z.unknown()).optional(),
+  freeQuota: z.record(z.string(), z.unknown()).nullable().optional(),
+}).strict();
+const membershipGrantSchema = z.object({
+  planId: z.string().min(1).max(64),
+  days: z.number().int().min(1).max(3650),
+  note: z.string().trim().max(500).nullable().optional(),
+}).strict();
+const membershipExtendSchema = z.object({
+  days: z.number().int().min(1).max(3650),
+  planId: z.string().min(1).max(64).optional(),
+}).strict();
+const referralRuleSchema = z.object({
+  eventType: z.string().trim().min(2).max(64),
+  inviterCredits: z.string().regex(/^\d+(?:\.\d{1,6})?$/),
+  inviteeCredits: z.string().regex(/^\d+(?:\.\d{1,6})?$/),
+  minRecharge: z.string().regex(/^\d+(?:\.\d{1,6})?$/).nullable().optional(),
+  active: z.boolean().optional(),
+}).strict();
+
   app.get('/chat-pricing', async () => getChatPricingConfig(app.prisma));
+
+  app.get('/membership/plans', async () => ({ items: await listMembershipPlansAdmin(app.prisma) }));
+
+  app.post('/membership/plans', async (request, reply) => {
+    const parsed = membershipPlanCreateSchema.safeParse(request.body);
+    if (!parsed.success) return invalid(reply, 'Membership plan data is invalid');
+    try {
+      const plan = await createMembershipPlan(app.prisma, {
+        ...parsed.data,
+        prices: parsed.data.prices as Prisma.InputJsonValue,
+        freeQuota: parsed.data.freeQuota as Prisma.InputJsonValue | null | undefined,
+      });
+      return reply.code(201).send(plan);
+    } catch (error) {
+      if (error instanceof ReferralServiceError) return reply.code(error.statusCode).send({ error: error.code, message: error.message });
+      throw error;
+    }
+  });
+
+  app.patch('/membership/plans/:planId', async (request, reply) => {
+    const params = z.object({ planId: z.string().min(1).max(64) }).safeParse(request.params);
+    const parsed = membershipPlanUpdateSchema.safeParse(request.body);
+    if (!params.success || !parsed.success) return invalid(reply, 'Membership plan data is invalid');
+    try {
+      return await updateMembershipPlan(app.prisma, params.data.planId, {
+        ...parsed.data,
+        prices: parsed.data.prices as Prisma.InputJsonValue | undefined,
+        freeQuota: parsed.data.freeQuota as Prisma.InputJsonValue | null | undefined,
+      });
+    } catch (error) {
+      if (error instanceof ReferralServiceError) return reply.code(error.statusCode).send({ error: error.code, message: error.message });
+      throw error;
+    }
+  });
+
+  app.get('/referral-rules', async () => ({ items: await listReferralRules(app.prisma) }));
+  app.patch('/referral-rules', async (request, reply) => {
+    const parsed = referralRuleSchema.safeParse(request.body);
+    if (!parsed.success) return invalid(reply, 'Referral rule data is invalid');
+    return upsertReferralRule(app.prisma, parsed.data);
+  });
 
   app.patch(
     '/chat-pricing',
@@ -284,6 +368,36 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
       }
     },
   );
+
+  app.post('/users/:userId/membership/grant', async (request, reply) => {
+    const params = userParamsSchema.safeParse(request.params);
+    const body = membershipGrantSchema.safeParse(request.body);
+    if (!params.success || !body.success) return invalid(reply, 'Membership grant is invalid');
+    try {
+      return await grantMembership(app.prisma, { userId: params.data.userId, ...body.data });
+    } catch (error) {
+      if (error instanceof ReferralServiceError) return reply.code(error.statusCode).send({ error: error.code, message: error.message });
+      throw error;
+    }
+  });
+
+  app.post('/users/:userId/membership/extend', async (request, reply) => {
+    const params = userParamsSchema.safeParse(request.params);
+    const body = membershipExtendSchema.safeParse(request.body);
+    if (!params.success || !body.success) return invalid(reply, 'Membership extension is invalid');
+    try {
+      return await extendMembership(app.prisma, { userId: params.data.userId, ...body.data });
+    } catch (error) {
+      if (error instanceof ReferralServiceError) return reply.code(error.statusCode).send({ error: error.code, message: error.message });
+      throw error;
+    }
+  });
+
+  app.post('/users/:userId/membership/revoke', async (request, reply) => {
+    const params = userParamsSchema.safeParse(request.params);
+    if (!params.success) return invalid(reply, 'User ID is invalid');
+    return revokeMembership(app.prisma, params.data.userId);
+  });
 
   app.patch(
     '/users/:userId/authorization',

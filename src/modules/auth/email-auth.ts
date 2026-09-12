@@ -5,7 +5,8 @@ import { env } from '../../config/env.js';
 import { hashCloudLicenseId, hashLicenseMachineId, verifySignedLicenseForMigration } from './license-verifier.js';
 import { canSignServerLicenses, signServerLicense } from './license-signer.js';
 import { sendVerificationEmail } from './mailer.js';
-import { AuthFlowError, exchangeLicense } from './service.js';
+import { AuthFlowError, createAccountSession, exchangeLicense } from './service.js';
+import { bindReferralOnRegistration, validateReferralCode } from '../membership/service.js';
 
 const maxCodeAttempts = 5;
 
@@ -30,9 +31,12 @@ function hashMatches(expected: string, actual: string) {
   return expectedBytes.length === actualBytes.length && timingSafeEqual(expectedBytes, actualBytes);
 }
 
-function thirtyDayExpiration() {
+function compatibilityLicenseExpiration() {
   const expiresAt = new Date();
-  expiresAt.setUTCDate(expiresAt.getUTCDate() + 30);
+  // Legacy desktop clients still require a signed expiration field. Keep this
+  // compatibility shim far beyond any normal account lifetime; new clients use
+  // the nullable account session and membership expiry instead.
+  expiresAt.setUTCDate(expiresAt.getUTCDate() + 36500);
   expiresAt.setUTCHours(23, 59, 59, 999);
   return expiresAt;
 }
@@ -92,6 +96,7 @@ type VerifyEmailInput = {
   machineId: string;
   displayName?: string | undefined;
   legacyLicense?: string | undefined;
+  inviteCode?: string | undefined;
 };
 
 export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailInput) {
@@ -104,6 +109,12 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
   }
 
   const email = normalizeEmail(input.email);
+  if (input.inviteCode) {
+    const referral = await validateReferralCode(app.prisma, input.inviteCode);
+    if (!referral.valid) {
+      throw new AuthFlowError('invalid_invite_code', 'Invite code is invalid', 400);
+    }
+  }
   const challenge = await app.prisma.emailVerificationChallenge.findUnique({
     where: { id: input.challengeId },
   });
@@ -160,6 +171,7 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
 
       const candidateUsers = [emailUser, legacyLicense?.user, priorMachineLicense?.user]
         .filter((user): user is NonNullable<typeof user> => Boolean(user));
+      const isNewAccount = !emailUser && !legacyLicense && !priorMachineLicense;
       const distinctUserIds = new Set(candidateUsers.map((user) => user.id));
       if (distinctUserIds.size > 1) {
         throw new AuthFlowError(
@@ -187,8 +199,8 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
         ?? null;
       let entitlementExpiresAt = user?.entitlementExpiresAt
         ?? inheritedExpiration
-        ?? thirtyDayExpiration();
-      if (legacy?.expiresAt && legacy.expiresAt > entitlementExpiresAt) {
+        ?? null;
+      if (legacy?.expiresAt && (!entitlementExpiresAt || legacy.expiresAt > entitlementExpiresAt)) {
         entitlementExpiresAt = legacy.expiresAt;
       }
 
@@ -201,7 +213,7 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
             emailVerifiedAt: now,
             entitlementEdition: 'ENTERPRISE',
             entitlementFeatures: ['*'],
-            entitlementExpiresAt,
+          entitlementExpiresAt,
           },
         });
       } else {
@@ -212,7 +224,6 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
             emailVerifiedAt: now,
             entitlementEdition: 'ENTERPRISE',
             entitlementFeatures: ['*'],
-            entitlementExpiresAt,
             wallet: { create: {} },
           },
         });
@@ -222,6 +233,13 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
         create: { userId: user.id },
         update: {},
       });
+
+      const referral = isNewAccount
+        ? await bindReferralOnRegistration(transaction, {
+            inviteeId: user.id,
+            inviteCode: input.inviteCode,
+          })
+        : null;
 
       if (legacy && !legacyLicense) {
         await transaction.license.create({
@@ -239,6 +257,7 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
       }
 
       const deviceLicenseId = `emaildev_${machineIdHash}`;
+      const deviceLicenseExpiresAt = entitlementExpiresAt ?? compatibilityLicenseExpiration();
       const existingDeviceLicense = await transaction.license.findUnique({
         where: { id: deviceLicenseId },
       });
@@ -253,18 +272,18 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
           customer: displayName,
           machineIdHash,
           userId: user.id,
-          status: entitlementExpiresAt < now ? 'EXPIRED' : 'ACTIVE',
+          status: deviceLicenseExpiresAt < now ? 'EXPIRED' : 'ACTIVE',
           edition: 'ENTERPRISE',
           features: ['*'],
-          expiresAt: entitlementExpiresAt,
+          expiresAt: deviceLicenseExpiresAt,
           lastExchangedAt: now,
         },
         update: {
           customer: displayName,
-          status: entitlementExpiresAt < now ? 'EXPIRED' : 'ACTIVE',
+          status: deviceLicenseExpiresAt < now ? 'EXPIRED' : 'ACTIVE',
           edition: 'ENTERPRISE',
           features: ['*'],
-          expiresAt: entitlementExpiresAt,
+          expiresAt: deviceLicenseExpiresAt,
           lastExchangedAt: now,
         },
       });
@@ -272,35 +291,41 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
       return {
         user,
         deviceLicense,
-        isNewAccount: !emailUser && !legacyLicense && !priorMachineLicense,
+        isNewAccount,
+        referral,
+        deviceLicenseExpiresAt,
       };
     },
     { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
   );
 
-  if (!result.user.entitlementExpiresAt || result.user.entitlementExpiresAt < now) {
+  if (result.user.entitlementExpiresAt && result.user.entitlementExpiresAt < now) {
     throw new AuthFlowError('license_expired', 'Account authorization has expired', 403);
   }
 
-  const license = signServerLicense({
-    licenseId: result.deviceLicense.id,
-    customer: result.user.displayName ?? email,
-    machineId,
-    edition: 'enterprise',
-    features: ['*'],
-    expiresAt: result.user.entitlementExpiresAt,
-  });
-  const authentication = await exchangeLicense(app, { license, machineId });
+  const authentication = canSignServerLicenses()
+    ? await (async () => {
+        const license = signServerLicense({
+          licenseId: result.deviceLicense.id,
+          customer: result.user.displayName ?? email,
+          machineId,
+          edition: 'enterprise',
+          features: ['*'],
+          expiresAt: result.deviceLicenseExpiresAt,
+        });
+        return { license, ...(await exchangeLicense(app, { license, machineId })) };
+      })()
+    : await createAccountSession(app, result.user.id);
 
   return {
-    license,
     ...authentication,
     registration: {
       isNewAccount: result.isNewAccount,
       email,
       displayName: result.user.displayName,
       edition: 'enterprise',
-      expiresAt: result.user.entitlementExpiresAt.toISOString(),
+      expiresAt: result.user.entitlementExpiresAt?.toISOString() ?? null,
+      referral: result.referral?.reward ?? null,
     },
   };
 }

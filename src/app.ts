@@ -12,6 +12,7 @@ import { adminRoutes } from './modules/admin/routes.js';
 import { aiRoutes } from './modules/ai/routes.js';
 import { inspirationSpaceRoutes } from './modules/inspiration-space/routes.js';
 import { mobileRoutes } from './modules/mobile/routes.js';
+import { membershipRoutes, referralAliasRoutes } from './modules/membership/routes.js';
 import { adminAuthPlugin } from './plugins/admin-auth.js';
 import { jwtPlugin } from './plugins/jwt.js';
 import { prismaPlugin } from './plugins/prisma.js';
@@ -102,6 +103,8 @@ export async function buildApp() {
       await v1.register(aiRoutes, { prefix: '/ai' });
       await v1.register(inspirationSpaceRoutes, { prefix: '/inspiration-space' });
       await v1.register(mobileRoutes, { prefix: '/mobile' });
+      await v1.register(membershipRoutes, { prefix: '/membership' });
+      await v1.register(referralAliasRoutes, { prefix: '/referrals' });
       await v1.register(adminRoutes, { prefix: '/admin' });
     },
     { prefix: '/v1' },

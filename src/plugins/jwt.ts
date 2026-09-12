@@ -7,7 +7,7 @@ const accessClaimsSchema = z.object({
   sub: z.string().min(1),
   tokenType: z.literal('access'),
   sessionId: z.string().uuid(),
-  licenseId: z.string().min(1),
+  licenseId: z.string().min(1).optional(),
 });
 
 export const jwtPlugin = fp(async (app) => {
@@ -54,12 +54,12 @@ export const jwtPlugin = fp(async (app) => {
     const invalidSession =
       !session ||
       session.userId !== claims.sub ||
-      session.licenseId !== claims.licenseId ||
+      (claims.licenseId !== undefined && session.licenseId !== claims.licenseId) ||
       session.revokedAt !== null ||
       session.expiresAt <= now ||
       session.user.status !== 'ACTIVE' ||
-      session.license.status !== 'ACTIVE' ||
-      (session.license.expiresAt !== null && session.license.expiresAt < now);
+      (session.license !== null && (session.license.status !== 'ACTIVE' ||
+        (session.license.expiresAt !== null && session.license.expiresAt < now)));
 
     if (invalidSession) {
       return reply.code(401).send({

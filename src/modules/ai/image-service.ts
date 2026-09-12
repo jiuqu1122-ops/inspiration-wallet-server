@@ -3857,7 +3857,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     ? await capturePricingSnapshot(prisma, catalogResolution.model, primaryRoute?.id ?? null, {
       resolution: validatedInput.resolution ?? '2k',
       count: validatedInput.count,
-    })
+    }, input.userId)
     : undefined;
   await assertPublicProviderUrl(primaryProvider.baseUrl);
   const reservation = await reserveImageCredits(
@@ -4793,7 +4793,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       referenceVideoCount: input.inputVideos.length,
       referenceVideoSeconds: (input.duration ?? 15) * input.inputVideos.length,
       referenceVideoResolution: input.resolution ?? '720p',
-    })
+    }, input.userId)
     : undefined;
   const reservation = await reserveVideo(prisma, upstreamInput, pricingSnapshot, canonicalModelKey);
   try {
