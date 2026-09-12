@@ -13,6 +13,7 @@ import {
   calculateSnapshotCharge,
   capturePricingSnapshot,
   publishPendingPrice,
+  resolveMembershipContextCredits,
   setPendingPrice,
   validatePricingProfile,
   type CatalogPricingProfile,
@@ -584,6 +585,37 @@ describe('catalog exposure and upstream discovery safety', () => {
     }, null, { resolution: '2k', count: 1 }, 'user-1');
     expect(captured.membershipPlanId).toBe('plan-pro');
     expect(calculateSnapshotCharge(captured).totalCredits).toBe('2.000000');
+  });
+
+  it('supports plan-level visual prices for video and fixed agent contexts', async () => {
+    const membership = {
+      userMembership: {
+        findFirst: vi.fn(async () => ({
+          plan: { versions: [{ prices: { videoPerSecond: '3.5', canvasTextAgent: '0.5' } }] },
+        })),
+      },
+    } as unknown as PrismaClient;
+    await expect(resolveMembershipContextCredits(membership, 'user-1', 'canvas_text_agent', 1n)).resolves.toBe(500000n);
+
+    const videoPrisma = {
+      aiModelPricing: {
+        findUnique: vi.fn(async () => ({
+          currentVersion: { id: 'price-video', version: 1, pricing: {
+            billingType: 'video_second', creditsPerSecond: '10', credits: '10',
+          } },
+        })),
+      },
+      userMembership: {
+        findFirst: vi.fn(async () => ({
+          planId: 'plan-pro',
+          plan: { versions: [{ id: 'plan-price-1', prices: { videoPerSecond: '3.5' } }] },
+        })),
+      },
+    } as unknown as PrismaClient;
+    const captured = await capturePricingSnapshot(videoPrisma, {
+      id: 'model-video', canonicalModelKey: 'seedance2', modality: 'video', billingType: 'video_second',
+    }, null, { duration: 2, resolution: '720p', count: 1 }, 'user-1');
+    expect(calculateSnapshotCharge(captured).totalCredits).toBe('7.000000');
   });
 
   it('never exposes route cost or provider credentials in the public catalog', async () => {

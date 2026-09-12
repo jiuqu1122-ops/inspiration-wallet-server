@@ -23,6 +23,7 @@ import {
   calculateSnapshotCharge,
   capturePricingSnapshot,
   estimateSnapshotCredits,
+  resolveMembershipContextCredits,
   toInputJson,
   type ChargeBreakdown,
   type PricingSnapshot,
@@ -1371,9 +1372,15 @@ export async function executeWalletAgentChat(
 ) {
   const usageContext = resolveAgentUsageContext(input.usageContext, input.clientRequestId);
   const isFixedCanvasLlm = isFixedCanvasLlmUsageContext(usageContext);
-  const fallbackCredits = isFixedCanvasLlm
+  const configuredFallbackCredits = isFixedCanvasLlm
     ? await configuredCanvasTextAgentCredits(prisma)
     : await configuredAgentRequestCredits(prisma);
+  const fallbackCredits = await resolveMembershipContextCredits(
+    prisma,
+    input.userId,
+    usageContext,
+    configuredFallbackCredits,
+  );
   await ensureAiCatalogSeeded(prisma);
   const allProviders = await listProviders(prisma);
   if (allProviders.length === 0) {
@@ -1731,7 +1738,13 @@ export async function executeWalletInspirationAnalysis(
   },
   options?: AgentExecutionOptions,
 ) {
-  const credits = await configuredInspirationAnalysisCredits(prisma);
+  const configuredCredits = await configuredInspirationAnalysisCredits(prisma);
+  const credits = await resolveMembershipContextCredits(
+    prisma,
+    input.userId,
+    'inspiration_analysis',
+    configuredCredits,
+  );
   const requestId = await reserveCredits(prisma, {
     userId: input.userId,
     clientRequestId: input.clientRequestId,

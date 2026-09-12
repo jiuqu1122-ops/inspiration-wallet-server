@@ -66,6 +66,32 @@ const scalarText = (value: unknown) => {
   return '';
 };
 
+const membershipPriceKeys: Record<string, readonly string[]> = {
+  canvas_text_agent: ['canvasTextAgent', 'canvas_text_agent'],
+  workflow: ['workflow', 'workflowNode'],
+  inspiration_analysis: ['inspirationAnalysis', 'inspiration_analysis'],
+  chat: ['agentRequest', 'agent', 'llm'],
+};
+
+/** Resolve a plan-level fixed price for non-catalog agent tasks. */
+export async function resolveMembershipContextCredits(
+  prisma: PrismaClient,
+  userId: string,
+  context: string,
+  fallback: bigint,
+) {
+  // Keep lightweight/legacy Prisma test doubles and pre-membership deployments safe.
+  if (!prisma.userMembership) return fallback;
+  const membership = await prisma.userMembership.findFirst({
+    where: { userId, status: 'ACTIVE', startsAt: { lte: new Date() }, expiresAt: { gt: new Date() } },
+    orderBy: { expiresAt: 'desc' },
+    select: { plan: { select: { versions: { orderBy: { version: 'desc' }, take: 1, select: { prices: true } } } } },
+  });
+  const prices = plainObject(membership?.plan.versions[0]?.prices);
+  const value = membershipPriceKeys[context]?.map((key) => scalarText(prices?.[key])).find((item) => creditPattern.test(item));
+  return value === undefined ? fallback : creditMicros(value);
+}
+
 export function creditMicros(value: unknown) {
   const text = scalarText(value);
   if (!creditPattern.test(text)) throw new Error(`Invalid credit amount: ${text || '<empty>'}`);
@@ -282,6 +308,14 @@ export async function capturePricingSnapshot(
             ...(candidate.image4K !== undefined || candidate['4k'] !== undefined ? { '4k': candidate.image4K ?? candidate['4k'] } : {}),
           },
         };
+      } else if (model.modality === 'video' && (candidate.video !== undefined || candidate.videoPerSecond !== undefined || candidate.videoPerVideo !== undefined)) {
+        const perVideo = scalarText(candidate.videoPerVideo);
+        const perSecond = scalarText(candidate.videoPerSecond ?? candidate.video);
+        override = profile.billingType === 'video_flat'
+          ? { ...profile, creditsPerVideo: perVideo || perSecond, credits: perVideo || perSecond }
+          : { ...profile, creditsPerSecond: perSecond || perVideo, credits: perSecond || perVideo };
+      } else if (model.modality === 'chat' && profile.billingType === 'request' && candidate.agentRequest !== undefined) {
+        override = { ...profile, billingType: 'request', creditsPerRequest: candidate.agentRequest };
       }
       if (override) {
         try {
