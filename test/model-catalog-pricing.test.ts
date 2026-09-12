@@ -271,20 +271,28 @@ describe('canonical model mapping', () => {
 });
 
 describe('versioned server-side pricing', () => {
-  it('charges only canvas text analysis at its fixed per-request price', () => {
-    const fixed = calculateSnapshotCharge(snapshot('chat', astraPricing, {
-      usageContext: 'canvas_text_agent',
-      fallbackCredits: '3',
-    }), {
-      usage: {
-        inputTokens: 500_000n,
-        cachedInputTokens: 0n,
-        cacheWriteTokens: 0n,
-        outputTokens: 500_000n,
-      },
-    });
+  it.each(['canvas_text_agent', 'workflow'])(
+    'charges %s canvas LLM usage at its fixed per-request price',
+    usageContext => {
+      const fixed = calculateSnapshotCharge(snapshot('chat', astraPricing, {
+        usageContext,
+        fallbackCredits: '3',
+      }), {
+        usage: {
+          inputTokens: 500_000n,
+          cachedInputTokens: 0n,
+          cacheWriteTokens: 0n,
+          outputTokens: 500_000n,
+        },
+      });
+      expect(fixed.billingType).toBe('request_fixed');
+      expect(fixed.totalCredits).toBe('3.000000');
+    },
+  );
+
+  it('keeps ordinary chat on token billing', () => {
     const token = calculateSnapshotCharge(snapshot('chat', astraPricing, {
-      usageContext: 'workflow',
+      usageContext: 'chat',
       fallbackCredits: '3',
     }), {
       usage: {
@@ -294,8 +302,6 @@ describe('versioned server-side pricing', () => {
         outputTokens: 500_000n,
       },
     });
-    expect(fixed.billingType).toBe('request_fixed');
-    expect(fixed.totalCredits).toBe('3.000000');
     expect(token.billingType).toBe('token');
     expect(token.totalCredits).not.toBe('3.000000');
   });

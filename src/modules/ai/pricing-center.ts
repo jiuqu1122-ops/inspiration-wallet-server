@@ -8,6 +8,7 @@ import type {
 import type { ImageModelCreditPrice, VideoModelCreditPrice } from './pricing.js';
 import { catalogDelegateAvailable, type AiModality } from './model-catalog.js';
 import { env } from '../../config/env.js';
+import { isFixedCanvasLlmUsageContext } from './usage-context.js';
 
 const CREDIT_SCALE = 1_000_000n;
 const TOKENS_PER_MILLION = 1_000_000n;
@@ -358,7 +359,7 @@ function videoCharge(snapshot: PricingSnapshot): ChargeBreakdown {
 function chatCharge(snapshot: PricingSnapshot, usage?: ChatTokenUsage | null): ChargeBreakdown {
   const pricing = snapshot.pricing;
   const usageContext = scalarText(snapshot.request.usageContext);
-  if (usageContext === 'canvas_text_agent') {
+  if (isFixedCanvasLlmUsageContext(usageContext)) {
     const total = creditMicros(snapshot.request.fallbackCredits ?? '0');
     return {
       schemaVersion: 1,

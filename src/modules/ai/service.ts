@@ -27,6 +27,10 @@ import {
   type ChargeBreakdown,
   type PricingSnapshot,
 } from './pricing-center.js';
+import {
+  isFixedCanvasLlmUsageContext,
+  resolveAgentUsageContext,
+} from './usage-context.js';
 
 const REQUEST_CREDITS = BigInt(env.AGENT_REQUEST_CREDITS);
 const agentUpstreamDispatcher = new Agent({
@@ -1365,7 +1369,9 @@ export async function executeWalletAgentChat(
   },
   options?: AgentExecutionOptions,
 ) {
-  const fallbackCredits = input.usageContext === 'canvas_text_agent'
+  const usageContext = resolveAgentUsageContext(input.usageContext, input.clientRequestId);
+  const isFixedCanvasLlm = isFixedCanvasLlmUsageContext(usageContext);
+  const fallbackCredits = isFixedCanvasLlm
     ? await configuredCanvasTextAgentCredits(prisma)
     : await configuredAgentRequestCredits(prisma);
   await ensureAiCatalogSeeded(prisma);
@@ -1398,7 +1404,7 @@ export async function executeWalletAgentChat(
         resolved = await resolveCatalogModel(prisma, input.model ?? '', 'chat', { requireEnabled: true });
       } catch (error) {
         if (!shouldFallbackCanvasTextAgentToAutomaticModel(
-          input.usageContext,
+          usageContext,
           automaticModelSelection,
           error,
         )) throw error;
@@ -1424,7 +1430,7 @@ export async function executeWalletAgentChat(
   const pricingSnapshot = canonicalModel
     ? await capturePricingSnapshot(prisma, canonicalModel, route?.id ?? null, {
       fallbackCredits: fallbackCredits.toString(),
-      ...(input.usageContext ? { usageContext: input.usageContext } : {}),
+      usageContext,
     })
     : undefined;
   const credits = pricingSnapshot ? estimateSnapshotCredits(pricingSnapshot) : fallbackCredits;
@@ -1434,7 +1440,7 @@ export async function executeWalletAgentChat(
     credits,
     capability: 'LLM',
     logicalModel: canonicalModelKey,
-    description: input.usageContext === 'canvas_text_agent'
+    description: isFixedCanvasLlm
       ? '文字分析节点按次结算预留'
       : 'Agent 请求预扣',
     pricingSnapshot,
@@ -1442,6 +1448,7 @@ export async function executeWalletAgentChat(
   try {
     const providerInput = {
       ...input,
+      usageContext,
       messages: await proxyAgentChatReferenceImages(prisma, input.userId, input.messages),
     };
     const providersById = new Map(allProviders.map(provider => [provider.id, provider]));
@@ -1593,7 +1600,7 @@ export async function executeWalletAgentChat(
         details: { fallbackReason: 'catalog_unavailable' },
       };
     const usage = billing.details.usage as Record<string, string> | null | undefined;
-    const description = input.usageContext === 'canvas_text_agent'
+    const description = isFixedCanvasLlm
       ? `文字分析节点按次结算 · ${billing.model}`
       : usage
       ? `Chat Token 结算 · ${billing.model} · 输入 ${usage.normalInputTokens} · 缓存读 ${usage.cachedInputTokens} · 缓存写 ${usage.cacheWriteTokens} · 输出 ${usage.outputTokens}`

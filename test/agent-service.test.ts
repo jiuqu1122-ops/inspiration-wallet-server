@@ -26,6 +26,37 @@ import {
   sanitizeAgentUpstreamDetail,
 } from '../src/modules/ai/service.js';
 import { ModelCatalogError } from '../src/modules/ai/model-catalog.js';
+import {
+  isFixedCanvasLlmUsageContext,
+  resolveAgentUsageContext,
+} from '../src/modules/ai/usage-context.js';
+
+describe('Agent usage context billing policy', () => {
+  it.each(['canvas_text_agent', 'workflow'])(
+    'treats %s as fixed-price canvas LLM usage',
+    usageContext => {
+      expect(isFixedCanvasLlmUsageContext(usageContext)).toBe(true);
+    },
+  );
+
+  it('keeps ordinary chat outside fixed-price canvas LLM usage', () => {
+    expect(isFixedCanvasLlmUsageContext('chat')).toBe(false);
+  });
+
+  it('infers fixed canvas contexts for legacy requests without a context', () => {
+    expect(resolveAgentUsageContext(undefined, 'canvas_text_agent_legacy')).toBe('canvas_text_agent');
+    expect(resolveAgentUsageContext(undefined, 'workflow-planner-api-legacy')).toBe('workflow');
+    expect(resolveAgentUsageContext(undefined, 'workflow-planner-model-fallback-legacy')).toBe('workflow');
+  });
+
+  it('lets a known internal request id correct a stale explicit chat context', () => {
+    expect(resolveAgentUsageContext('chat', 'workflow-planner-api-legacy')).toBe('workflow');
+  });
+
+  it('does not infer fixed billing for an ordinary chat request id', () => {
+    expect(resolveAgentUsageContext(undefined, 'chat-request-legacy')).toBe('chat');
+  });
+});
 
 describe('Agent provider fallback policy', () => {
   it('falls stale canvas text selections back to the configured automatic route only', () => {
