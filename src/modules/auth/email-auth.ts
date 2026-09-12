@@ -41,6 +41,17 @@ function compatibilityLicenseExpiration() {
   return expiresAt;
 }
 
+function latestFutureExpiration(
+  now: Date,
+  ...values: Array<Date | null | undefined>
+) {
+  return values
+    .filter((value): value is Date => value instanceof Date && value > now)
+    .reduce<Date | null>((latest, value) => (
+      latest && latest >= value ? latest : value
+    ), null);
+}
+
 function validDisplayName(value: string | undefined) {
   const displayName = value?.trim() ?? '';
   const length = [...displayName].length;
@@ -194,15 +205,16 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
         throw new AuthFlowError('display_name_required', 'A 2-32 character display name is required', 400);
       }
 
-      const inheritedExpiration = legacy?.expiresAt
-        ?? priorMachineLicense?.expiresAt
-        ?? null;
-      let entitlementExpiresAt = user?.entitlementExpiresAt
-        ?? inheritedExpiration
-        ?? null;
-      if (legacy?.expiresAt && (!entitlementExpiresAt || legacy.expiresAt > entitlementExpiresAt)) {
-        entitlementExpiresAt = legacy.expiresAt;
-      }
+      // An expired desktop License is only a migration identity. It must not
+      // turn an ordinary account into an expired account again on re-login.
+      // Preserve a still-future legacy entitlement for compatibility, while
+      // clearing stale expiration dates during this successful email login.
+      const entitlementExpiresAt = latestFutureExpiration(
+        now,
+        user?.entitlementExpiresAt,
+        legacy?.expiresAt,
+        priorMachineLicense?.expiresAt,
+      );
 
       if (user) {
         user = await transaction.user.update({
@@ -299,10 +311,6 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
     { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
   );
 
-  if (result.user.entitlementExpiresAt && result.user.entitlementExpiresAt < now) {
-    throw new AuthFlowError('license_expired', 'Account authorization has expired', 403);
-  }
-
   const authentication = canSignServerLicenses()
     ? await (async () => {
         const license = signServerLicense({
@@ -384,6 +392,7 @@ export async function syncEmailLicense(
 
 export const emailAuthInternals = {
   codeHash,
+  latestFutureExpiration,
   normalizeEmail,
   validDisplayName,
 };

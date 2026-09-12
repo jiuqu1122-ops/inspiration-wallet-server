@@ -19,4 +19,23 @@ describe('email authentication helpers', () => {
     expect(emailAuthInternals.validDisplayName('a')).toBeNull();
     expect(emailAuthInternals.validDisplayName('a\nb')).toBeNull();
   });
+
+  it('does not inherit an expired desktop license date during email migration', () => {
+    const now = new Date('2026-09-12T00:00:00.000Z');
+    expect(emailAuthInternals.latestFutureExpiration(
+      now,
+      new Date('2026-09-11T23:59:59.999Z'),
+      null,
+    )).toBeNull();
+  });
+
+  it('keeps the latest future entitlement when legacy dates are still valid', () => {
+    const now = new Date('2026-09-12T00:00:00.000Z');
+    const latest = new Date('2026-10-01T23:59:59.999Z');
+    expect(emailAuthInternals.latestFutureExpiration(
+      now,
+      new Date('2026-09-20T23:59:59.999Z'),
+      latest,
+    )).toEqual(latest);
+  });
 });
