@@ -12,6 +12,7 @@ import {
 import {
   calculateSnapshotCharge,
   capturePricingSnapshot,
+  estimateSnapshotCredits,
   publishPendingPrice,
   resolveMembershipContextCredits,
   setPendingPrice,
@@ -305,6 +306,47 @@ describe('versioned server-side pricing', () => {
     });
     expect(token.billingType).toBe('token');
     expect(token.totalCredits).not.toBe('3.000000');
+  });
+
+  it('does not reserve the fixed fallback for post-billed token chat', () => {
+    const token = snapshot('chat', astraPricing, {
+      usageContext: 'chat',
+      fallbackCredits: '10',
+    });
+    expect(estimateSnapshotCredits(token)).toBe('0.000001');
+  });
+
+  it('applies the membership Chat fold to token rates at settlement time', async () => {
+    const prisma = {
+      aiModelPricing: {
+        findUnique: vi.fn(async () => ({
+          currentVersion: { id: 'price-chat-fold', version: 1, pricing: astraPricing },
+        })),
+      },
+      userMembership: {
+        findFirst: vi.fn(async () => ({
+          plan: { versions: [{ prices: { agentRequest: '100', discounts: { chat: '5' } } }] },
+        })),
+      },
+    } as unknown as PrismaClient;
+    const captured = await capturePricingSnapshot(prisma, {
+      id: 'chat-1', canonicalModelKey: 'gpt-6-astra', modality: 'chat', billingType: 'token',
+    }, null, { usageContext: 'chat', fallbackCredits: '50' }, 'user-chat');
+    expect(estimateSnapshotCredits(captured)).toBe('0.000001');
+    expect(calculateSnapshotCharge(captured, {
+      usage: { inputTokens: 1_000_000n, cachedInputTokens: 0n, cacheWriteTokens: 0n, outputTokens: 1_000_000n },
+    }).totalCredits).toBe('1425.000000');
+  });
+
+  it('ignores legacy fixed Agent prices when resolving ordinary Chat fallback', async () => {
+    const prisma = {
+      userMembership: {
+        findFirst: vi.fn(async () => ({
+          plan: { versions: [{ prices: { agentRequest: '100', discounts: { chat: '5' } } }] },
+        })),
+      },
+    } as unknown as PrismaClient;
+    await expect(resolveMembershipContextCredits(prisma, 'user-chat', 'chat', 10n)).resolves.toBe(5_000_000n);
   });
 
   it('uses Astra standard pricing at 272000 and extended pricing at 272001', () => {

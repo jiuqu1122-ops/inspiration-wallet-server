@@ -1276,15 +1276,34 @@ async function settleCredits(
         },
       });
     }
-    const wallet = await transaction.wallet.update({
-      where: { userId },
-      data: {
-        reservedCredits: { decrement: reserved },
-        ...(release.gt(0) ? { availableCredits: { increment: release } } : {}),
-        ...(extra.gt(0) ? { availableCredits: { decrement: extra } } : {}),
-        lifetimeConsumed: { increment: charged },
-      },
-    });
+    // Token chats are reserved with zero credits and settled after usage is
+    // known. Guard the extra debit atomically so a post-billed request can
+    // never drive the wallet negative when its actual charge exceeds the
+    // remaining balance.
+    let wallet;
+    if (extra.gt(0)) {
+      const updated = await transaction.wallet.updateMany({
+        where: { userId, availableCredits: { gte: extra } },
+        data: {
+          reservedCredits: { decrement: reserved },
+          availableCredits: { decrement: extra },
+          lifetimeConsumed: { increment: charged },
+        },
+      });
+      if (updated.count !== 1) {
+        throw new CloudAiError('insufficient_credits', '授权钱包余额不足', 402);
+      }
+      wallet = await transaction.wallet.findUniqueOrThrow({ where: { userId } });
+    } else {
+      wallet = await transaction.wallet.update({
+        where: { userId },
+        data: {
+          reservedCredits: { decrement: reserved },
+          ...(release.gt(0) ? { availableCredits: { increment: release } } : {}),
+          lifetimeConsumed: { increment: charged },
+        },
+      });
+    }
     await transaction.walletLedger.create({
       data: {
         userId,

@@ -1,5 +1,5 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
-import { creditDecimal, serializeCredit } from '../wallets/credit-amount.js';
+import { creditDecimal } from '../wallets/credit-amount.js';
 import type {
   ChatModelCreditPrice,
   ChatTokenRates,
@@ -70,7 +70,9 @@ const membershipPriceKeys: Record<string, readonly string[]> = {
   canvas_text_agent: ['canvasTextAgent', 'canvas_text_agent'],
   workflow: ['workflow', 'workflowNode'],
   inspiration_analysis: ['inspirationAnalysis', 'inspiration_analysis'],
-  chat: ['agentRequest', 'agent', 'llm'],
+  // Ordinary Chat is catalog-priced (token or per-request). Keep legacy
+  // Agent fields from changing its fallback reservation amount.
+  chat: [],
 };
 
 type MembershipDiscountCategory = 'gptImage1K' | 'chat' | 'video' | 'other';
@@ -623,7 +625,20 @@ export function calculateSnapshotCharge(
 
 export function estimateSnapshotCredits(snapshot: PricingSnapshot) {
   if (snapshot.modality === 'chat' && snapshot.pricing.billingType === 'token') {
-    return serializeCredit(creditDecimal(scalarText(snapshot.request.fallbackCredits) || '0'));
+    // Token chats are post-billed after the provider returns token usage. The
+    // fallback value is only used when usage metadata is missing; reserving it
+    // up front makes a low-balance user fail even when the actual token charge
+    // would fit in the wallet (and used to make membership discounts appear
+    // to cause false INSUFFICIENT_CREDITS errors).
+    const hasBillableRate = ['standard', 'extended'].some((tier) => {
+      const rates = plainObject(snapshot.pricing[tier]);
+      return rates ? Object.values(rates).some(value => {
+        try { return creditMicros(value) > 0n; } catch { return false; }
+      }) : false;
+    });
+    // Keep zero-priced Chat plans usable with an empty wallet while still
+    // preventing non-free requests from reaching an upstream with no balance.
+    return hasBillableRate ? '0.000001' : '0.000000';
   }
   return calculateSnapshotCharge(snapshot).totalCredits;
 }
