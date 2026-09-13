@@ -831,6 +831,102 @@ describe('catalog exposure and upstream discovery safety', () => {
     }));
   });
 
+  it('classifies newly discovered media models without requiring a legacy channel enum', async () => {
+    const provider = {
+      id: 'provider-dynamic-image',
+      name: 'provider-dynamic-image',
+      kind: 'NEW_API',
+      status: 'ACTIVE',
+      priority: 10,
+      baseUrl: 'https://8.8.8.8',
+      defaultModel: null,
+      allowInsecureHttp: false,
+      encryptedSecrets: encryptProviderSecrets({ apiKey: 'sk-test', headers: {} }),
+      apiKeyLast4: 'test',
+      capabilities: ['LLM'],
+      lastTestStatus: null,
+      lastTestMessage: null,
+      lastTestModelCount: null,
+      lastTestedAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as AiProviderChannel;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      data: [{ id: 'future-image-v9' }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+    const discoveryUpsert = vi.fn(async (input: unknown) => input);
+    const prisma = {
+      aiProviderChannel: { findUnique: vi.fn(async () => provider) },
+      aiModelRoute: { findFirst: vi.fn(async () => null), create: vi.fn() },
+      aiModel: { findUnique: vi.fn(async () => null) },
+      aiModelAlias: { findUnique: vi.fn(async () => null) },
+      aiUpstreamDiscovery: { findUnique: vi.fn(async () => null), upsert: discoveryUpsert },
+    } as unknown as PrismaClient;
+
+    await expect(syncUpstreamModels(prisma, provider.id)).resolves.toMatchObject({ unmapped: 1 });
+    expect(discoveryUpsert).toHaveBeenCalledWith(expect.objectContaining({
+      create: expect.objectContaining({
+        upstreamModelId: 'future-image-v9',
+        suggestedModality: 'image',
+      }),
+    }));
+  });
+
+  it('does not overwrite a manually configured route capability during sync', async () => {
+    const provider = {
+      id: 'provider-manual-capabilities',
+      name: 'provider-manual-capabilities',
+      kind: 'NEW_API',
+      status: 'ACTIVE',
+      priority: 10,
+      baseUrl: 'https://8.8.8.8',
+      defaultModel: null,
+      allowInsecureHttp: false,
+      encryptedSecrets: encryptProviderSecrets({ apiKey: 'sk-test', headers: {} }),
+      apiKeyLast4: 'test',
+      capabilities: ['LLM'],
+      lastTestStatus: null,
+      lastTestMessage: null,
+      lastTestModelCount: null,
+      lastTestedAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as AiProviderChannel;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      data: [{
+        id: 'future-image-v9',
+        capabilities: { supportedResolutions: ['2k'] },
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+    const routeUpdate = vi.fn(async (input: unknown) => input);
+    const prisma = {
+      aiProviderChannel: { findUnique: vi.fn(async () => provider) },
+      aiModelRoute: {
+        findFirst: vi.fn(async () => ({
+          id: 'route-manual-capabilities',
+          canonicalModelId: 'model-future-image',
+          upstreamAvailable: true,
+          healthStatus: 'HEALTHY',
+          costProfile: null,
+          metadata: {
+            capabilitiesOverrideSource: 'MANUAL',
+            operatorNote: '8K beta enabled',
+          },
+        })),
+        update: routeUpdate,
+      },
+      aiRouteCostHistory: { create: vi.fn() },
+    } as unknown as PrismaClient;
+
+    await expect(syncUpstreamModels(prisma, provider.id)).resolves.toMatchObject({ mapped: 1 });
+    const routeRefresh = routeUpdate.mock.calls[0]?.[0] as { data: Record<string, unknown> };
+    expect(routeRefresh.data).not.toHaveProperty('capabilitiesOverride');
+    expect(routeRefresh.data.metadata).toMatchObject({
+      capabilitiesOverrideSource: 'MANUAL',
+      operatorNote: '8K beta enabled',
+    });
+  });
+
   it('reuses an explicit mapping but keeps a newly discovered route disabled', async () => {
     const provider = {
       id: 'provider-image',

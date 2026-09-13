@@ -67,12 +67,28 @@ function providerModalityHints(provider: AiProviderChannel) {
 
 function suggestedModality(provider: AiProviderChannel, id: string): AiModality | null {
   const hints = providerModalityHints(provider);
-  if (hints.length === 1) return hints[0]!;
   const token = catalogAliasKey(id);
   // This is advisory only. It never maps or opens a model.
-  if (/(?:image|imagen|img|banana|flux|dalle|recraft)/.test(token)) return hints.includes('image') ? 'image' : null;
-  if (/(?:video|sora|veo|kling|seedance|minimaxh3)/.test(token)) return hints.includes('video') ? 'video' : null;
+  // Model discovery must not be constrained by the legacy channel enum: a
+  // newly launched model may not have a matching enum value yet.
+  if (/(?:image|imagen|img|banana|flux|dalle|recraft)/.test(token)) return 'image';
+  if (/(?:video|sora|veo|kling|seedance|minimaxh3)/.test(token)) return 'video';
+  if (hints.length === 1) return hints[0]!;
   return hints.includes('chat') ? 'chat' : null;
+}
+
+function preservesConfiguredRouteCapabilities(metadata: unknown) {
+  const source = objectValue(metadata)?.capabilitiesOverrideSource;
+  return source === 'MANUAL' || source === 'INHERIT';
+}
+
+function refreshedRouteMetadata(current: unknown, discovered: Prisma.InputJsonValue) {
+  if (!preservesConfiguredRouteCapabilities(current)) return discovered;
+  return {
+    ...(objectValue(current) ?? {}),
+    ...(objectValue(discovered) ?? {}),
+    capabilitiesOverrideSource: objectValue(current)?.capabilitiesOverrideSource,
+  } as Prisma.InputJsonValue;
 }
 
 function normalizeModel(provider: AiProviderChannel, item: unknown): NormalizedUpstreamModel | null {
@@ -228,8 +244,10 @@ export async function syncUpstreamModels(prisma: PrismaClient, providerId: strin
           upstreamAvailable: item.availability !== 'UNAVAILABLE',
           healthStatus: item.availability === 'UNAVAILABLE' ? 'UNAVAILABLE' : 'HEALTHY',
           lastSyncedAt: new Date(),
-          ...(item.capabilities ? { capabilitiesOverride: item.capabilities } : {}),
-          metadata: item.metadata,
+          ...(item.capabilities && !preservesConfiguredRouteCapabilities(existingRoute.metadata)
+            ? { capabilitiesOverride: item.capabilities }
+            : {}),
+          metadata: refreshedRouteMetadata(existingRoute.metadata, item.metadata),
         },
       });
       if (await updateMappedRouteCost(prisma, existingRoute, item.cost)) {

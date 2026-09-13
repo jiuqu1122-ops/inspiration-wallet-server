@@ -17,6 +17,7 @@ import {
   catalogDelegateAvailable,
   legacyUpstreamModelForCanonical,
   ModelCatalogError,
+  resolveAutomaticChatModel,
   resolveCatalogModel,
 } from './model-catalog.js';
 import {
@@ -1401,16 +1402,42 @@ export async function executeWalletAgentChat(
     configuredFallbackCredits,
   );
   await ensureAiCatalogSeeded(prisma);
-  const allProviders = await listProviders(prisma);
+  const automaticModelSelection = isDefaultAgentModelSentinel(input.model);
+  let resolved = null;
+  if (catalogDelegateAvailable(prisma)) {
+    if (automaticModelSelection) {
+      try {
+        const automaticCatalogModel = await resolveAutomaticChatModel(prisma);
+        if (automaticCatalogModel?.model.routingMode === 'MANAGED') resolved = automaticCatalogModel;
+      } catch (error) {
+        if (!(error instanceof ModelCatalogError) || error.code !== 'MODEL_NOT_AVAILABLE') throw error;
+      }
+    } else {
+      try {
+        resolved = await resolveCatalogModel(prisma, input.model ?? '', 'chat', { requireEnabled: true });
+      } catch (error) {
+        if (!shouldFallbackCanvasTextAgentToAutomaticModel(
+          usageContext,
+          automaticModelSelection,
+          error,
+        )) throw error;
+      }
+    }
+  }
+  const managedProviders = resolved?.model.routingMode === 'MANAGED'
+    ? resolved.enabledRoutes.flatMap(candidate => candidate.channel ? [candidate.channel] : [])
+    : [];
+  const allProviders = managedProviders.length > 0
+    ? Array.from(new Map(managedProviders.map(provider => [provider.id, provider])).values())
+    : await listProviders(prisma);
   if (allProviders.length === 0) {
     throw new CloudAiError('provider_unavailable', '当前没有可用的 Agent 渠道', 503);
   }
-  const automaticModelSelection = isDefaultAgentModelSentinel(input.model);
   const automaticProvider = allProviders[0]!;
   const automaticProviderModel = automaticModelSelection
-    ? automaticProvider.defaultModel?.trim() ?? ''
+    ? resolved?.route?.upstreamModelId.trim() || automaticProvider.defaultModel?.trim() || ''
     : '';
-  if (automaticModelSelection && !isLikelyAgentTextModel(automaticProviderModel)) {
+  if (automaticModelSelection && !resolved && !isLikelyAgentTextModel(automaticProviderModel)) {
     throw new CloudAiError(
       'provider_model_missing',
       '已启用的首选 Agent 渠道未配置有效的默认文字模型',
@@ -1418,8 +1445,7 @@ export async function executeWalletAgentChat(
     );
   }
   let effectiveAutomaticModelSelection = automaticModelSelection;
-  let resolved = null;
-  if (catalogDelegateAvailable(prisma)) {
+  if (catalogDelegateAvailable(prisma) && !resolved) {
     if (automaticModelSelection) {
       resolved = await resolveCatalogModel(prisma, automaticProviderModel, 'chat', {
         requireEnabled: true,

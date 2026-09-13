@@ -228,6 +228,41 @@ describe('provider connection probes', () => {
     expect(new Headers(requestInit.headers).get('x-goog-api-key')).toBe('test-api-key-123456');
   });
 
+  it('tests a generic Bigmodel channel through model discovery without a model-family enum', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        models: [{ name: 'models/future-image-v9' }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await testProvider(
+      prismaFor(provider('BIGMODEL', ['IMAGE'], 'future-image-v9')),
+      'provider-test-1',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.modelCount).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://example.com/v1beta/models');
+  });
+
+  it('does not force a Chat probe when a channel only discovers image models', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [{ id: 'future-image-v9' }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await testProvider(
+      prismaFor(provider('USELG', ['IMAGE'], 'future-image-v9')),
+      'provider-test-1',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain('1 models discovered');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('accepts a configured Mikoto model when chat works but model listing is unavailable', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response('model list disabled', { status: 403 }))

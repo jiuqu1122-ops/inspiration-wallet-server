@@ -60,6 +60,12 @@ const asIso = (value: Date | string) => (
   value instanceof Date ? value.toISOString() : new Date(value).toISOString()
 );
 
+const jsonObject = (value: unknown): Record<string, Prisma.JsonValue> => (
+  value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, Prisma.JsonValue>
+    : {}
+);
+
 async function bestEnabledRouteId(
   transaction: Prisma.TransactionClient,
   canonicalModelId: string,
@@ -342,6 +348,10 @@ export async function updateAdminAiRoute(
     if (input.upstreamAvailable !== undefined) data.upstreamAvailable = input.upstreamAvailable;
     if (input.capabilitiesOverride !== undefined) {
       data.capabilitiesOverride = input.capabilitiesOverride === null ? Prisma.JsonNull : input.capabilitiesOverride;
+      data.metadata = {
+        ...jsonObject(current.metadata),
+        capabilitiesOverrideSource: input.capabilitiesOverride === null ? 'INHERIT' : 'MANUAL',
+      };
     }
     if (input.costProfile !== undefined) {
       data.costProfile = input.costProfile === null ? Prisma.JsonNull : input.costProfile;

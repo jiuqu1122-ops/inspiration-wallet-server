@@ -443,7 +443,7 @@ export async function resolveCatalogModel(
 export async function resolveAutomaticChatModel(prisma: PrismaClient) {
   if (!catalogDelegateAvailable(prisma)) return null;
   const models = await prisma.aiModel.findMany({
-    where: { modality: 'chat', enabled: true },
+    where: { modality: 'chat', enabled: true, visible: true, status: 'PUBLISHED' },
     include: { routes: { include: { channel: true }, orderBy: [{ priority: 'asc' }, { id: 'asc' }] } },
     orderBy: [{ sortOrder: 'asc' }, { canonicalModelKey: 'asc' }],
   });

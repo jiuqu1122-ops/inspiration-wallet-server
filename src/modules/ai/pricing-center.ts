@@ -1,5 +1,4 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
-import { creditDecimal } from '../wallets/credit-amount.js';
 import type {
   ChatModelCreditPrice,
   ChatTokenRates,

@@ -88,7 +88,9 @@ function serializeProvider(provider: AiProviderChannel) {
   };
 }
 
-function defaultCapabilities(): AiCapability[] {
+function defaultCapabilities(kind: AiProviderKind): AiCapability[] {
+  if (kind === 'MINIMAX') return ['VIDEO_MINIMAX'];
+  if (kind === 'USELG' || kind === 'BIGMODEL') return ['IMAGE'];
   return ['LLM'];
 }
 
@@ -165,7 +167,7 @@ export async function createProvider(prisma: PrismaClient, input: ProviderInput)
   } catch (error) {
     configurationError(error);
   }
-  const capabilities = input.capabilities ?? defaultCapabilities();
+  const capabilities = input.capabilities ?? defaultCapabilities(input.kind);
 
   try {
     return await prisma.$transaction(async (tx) => {
@@ -645,8 +647,9 @@ function providerModelProbeCandidates(
   const candidates: Array<{ name: string; path: string; headers?: Record<string, string> }> = [];
   const needsOpenAi = provider.capabilities.includes('LLM')
     || provider.capabilities.includes('VISION')
-    || provider.capabilities.some(isOpenAiImageCapability);
-  const needsNativeImage = provider.capabilities.some(isNativeBigmodelImageCapability);
+    || provider.capabilities.some(capability => capability !== 'IMAGE' && isOpenAiImageCapability(capability));
+  const needsNativeImage = provider.capabilities.includes('IMAGE')
+    || provider.capabilities.some(isNativeBigmodelImageCapability);
   if (needsOpenAi || !needsNativeImage) {
     candidates.push({ name: 'Bigmodel OpenAI /v1/models', path: '/v1/models' });
   }
@@ -784,7 +787,12 @@ export async function testProvider(prisma: PrismaClient, providerId: string) {
     }
   }
 
-  const needsTextProbe = provider.capabilities.includes('LLM') || provider.capabilities.includes('VISION');
+  const configuredTextModel = provider.defaultModel?.trim() ?? '';
+  const discoveredTextModel = models.find(isLikelyTextModel) ?? '';
+  const needsVisionProbe = provider.capabilities.includes('VISION');
+  const needsTextProbe = needsVisionProbe
+    || ((provider.capabilities.includes('LLM'))
+      && Boolean(isLikelyTextModel(configuredTextModel) ? configuredTextModel : discoveredTextModel));
   const needsNativeImageProbe = provider.kind === 'BIGMODEL'
     && provider.capabilities.some(isNativeBigmodelImageCapability);
   if (needsNativeImageProbe && !nativeImageCatalogReachable) {
@@ -794,10 +802,9 @@ export async function testProvider(prisma: PrismaClient, providerId: string) {
   }
   let probeModel = '';
   if (needsTextProbe) {
-    const configured = provider.defaultModel?.trim() ?? '';
-    probeModel = configured && isLikelyTextModel(configured)
-      ? configured
-      : models.find(isLikelyTextModel) ?? '';
+    probeModel = configuredTextModel && isLikelyTextModel(configuredTextModel)
+      ? configuredTextModel
+      : discoveredTextModel;
     if (!probeModel) {
       throw new Error(
         modelErrors.length

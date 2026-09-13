@@ -798,6 +798,13 @@ describe('wallet image provider normalization', () => {
     )).toBe(false);
     expect(imageRouteSupportsRequest({ channel: gpt }, 'gpt-image-2', '1k')).toBe(false);
     expect(imageRouteSupportsRequest(
+      { channel: { capabilities: ['LLM'] as const } },
+      'future-image-model',
+      '2k',
+      '16:9',
+      true,
+    )).toBe(true);
+    expect(imageRouteSupportsRequest(
       { channel: { capabilities: ['IMAGE_GPT_1K'] as const } },
       'gpt-image-2',
       '1k',
@@ -1004,6 +1011,13 @@ describe('wallet image provider normalization', () => {
     expect(providerSupportsVideoModel(generic, 'MiniMax-H3')).toBe(false);
     expect(providerSupportsVideoModel(minimax, 'seedance-2')).toBe(false);
     expect(videoRouteSupportsRequest({ channel: minimax }, 'MiniMax-H3', '1080p', 5)).toBe(true);
+    expect(videoRouteSupportsRequest(
+      { channel: { capabilities: ['LLM'] as const } },
+      'future-video-model',
+      '1080p',
+      5,
+      true,
+    )).toBe(true);
     expect(videoRouteSupportsRequest({
       channel: minimax,
       capabilitiesOverride: { supportedResolutions: ['768p'], supportedDurations: [5] },
@@ -1014,6 +1028,16 @@ describe('wallet image provider normalization', () => {
     const prisma = { aiProviderChannel: { findMany } } as never;
     await expect(selectVideoProvider(prisma, undefined, undefined, 'seedance-2')).resolves.toBe(generic);
     await expect(selectVideoProvider(prisma, undefined, undefined, 'MiniMax-H3')).resolves.toBe(minimax);
+
+    const managed = { id: 'video-managed', baseUrl: 'https://1.1.1.1', capabilities: ['LLM'] as const };
+    const managedPrisma = { aiProviderChannel: { findFirst: vi.fn(async () => managed) } } as never;
+    await expect(selectVideoProvider(
+      managedPrisma,
+      undefined,
+      managed.id,
+      'future-video-model',
+      true,
+    )).resolves.toBe(managed);
   });
 
   it('calls Mikoto Gemini native endpoint with imageConfig', async () => {

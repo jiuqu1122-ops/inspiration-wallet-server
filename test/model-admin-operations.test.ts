@@ -7,6 +7,7 @@ import {
   mapDiscoveryToCanonical,
   remapAdminAiRoute,
   unmapAdminAiRoute,
+  updateAdminAiRoute,
 } from '../src/modules/ai/model-admin.js';
 
 const context = { actor: 'admin-api', requestId: 'request-test' };
@@ -19,6 +20,40 @@ function withTransaction<T extends object>(transaction: T) {
 }
 
 describe('AI Model Center route operations', () => {
+  it('marks route capability overrides as manual configuration', async () => {
+    const route = {
+      id: 'route-capabilities',
+      canonicalModelId: 'model-image',
+      enabled: true,
+      costProfile: null,
+      metadata: { upstreamLabel: 'Future Image' },
+      updatedAt,
+    };
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const transaction = {
+      aiModelRoute: {
+        findUnique: vi.fn(async () => route),
+        updateMany,
+        findUniqueOrThrow: vi.fn(async () => route),
+      },
+    };
+
+    await updateAdminAiRoute(withTransaction(transaction), route.id, {
+      capabilitiesOverride: { supportedResolutions: ['8k'] },
+      expectedUpdatedAt: updatedAt.toISOString(),
+    }, context);
+
+    expect(updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        capabilitiesOverride: { supportedResolutions: ['8k'] },
+        metadata: {
+          upstreamLabel: 'Future Image',
+          capabilitiesOverrideSource: 'MANUAL',
+        },
+      }),
+    }));
+  });
+
   it('deletes only an unused hidden draft model and records the operation', async () => {
     const model = {
       id: 'model-unused',
