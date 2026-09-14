@@ -20,6 +20,7 @@ import { getImageResult, imageResultMimeForKey } from './image-result-store.js';
 import { agentToolChoiceSchema, createAiTaskSchema } from './task-schema.js';
 import { ensureAiCatalogSeeded } from './catalog-seed.js';
 import { getPublicAiCatalog, ModelCatalogError } from './model-catalog.js';
+import { UsageModelBindingError } from './usage-model-binding.js';
 import { AGENT_USAGE_CONTEXTS } from './usage-context.js';
 import {
   ReferenceUploadError,
@@ -194,6 +195,9 @@ export const normalizeImageRequestBody = (body: unknown) => imageSchema.parse(bo
 export const normalizeVideoRequestBody = (body: unknown) => videoSchema.parse(body);
 
 function knownError(reply: FastifyReply, error: unknown) {
+  if (error instanceof UsageModelBindingError) {
+    return reply.code(error.statusCode).send({ error: error.code, message: error.message });
+  }
   if (error instanceof ModelCatalogError) {
     return reply.code(error.statusCode).send({ error: error.code, message: error.message });
   }

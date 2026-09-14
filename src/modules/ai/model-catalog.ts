@@ -5,7 +5,7 @@ export type AiModality = 'chat' | 'image' | 'video';
 
 const ROUTE_UNAVAILABLE_HEALTH = new Set(['UNAVAILABLE', 'UNHEALTHY', 'DOWN', 'FAILED', 'DISABLED']);
 
-const routeCanReceiveTraffic = (route: {
+export const routeCanReceiveTraffic = (route: {
   enabled: boolean;
   upstreamAvailable: boolean;
   healthStatus: string;
@@ -19,7 +19,7 @@ const routeCanReceiveTraffic = (route: {
 
 export class ModelCatalogError extends Error {
   constructor(
-    public readonly code: 'MODEL_NOT_AVAILABLE' | 'MODEL_NOT_FOUND' | 'MODEL_ROUTE_NOT_AVAILABLE',
+    public readonly code: 'MODEL_NOT_AVAILABLE' | 'MODEL_NOT_FOUND' | 'MODEL_ROUTE_NOT_AVAILABLE' | 'MODEL_IDENTITY_MISMATCH',
     message: string,
     public readonly statusCode = 404,
   ) {
@@ -153,6 +153,15 @@ export function canonicalDisplayName(key: string, fallback?: string) {
 }
 
 export const GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION = {
+  '1k': [
+    '1024x1024',
+    '1280x720',
+    '720x1280',
+    '1152x768',
+    '768x1152',
+    '1024x768',
+    '768x1024',
+  ],
   '2k': [
     '2048x2048',
     '2048x1152',
@@ -209,6 +218,7 @@ export function withGptImage2DimensionCapabilities(
     // Administrators may have created the model before exact dimensions were
     // supported, leaving a legacy ratio map here. Image 2 family dimensions
     // are part of the upstream contract, so replace both accepted aliases.
+    supportedResolutions: ['1k', '2k', '4k'],
     aspectRatiosByResolution: GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION,
     supportedAspectRatiosByResolution: GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION,
   };
@@ -328,6 +338,7 @@ export function normalizePublicModelCapabilities(value: unknown) {
     supportedInputModes: stringArray('supportedInputModes'),
     supportedOutputFormats: stringArray('supportedOutputFormats'),
     supportsTransparentBackground: booleanValue('supportsTransparentBackground'),
+    supportsVision: booleanValue('supportsVision'),
     maxOutputs: numberValue('maxOutputs'),
   }).filter((entry): entry is [string, Exclude<typeof entry[1], undefined>] => entry[1] !== undefined));
 }
@@ -410,7 +421,10 @@ export async function resolveCatalogModel(
   if (!aliased || aliased.modality !== modality) {
     throw new ModelCatalogError('MODEL_NOT_FOUND', `Unknown ${modality} model`, 404);
   }
-  if (options.requireEnabled !== false && !aliased.enabled) {
+  if (options.requireEnabled !== false && (
+    !aliased.enabled
+    || ('status' in aliased && aliased.status !== undefined && aliased.status !== 'PUBLISHED')
+  )) {
     throw new ModelCatalogError('MODEL_NOT_AVAILABLE', 'The selected model is not available', 409);
   }
   const enabledRoutes = aliased.routes.filter(routeCanReceiveTraffic);
@@ -422,9 +436,9 @@ export async function resolveCatalogModel(
       503,
     );
   }
-  if (options.providerChannelId) {
+  if (options.providerChannelId && !managedRouting) {
     const enabledForChannel = enabledRoutes.some(route => route.channelId === options.providerChannelId);
-    if (managedRouting && !enabledForChannel) {
+    if (!enabledForChannel) {
       throw new ModelCatalogError(
         'MODEL_ROUTE_NOT_AVAILABLE',
         'The selected model route is disabled or unavailable',
@@ -432,12 +446,34 @@ export async function resolveCatalogModel(
       );
     }
   }
-  const selectedRoute = options.providerChannelId
+  const selectedRoute = options.providerChannelId && !managedRouting
     ? enabledRoutes.find(route => route.channelId === options.providerChannelId) ?? null
     : aliased.defaultRouteId
       ? enabledRoutes.find(route => route.id === aliased.defaultRouteId) ?? enabledRoutes[0] ?? null
       : enabledRoutes[0] ?? null;
-  return { model: aliased, route: selectedRoute, enabledRoutes };
+  return {
+    model: aliased,
+    route: selectedRoute,
+    enabledRoutes,
+    requestIdentity: {
+      requestedModel: requested,
+      requestedCanonicalModel: aliased.canonicalModelKey,
+      matchedBy: direct ? 'canonical' as const : 'alias' as const,
+    },
+  };
+}
+
+export function assertCanonicalModelIdentity(
+  requestedCanonicalModel: string | null | undefined,
+  resolvedCanonicalModel: string,
+) {
+  const requested = requestedCanonicalModel?.trim().toLowerCase();
+  if (!requested || requested === resolvedCanonicalModel.trim().toLowerCase()) return;
+  throw new ModelCatalogError(
+    'MODEL_IDENTITY_MISMATCH',
+    `Requested canonical model ${requestedCanonicalModel} resolved as ${resolvedCanonicalModel}`,
+    409,
+  );
 }
 
 export async function resolveAutomaticChatModel(prisma: PrismaClient) {

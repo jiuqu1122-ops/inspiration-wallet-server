@@ -31,6 +31,7 @@ import {
   type CatalogPricingProfile,
   toInputJson,
 } from './pricing-center.js';
+import { ensureDefaultUsageModelBindings } from './usage-model-binding.js';
 
 type CatalogTransaction = Prisma.TransactionClient;
 
@@ -232,6 +233,7 @@ async function seedCatalog(prisma: CatalogTransaction, publishChanges: boolean) 
       if (model) await ensureAlias(prisma, model.id, modality, aliasKey, 'EXPLICIT_COMPATIBILITY_MAP');
     }
   }
+  await ensureDefaultUsageModelBindings(prisma);
   return true;
 }
 

@@ -14,11 +14,13 @@ import { creditDecimal } from '../wallets/credit-amount.js';
 import { proxyAgentChatReferenceImages } from './reference-upload-service.js';
 import { ensureAiCatalogSeeded } from './catalog-seed.js';
 import {
+  assertCanonicalModelIdentity,
   catalogDelegateAvailable,
   legacyUpstreamModelForCanonical,
   ModelCatalogError,
   resolveAutomaticChatModel,
   resolveCatalogModel,
+  type ResolvedCatalogModel,
 } from './model-catalog.js';
 import {
   calculateSnapshotCharge,
@@ -33,6 +35,10 @@ import {
   isFixedCanvasLlmUsageContext,
   resolveAgentUsageContext,
 } from './usage-context.js';
+import {
+  resolveUsageModelBinding,
+  type AiUsageModelKey,
+} from './usage-model-binding.js';
 
 const REQUEST_CREDITS = BigInt(env.AGENT_REQUEST_CREDITS);
 const agentUpstreamDispatcher = new Agent({
@@ -205,19 +211,12 @@ export function resolveConfiguredAgentModel(
   return requested || configured || null;
 }
 
-export function shouldFallbackCanvasTextAgentToAutomaticModel(
+export function usageModelBindingKeyForAgentContext(
   usageContext: string | undefined,
-  automaticModelSelection: boolean,
-  error: unknown,
-) {
-  return usageContext === 'canvas_text_agent'
-    && !automaticModelSelection
-    && error instanceof ModelCatalogError
-    && [
-      'MODEL_NOT_FOUND',
-      'MODEL_NOT_AVAILABLE',
-      'MODEL_ROUTE_NOT_AVAILABLE',
-    ].includes(error.code);
+): AiUsageModelKey | null {
+  return usageContext === 'canvas_text_agent' || usageContext === 'prompt_optimization'
+    ? 'CANVAS_TEXT'
+    : null;
 }
 
 const NON_AGENT_TEXT_MODEL_PATTERN = /(?:^|[-_/.\s])(?:embeddings?|embed|rerank|re-rank|image|images|imagen|img2|flux|sdxl|stable[-_.\s]?diffusion|dall[-_.\s]?e|recraft|ideogram|midjourney|seedream|nano[-_.\s]?banana|hidream|kolors|jimeng|video|sora|veo|kling|seedance|tts|speech|whisper|transcrib(?:e|er)|transcription|moderation)(?:$|[-_/.\s\d])/i;
@@ -1171,6 +1170,8 @@ async function reserveCredits(
     logicalModel: string;
     description: string;
     pricingSnapshot?: PricingSnapshot | undefined;
+    canonicalModelId?: string | undefined;
+    routeId?: string | null | undefined;
   },
 ) {
   const credits = creditDecimal(input.credits);
@@ -1197,17 +1198,21 @@ async function reserveCredits(
       throw new CloudAiError('insufficient_credits', '授权钱包余额不足', 402);
     }
     const wallet = await transaction.wallet.findUniqueOrThrow({ where: { userId: input.userId } });
+    const canonicalModelId = input.pricingSnapshot?.canonicalModelId ?? input.canonicalModelId;
+    const routeId = input.pricingSnapshot?.routeId ?? input.routeId;
     const request = await transaction.aiRequest.create({
       data: {
         userId: input.userId,
         clientRequestId: input.clientRequestId,
         capability: input.capability,
         logicalModel: input.logicalModel,
-        ...(input.pricingSnapshot ? {
-          canonicalModelId: input.pricingSnapshot.canonicalModelId,
-          routeId: input.pricingSnapshot.routeId,
+        ...(canonicalModelId ? {
+          canonicalModelId,
+          ...(routeId !== undefined ? { routeId } : {}),
+          ...(input.pricingSnapshot ? {
           priceVersionId: input.pricingSnapshot.priceVersionId,
           pricingSnapshot: toInputJson(input.pricingSnapshot),
+          } : {}),
         } : {}),
         status: 'RESERVED',
         estimatedCredits: credits,
@@ -1402,40 +1407,40 @@ export async function executeWalletAgentChat(
     configuredFallbackCredits,
   );
   await ensureAiCatalogSeeded(prisma);
-  const automaticModelSelection = isDefaultAgentModelSentinel(input.model);
-  let resolved = null;
+  const usageBindingKey = usageModelBindingKeyForAgentContext(usageContext);
+  const automaticModelSelection = !usageBindingKey && isDefaultAgentModelSentinel(input.model);
+  let resolved:
+    | ResolvedCatalogModel
+    | Awaited<ReturnType<typeof resolveAutomaticChatModel>>
+    | Awaited<ReturnType<typeof resolveUsageModelBinding>> = null;
   if (catalogDelegateAvailable(prisma)) {
-    if (automaticModelSelection) {
-      try {
-        const automaticCatalogModel = await resolveAutomaticChatModel(prisma);
-        if (automaticCatalogModel?.model.routingMode === 'MANAGED') resolved = automaticCatalogModel;
-      } catch (error) {
-        if (!(error instanceof ModelCatalogError) || error.code !== 'MODEL_NOT_AVAILABLE') throw error;
-      }
+    if (usageBindingKey) {
+      resolved = await resolveUsageModelBinding(prisma, usageBindingKey);
+    } else if (automaticModelSelection) {
+      resolved = await resolveAutomaticChatModel(prisma);
     } else {
-      try {
-        resolved = await resolveCatalogModel(prisma, input.model ?? '', 'chat', { requireEnabled: true });
-      } catch (error) {
-        if (!shouldFallbackCanvasTextAgentToAutomaticModel(
-          usageContext,
-          automaticModelSelection,
-          error,
-        )) throw error;
-      }
+      resolved = await resolveCatalogModel(prisma, input.model ?? '', 'chat', { requireEnabled: true });
     }
   }
-  const managedProviders = resolved?.model.routingMode === 'MANAGED'
-    ? resolved.enabledRoutes.flatMap(candidate => candidate.channel ? [candidate.channel] : [])
+  const strictCanonicalRoutes = Boolean(
+    resolved && (usageBindingKey || resolved.model.routingMode === 'MANAGED'),
+  );
+  const routedChannels = strictCanonicalRoutes
+    ? resolved!.enabledRoutes.flatMap(candidate => candidate.channel ? [candidate.channel] : [])
     : [];
-  const allProviders = managedProviders.length > 0
-    ? Array.from(new Map(managedProviders.map(provider => [provider.id, provider])).values())
+  const allProviders = strictCanonicalRoutes
+    ? Array.from(new Map(routedChannels.map(provider => [provider.id, provider])).values())
     : await listProviders(prisma);
   if (allProviders.length === 0) {
-    throw new CloudAiError('provider_unavailable', '当前没有可用的 Agent 渠道', 503);
+    throw new ModelCatalogError(
+      'MODEL_ROUTE_NOT_AVAILABLE',
+      'No operational upstream route is available for the selected canonical model',
+      503,
+    );
   }
   const automaticProvider = allProviders[0]!;
-  const automaticProviderModel = automaticModelSelection
-    ? resolved?.route?.upstreamModelId.trim() || automaticProvider.defaultModel?.trim() || ''
+  const automaticProviderModel = !resolved && automaticModelSelection
+    ? automaticProvider.defaultModel?.trim() || ''
     : '';
   if (automaticModelSelection && !resolved && !isLikelyAgentTextModel(automaticProviderModel)) {
     throw new CloudAiError(
@@ -1444,41 +1449,25 @@ export async function executeWalletAgentChat(
       503,
     );
   }
-  let effectiveAutomaticModelSelection = automaticModelSelection;
-  if (catalogDelegateAvailable(prisma) && !resolved) {
-    if (automaticModelSelection) {
-      resolved = await resolveCatalogModel(prisma, automaticProviderModel, 'chat', {
-        requireEnabled: true,
-        providerChannelId: automaticProvider.id,
-      });
-    } else {
-      try {
-        resolved = await resolveCatalogModel(prisma, input.model ?? '', 'chat', { requireEnabled: true });
-      } catch (error) {
-        if (!shouldFallbackCanvasTextAgentToAutomaticModel(
-          usageContext,
-          automaticModelSelection,
-          error,
-        )) throw error;
-        const fallbackModel = automaticProvider.defaultModel?.trim() ?? '';
-        if (!isLikelyAgentTextModel(fallbackModel)) {
-          throw new CloudAiError(
-            'provider_model_missing',
-            '已启用的首选 Agent 渠道未配置有效的默认文字模型',
-            503,
-          );
-        }
-        resolved = await resolveCatalogModel(prisma, fallbackModel, 'chat', {
-          requireEnabled: true,
-          providerChannelId: automaticProvider.id,
-        });
-        effectiveAutomaticModelSelection = true;
-      }
-    }
-  }
+  // Once automatic selection resolves a canonical model, retries stay inside
+  // that model's routes. Model discovery is retained only for deployments
+  // without the catalog schema during the compatibility window.
+  const effectiveAutomaticModelSelection = automaticModelSelection && !resolved;
   const canonicalModel = resolved?.model ?? null;
   const route = resolved?.route ?? null;
   const canonicalModelKey = canonicalModel?.canonicalModelKey ?? (input.model?.trim() || 'unmind-agent');
+  const catalogRequestIdentity = resolved && 'requestIdentity' in resolved
+    ? resolved.requestIdentity
+    : null;
+  const explicitCanonicalRequest = catalogRequestIdentity?.matchedBy === 'canonical'
+    ? catalogRequestIdentity.requestedModel
+    : null;
+  const requestedCanonicalModel = canonicalModel && !automaticModelSelection
+    ? catalogRequestIdentity?.requestedCanonicalModel ?? canonicalModel.canonicalModelKey
+    : null;
+  if (explicitCanonicalRequest) {
+    assertCanonicalModelIdentity(explicitCanonicalRequest, canonicalModelKey);
+  }
   const pricingSnapshot = canonicalModel
     ? await capturePricingSnapshot(prisma, canonicalModel, route?.id ?? null, {
       fallbackCredits: fallbackCredits.toString(),
@@ -1510,21 +1499,27 @@ export async function executeWalletAgentChat(
         ...resolved.enabledRoutes.filter(candidate => candidate.id !== resolved.route?.id),
       ]
       : [];
-    const routedProviders = prioritizedRoutes.flatMap(candidate => {
-      const provider = candidate.channelId ? providersById.get(candidate.channelId) : undefined;
-      return provider ? [provider] : [];
-    });
-    const providers = routedProviders.length > 0
-      ? Array.from(new Map(routedProviders.map(provider => [provider.id, provider])).values())
-      : allProviders;
-    if (providers.length === 0) {
+    const strictRouteAttempts = strictCanonicalRoutes
+      ? prioritizedRoutes.flatMap(candidate => {
+        const provider = candidate.channelId ? providersById.get(candidate.channelId) : undefined;
+        return provider ? [{ provider, route: candidate }] : [];
+      })
+      : [];
+    const providerAttempts = strictRouteAttempts.length > 0
+      ? strictRouteAttempts
+      : allProviders.map(provider => ({
+        provider,
+        route: resolved?.enabledRoutes.find(candidate => candidate.channelId === provider.id) ?? null,
+      }));
+    if (providerAttempts.length === 0) {
       throw new CloudAiError('provider_unavailable', '当前没有可用的 Agent 渠道', 503);
     }
     const failures: string[] = [];
     let result: unknown;
     let requestAttempt = 0;
     let successfulRouteId = route?.id ?? null;
-    for (const [index, provider] of providers.entries()) {
+    for (const [index, attempt] of providerAttempts.entries()) {
+      const { provider, route: providerRoute } = attempt;
       let discoveredModels: string[] = [];
       if (effectiveAutomaticModelSelection) {
         try {
@@ -1534,7 +1529,13 @@ export async function executeWalletAgentChat(
           discoveredModels = [];
         }
       }
-      const providerRoute = resolved?.enabledRoutes.find(candidate => candidate.channelId === provider.id);
+      if (canonicalModel && providerRoute && providerRoute.canonicalModelId !== canonicalModel.id) {
+        throw new ModelCatalogError(
+          'MODEL_IDENTITY_MISMATCH',
+          'Resolved route does not belong to the requested canonical model',
+          409,
+        );
+      }
       const requestedUpstreamModel = providerRoute?.upstreamModelId
         ?? (canonicalModel ? legacyUpstreamModelForCanonical(canonicalModelKey, 'chat') : input.model);
       const modelCandidates = buildAgentModelCandidates(provider, requestedUpstreamModel, discoveredModels);
@@ -1542,6 +1543,17 @@ export async function executeWalletAgentChat(
       const providerAttemptInput = initialModel
         ? { ...providerInput, model: initialModel }
         : providerInput;
+      console.info('[ai_route_attempt]', {
+        requestedCanonicalModel: requestedCanonicalModel ?? (automaticModelSelection ? 'automatic' : input.model),
+        resolvedCanonicalModel: canonicalModelKey,
+        routeId: providerRoute?.id ?? null,
+        providerChannelId: provider.id,
+        upstreamModel: initialModel ?? null,
+        usageContext,
+        resolution: null,
+        aspectRatio: null,
+        fallbackType: index === 0 ? 'none' : 'same_canonical_route',
+      });
       try {
         requestAttempt += 1;
         result = await requestAgentCompletionFromProvider(
@@ -1617,12 +1629,12 @@ export async function executeWalletAgentChat(
           ? `（同渠道已重试模型 ${retriedModels.join(' → ')}）`
           : '';
         failures.push(`${provider.name}${modelDetail}：${agentProviderFailureDetail(finalError)}`);
-        const hasNextProvider = index + 1 < providers.length;
+        const hasNextProvider = index + 1 < providerAttempts.length;
         if (!hasNextProvider || !canFallbackToNextAgentProvider(finalError)) {
           const lastFailure = failures[failures.length - 1] || '未知通道错误';
           throw new CloudAiError(
             'provider_request_failed',
-            providers.length > 1
+            providerAttempts.length > 1
               ? `全部 Agent 渠道请求失败（已尝试 ${failures.length} 个）；末次错误：${lastFailure}`
               : `Agent 渠道请求失败：${lastFailure}`,
             502,
@@ -1671,7 +1683,7 @@ export async function executeWalletAgentChat(
   }
 }
 
-export async function executeFreeInspirationAnalysis(
+async function executeBoundInspirationAnalysis(
   prisma: PrismaClient,
   input: {
     itemId: string;
@@ -1681,6 +1693,7 @@ export async function executeFreeInspirationAnalysis(
     existingProfile?: unknown;
   },
   options?: AgentExecutionOptions,
+  preResolved?: Awaited<ReturnType<typeof resolveUsageModelBinding>>,
 ) {
   const prompt = `You are an industrial-design, CMF, and product-visual-analysis expert.
 Analyze the attached saved inspiration image. Return one JSON object only; no markdown and no explanation.
@@ -1693,22 +1706,38 @@ Generate 5-16 concise tags. Confidence must be a number from 0 to 1. Keep uncert
 User tags: ${JSON.stringify(input.userTags ?? [])}
 User notes: ${JSON.stringify(input.userNotes ?? [])}
 Existing profile: ${JSON.stringify(input.existingProfile ?? null)}`;
-  const providers = await listInspirationProviders(prisma);
-  if (providers.length === 0) {
-    throw new CloudAiError('provider_unavailable', '当前没有可用的灵感分析渠道', 503);
-  }
+  await ensureAiCatalogSeeded(prisma);
+  const resolved = preResolved ?? await resolveUsageModelBinding(prisma, 'IMAGE_ANALYSIS');
+  const routes = [
+    ...(resolved.route ? [resolved.route] : []),
+    ...resolved.enabledRoutes.filter(route => route.id !== resolved.route?.id),
+  ];
   let value: unknown;
   let requestAttempt = 0;
   const failures: string[] = [];
-  for (const [providerIndex, provider] of providers.entries()) {
-    const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-    const model = await discoverModel(
-      provider,
-      secrets.apiKey,
-      secrets.headers,
-      undefined,
-      providerIndex > 0,
-    );
+  let successfulRouteId: string | null = null;
+  for (const [routeIndex, route] of routes.entries()) {
+    if (route.canonicalModelId !== resolved.model.id) {
+      throw new ModelCatalogError(
+        'MODEL_IDENTITY_MISMATCH',
+        'Image-analysis route does not belong to its bound canonical model',
+        409,
+      );
+    }
+    const provider = route.channel;
+    if (!provider) continue;
+    const model = route.upstreamModelId;
+    console.info('[ai_route_attempt]', {
+      requestedCanonicalModel: resolved.model.canonicalModelKey,
+      resolvedCanonicalModel: resolved.model.canonicalModelKey,
+      routeId: route.id,
+      providerChannelId: provider.id,
+      upstreamModel: model,
+      usageContext: 'inspiration_analysis',
+      resolution: null,
+      aspectRatio: null,
+      fallbackType: routeIndex === 0 ? 'none' : 'same_canonical_route',
+    });
     let finalError: unknown;
     for (let retry = 0; retry < 3; retry += 1) {
       if (retry > 0) {
@@ -1734,6 +1763,7 @@ Existing profile: ${JSON.stringify(input.existingProfile ?? null)}`;
           }],
         }, options, requestAttempt);
         value = completion.result;
+        successfulRouteId = route.id;
         break;
       } catch (error) {
         if (options?.signal?.aborted) {
@@ -1764,10 +1794,26 @@ Existing profile: ${JSON.stringify(input.existingProfile ?? null)}`;
   for (const payload of payloads) {
     const analysis = normalizeImageTagAnalysis(payload, input);
     if (!bestAnalysis || analysis.tags.length > bestAnalysis.tags.length) bestAnalysis = analysis;
-    if (analysis.tags.length >= MIN_AI_IMAGE_TAGS) return analysis;
+    if (analysis.tags.length >= MIN_AI_IMAGE_TAGS) {
+      return { analysis, resolved, successfulRouteId };
+    }
   }
-  if (bestAnalysis?.tags.length) return bestAnalysis;
+  if (bestAnalysis?.tags.length) return { analysis: bestAnalysis, resolved, successfulRouteId };
   throw new CloudAiError('provider_invalid_response', '灵感自动分析没有返回有效标签', 502);
+}
+
+export async function executeFreeInspirationAnalysis(
+  prisma: PrismaClient,
+  input: {
+    itemId: string;
+    imageSource: string;
+    userTags?: string[] | undefined;
+    userNotes?: string[] | undefined;
+    existingProfile?: unknown;
+  },
+  options?: AgentExecutionOptions,
+) {
+  return (await executeBoundInspirationAnalysis(prisma, input, options)).analysis;
 }
 
 export async function executeWalletInspirationAnalysis(
@@ -1783,6 +1829,8 @@ export async function executeWalletInspirationAnalysis(
   },
   options?: AgentExecutionOptions,
 ) {
+  await ensureAiCatalogSeeded(prisma);
+  const resolved = await resolveUsageModelBinding(prisma, 'IMAGE_ANALYSIS');
   const configuredCredits = await configuredInspirationAnalysisCredits(prisma);
   const credits = await resolveMembershipContextCredits(
     prisma,
@@ -1790,18 +1838,38 @@ export async function executeWalletInspirationAnalysis(
     'inspiration_analysis',
     configuredCredits,
   );
+  // Keep the established fixed usage charge, while snapshotting the bound
+  // canonical identity and published pricing metadata for audit/recovery.
+  const pricingSnapshot = await capturePricingSnapshot(
+    prisma,
+    resolved.model,
+    resolved.route?.id ?? null,
+    {
+      usageContext: 'inspiration_analysis',
+      fixedUsageCredits: creditDecimal(credits).toFixed(6),
+    },
+    input.userId,
+  );
   const requestId = await reserveCredits(prisma, {
     userId: input.userId,
     clientRequestId: input.clientRequestId,
     credits,
     capability: 'VISION',
-    logicalModel: 'inspiration-analysis',
+    logicalModel: resolved.model.canonicalModelKey,
+    canonicalModelId: resolved.model.id,
+    routeId: resolved.route?.id ?? null,
+    pricingSnapshot,
     description: '图片分析预扣',
   });
   try {
-    const result = await executeFreeInspirationAnalysis(prisma, input, options);
-    await settleCredits(prisma, input.userId, requestId);
-    return result;
+    const result = await executeBoundInspirationAnalysis(prisma, input, options, resolved);
+    await settleCredits(prisma, input.userId, requestId, {
+      chargedCredits: creditDecimal(credits).toFixed(6),
+      logicalModel: resolved.model.canonicalModelKey,
+      actualRouteId: result.successfulRouteId,
+      description: `图片分析结算 · ${resolved.model.canonicalModelKey}`,
+    });
+    return result.analysis;
   } catch (error) {
     await releaseCredits(prisma, input.userId, requestId);
     throw error;

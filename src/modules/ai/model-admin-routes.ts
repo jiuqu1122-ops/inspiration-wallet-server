@@ -23,6 +23,11 @@ import {
 } from './model-admin.js';
 import { toInputJson } from './pricing-center.js';
 import { syncAllUpstreamModels, syncUpstreamModels } from './upstream-sync.js';
+import {
+  AI_USAGE_MODEL_KEYS,
+  listAdminUsageModelBindings,
+  updateAdminUsageModelBinding,
+} from './usage-model-binding.js';
 
 const modalitySchema = z.enum(['chat', 'image', 'video']);
 const jsonObjectSchema = z.record(z.string(), z.unknown());
@@ -110,6 +115,8 @@ const pricingPolicySchema = z.object({
   pricingMode: z.enum(['MANUAL', 'MARKUP']),
   markupMultiplier: z.string().regex(/^(?:0|[1-9]\d{0,2})(?:\.\d{1,6})?$/),
 }).strict();
+const usageBindingParamsSchema = z.object({ key: z.enum(AI_USAGE_MODEL_KEYS) }).strict();
+const updateUsageBindingSchema = z.object({ canonicalModelId: idSchema }).strict();
 
 function invalid(reply: FastifyReply, message: string) {
   return reply.code(400).send({ error: 'invalid_request', message });
@@ -147,6 +154,20 @@ export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
   });
 
   app.get('/unmapped', async () => ({ items: await listUnmappedModels(app.prisma) }));
+
+  app.get('/usage-model-bindings', async () => listAdminUsageModelBindings(app.prisma));
+
+  app.patch('/usage-model-bindings/:key', async (request, reply) => {
+    const params = usageBindingParamsSchema.safeParse(request.params);
+    const body = updateUsageBindingSchema.safeParse(request.body);
+    if (!params.success || !body.success) return invalid(reply, 'Usage model binding update is invalid');
+    return adminOperation(reply, () => updateAdminUsageModelBinding(
+      app.prisma,
+      params.data.key,
+      body.data.canonicalModelId,
+      mutationContext(request),
+    ));
+  });
 
   app.post(
     '/sync',

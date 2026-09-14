@@ -813,6 +813,16 @@ describe('wallet image provider normalization', () => {
       channel: gpt,
       capabilitiesOverride: { supportedResolutions: ['4k'] },
     }, 'gpt-image-2', '2k')).toBe(false);
+    expect(imageRouteSupportsRequest({
+      channel: { capabilities: ['LLM'] as const },
+      capabilitiesOverride: { supportedResolutions: ['4k'] },
+      metadata: { capabilitiesOverrideSource: 'DISCOVERY' },
+    }, 'gpt-image-2.5', '2k', '16:9', true)).toBe(true);
+    expect(imageRouteSupportsRequest({
+      channel: { capabilities: ['LLM'] as const },
+      capabilitiesOverride: { supportedResolutions: ['4k'] },
+      metadata: { capabilitiesOverrideSource: 'MANUAL' },
+    }, 'gpt-image-2.5', '2k', '16:9', true)).toBe(false);
     expect(catalogModelSupportsImageRequest({ supportedResolutions: ['2k', '4k'] }, '1k')).toBe(false);
     expect(catalogModelSupportsImageRequest({ supportedResolutions: ['2k', '4k'] }, '4k')).toBe(true);
     const exactDimensions = {
@@ -1469,6 +1479,38 @@ describe('wallet image provider normalization', () => {
       size: '3520x2352',
       quality: 'medium',
     });
+    expect(newApiImageRequestParams('seedream-4.0', 1, '16:9', '2K')).toEqual({
+      n: 1,
+      size: '2048x1152',
+      aspect_ratio: '16:9',
+      output_resolution: '2K',
+      image_size: '2K',
+    });
+  });
+
+  it.each([
+    ['1K', '1:1', '1024x1024'],
+    ['1K', '16:9', '1280x720'],
+    ['1K', '9:16', '720x1280'],
+    ['1K', '3:2', '1152x768'],
+    ['1K', '3:4', '768x1024'],
+    ['2K', '1:1', '2048x2048'],
+    ['2K', '16:9', '2048x1152'],
+    ['2K', '9:16', '1152x2048'],
+    ['2K', '3:2', '2064x1376'],
+    ['2K', '3:4', '1536x2048'],
+    ['4K', '1:1', '2880x2880'],
+    ['4K', '16:9', '3840x2160'],
+    ['4K', '9:16', '2160x3840'],
+    ['4K', '3:2', '3520x2352'],
+    ['4K', '3:4', '2480x3312'],
+  ] as const)('maps GPT Image 2.5 %s %s to exact upstream size %s', (resolution, ratio, size) => {
+    expect(newApiImageRequestParams('gpt-image-2.5', 1, ratio, resolution)).toMatchObject({
+      n: 1,
+      size,
+      aspect_ratio: ratio,
+      quality: 'medium',
+    });
   });
 
   it('keeps NewAPI image references on the public URL path', () => {
@@ -2059,6 +2101,74 @@ describe('wallet image provider normalization', () => {
       async: true,
       stream: false,
     });
+  });
+
+  it('submits GPT Image 2.5 4K generations with the exact 3:2 dimensions', async () => {
+    const rawPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({
+      output: [{ result: rawPng }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateNewApiImages(
+      { baseUrl: 'https://provider.example' } as Parameters<typeof generateNewApiImages>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-1',
+        clientRequestId: 'gpt-image-25-generation-4k',
+        model: 'gpt-image-2.5',
+        prompt: 'render the projector',
+        inputImages: [],
+        aspectRatio: '3:2',
+        resolution: '4K',
+        outputFormat: 'jpg',
+        count: 1,
+      },
+    )).resolves.toEqual([`data:image/png;base64,${rawPng}`]);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://provider.example/v1/images/generations');
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+      model: 'gpt-image-2.5',
+      size: '3520x2352',
+      aspect_ratio: '3:2',
+    });
+  });
+
+  it('keeps GPT Image 2.5 references on edits with exact 2K dimensions', async () => {
+    const reference = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
+    const output = `data:image/png;base64,${(await sharp({
+      create: { width: 2, height: 2, channels: 3, background: '#ff0000' },
+    }).png().toBuffer()).toString('base64')}`;
+    let multipartBody = '';
+    const fetchMock = vi.fn().mockImplementation(async (_url, init) => {
+      multipartBody = Buffer.from(await new Response(init?.body as BodyInit).arrayBuffer()).toString('utf8');
+      return new Response(JSON.stringify({ output: [{ result: output.split(',')[1] }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateNewApiImages(
+      { baseUrl: 'https://provider.example' } as Parameters<typeof generateNewApiImages>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-1',
+        clientRequestId: 'gpt-image-25-edit-2k',
+        model: 'gpt-image-2.5',
+        prompt: 'redesign the handle',
+        inputImages: [reference],
+        aspectRatio: '3:2',
+        resolution: '2K',
+        outputFormat: 'jpg',
+        count: 1,
+      },
+    )).resolves.toEqual([output]);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://provider.example/v1/images/edits');
+    expect(multipartBody).toContain('name="model"\r\n\r\ngpt-image-2.5');
+    expect(multipartBody).toContain('name="size"\r\n\r\n2064x1376');
+    expect(multipartBody).toContain('name="aspect_ratio"\r\n\r\n3:2');
   });
 
   it('falls back to synchronous NewAPI requests when a channel rejects the async field', async () => {

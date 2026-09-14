@@ -40,7 +40,7 @@ const operationKey = (context: AdminMutationContext, type: AdminOperationType) =
   `ai-model:${type.toLowerCase()}:${context.requestId}:${randomUUID()}`
 );
 
-async function recordAdminOperation(
+export async function recordAdminOperation(
   transaction: Prisma.TransactionClient,
   type: AdminOperationType,
   context: AdminMutationContext,
@@ -171,7 +171,7 @@ export async function getAdminAiModel(prisma: PrismaClient, canonicalModelKey: s
       },
       pricing: { include: { currentVersion: true } },
       priceVersions: { orderBy: { version: 'desc' }, take: 50 },
-      _count: { select: { routes: true, priceVersions: true, requests: true, billingSettlements: true } },
+      _count: { select: { routes: true, priceVersions: true, requests: true, billingSettlements: true, usageBindings: true } },
     },
   });
 }
@@ -186,7 +186,7 @@ export async function deleteAdminAiModel(
     const model = await transaction.aiModel.findUnique({
       where: { canonicalModelKey },
       include: {
-        _count: { select: { routes: true, priceVersions: true, requests: true, billingSettlements: true } },
+        _count: { select: { routes: true, priceVersions: true, requests: true, billingSettlements: true, usageBindings: true } },
       },
     });
     if (!model) throw new AiModelAdminError('NOT_FOUND', 'Canonical model was not found', 404);
@@ -208,6 +208,9 @@ export async function deleteAdminAiModel(
     }
     if (model._count.requests > 0 || model._count.billingSettlements > 0) {
       throw new AiModelAdminError('INVALID_REQUEST', 'A model with request or billing history cannot be deleted', 400);
+    }
+    if (model._count.usageBindings > 0) {
+      throw new AiModelAdminError('INVALID_REQUEST', 'Move internal usage bindings before deleting this model', 400);
     }
     const deleted = await transaction.aiModel.deleteMany({
       where: { id: model.id, updatedAt: model.updatedAt },

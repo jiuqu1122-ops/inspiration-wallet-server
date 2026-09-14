@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { encryptProviderSecrets } from '../src/lib/provider-secrets.js';
 import {
   ModelCatalogError,
+  assertCanonicalModelIdentity,
   defaultModelCapabilities,
   explicitCanonicalModelKey,
   getPublicAiCatalog,
@@ -70,9 +71,19 @@ afterEach(() => {
 });
 
 describe('canonical model mapping', () => {
+  it('stops dispatch when an explicit canonical identity changes during resolution', () => {
+    expect(() => assertCanonicalModelIdentity('chat-model-a', 'chat-model-b')).toThrow(expect.objectContaining({
+      code: 'MODEL_IDENTITY_MISMATCH',
+      statusCode: 409,
+    }));
+    expect(() => assertCanonicalModelIdentity('Chat-Model-A', 'chat-model-a')).not.toThrow();
+  });
+
   it('gives administrator-created GPT Image 2.5 variants exact pixel dimensions', () => {
     expect(defaultModelCapabilities('gpt-image-2.5-high', 'image')).toMatchObject({
+      supportedResolutions: ['1k', '2k', '4k'],
       supportedAspectRatiosByResolution: {
+        '1k': expect.arrayContaining(['1024x1024', '1280x720', '720x1280']),
         '2k': expect.arrayContaining(['2048x1152', '2064x1376']),
         '4k': expect.arrayContaining(['3840x2160', '3520x2352']),
       },
@@ -100,7 +111,7 @@ describe('canonical model mapping', () => {
     expect(explicitCanonicalModelKey('image', 'unreviewed-product')).toBeNull();
   });
 
-  it('rejects disabled models and unapproved provider-channel bypasses', async () => {
+  it('rejects disabled models and ignores stale managed provider-channel hints', async () => {
     const disabledPrisma = {
       aiModel: {
         findUnique: vi.fn(async () => ({
@@ -138,7 +149,7 @@ describe('canonical model mapping', () => {
     } as unknown as PrismaClient;
     await expect(resolveCatalogModel(routedPrisma, 'routed-model', 'image', {
       providerChannelId: 'channel-not-mapped',
-    })).rejects.toMatchObject<ModelCatalogError>({ code: 'MODEL_ROUTE_NOT_AVAILABLE' });
+    })).resolves.toMatchObject({ route: { id: 'route-a' } });
   });
 
   it('auto selection skips a model whose recorded operational routes are all disabled', async () => {
@@ -597,7 +608,7 @@ describe('catalog exposure and upstream discovery safety', () => {
     const catalog = await getPublicAiCatalog(prisma);
 
     expect(catalog.models[0]?.capabilities).toMatchObject({
-      resolutions: ['2k', '4k'],
+      resolutions: ['1k', '2k', '4k'],
       aspectRatiosByResolution: {
         '2k': expect.arrayContaining(['2048x1152', '2064x1376']),
         '4k': expect.arrayContaining(['3840x2160', '3520x2352']),

@@ -91,6 +91,7 @@ enum AdminOperationType {
   MODEL_ALIAS_CREATED
   MODEL_ALIAS_DELETED
   MODEL_DELETED
+  USAGE_MODEL_BINDING_UPDATED
 }
 
 enum AiProviderKind {
@@ -528,9 +529,20 @@ model AiModel {
   priceVersions      AiPriceVersion[]
   requests           AiRequest[]
   billingSettlements AiBillingSettlement[]
+  usageBindings      AiUsageModelBinding[]
 
   @@index([modality, enabled, visible, sortOrder])
   @@index([status, modality])
+}
+
+/// Server-owned binding from an internal business purpose to a canonical Chat model.
+model AiUsageModelBinding {
+  key              String   @id
+  canonicalModelId String
+  updatedAt        DateTime @updatedAt
+  canonicalModel   AiModel  @relation(fields: [canonicalModelId], references: [id], onDelete: Restrict)
+
+  @@index([canonicalModelId])
 }
 
 /// Provider/channel-specific route and upstream purchasing cost.

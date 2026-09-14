@@ -32,12 +32,14 @@ import { creditDecimal, serializeCredit } from '../wallets/credit-amount.js';
 import { ensureAiCatalogSeeded } from './catalog-seed.js';
 import {
   GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION,
+  assertCanonicalModelIdentity,
   catalogDelegateAvailable,
   catalogAliasKey,
   explicitCanonicalModelKey,
   getPublicAiCatalog,
   isGptImage2CatalogIdentity,
   legacyUpstreamModelForCanonical,
+  ModelCatalogError,
   normalizePublicModelCapabilities,
   resolveCatalogModel,
   withGptImage2DimensionCapabilities,
@@ -245,6 +247,7 @@ export function providerSupportsImageModel(
 export function imageRouteSupportsRequest<T extends {
   channel: { capabilities: readonly AiCapability[] } | null;
   capabilitiesOverride?: unknown;
+  metadata?: unknown;
 }>(
   route: T,
   model: string,
@@ -258,7 +261,9 @@ export function imageRouteSupportsRequest<T extends {
   // not block newly discovered upstream models.
   if (!managedRouting && !providerSupportsImageModel(route.channel, model, resolution)) return false;
   const requestedResolution = String(resolution || '').trim().toLowerCase();
-  const routeCapabilities = normalizePublicModelCapabilities(route.capabilitiesOverride);
+  const routeCapabilities = normalizePublicModelCapabilities(
+    effectiveRouteCapabilitiesOverride(route, managedRouting),
+  );
   const supportedResolutions = Array.isArray(routeCapabilities.resolutions)
     ? routeCapabilities.resolutions.map(item => String(item).trim().toLowerCase())
     : [];
@@ -271,6 +276,19 @@ export function imageRouteSupportsRequest<T extends {
     aspectRatio,
     true,
   );
+}
+
+function effectiveRouteCapabilitiesOverride(
+  route: { capabilitiesOverride?: unknown; metadata?: unknown },
+  managedRouting: boolean,
+) {
+  if (!managedRouting) return route.capabilitiesOverride;
+  const metadata = route.metadata && typeof route.metadata === 'object' && !Array.isArray(route.metadata)
+    ? route.metadata as Record<string, unknown>
+    : {};
+  return metadata.capabilitiesOverrideSource === 'MANUAL'
+    ? route.capabilitiesOverride
+    : undefined;
 }
 
 function capabilitiesSupportImageAspectRatio(
@@ -1307,6 +1325,7 @@ function newApiImageFamily(model: string) {
     || token.includes('gemini31flashimage')
     || token.includes('gemini3flashimage')) return 'nano-banana';
   if (isGptImage2CatalogIdentity(model)) return 'gpt-image-2';
+  if (token.includes('seedream')) return 'seedream';
   return 'legacy';
 }
 
@@ -1400,11 +1419,13 @@ function normalizedImageResolution(resolution?: string): PricedImageResolution {
 function newApiExactImageSize(ratio: string, resolution?: string) {
   const normalizedResolution = normalizedImageResolution(resolution);
   const requested = ratio.trim().replace(/×/g, 'x');
-  const exactOptions = GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION[normalizedResolution as '2k' | '4k'];
+  const exactOptions = GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION[normalizedResolution];
   if (exactOptions?.some(option => option.toLowerCase() === requested.toLowerCase())) return requested;
   const sizes: Record<PricedImageResolution, Record<string, string>> = {
     '1k': {
       '1:1': '1024x1024',
+      '2:3': '768x1152',
+      '3:2': '1152x768',
       '3:4': '768x1024',
       '4:3': '1024x768',
       '9:16': '720x1280',
@@ -1412,6 +1433,8 @@ function newApiExactImageSize(ratio: string, resolution?: string) {
     },
     '2k': {
       '1:1': '2048x2048',
+      '2:3': '1376x2064',
+      '3:2': '2064x1376',
       '3:4': '1536x2048',
       '4:3': '2048x1536',
       '9:16': '1152x2048',
@@ -1419,8 +1442,10 @@ function newApiExactImageSize(ratio: string, resolution?: string) {
     },
     '4k': {
       '1:1': '2880x2880',
-      '3:4': '2400x3200',
-      '4:3': '3200x2400',
+      '2:3': '2352x3520',
+      '3:2': '3520x2352',
+      '3:4': '2480x3312',
+      '4:3': '3312x2480',
       '9:16': '2160x3840',
       '16:9': '3840x2160',
     },
@@ -1438,7 +1463,7 @@ export function newApiImageRequestParams(
 ) {
   const family = newApiImageFamily(model);
   const transparentPng = outputFormat === 'png' || background === 'transparent';
-  if (family === 'nano-banana') {
+  if (family === 'nano-banana' || family === 'seedream') {
     const resolutionLabel = normalizedImageResolution(resolution).toUpperCase();
     return {
       n: count,
@@ -3823,11 +3848,22 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
   const catalogResolution = catalogDelegateAvailable(prisma)
     ? await resolveCatalogModel(prisma, input.model, 'image', {
       requireEnabled: true,
-      ...(input.providerChannelId ? { providerChannelId: input.providerChannelId } : {}),
     })
     : null;
   const catalogResolvedAt = Date.now();
   const canonicalModelKey = catalogResolution?.model.canonicalModelKey ?? input.model;
+  const requestedCanonicalModel = catalogResolution?.requestIdentity.requestedCanonicalModel ?? input.model;
+  const managedRouting = catalogResolution?.model.routingMode === 'MANAGED';
+  if (managedRouting && (input.provider || input.providerChannelId)) {
+    console.info('[legacy_wallet_route_hint_ignored]', {
+      requestedCanonicalModel,
+      resolvedCanonicalModel: canonicalModelKey,
+      legacyProviderHint: input.provider ?? null,
+      legacyProviderChannelId: input.providerChannelId ?? null,
+      ignored: true,
+      usageContext: 'image_generation',
+    });
+  }
   const validatedInput: ImageInput = {
     ...input,
     inputImages: await resolveReferenceImageSources(prisma, input.userId, input.inputImages),
@@ -3853,10 +3889,11 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       canonicalModelKey,
       validatedInput.resolution,
       validatedInput.aspectRatio,
-      catalogResolution.model.routingMode === 'MANAGED',
+      managedRouting,
     )
   )) ?? [];
-  if (validatedInput.providerChannelId
+  if (!managedRouting
+    && validatedInput.providerChannelId
     && catalogResolution
     && !compatibleCatalogRoutes.some(route => route.channelId === validatedInput.providerChannelId)) {
     throw new CloudAiError(
@@ -3865,10 +3902,10 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       400,
     );
   }
-  if (catalogResolution?.model.routingMode === 'MANAGED' && compatibleCatalogRoutes.length === 0) {
-    throw new CloudAiError(
-      'provider_unavailable',
-      '当前没有支持该模型请求分辨率的可用渠道',
+  if (managedRouting && compatibleCatalogRoutes.length === 0) {
+    throw new ModelCatalogError(
+      'MODEL_ROUTE_NOT_AVAILABLE',
+      'No operational route supports the selected canonical image model request',
       503,
     );
   }
@@ -3879,7 +3916,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
   const compatibleDefaultRoute = catalogResolution?.route
     ? compatibleCatalogRoutes.find(route => route.id === catalogResolution.route?.id) ?? compatibleCatalogRoutes[0]
     : compatibleCatalogRoutes[0];
-  const preferredRouteChannelId = validatedInput.providerChannelId
+  const preferredRouteChannelId = (!managedRouting ? validatedInput.providerChannelId : undefined)
     ?? compatibleDefaultRoute?.channelId
     ?? undefined;
   const preferredRouteProvider = preferredRouteChannelId
@@ -3905,7 +3942,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     ...effectiveImageInputForProvider(
       primaryProvider,
       validatedInput,
-      primaryRoute?.capabilitiesOverride,
+      primaryRoute ? effectiveRouteCapabilitiesOverride(primaryRoute, managedRouting) : undefined,
     ),
     ...(primaryRoute ? { model: primaryRoute.upstreamModelId } : {}),
   };
@@ -3953,19 +3990,42 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
           ...effectiveImageInputForProvider(
             activeProvider,
             validatedInput,
-            activeRoute?.capabilitiesOverride,
+            activeRoute ? effectiveRouteCapabilitiesOverride(activeRoute, managedRouting) : undefined,
           ),
           ...(activeRoute ? { model: activeRoute.upstreamModelId } : {}),
         };
       if (index > 0) await assertPublicProviderUrl(activeProvider.baseUrl);
       try {
+        if (catalogResolution && activeRoute && activeRoute.canonicalModelId !== catalogResolution.model.id) {
+          throw new ModelCatalogError(
+            'MODEL_IDENTITY_MISMATCH',
+            'Image route does not belong to the requested canonical model',
+            409,
+          );
+        }
+        if (catalogResolution) {
+          assertCanonicalModelIdentity(
+            catalogResolution.requestIdentity.matchedBy === 'canonical'
+              ? catalogResolution.requestIdentity.requestedModel
+              : catalogResolution.requestIdentity.requestedCanonicalModel,
+            catalogResolution.model.canonicalModelKey,
+          );
+        }
         console.info('[image_generation_upstream_dispatch]', {
           clientRequestId: input.clientRequestId,
           requestedModel: input.model,
+          requestedCanonicalModel,
+          resolvedCanonicalModel: canonicalModelKey,
           canonicalModelKey,
           provider: activeProvider.name,
           providerId: activeProvider.id,
           submittedUpstreamModel: activeInput.model,
+          routeId: activeRoute?.id ?? null,
+          providerChannelId: activeProvider.id,
+          usageContext: 'image_generation',
+          resolution: validatedInput.resolution ?? null,
+          aspectRatio: validatedInput.aspectRatio,
+          fallbackType: index === 0 ? 'none' : 'same_canonical_route',
           catalogSeedMs: catalogSeededAt - requestStartedAt,
           catalogResolveMs: catalogResolvedAt - catalogSeededAt,
           referenceResolveMs: referencesResolvedAt - catalogResolvedAt,
@@ -4056,7 +4116,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       error: error instanceof Error ? error.message : String(error),
     });
     await releaseImageCredits(prisma, reservationInput, reservation.requestId, reservation.estimated);
-    if (error instanceof CloudAiError) throw error;
+    if (error instanceof CloudAiError || error instanceof ModelCatalogError) throw error;
     if (error instanceof UpstreamImageError) {
       if (activeProvider.kind === 'NEW_API' && isNewApiParamOverrideCopyError(error)) {
         throw new CloudAiError(
@@ -4262,6 +4322,7 @@ export function providerSupportsVideoModel(
 export function videoRouteSupportsRequest<T extends {
   channel: { capabilities: readonly AiCapability[] } | null;
   capabilitiesOverride?: unknown;
+  metadata?: unknown;
 }>(
   route: T,
   model: string,
@@ -4271,7 +4332,9 @@ export function videoRouteSupportsRequest<T extends {
 ) {
   if (!route.channel) return false;
   if (!managedRouting && !providerSupportsVideoModel(route.channel, model)) return false;
-  const capabilities = normalizePublicModelCapabilities(route.capabilitiesOverride);
+  const capabilities = normalizePublicModelCapabilities(
+    effectiveRouteCapabilitiesOverride(route, managedRouting),
+  );
   const requestedResolution = String(resolution || '').trim().toLowerCase();
   const supportedResolutions = Array.isArray(capabilities.resolutions)
     ? capabilities.resolutions.map(item => String(item).trim().toLowerCase())
@@ -4805,10 +4868,21 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
   const catalogResolution = catalogDelegateAvailable(prisma)
     ? await resolveCatalogModel(prisma, input.model, 'video', {
       requireEnabled: true,
-      ...(input.providerChannelId ? { providerChannelId: input.providerChannelId } : {}),
     })
     : null;
   const canonicalModelKey = catalogResolution?.model.canonicalModelKey ?? input.model;
+  const requestedCanonicalModel = catalogResolution?.requestIdentity.requestedCanonicalModel ?? input.model;
+  const managedRouting = catalogResolution?.model.routingMode === 'MANAGED';
+  if (managedRouting && (input.provider || input.providerChannelId)) {
+    console.info('[legacy_wallet_route_hint_ignored]', {
+      requestedCanonicalModel,
+      resolvedCanonicalModel: canonicalModelKey,
+      legacyProviderHint: input.provider ?? null,
+      legacyProviderChannelId: input.providerChannelId ?? null,
+      ignored: true,
+      usageContext: 'video_generation',
+    });
+  }
   if (isSeedance20VideoModel(input.model)
     && (input.inputImages.length > 9 || input.inputVideos.length > 3 || input.inputAudios.length > 3)) {
     throw new CloudAiError('invalid_request', 'Seedance 2.0 supports 9 images, 3 videos, and 3 audios at most', 400);
@@ -4835,30 +4909,52 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       canonicalModelKey,
       input.resolution,
       input.duration,
-      catalogResolution.model.routingMode === 'MANAGED',
+      managedRouting,
     )
   )) ?? [];
-  if (input.providerChannelId
+  if (!managedRouting
+    && input.providerChannelId
     && catalogResolution
     && !compatibleCatalogRoutes.some(route => route.channelId === input.providerChannelId)) {
     throw new CloudAiError('provider_model_family_mismatch', '所选视频渠道不支持该模型能力', 400);
   }
-  if (catalogResolution?.model.routingMode === 'MANAGED' && compatibleCatalogRoutes.length === 0) {
-    throw new CloudAiError('provider_unavailable', '当前没有支持该视频模型能力的可用渠道', 503);
+  if (managedRouting && compatibleCatalogRoutes.length === 0) {
+    throw new ModelCatalogError(
+      'MODEL_ROUTE_NOT_AVAILABLE',
+      'No operational route supports the selected canonical video model request',
+      503,
+    );
   }
   const compatibleDefaultRoute = catalogResolution?.route
     ? compatibleCatalogRoutes.find(route => route.id === catalogResolution.route?.id) ?? compatibleCatalogRoutes[0]
     : compatibleCatalogRoutes[0];
   const provider = await selectVideoProvider(
     prisma,
-    input.provider,
-    input.providerChannelId ?? compatibleDefaultRoute?.channelId ?? undefined,
+    managedRouting ? undefined : input.provider,
+    (managedRouting ? compatibleDefaultRoute?.channelId : input.providerChannelId)
+      ?? compatibleDefaultRoute?.channelId
+      ?? undefined,
     canonicalModelKey,
-    catalogResolution?.model.routingMode === 'MANAGED',
+    managedRouting,
   );
   const route = compatibleCatalogRoutes.find(candidate => candidate.channelId === provider.id)
     ?? (catalogResolution?.route?.channelId === null ? catalogResolution.route : null)
     ?? null;
+  if (catalogResolution && route && route.canonicalModelId !== catalogResolution.model.id) {
+    throw new ModelCatalogError(
+      'MODEL_IDENTITY_MISMATCH',
+      'Video route does not belong to the requested canonical model',
+      409,
+    );
+  }
+  if (catalogResolution) {
+    assertCanonicalModelIdentity(
+      catalogResolution.requestIdentity.matchedBy === 'canonical'
+        ? catalogResolution.requestIdentity.requestedModel
+        : catalogResolution.requestIdentity.requestedCanonicalModel,
+      catalogResolution.model.canonicalModelKey,
+    );
+  }
   const upstreamInput = {
     ...input,
     model: route?.upstreamModelId
@@ -4878,6 +4974,17 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
     : undefined;
   const reservation = await reserveVideo(prisma, upstreamInput, pricingSnapshot, canonicalModelKey);
   try {
+    console.info('[video_generation_upstream_dispatch]', {
+      requestedCanonicalModel,
+      resolvedCanonicalModel: canonicalModelKey,
+      routeId: route?.id ?? null,
+      providerChannelId: provider.id,
+      upstreamModel: upstreamInput.model,
+      usageContext: 'video_generation',
+      resolution: input.resolution ?? null,
+      aspectRatio: input.aspectRatio ?? null,
+      fallbackType: 'none',
+    });
     if (provider.kind === 'MIKOTO' && isKlingVideoModel(upstreamInput.model)) {
       const maxImages = /omni/i.test(upstreamInput.model) ? 3 : 2;
       if (upstreamInput.inputImages.length > maxImages || upstreamInput.inputVideos.length > 0 || upstreamInput.inputAudios.length > 0) {
@@ -4984,7 +5091,32 @@ export async function executeWalletVideoStatus(
   prisma: PrismaClient,
   input: { userId: string; provider?: VideoInput['provider']; providerChannelId?: string | undefined; taskId: string; clientRequestId?: string | undefined },
 ) {
-  const provider = await selectVideoProvider(prisma, input.provider, input.providerChannelId);
+  const requestRoute = input.clientRequestId
+    ? (await prisma.aiRequest.findUnique({
+      where: {
+        userId_clientRequestId: {
+          userId: input.userId,
+          clientRequestId: input.clientRequestId,
+        },
+      },
+      include: { route: { include: { channel: true } } },
+    }))?.route ?? null
+    : null;
+  const provider = requestRoute?.channel
+    ?? await selectVideoProvider(prisma, input.provider, input.providerChannelId);
+  await assertPublicProviderUrl(provider.baseUrl);
+  if (requestRoute?.channel && (input.provider || input.providerChannelId)) {
+    console.info('[legacy_wallet_route_hint_ignored]', {
+      requestedCanonicalModel: null,
+      resolvedCanonicalModel: null,
+      legacyProviderHint: input.provider ?? null,
+      legacyProviderChannelId: input.providerChannelId ?? null,
+      ignored: true,
+      usageContext: 'video_status',
+      routeId: requestRoute.id,
+      providerChannelId: provider.id,
+    });
+  }
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
   const path = provider.kind === 'XAIS'
     ? `/xais/workerTaskWait?json=1&id=${encodeURIComponent(input.taskId)}`
