@@ -145,7 +145,7 @@ export async function resolveMembershipContextCredits(
   fallback: bigint,
 ) {
   // Keep lightweight/legacy Prisma test doubles and pre-membership deployments safe.
-  if (!prisma.userMembership) return fallback;
+  if (!prisma.userMembership) return microsToCredit(creditMicros(fallback));
   const membership = await prisma.userMembership.findFirst({
     where: { userId, status: 'ACTIVE', startsAt: { lte: new Date() }, expiresAt: { gt: new Date() } },
     orderBy: { expiresAt: 'desc' },
@@ -155,7 +155,12 @@ export async function resolveMembershipContextCredits(
   const value = membershipPriceKeys[context]?.map((key) => scalarText(prices?.[key])).find((item) => creditPattern.test(item));
   const base = value === undefined ? creditMicros(fallback) : creditMicros(value);
   const fold = membershipDiscountFold(prices, membershipCategory(context, 'chat', '', {}));
-  return fold === null ? base : base * fold / (10n * CREDIT_SCALE);
+  const resolvedMicros = fold === null ? base : base * fold / (10n * CREDIT_SCALE);
+  // Public wallet balances and every reserve/settlement caller use decimal
+  // credit units. Do not leak the internal 1e-6 fixed-point integer here:
+  // returning 1_000_000n for one credit makes the caller reserve one million
+  // credits instead of 1.000000.
+  return microsToCredit(resolvedMicros);
 }
 
 export function creditMicros(value: unknown) {
@@ -623,6 +628,14 @@ export function calculateSnapshotCharge(
 }
 
 export function estimateSnapshotCredits(snapshot: PricingSnapshot) {
+  if (snapshot.modality === 'chat'
+    && isFixedCanvasLlmUsageContext(scalarText(snapshot.request.usageContext))) {
+    // Canvas/workflow LLM nodes are sold at a fixed per-run price regardless
+    // of whether the bound upstream model itself is token- or request-billed.
+    // Reserve that fixed amount before contacting the provider so changing the
+    // binding cannot change when (or whether) the wallet balance is checked.
+    return calculateSnapshotCharge(snapshot).totalCredits;
+  }
   if (snapshot.modality === 'chat' && snapshot.pricing.billingType === 'token') {
     // Token chats are post-billed after the provider returns token usage. The
     // fallback value is only used when usage metadata is missing; reserving it

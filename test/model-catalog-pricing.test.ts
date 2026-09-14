@@ -327,6 +327,17 @@ describe('versioned server-side pricing', () => {
     expect(estimateSnapshotCredits(token)).toBe('0.000001');
   });
 
+  it.each(['canvas_text_agent', 'workflow'])(
+    'reserves the fixed price for token-backed %s requests',
+    usageContext => {
+      const token = snapshot('chat', astraPricing, {
+        usageContext,
+        fallbackCredits: '1.000000',
+      });
+      expect(estimateSnapshotCredits(token)).toBe('1.000000');
+    },
+  );
+
   it('applies the membership Chat fold to token rates at settlement time', async () => {
     const prisma = {
       aiModelPricing: {
@@ -357,7 +368,7 @@ describe('versioned server-side pricing', () => {
         })),
       },
     } as unknown as PrismaClient;
-    await expect(resolveMembershipContextCredits(prisma, 'user-chat', 'chat', 10n)).resolves.toBe(5_000_000n);
+    await expect(resolveMembershipContextCredits(prisma, 'user-chat', 'chat', 10n)).resolves.toBe('5.000000');
   });
 
   it('uses Astra standard pricing at 272000 and extended pricing at 272001', () => {
@@ -648,7 +659,7 @@ describe('catalog exposure and upstream discovery safety', () => {
         })),
       },
     } as unknown as PrismaClient;
-    await expect(resolveMembershipContextCredits(membership, 'user-1', 'canvas_text_agent', 1n)).resolves.toBe(500000n);
+    await expect(resolveMembershipContextCredits(membership, 'user-1', 'canvas_text_agent', 1n)).resolves.toBe('0.500000');
 
     const videoPrisma = {
       aiModelPricing: {
@@ -671,6 +682,16 @@ describe('catalog exposure and upstream discovery safety', () => {
     expect(calculateSnapshotCharge(captured).totalCredits).toBe('7.000000');
   });
 
+  it('returns fixed canvas prices in wallet credit units instead of internal micros', async () => {
+    const prisma = {
+      userMembership: { findFirst: vi.fn(async () => null) },
+    } as unknown as PrismaClient;
+
+    await expect(
+      resolveMembershipContextCredits(prisma, 'user-1', 'canvas_text_agent', 1n),
+    ).resolves.toBe('1.000000');
+  });
+
   it('applies the other-module fold to fixed canvas/workflow pricing', async () => {
     const prisma = {
       userMembership: {
@@ -679,7 +700,7 @@ describe('catalog exposure and upstream discovery safety', () => {
         })),
       },
     } as unknown as PrismaClient;
-    await expect(resolveMembershipContextCredits(prisma, 'user-1', 'canvas_text_agent', 1n)).resolves.toBe(0n);
+    await expect(resolveMembershipContextCredits(prisma, 'user-1', 'canvas_text_agent', 1n)).resolves.toBe('0.000000');
   });
 
   it('applies membership folds by billing module, including free GPT Image 1K', async () => {
