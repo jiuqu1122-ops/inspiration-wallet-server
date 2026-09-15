@@ -49,6 +49,31 @@ const DAILY_IMAGE_CAPABILITIES: AiCapability[] = [
 ];
 const DAILY_TOKEN_CAPABILITIES: AiCapability[] = ['LLM', 'VISION'];
 
+type DailyImageModelUsage = {
+  key: string;
+  displayName: string;
+  imageRequests: number;
+  imageCount: bigint;
+};
+
+type DailyUserUsage = {
+  userId: string;
+  email: string | null;
+  displayName: string | null;
+  status: string;
+  imageRequests: number;
+  imageCount: bigint;
+  imageModels: Map<string, DailyImageModelUsage>;
+  tokenRequests: number;
+  tokenRequestsWithUsage: number;
+  tokenRequestsWithoutUsage: number;
+  inputTokens: bigint;
+  cachedInputTokens: bigint;
+  cacheWriteTokens: bigint;
+  outputTokens: bigint;
+  totalTokens: bigint;
+};
+
 const jsonObject = (value: unknown): Record<string, unknown> | null => (
   value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -115,23 +140,7 @@ export async function getAdminTodayUsage(prisma: PrismaClient, now = new Date())
   });
   const imageCapabilities = new Set<string>(DAILY_IMAGE_CAPABILITIES);
   const tokenCapabilities = new Set<string>(DAILY_TOKEN_CAPABILITIES);
-  const byUser = new Map<string, {
-    userId: string;
-    email: string | null;
-    displayName: string | null;
-    status: string;
-    imageRequests: number;
-    imageCount: bigint;
-    imageModels: Map<string, { key: string; displayName: string; imageRequests: number; imageCount: bigint }>;
-    tokenRequests: number;
-    tokenRequestsWithUsage: number;
-    tokenRequestsWithoutUsage: number;
-    inputTokens: bigint;
-    cachedInputTokens: bigint;
-    cacheWriteTokens: bigint;
-    outputTokens: bigint;
-    totalTokens: bigint;
-  }>();
+  const byUser = new Map<string, DailyUserUsage>();
 
   for (const request of requests) {
     const current = byUser.get(request.user.id) ?? {
@@ -141,7 +150,7 @@ export async function getAdminTodayUsage(prisma: PrismaClient, now = new Date())
       status: request.user.status,
       imageRequests: 0,
       imageCount: 0n,
-      imageModels: new Map(),
+      imageModels: new Map<string, DailyImageModelUsage>(),
       tokenRequests: 0,
       tokenRequestsWithUsage: 0,
       tokenRequestsWithoutUsage: 0,
@@ -216,7 +225,7 @@ export async function getAdminTodayUsage(prisma: PrismaClient, now = new Date())
   });
   const serializeCounts = <T extends {
     imageCount: bigint;
-    imageModels?: Map<string, { key: string; displayName: string; imageRequests: number; imageCount: bigint }>;
+    imageModels?: Map<string, DailyImageModelUsage>;
     inputTokens: bigint;
     cachedInputTokens: bigint;
     cacheWriteTokens: bigint;
@@ -240,7 +249,7 @@ export async function getAdminTodayUsage(prisma: PrismaClient, now = new Date())
     };
   };
 
-  const imageModels = new Map<string, { key: string; displayName: string; imageRequests: number; imageCount: bigint }>();
+  const imageModels = new Map<string, DailyImageModelUsage>();
   for (const row of rows) {
     for (const model of row.imageModels.values()) {
       const current = imageModels.get(model.key) ?? {

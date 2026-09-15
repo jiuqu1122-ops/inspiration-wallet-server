@@ -118,7 +118,7 @@ nano .env
 - `AI_UPSTREAM_CONNECT_TIMEOUT_MS`、`AI_UPSTREAM_FIRST_RESPONSE_TIMEOUT_MS`、`AI_UPSTREAM_IDLE_TIMEOUT_MS`：上游连接建立、首个响应和流读取空闲超时。首个响应或流读取超时后不会自动重发请求，避免上游已经受理时产生重复扣费。
 - `WORKER_HEALTH_FILE`：容器内 liveness 文件路径，通常保持默认值。
 - `STORAGE_PROVIDER`：对象存储实现，生产环境必须显式设置为 `tencent-cos`，应用缺省值也是 `tencent-cos`。`aliyun-oss` 只保留为显式选择的历史兼容实现。
-- `BACKEND_IMAGE`：低内存生产机应在执行部署脚本时传入 GitHub Actions 生成的不可变 `sha-*` GHCR 镜像；未设置时部署脚本才会在服务器本地构建。
+- `BACKEND_IMAGE`：可选的镜像覆盖值。标准部署脚本默认根据当前 Git 提交自动使用 `ghcr.io/jiuqu1122-ops/inspiration-wallet-server:sha-<完整提交哈希>`；生产服务器不执行本地构建。
 - `STORAGE_SIGNED_URL_EXPIRES_SECONDS`：私有对象下载 URL 有效期，建议 `3600`。
 - 当 `STORAGE_PROVIDER=aliyun-oss` 时，必须配置 `OSS_REGION`、`OSS_BUCKET`、`OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`。
 - 当 `STORAGE_PROVIDER=tencent-cos` 时，必须配置 `COS_REGION`、`COS_BUCKET`、`COS_SECRET_ID`、`COS_SECRET_KEY`。`COS_BUCKET` 必须使用控制台显示的完整 `BucketName-APPID`，例如 `inspirationdrawer-1475663212`，不要另写 AppId。
@@ -137,30 +137,26 @@ git status --short
 
 ## 6. 首次部署
 
-先验证配置和镜像构建，再单独启动数据库、执行一次迁移，最后启动 API、worker 和 Caddy：
+先确认当前提交对应的 GitHub Actions `Build backend image` 已成功，再运行标准部署脚本。镜像在 GitHub 托管运行器上构建，生产服务器只负责拉取、迁移和启动容器：
 
 ```bash
 cd /opt/inspiration-wallet-server
-docker compose config --quiet
-docker compose build api
-docker compose up -d postgres
-docker compose ps
-
-docker compose run --rm --no-deps api npm run prisma:migrate:deploy
-docker compose up -d api worker caddy
+chmod +x scripts/deploy.sh scripts/backup-postgres.sh
+PROJECT_DIR=/opt/inspiration-wallet-server ./scripts/deploy.sh
 docker compose ps
 ```
 
 迁移失败时立即停止部署，保留错误输出；不要执行 `prisma migrate reset`、`prisma db push`、`docker compose down -v` 或删除 Volume。API 容器不会在每次启动时自动迁移，避免以后多个 API 副本并发迁移。
 
-也可以在仓库已配置 Git remote 后运行标准脚本：
+若 GHCR 包是私有的，服务器只需使用具有 `read:packages` 权限的 GitHub Token 登录一次。Token 通过标准输入提交，不写入命令历史：
 
 ```bash
-chmod +x scripts/deploy.sh scripts/backup-postgres.sh
-PROJECT_DIR=/opt/inspiration-wallet-server ./scripts/deploy.sh
+read -rsp 'GHCR token: ' GHCR_TOKEN; echo
+printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u jiuqu1122-ops --password-stdin
+unset GHCR_TOKEN
 ```
 
-脚本使用 `git pull --ff-only`、构建镜像、等待数据库、单独迁移、更新服务并检查公网健康状态；失败不会删除数据库或 Volume。
+脚本使用 `git pull --ff-only`，自动选择当前提交的不可变 `sha-*` 镜像，等待数据库、单独迁移、更新服务并检查公网健康状态。镜像尚未构建成功或服务器无权读取 GHCR 时会在更新服务前明确失败；不会回退到本地构建，也不会删除数据库或 Volume。
 
 ## 7. 上线验证
 
@@ -220,15 +216,12 @@ cd /opt/inspiration-wallet-server
 ./scripts/backup-postgres.sh
 git status --short
 git pull --ff-only
-docker compose build api
-docker compose up -d postgres
-docker compose run --rm --no-deps api npm run prisma:migrate:deploy
-docker compose up -d api worker caddy
+PROJECT_DIR=/opt/inspiration-wallet-server ./scripts/deploy.sh
 docker compose ps
 curl --fail --show-error https://api.unmind.art/health
 ```
 
-也可直接使用 `./scripts/deploy.sh`。先构建再迁移可缩短停机；数据库结构变更仍应采用向后兼容的 expand/contract 迁移，确保新旧 API 在滚动窗口内都能工作。
+执行前必须确认 `Build backend image` 已为目标提交成功发布镜像。数据库结构变更仍应采用向后兼容的 expand/contract 迁移，确保新旧 API 在滚动窗口内都能工作。
 
 ## 10. 代码回滚
 
@@ -239,17 +232,16 @@ cd /opt/inspiration-wallet-server
 ./scripts/backup-postgres.sh
 git log --oneline --decorate -20
 git status --short
-git switch --detach <稳定提交哈希>
-docker compose build api
-docker compose up -d api worker
+BACKEND_IMAGE=ghcr.io/jiuqu1122-ops/inspiration-wallet-server:sha-<稳定提交完整哈希> \
+  PROJECT_DIR=/opt/inspiration-wallet-server ./scripts/deploy.sh
 docker compose ps
 curl --fail --show-error https://api.unmind.art/health
 ```
 
-恢复到主分支：
+恢复到最新主分支镜像：
 
 ```bash
-git switch main
+PROJECT_DIR=/opt/inspiration-wallet-server ./scripts/deploy.sh
 ```
 
 Prisma 不会自动安全回滚已执行的生产迁移。不要自动运行反向 SQL。数据库结构回滚必须先审查迁移内容，再创建人工修复迁移；极端情况下从已验证备份恢复。
@@ -311,10 +303,7 @@ curl --fail --show-error https://api.unmind.art/health
 cd /opt/inspiration-wallet-server
 ./scripts/backup-postgres.sh
 git pull --ff-only
-docker compose build api
-docker compose up -d postgres
-docker compose run --rm --no-deps api npm run prisma:migrate:deploy
-docker compose up -d api worker caddy
+PROJECT_DIR=/opt/inspiration-wallet-server ./scripts/deploy.sh
 docker compose ps
 curl --fail --show-error https://api.unmind.art/health
 ```
@@ -346,10 +335,7 @@ Docker 安装命令依据 [Docker 官方 Ubuntu 安装文档](https://docs.docke
 cd /opt/inspiration-wallet-server
 ./scripts/backup-postgres.sh
 git pull --ff-only
-docker compose build api
-docker compose up -d postgres
-docker compose run --rm --no-deps api npm run prisma:migrate:deploy
-docker compose up -d api worker caddy
+PROJECT_DIR=/opt/inspiration-wallet-server ./scripts/deploy.sh
 
 curl --fail --show-error https://api.unmind.art/health
 curl --fail --show-error \

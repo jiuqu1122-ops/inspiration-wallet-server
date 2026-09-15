@@ -23,10 +23,7 @@ services:
       - no-new-privileges:true
 
   api:
-    image: ${BACKEND_IMAGE:-inspiration-wallet-server:local}
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ${BACKEND_IMAGE:-ghcr.io/jiuqu1122-ops/inspiration-wallet-server:latest}
     restart: unless-stopped
     init: true
     env_file:
@@ -68,7 +65,7 @@ services:
       - no-new-privileges:true
 
   worker:
-    image: ${BACKEND_IMAGE:-inspiration-wallet-server:local}
+    image: ${BACKEND_IMAGE:-ghcr.io/jiuqu1122-ops/inspiration-wallet-server:latest}
     restart: unless-stopped
     init: true
     command: ["node", "dist/worker.js"]

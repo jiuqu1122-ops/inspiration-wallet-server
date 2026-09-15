@@ -7,8 +7,9 @@ When the user says “给我部署代码” for this repository, treat it as a d
 1. Fetch `origin`, confirm the current branch is the latest `main`, and preserve unrelated working-tree changes.
 2. Run the relevant typecheck, lint, tests, and build.
 3. Commit only the requested files and push `main` to `origin`.
-4. Do not SSH to or mutate production unless the user separately and explicitly asks for production deployment.
-5. Return the following root-server command block, adjusted only if the checked-in deployment scripts change:
+4. Wait for the GitHub Actions workflow `Build backend image` for that commit to succeed. The 2 GiB production server must pull the prebuilt immutable `sha-*` image and must never build the backend locally.
+5. Do not SSH to or mutate production unless the user separately and explicitly asks for production deployment.
+6. Return the following root-server command block, adjusted only if the checked-in deployment scripts change:
 
 ```bash
 cd /opt/inspiration-wallet-server
@@ -21,4 +22,4 @@ docker compose ps
 curl --fail --show-error https://api.unmind.art/health
 ```
 
-The production `.env` and its keys already live under `/opt/inspiration-wallet-server` for the root deployment. Never print, replace, upload, commit, or recreate that file. Never use `docker compose down -v`, `prisma migrate reset`, or `prisma db push` in this workflow.
+The production `.env` and its keys already live under `/opt/inspiration-wallet-server` for the root deployment. Never print, replace, upload, commit, or recreate that file. Never run `docker compose build` on production. Never use `docker compose down -v`, `prisma migrate reset`, or `prisma db push` in this workflow.

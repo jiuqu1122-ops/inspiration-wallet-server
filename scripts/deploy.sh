@@ -6,6 +6,7 @@ readonly PROJECT_DIR="${PROJECT_DIR:-/opt/inspiration-wallet-server}"
 readonly HEALTH_URL="${HEALTH_URL:-https://api.unmind.art/health}"
 readonly PROMPT_SMOKE_URL="${PROMPT_SMOKE_URL:-https://api.unmind.art/v1/inspiration-space?kind=PROMPT&limit=1}"
 readonly MEMBERSHIP_SMOKE_URL="${MEMBERSHIP_SMOKE_URL:-https://api.unmind.art/v1/membership/plans}"
+readonly BACKEND_IMAGE_REPOSITORY="${BACKEND_IMAGE_REPOSITORY:-ghcr.io/jiuqu1122-ops/inspiration-wallet-server}"
 
 log() {
   printf '[deploy] %s\n' "$*"
@@ -39,16 +40,16 @@ else
   log 'No Git origin is configured; using the current working tree.'
 fi
 
+source_revision="$(git rev-parse HEAD 2>/dev/null)" || fail 'Cannot resolve the Git revision for the prebuilt image.'
+deployment_image="${BACKEND_IMAGE:-${BACKEND_IMAGE_REPOSITORY}:sha-${source_revision}}"
+export BACKEND_IMAGE="$deployment_image"
+
 log 'Validating Docker Compose configuration...'
 docker compose config --quiet
 
-if [[ -n "${BACKEND_IMAGE:-}" ]]; then
-  log "Pulling the prebuilt shared API/worker image: $BACKEND_IMAGE"
-  docker compose pull api worker
-else
-  log 'Building the shared API/worker image locally...'
-  source_revision="$(git rev-parse HEAD 2>/dev/null || date +%s)"
-  docker compose build --build-arg "SOURCE_REV=$source_revision" api
+log "Pulling the prebuilt shared API/worker image: $BACKEND_IMAGE"
+if ! docker compose pull api worker; then
+  fail "Prebuilt image pull failed. Confirm that the 'Build backend image' GitHub Actions run for $source_revision succeeded and that this server can read the GHCR package."
 fi
 
 log 'Ensuring immutable client engine archives are present and verified in object storage...'
