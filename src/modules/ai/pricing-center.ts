@@ -531,6 +531,18 @@ function videoCharge(snapshot: PricingSnapshot): ChargeBreakdown {
 function chatCharge(snapshot: PricingSnapshot, usage?: ChatTokenUsage | null): ChargeBreakdown {
   const pricing = snapshot.pricing;
   const usageContext = scalarText(snapshot.request.usageContext);
+  const serializedUsage = usage ? (() => {
+    const cachedInputTokens = usage.cachedInputTokens > usage.inputTokens
+      ? usage.inputTokens
+      : usage.cachedInputTokens;
+    return {
+      inputTokens: usage.inputTokens.toString(),
+      normalInputTokens: (usage.inputTokens - cachedInputTokens).toString(),
+      cachedInputTokens: cachedInputTokens.toString(),
+      cacheWriteTokens: usage.cacheWriteTokens.toString(),
+      outputTokens: usage.outputTokens.toString(),
+    };
+  })() : null;
   if (isFixedCanvasLlmUsageContext(usageContext)) {
     const total = creditMicros(snapshot.request.fallbackCredits ?? '0');
     return {
@@ -544,7 +556,7 @@ function chatCharge(snapshot: PricingSnapshot, usage?: ChatTokenUsage | null): C
       baseCharge: microsToCredit(total),
       surcharges: [],
       totalCredits: microsToCredit(total),
-      details: { context: usageContext, usage: null },
+      details: { context: usageContext, usage: serializedUsage },
     };
   }
   if (pricing.billingType === 'request') {
@@ -560,7 +572,7 @@ function chatCharge(snapshot: PricingSnapshot, usage?: ChatTokenUsage | null): C
       baseCharge: microsToCredit(total),
       surcharges: [],
       totalCredits: microsToCredit(total),
-      details: { contextTier: 'request', usage: null },
+      details: { contextTier: 'request', usage: serializedUsage },
     };
   }
   if (!usage) {
@@ -606,13 +618,7 @@ function chatCharge(snapshot: PricingSnapshot, usage?: ChatTokenUsage | null): C
     details: {
       contextTier: tier,
       contextThresholdTokens: threshold.toString(),
-      usage: {
-        inputTokens: usage.inputTokens.toString(),
-        normalInputTokens: normalInput.toString(),
-        cachedInputTokens: cachedInput.toString(),
-        cacheWriteTokens: usage.cacheWriteTokens.toString(),
-        outputTokens: usage.outputTokens.toString(),
-      },
+      usage: serializedUsage,
       rates: toInputJson(rates),
     },
   };

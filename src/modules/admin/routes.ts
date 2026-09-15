@@ -5,6 +5,7 @@ import { LicenseVerificationError } from '../auth/license-verifier.js';
 import {
   AdminServiceError,
   getAdminOverview,
+  getAdminTodayUsage,
   getAdminUser,
   grantAdminCredits,
   listAdminUsers,
@@ -308,6 +309,12 @@ const referralRuleSchema = z.object({
     '/overview',
     { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } },
     async () => getAdminOverview(app.prisma),
+  );
+
+  app.get(
+    '/usage/today',
+    { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } },
+    async () => getAdminTodayUsage(app.prisma),
   );
 
   app.get('/users', async (request, reply) => {

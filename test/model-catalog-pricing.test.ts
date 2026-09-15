@@ -300,6 +300,13 @@ describe('versioned server-side pricing', () => {
       });
       expect(fixed.billingType).toBe('request_fixed');
       expect(fixed.totalCredits).toBe('3.000000');
+      expect(fixed.details.usage).toEqual({
+        inputTokens: '500000',
+        normalInputTokens: '500000',
+        cachedInputTokens: '0',
+        cacheWriteTokens: '0',
+        outputTokens: '500000',
+      });
     },
   );
 

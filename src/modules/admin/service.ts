@@ -1,4 +1,4 @@
-import { Prisma, type PrismaClient } from '@prisma/client';
+import { Prisma, type AiCapability, type PrismaClient } from '@prisma/client';
 import type { FastifyInstance } from 'fastify';
 import { resolveLicenseIdentity } from '../auth/service.js';
 import { verifySignedLicenseForProvision } from '../auth/license-verifier.js';
@@ -31,6 +31,246 @@ function serializeLicense(license: {
     expiresAt: license.expiresAt?.toISOString() ?? null,
     createdAt: license.createdAt.toISOString(),
     updatedAt: license.updatedAt.toISOString(),
+  };
+}
+
+const CHINA_STANDARD_TIME_OFFSET_MS = 8 * 60 * 60 * 1_000;
+const DAILY_IMAGE_CAPABILITIES: AiCapability[] = [
+  'IMAGE',
+  'IMAGE_NANO_BANANA',
+  'IMAGE_NANO_BANANA_2',
+  'IMAGE_NANO_BANANA_PRO_FAST',
+  'IMAGE_NANO_BANANA_2_FAST',
+  'IMAGE_NANO_BANANA_PRO_1K',
+  'IMAGE_NANO_BANANA_DUAL_2K',
+  'IMAGE_GPT',
+  'IMAGE_GPT_1K',
+  'IMAGE_GROK',
+];
+const DAILY_TOKEN_CAPABILITIES: AiCapability[] = ['LLM', 'VISION'];
+
+const jsonObject = (value: unknown): Record<string, unknown> | null => (
+  value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+);
+
+const usageCount = (value: unknown) => {
+  const text = typeof value === 'bigint'
+    ? value.toString()
+    : typeof value === 'number' && Number.isSafeInteger(value)
+      ? String(value)
+      : typeof value === 'string'
+        ? value.trim()
+        : '';
+  return /^\d+$/.test(text) ? BigInt(text) : 0n;
+};
+
+const chinaStandardDayRange = (now: Date) => {
+  const shifted = new Date(now.getTime() + CHINA_STANDARD_TIME_OFFSET_MS);
+  const shiftedStart = Date.UTC(
+    shifted.getUTCFullYear(),
+    shifted.getUTCMonth(),
+    shifted.getUTCDate(),
+  );
+  const start = new Date(shiftedStart - CHINA_STANDARD_TIME_OFFSET_MS);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1_000);
+  return { start, end, date: shifted.toISOString().slice(0, 10) };
+};
+
+const tokenUsageFromBreakdown = (value: unknown) => {
+  const breakdown = jsonObject(value);
+  const details = jsonObject(breakdown?.details);
+  const usage = jsonObject(details?.usage) ?? jsonObject(breakdown?.usage);
+  if (!usage) return null;
+  const inputTokens = usageCount(usage.inputTokens);
+  const cachedInputTokens = usageCount(usage.cachedInputTokens);
+  const cacheWriteTokens = usageCount(usage.cacheWriteTokens);
+  const outputTokens = usageCount(usage.outputTokens);
+  return {
+    inputTokens,
+    cachedInputTokens,
+    cacheWriteTokens,
+    outputTokens,
+    totalTokens: inputTokens + cacheWriteTokens + outputTokens,
+  };
+};
+
+export async function getAdminTodayUsage(prisma: PrismaClient, now = new Date()) {
+  const range = chinaStandardDayRange(now);
+  const requests = await prisma.aiRequest.findMany({
+    where: {
+      status: 'SUCCEEDED',
+      createdAt: { gte: range.start, lt: range.end },
+      capability: { in: [...DAILY_IMAGE_CAPABILITIES, ...DAILY_TOKEN_CAPABILITIES] },
+    },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    select: {
+      capability: true,
+      logicalModel: true,
+      chargeBreakdown: true,
+      canonicalModel: { select: { canonicalModelKey: true, displayName: true } },
+      user: { select: { id: true, email: true, displayName: true, status: true } },
+    },
+  });
+  const imageCapabilities = new Set<string>(DAILY_IMAGE_CAPABILITIES);
+  const tokenCapabilities = new Set<string>(DAILY_TOKEN_CAPABILITIES);
+  const byUser = new Map<string, {
+    userId: string;
+    email: string | null;
+    displayName: string | null;
+    status: string;
+    imageRequests: number;
+    imageCount: bigint;
+    imageModels: Map<string, { key: string; displayName: string; imageRequests: number; imageCount: bigint }>;
+    tokenRequests: number;
+    tokenRequestsWithUsage: number;
+    tokenRequestsWithoutUsage: number;
+    inputTokens: bigint;
+    cachedInputTokens: bigint;
+    cacheWriteTokens: bigint;
+    outputTokens: bigint;
+    totalTokens: bigint;
+  }>();
+
+  for (const request of requests) {
+    const current = byUser.get(request.user.id) ?? {
+      userId: request.user.id,
+      email: request.user.email,
+      displayName: request.user.displayName,
+      status: request.user.status,
+      imageRequests: 0,
+      imageCount: 0n,
+      imageModels: new Map(),
+      tokenRequests: 0,
+      tokenRequestsWithUsage: 0,
+      tokenRequestsWithoutUsage: 0,
+      inputTokens: 0n,
+      cachedInputTokens: 0n,
+      cacheWriteTokens: 0n,
+      outputTokens: 0n,
+      totalTokens: 0n,
+    };
+    if (imageCapabilities.has(request.capability)) {
+      const quantity = usageCount(jsonObject(request.chargeBreakdown)?.quantity);
+      const modelKey = request.canonicalModel?.canonicalModelKey?.trim()
+        || request.logicalModel.trim()
+        || 'unknown';
+      const modelUsage = current.imageModels.get(modelKey) ?? {
+        key: modelKey,
+        displayName: request.canonicalModel?.displayName?.trim() || request.logicalModel.trim() || '未知模型',
+        imageRequests: 0,
+        imageCount: 0n,
+      };
+      current.imageRequests += 1;
+      current.imageCount += quantity > 0n ? quantity : 1n;
+      modelUsage.imageRequests += 1;
+      modelUsage.imageCount += quantity > 0n ? quantity : 1n;
+      current.imageModels.set(modelKey, modelUsage);
+    }
+    if (tokenCapabilities.has(request.capability)) {
+      const usage = tokenUsageFromBreakdown(request.chargeBreakdown);
+      current.tokenRequests += 1;
+      if (usage) {
+        current.tokenRequestsWithUsage += 1;
+        current.inputTokens += usage.inputTokens;
+        current.cachedInputTokens += usage.cachedInputTokens;
+        current.cacheWriteTokens += usage.cacheWriteTokens;
+        current.outputTokens += usage.outputTokens;
+        current.totalTokens += usage.totalTokens;
+      } else {
+        current.tokenRequestsWithoutUsage += 1;
+      }
+    }
+    byUser.set(request.user.id, current);
+  }
+
+  const rows = [...byUser.values()].sort((left, right) => {
+    if (left.imageCount !== right.imageCount) return left.imageCount > right.imageCount ? -1 : 1;
+    if (left.totalTokens !== right.totalTokens) return left.totalTokens > right.totalTokens ? -1 : 1;
+    return (left.displayName || left.email || left.userId)
+      .localeCompare(right.displayName || right.email || right.userId, 'zh-CN');
+  });
+  const totals = rows.reduce((result, row) => ({
+    imageRequests: result.imageRequests + row.imageRequests,
+    imageCount: result.imageCount + row.imageCount,
+    tokenRequests: result.tokenRequests + row.tokenRequests,
+    tokenRequestsWithUsage: result.tokenRequestsWithUsage + row.tokenRequestsWithUsage,
+    tokenRequestsWithoutUsage: result.tokenRequestsWithoutUsage + row.tokenRequestsWithoutUsage,
+    inputTokens: result.inputTokens + row.inputTokens,
+    cachedInputTokens: result.cachedInputTokens + row.cachedInputTokens,
+    cacheWriteTokens: result.cacheWriteTokens + row.cacheWriteTokens,
+    outputTokens: result.outputTokens + row.outputTokens,
+    totalTokens: result.totalTokens + row.totalTokens,
+  }), {
+    imageRequests: 0,
+    imageCount: 0n,
+    tokenRequests: 0,
+    tokenRequestsWithUsage: 0,
+    tokenRequestsWithoutUsage: 0,
+    inputTokens: 0n,
+    cachedInputTokens: 0n,
+    cacheWriteTokens: 0n,
+    outputTokens: 0n,
+    totalTokens: 0n,
+  });
+  const serializeCounts = <T extends {
+    imageCount: bigint;
+    imageModels?: Map<string, { key: string; displayName: string; imageRequests: number; imageCount: bigint }>;
+    inputTokens: bigint;
+    cachedInputTokens: bigint;
+    cacheWriteTokens: bigint;
+    outputTokens: bigint;
+    totalTokens: bigint;
+  }>(value: T) => {
+    const { imageModels, ...counts } = value;
+    return {
+      ...counts,
+      imageCount: value.imageCount.toString(),
+      inputTokens: value.inputTokens.toString(),
+      cachedInputTokens: value.cachedInputTokens.toString(),
+      cacheWriteTokens: value.cacheWriteTokens.toString(),
+      outputTokens: value.outputTokens.toString(),
+      totalTokens: value.totalTokens.toString(),
+      ...(imageModels ? {
+        imageModels: [...imageModels.values()]
+          .sort((left, right) => left.displayName.localeCompare(right.displayName, 'zh-CN'))
+          .map((model) => ({ ...model, imageCount: model.imageCount.toString() })),
+      } : {}),
+    };
+  };
+
+  const imageModels = new Map<string, { key: string; displayName: string; imageRequests: number; imageCount: bigint }>();
+  for (const row of rows) {
+    for (const model of row.imageModels.values()) {
+      const current = imageModels.get(model.key) ?? {
+        key: model.key,
+        displayName: model.displayName,
+        imageRequests: 0,
+        imageCount: 0n,
+      };
+      current.imageRequests += model.imageRequests;
+      current.imageCount += model.imageCount;
+      imageModels.set(model.key, current);
+    }
+  }
+
+  return {
+    date: range.date,
+    timeZone: 'Asia/Shanghai',
+    range: { start: range.start.toISOString(), end: range.end.toISOString() },
+    generatedAt: now.toISOString(),
+    totals: {
+      activeUsers: rows.length,
+      ...serializeCounts(totals),
+      imageModels: [...imageModels.values()]
+        .sort((left, right) => {
+          if (left.imageCount !== right.imageCount) return left.imageCount > right.imageCount ? -1 : 1;
+          return left.displayName.localeCompare(right.displayName, 'zh-CN');
+        })
+        .map((model) => ({ ...model, imageCount: model.imageCount.toString() })),
+    },
+    items: rows.map(serializeCounts),
   };
 }
 
