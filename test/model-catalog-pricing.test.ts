@@ -593,7 +593,7 @@ describe('versioned server-side pricing', () => {
 });
 
 describe('catalog exposure and upstream discovery safety', () => {
-  it('replaces legacy ratios with exact dimensions for a named GPT Image 2.5 variant', async () => {
+  it('replaces legacy ratios without expanding configured GPT Image 2.5 resolutions', async () => {
     const prisma = {
       aiModel: {
         findMany: vi.fn(async () => [{
@@ -619,7 +619,7 @@ describe('catalog exposure and upstream discovery safety', () => {
     const catalog = await getPublicAiCatalog(prisma);
 
     expect(catalog.models[0]?.capabilities).toMatchObject({
-      resolutions: ['1k', '2k', '4k'],
+      resolutions: ['2k', '4k'],
       aspectRatiosByResolution: {
         '2k': expect.arrayContaining(['2048x1152', '2064x1376']),
         '4k': expect.arrayContaining(['3840x2160', '3520x2352']),

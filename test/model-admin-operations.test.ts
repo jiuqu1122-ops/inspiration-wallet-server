@@ -7,6 +7,7 @@ import {
   mapDiscoveryToCanonical,
   remapAdminAiRoute,
   unmapAdminAiRoute,
+  updateAdminAiModel,
   updateAdminAiRoute,
 } from '../src/modules/ai/model-admin.js';
 
@@ -20,6 +21,44 @@ function withTransaction<T extends object>(transaction: T) {
 }
 
 describe('AI Model Center route operations', () => {
+  it('preserves administrator-selected GPT Image 2.5 resolutions', async () => {
+    const model = {
+      id: 'model-gpt-image-2-5',
+      canonicalModelKey: 'gpt-image-2.5-flare',
+      displayName: 'GPT Image 2.5 Flare',
+      modality: 'image',
+      capabilities: { supportedResolutions: ['1k', '2k', '4k'] },
+      enabled: true,
+      visible: true,
+      defaultRouteId: 'route-gpt-image-2-5',
+      updatedAt,
+    };
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const transaction = {
+      aiModel: {
+        findUnique: vi.fn(async () => model),
+        updateMany,
+        findUniqueOrThrow: vi.fn(async () => ({
+          ...model,
+          capabilities: { supportedResolutions: ['1k'] },
+        })),
+      },
+    };
+
+    await updateAdminAiModel(withTransaction(transaction), model.canonicalModelKey, {
+      capabilities: { supportedResolutions: ['1k'] },
+      expectedUpdatedAt: updatedAt.toISOString(),
+    }, context);
+
+    expect(updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        capabilities: expect.objectContaining({
+          supportedResolutions: ['1k'],
+        }),
+      }),
+    }));
+  });
+
   it('marks route capability overrides as manual configuration', async () => {
     const route = {
       id: 'route-capabilities',

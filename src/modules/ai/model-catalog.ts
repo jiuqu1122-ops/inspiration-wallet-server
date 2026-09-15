@@ -213,12 +213,17 @@ export function withGptImage2DimensionCapabilities(
     ? capabilities as Record<string, unknown>
     : {};
   if (!isGptImage2CatalogIdentity(...identityValues)) return source;
+  const supportedResolutions = Array.isArray(source.supportedResolutions)
+    ? source.supportedResolutions
+    : ['1k', '2k', '4k'];
   return {
     ...source,
     // Administrators may have created the model before exact dimensions were
     // supported, leaving a legacy ratio map here. Image 2 family dimensions
     // are part of the upstream contract, so replace both accepted aliases.
-    supportedResolutions: ['1k', '2k', '4k'],
+    // An explicitly configured resolution list is an availability policy,
+    // however, and must remain authoritative after an administrator saves it.
+    supportedResolutions,
     aspectRatiosByResolution: GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION,
     supportedAspectRatiosByResolution: GPT_IMAGE_2_ASPECT_RATIO_OPTIONS_BY_RESOLUTION,
   };
