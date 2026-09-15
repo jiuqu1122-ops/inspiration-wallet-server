@@ -28,9 +28,24 @@ import {
   listAdminUsageModelBindings,
   updateAdminUsageModelBinding,
 } from './usage-model-binding.js';
+import { IMAGE_ADAPTER_KEYS } from './image-adapters/registry.js';
 
 const modalitySchema = z.enum(['chat', 'image', 'video']);
 const jsonObjectSchema = z.record(z.string(), z.unknown());
+const adapterEndpointSchema = z.string().trim().min(1).max(240).regex(/^\/(?!\/)/);
+const adapterConfigSchema = z.object({
+  resolutionParameter: z.enum(['none', 'size', 'resolution']).optional(),
+  resolutionValueMode: z.enum(['label', 'exact']).optional(),
+  aspectRatioParameter: z.enum(['none', 'aspect_ratio']).optional(),
+  async: z.union([z.literal('inherit'), z.boolean()]).optional(),
+  generationEndpoint: adapterEndpointSchema.optional(),
+  editEndpoint: adapterEndpointSchema.optional(),
+  exactDimensions: z.record(
+    z.string().trim().min(1).max(32),
+    z.record(z.string().trim().min(1).max(32), z.string().trim().regex(/^\d+x\d+$/i)),
+  ).optional(),
+  referenceSerializer: z.enum(['json_image', 'json_images']).optional(),
+}).strict();
 const modelKeySchema = z.string().trim().min(1).max(160).regex(/^[a-z0-9][a-z0-9._-]*$/);
 const idSchema = z.string().trim().min(1).max(128);
 
@@ -66,6 +81,8 @@ const updateRouteSchema = z.object({
   upstreamAvailable: z.boolean().optional(),
   costProfile: jsonObjectSchema.nullable().optional(),
   capabilitiesOverride: jsonObjectSchema.nullable().optional(),
+  adapterKey: z.enum(IMAGE_ADAPTER_KEYS).nullable().optional(),
+  adapterConfig: adapterConfigSchema.nullable().optional(),
   expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
 }).strict().refine(value => Object.keys(value).length > 0, 'No route changes were supplied');
 
@@ -244,6 +261,10 @@ export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
       } : {}),
       ...(body.data.capabilitiesOverride !== undefined ? {
         capabilitiesOverride: body.data.capabilitiesOverride === null ? null : toInputJson(body.data.capabilitiesOverride),
+      } : {}),
+      ...(body.data.adapterKey !== undefined ? { adapterKey: body.data.adapterKey } : {}),
+      ...(body.data.adapterConfig !== undefined ? {
+        adapterConfig: body.data.adapterConfig === null ? null : toInputJson(body.data.adapterConfig),
       } : {}),
       ...(body.data.expectedUpdatedAt ? { expectedUpdatedAt: body.data.expectedUpdatedAt } : {}),
     };

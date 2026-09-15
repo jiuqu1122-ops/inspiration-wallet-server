@@ -329,18 +329,28 @@ export async function updateAdminAiRoute(
     upstreamAvailable?: boolean | undefined;
     costProfile?: Prisma.InputJsonValue | null | undefined;
     capabilitiesOverride?: Prisma.InputJsonValue | null | undefined;
+    adapterKey?: string | null | undefined;
+    adapterConfig?: Prisma.InputJsonValue | null | undefined;
     expectedUpdatedAt?: string | undefined;
   },
   context: AdminMutationContext = { actor: 'admin-api', requestId: randomUUID() },
 ) {
   return prisma.$transaction(async (transaction) => {
-    const current = await transaction.aiModelRoute.findUnique({ where: { id: routeId } });
+    const current = await transaction.aiModelRoute.findUnique({
+      where: { id: routeId },
+      include: { canonicalModel: { select: { modality: true } } },
+    });
     if (!current) throw new AiModelAdminError('NOT_FOUND', 'Model route was not found', 404);
     if (input.expectedUpdatedAt && asIso(current.updatedAt) !== asIso(input.expectedUpdatedAt)) {
       throw new AiModelAdminError('CONFLICT', 'Route configuration was modified by another administrator', 409);
     }
     if (input.enabled === true && !current.canonicalModelId) {
       throw new AiModelAdminError('INVALID_REQUEST', 'An unmapped route cannot be enabled', 400);
+    }
+    if ((input.adapterKey !== undefined && input.adapterKey !== null
+      || input.adapterConfig !== undefined && input.adapterConfig !== null)
+      && current.canonicalModel?.modality !== 'image') {
+      throw new AiModelAdminError('INVALID_REQUEST', 'Image adapters may only be configured on image model routes', 400);
     }
     const costChanged = input.costProfile !== undefined
       && JSON.stringify(current.costProfile) !== JSON.stringify(input.costProfile);
@@ -355,6 +365,10 @@ export async function updateAdminAiRoute(
         ...jsonObject(current.metadata),
         capabilitiesOverrideSource: input.capabilitiesOverride === null ? 'INHERIT' : 'MANUAL',
       };
+    }
+    if (input.adapterKey !== undefined) data.adapterKey = input.adapterKey;
+    if (input.adapterConfig !== undefined) {
+      data.adapterConfig = input.adapterConfig === null ? Prisma.DbNull : input.adapterConfig;
     }
     if (input.costProfile !== undefined) {
       data.costProfile = input.costProfile === null ? Prisma.JsonNull : input.costProfile;

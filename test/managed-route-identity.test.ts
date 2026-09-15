@@ -226,6 +226,8 @@ describe('managed canonical route identity', () => {
           provider: 'MIKOTO',
           channelId: routeA1Provider.id,
           upstreamModelId: 'gemini-3-pro-image-preview',
+          adapterKey: null,
+          adapterConfig: null,
           enabled: true,
           upstreamAvailable: true,
           healthStatus: 'HEALTHY',
@@ -240,6 +242,8 @@ describe('managed canonical route identity', () => {
           provider: 'MIKOTO',
           channelId: routeA2Provider.id,
           upstreamModelId: 'gemini-3-pro-image-preview',
+          adapterKey: null,
+          adapterConfig: null,
           enabled: true,
           upstreamAvailable: true,
           healthStatus: 'HEALTHY',
@@ -272,11 +276,11 @@ describe('managed canonical route identity', () => {
       $transaction: vi.fn(async (operation: (tx: typeof transaction) => unknown) => operation(transaction)),
     } as unknown as PrismaClient;
     const resultUrl = 'https://api.example.test/v1/ai/image-results/model-a.png';
-    const submissions: Array<{ url: string; model: string }> = [];
+    const submissions: Array<{ url: string; model: string; body: Record<string, unknown> }> = [];
     vi.stubGlobal('fetch', vi.fn(async (source: RequestInfo | URL, init?: RequestInit) => {
       const url = String(source);
-      const body = JSON.parse(String(init?.body)) as { generationConfig?: { model?: string }; model?: string };
-      submissions.push({ url, model: body.model ?? body.generationConfig?.model ?? '' });
+      const body = JSON.parse(String(init?.body)) as { generationConfig?: { model?: string }; model?: string } & Record<string, unknown>;
+      submissions.push({ url, model: body.model ?? body.generationConfig?.model ?? '', body });
       if (url.startsWith(routeA1Provider.baseUrl)) {
         return new Response(JSON.stringify({ error: { message: 'primary route unavailable' } }), {
           status: 503,
@@ -312,11 +316,135 @@ describe('managed canonical route identity', () => {
       'https://1.0.0.1/v1beta/models/gemini-3-pro-image-preview:generateContent',
       'https://8.8.4.4/v1beta/models/gemini-3-pro-image-preview:generateContent',
     ]);
+    for (const { body } of submissions) {
+      expect(body).toMatchObject({
+        generationConfig: {
+          responseModalities: ['TEXT', 'IMAGE'],
+          imageConfig: { imageSize: '2K', aspectRatio: '1:1' },
+        },
+      });
+    }
     expect(submissions.some(({ url }) => url.startsWith(modelBProvider.baseUrl))).toBe(false);
     expect(getRequest()).toMatchObject({
       canonicalModelId: 'image-model-a',
       logicalModel: 'image-model-a',
       routeId: 'image-route-a-2',
+      status: 'SUCCEEDED',
+    });
+  });
+
+  it('keeps an explicit Grok adapter on the selected route SKU during same-canonical failover', async () => {
+    const primary = provider('grok-primary', 'https://1.1.1.1', 'NEW_API', ['IMAGE']);
+    const fallback = provider('grok-fallback', 'https://8.8.8.8', 'NEW_API', ['IMAGE']);
+    const unrelated = provider('grok-other-model', 'https://9.9.9.9', 'NEW_API', ['IMAGE']);
+    const route = (id: string, channel: AiProviderChannel, priority: number) => ({
+      id,
+      canonicalModelId: 'model-grok',
+      provider: 'NEW_API',
+      channelId: channel.id,
+      upstreamModelId: 'grok-imagine-image-edit',
+      adapterKey: 'GROK_IMAGES_API',
+      adapterConfig: null,
+      enabled: true,
+      upstreamAvailable: true,
+      healthStatus: 'HEALTHY',
+      priority,
+      capabilitiesOverride: null,
+      metadata: null,
+      channel,
+    });
+    const model = {
+      id: 'model-grok',
+      canonicalModelKey: 'grok-image',
+      displayName: 'Grok Image',
+      modality: 'image',
+      enabled: true,
+      visible: true,
+      status: 'PUBLISHED',
+      routingMode: 'MANAGED',
+      billingType: 'image_resolution',
+      capabilities: {
+        supportedResolutions: ['2k'],
+        supportedAspectRatios: ['16:9'],
+      },
+      defaultRouteId: 'route-grok-primary',
+      routes: [
+        route('route-grok-primary', primary, 0),
+        route('route-grok-fallback', fallback, 10),
+      ],
+    };
+    const { transaction, getRequest } = walletTransaction('image-request-grok');
+    const findLegacyProviders = vi.fn(async () => [unrelated]);
+    const prisma = {
+      userMembership: { findFirst: vi.fn(async () => null) },
+      aiModel: { findUnique: vi.fn(async () => model) },
+      aiModelPricing: {
+        findUnique: vi.fn(async () => ({
+          currentVersion: {
+            id: 'image-price-grok',
+            version: 1,
+            publishedAt: new Date(0),
+            pricing: {
+              billingType: 'image_resolution',
+              creditsPerImageByResolution: { '2k': '10', '4k': '20' },
+            },
+          },
+        })),
+      },
+      aiProviderChannel: { findMany: findLegacyProviders },
+      $transaction: vi.fn(async (operation: (tx: typeof transaction) => unknown) => operation(transaction)),
+    } as unknown as PrismaClient;
+    const resultUrl = 'https://api.example.test/v1/ai/image-results/grok-fallback.png';
+    const submissions: Array<{ url: string; body: Record<string, unknown> }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (source: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(source);
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      submissions.push({ url, body });
+      if (url.startsWith(primary.baseUrl)) {
+        return new Response(JSON.stringify({ error: { message: 'primary unavailable' } }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ data: [{ url: resultUrl }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(executeWalletImageGeneration(prisma, {
+      userId: 'user-1',
+      clientRequestId: 'managed-grok',
+      model: 'grok-image',
+      prompt: 'a red apple',
+      inputImages: [],
+      aspectRatio: '16:9',
+      resolution: '2k',
+      outputFormat: 'png',
+      count: 1,
+    })).resolves.toMatchObject({
+      images: [resultUrl],
+      providerChannelId: fallback.id,
+      model: 'grok-image',
+    });
+
+    expect(findLegacyProviders).not.toHaveBeenCalled();
+    expect(submissions.map(({ url }) => url)).toEqual([
+      'https://1.1.1.1/v1/images/generations',
+      'https://8.8.8.8/v1/images/generations',
+    ]);
+    for (const submission of submissions) {
+      expect(submission.body.model).toBe('grok-imagine-image-edit');
+      expect(submission.body).not.toHaveProperty('quality');
+      expect(submission.body).not.toHaveProperty('size');
+      expect(submission.body).not.toHaveProperty('output_resolution');
+    }
+    expect(submissions.some(({ url }) => url.startsWith(unrelated.baseUrl))).toBe(false);
+    expect(getRequest()).toMatchObject({
+      canonicalModelId: 'model-grok',
+      logicalModel: 'grok-image',
+      routeId: 'route-grok-fallback',
       status: 'SUCCEEDED',
     });
   });

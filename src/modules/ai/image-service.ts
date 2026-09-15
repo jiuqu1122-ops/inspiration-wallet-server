@@ -52,6 +52,12 @@ import {
   legacyPricingFromCatalog,
   toInputJson,
 } from './pricing-center.js';
+import {
+  ImageAdapterError,
+  getImageModelAdapter,
+  prepareImageAdapterRequest,
+  type PreparedImageAdapterRequest,
+} from './image-adapters/registry.js';
 
 export const IMAGE_GENERATION_TIMEOUT_MS = 15 * 60_000;
 const longImageRequestDispatcher = new Agent({
@@ -371,6 +377,18 @@ export type ImageInput = {
   outputFormat: 'jpg' | 'jpeg' | 'png' | 'webp';
   background?: 'transparent' | undefined;
   count: number;
+};
+
+type ImageAdapterRouteContext = {
+  adapterKey: string | null;
+  adapterConfig: unknown;
+  requestedCanonicalModel: string;
+  resolvedCanonicalModel: string;
+  canonicalModelId: string;
+  canonicalModelKey: string;
+  routeId: string;
+  channelId: string;
+  upstreamModel: string;
 };
 
 class UpstreamImageError extends Error {
@@ -1115,8 +1133,9 @@ export async function generateBigmodelBananaImages(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   input: ImageInput,
+  preserveUpstreamModel = false,
 ) {
-  const model = resolveBigmodelImageModel(input.model);
+  const model = preserveUpstreamModel ? input.model : resolveBigmodelImageModel(input.model);
   const materialized = await Promise.all(input.inputImages.map(materializeNewApiReferenceImage));
   const parts = [
     { text: promptWithConstraints(input) },
@@ -1160,12 +1179,13 @@ export async function generateMikotoBananaImages(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   input: ImageInput,
+  preserveUpstreamModel = false,
 ) {
   return generateGeminiImageConfigImages(
     provider,
     secrets,
     input,
-    resolveMikotoImageModel(input.model),
+    preserveUpstreamModel ? input.model : resolveMikotoImageModel(input.model),
     'Mikoto Banana',
   );
 }
@@ -1174,12 +1194,13 @@ export async function generateUselgGeminiImages(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   input: ImageInput,
+  preserveUpstreamModel = false,
 ) {
   return generateGeminiImageConfigImages(
     provider,
     secrets,
     input,
-    resolveUselgImageModel(input.model),
+    preserveUpstreamModel ? input.model : resolveUselgImageModel(input.model),
     'uselg Gemini',
     true,
     (started) => resolveUselgImageResponse(
@@ -1938,6 +1959,71 @@ export async function resolveUselgImageResponse(
 
   const pollDetail = lastPollError instanceof Error ? `：${lastPollError.message}` : '';
   throw new Error(`uselg 图片任务等待超时：${taskId}${pollDetail}`);
+}
+
+function uniqueImageAdapterImages(value: unknown, inputImages: string[], count: number) {
+  const controlUrls = new Set([
+    nestedStringByKeys(value, new Set(['status_url', 'poll_url'])),
+    nestedStringByKeys(value, new Set(['result_url'])),
+  ].filter(Boolean));
+  return uniqueImages(value, inputImages, Math.max(64, count))
+    .filter(source => !controlUrls.has(source))
+    .slice(0, Math.max(1, count));
+}
+
+export async function resolveImageAdapterResponse(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  started: unknown,
+  inputImages: string[],
+  count: number,
+  wait: (milliseconds: number) => Promise<unknown> = (
+    milliseconds,
+  ) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+) {
+  const immediate = uniqueImageAdapterImages(started, inputImages, count);
+  if (immediate.length) return immediate;
+  const taskId = getTaskId(started);
+  if (!taskId) throw new UpstreamImageError(502, 'Image adapter response contained neither images nor task_id', started);
+
+  let statusUrl = nestedStringByKeys(started, new Set(['status_url', 'poll_url']));
+  if (!statusUrl) {
+    throw new UpstreamImageError(
+      502,
+      'Asynchronous image response did not provide status_url',
+      started,
+    );
+  }
+  let resultUrl = nestedStringByKeys(started, new Set(['result_url']));
+  let pollAfterMs = uselgPollAfterMs(started);
+  const deadline = Date.now() + IMAGE_GENERATION_TIMEOUT_MS;
+  let lastStatus: unknown = started;
+
+  while (Date.now() < deadline) {
+    await wait(pollAfterMs);
+    lastStatus = await providerRequest(provider, secrets, statusUrl, undefined, 45_000);
+    statusUrl = nestedStringByKeys(lastStatus, new Set(['status_url', 'poll_url'])) || statusUrl;
+    resultUrl = nestedStringByKeys(lastStatus, new Set(['result_url'])) || resultUrl;
+    pollAfterMs = uselgPollAfterMs(lastStatus);
+
+    const images = uniqueImageAdapterImages(lastStatus, inputImages, count);
+    if (images.length) return images;
+    const failure = getFailure(lastStatus);
+    if (failure) throw new UpstreamImageError(502, failure, lastStatus);
+    const state = newApiImageTaskState(lastStatus);
+    if (/^(?:failed|failure|error|cancelled|canceled)$/.test(state)) {
+      throw new UpstreamImageError(502, `Image adapter task failed (${state}): ${taskId}`, lastStatus);
+    }
+    if (!/^(?:completed|complete|succeeded|success|finished|done)$/.test(state)) continue;
+    if (!resultUrl) {
+      throw new UpstreamImageError(502, `Image adapter task completed without an image or result_url: ${taskId}`, lastStatus);
+    }
+    const result = await providerRequest(provider, secrets, resultUrl, undefined, 45_000);
+    const resultImages = uniqueImageAdapterImages(result, inputImages, count);
+    if (resultImages.length) return resultImages;
+    throw new UpstreamImageError(502, `Image adapter result_url returned no image: ${taskId}`, result);
+  }
+  throw new UpstreamImageError(504, `Image adapter task timed out: ${taskId}`, lastStatus);
 }
 
 export async function resolveNewApiImageResponse(
@@ -3349,8 +3435,9 @@ export async function runXaisWorkerTask(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   input: ImageInput,
+  preserveUpstreamModel = false,
 ) {
-  const model = resolveXaisModel(input.model);
+  const model = preserveUpstreamModel ? input.model : resolveXaisModel(input.model);
   const isNanoModel = /(?:Nano_Banana|Xais_Nano)/i.test(model);
   const isNanoLiteModel = /Lite/i.test(model);
   const referenceInputs = await uploadXaisReferenceImages(
@@ -3442,17 +3529,22 @@ async function generateXaisImages(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   input: ImageInput,
+  preserveUpstreamModel = false,
 ) {
-  if (isXaisWorkerModel(input.model)) {
+  const upstreamModel = preserveUpstreamModel ? input.model : resolveXaisModel(input.model);
+  const workerModel = preserveUpstreamModel
+    ? /^(?:Nano_Banana|Image2_|Xais_)/i.test(upstreamModel)
+    : isXaisWorkerModel(input.model);
+  if (workerModel) {
     const results: string[] = [];
     for (let index = 0; index < input.count; index += 1) {
-      results.push(await runXaisWorkerTask(provider, secrets, input));
+      results.push(await runXaisWorkerTask(provider, secrets, input, preserveUpstreamModel));
     }
     return Array.from(new Set(results)).slice(0, input.count);
   }
   try {
     const value = await providerRequest(provider, secrets, '/v1/images/generations', {
-      model: resolveXaisModel(input.model),
+      model: upstreamModel,
       prompt: promptWithConstraints(input),
       n: input.count,
       size: sizeFromRatio(input.aspectRatio),
@@ -3467,7 +3559,7 @@ async function generateXaisImages(
     if (error instanceof UpstreamImageError && error.status === 401) throw error;
   }
   const value = await providerRequest(provider, secrets, '/v1/chat/completions', {
-    model: resolveXaisModel(input.model),
+    model: upstreamModel,
     ...(input.negativePrompt ? { negative_prompt: input.negativePrompt } : {}),
     messages: [{ role: 'user', content: chatContent(input) }],
     stream: false,
@@ -3757,21 +3849,87 @@ export function boundProviderImageResults(images: string[], count: number) {
   return Array.from(new Set(images)).slice(0, Math.max(0, count));
 }
 
+function prepareRouteImageAdapterRequest(
+  provider: AiProviderChannel,
+  input: ImageInput,
+  route: ImageAdapterRouteContext,
+) {
+  if (input.model !== route.upstreamModel) {
+    throw new ImageAdapterError(
+      'IMAGE_MODEL_IDENTITY_MISMATCH',
+      `Selected route model ${route.upstreamModel} changed to ${input.model} before adapter dispatch`,
+    );
+  }
+  const adapter = getImageModelAdapter(route.adapterKey);
+  return prepareImageAdapterRequest(adapter, {
+    requestedCanonicalModel: route.requestedCanonicalModel,
+    resolvedCanonicalModel: route.resolvedCanonicalModel,
+    canonicalModelId: route.canonicalModelId,
+    canonicalModelKey: route.canonicalModelKey,
+    routeId: route.routeId,
+    channelId: route.channelId,
+    upstreamModel: route.upstreamModel,
+    prompt: promptWithConstraints(input, provider.kind),
+    ...(input.negativePrompt ? { negativePrompt: input.negativePrompt } : {}),
+    references: input.inputImages,
+    ...(input.resolution ? { resolution: input.resolution } : {}),
+    aspectRatio: input.aspectRatio,
+    count: input.count,
+    outputFormat: input.outputFormat,
+    ...(input.background ? { background: input.background } : {}),
+    adapterConfig: route.adapterConfig,
+  });
+}
+
+async function generatePreparedImageAdapterImages(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  input: ImageInput,
+  prepared: PreparedImageAdapterRequest,
+) {
+  const started = await providerRequest(
+    provider,
+    secrets,
+    prepared.endpoint,
+    prepared.body,
+    IMAGE_GENERATION_TIMEOUT_MS,
+  );
+  return resolveImageAdapterResponse(
+    provider,
+    secrets,
+    started,
+    input.inputImages,
+    input.count,
+  );
+}
+
 async function generateImagesFromProvider(
   provider: AiProviderChannel,
   effectiveInput: ImageInput,
+  adapterRoute?: ImageAdapterRouteContext,
 ) {
   const startedAt = Date.now();
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-  const generateBatch = async (input: ImageInput) => provider.kind === 'XAIS'
-    ? generateXaisImages(provider, secrets, input)
+  const generateLegacyBatch = async (input: ImageInput, preserveUpstreamModel = false) => provider.kind === 'XAIS'
+    ? generateXaisImages(provider, secrets, input, preserveUpstreamModel)
     : provider.kind === 'BIGMODEL' && isBigmodelBananaModel(input.model)
-      ? generateBigmodelBananaImages(provider, secrets, input)
+      ? generateBigmodelBananaImages(provider, secrets, input, preserveUpstreamModel)
       : provider.kind === 'MIKOTO' && isMikotoBananaModel(input.model)
-        ? generateMikotoBananaImages(provider, secrets, input)
+        ? generateMikotoBananaImages(provider, secrets, input, preserveUpstreamModel)
         : provider.kind === 'USELG' && isUselgGeminiImageModel(input.model)
-          ? generateUselgGeminiImages(provider, secrets, input)
+          ? generateUselgGeminiImages(provider, secrets, input, preserveUpstreamModel)
           : generateNewApiImages(provider, secrets, input);
+  const generateBatch = async (input: ImageInput) => {
+    const prepared = adapterRoute
+      ? prepareRouteImageAdapterRequest(provider, input, adapterRoute)
+      : null;
+    return prepared
+      ? generatePreparedImageAdapterImages(provider, secrets, input, prepared)
+      : generateLegacyBatch(
+        input,
+        Boolean(adapterRoute?.adapterKey && adapterRoute.adapterKey !== 'LEGACY'),
+      );
+  };
   const providerImages: string[] = [];
   for (const input of splitTabletImageProviderInputs(effectiveInput)) {
     providerImages.push(...await generateBatch(input));
@@ -3980,6 +4138,10 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
   const reservedAt = Date.now();
   let activeProvider = primaryProvider;
   let activeInput = reservationInput;
+  let activeAdapterKey = 'LEGACY';
+  let activeEndpoint: string | null = null;
+  let activeRouteId: string | null = primaryRoute?.id ?? null;
+  let activeFallbackType = 'none';
   try {
     for (let index = 0; index < providers.length; index += 1) {
       activeProvider = providers[index]!;
@@ -4011,6 +4173,32 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
             catalogResolution.model.canonicalModelKey,
           );
         }
+        const activeAdapterRoute: ImageAdapterRouteContext | undefined = catalogResolution && activeRoute
+          ? {
+            adapterKey: activeRoute.adapterKey,
+            adapterConfig: activeRoute.adapterConfig,
+            requestedCanonicalModel,
+            resolvedCanonicalModel: canonicalModelKey,
+            canonicalModelId: catalogResolution.model.id,
+            canonicalModelKey,
+            routeId: activeRoute.id,
+            channelId: activeRoute.channelId ?? activeProvider.id,
+            upstreamModel: activeRoute.upstreamModelId,
+          }
+          : undefined;
+        activeAdapterKey = activeAdapterRoute?.adapterKey ?? 'LEGACY';
+        activeRouteId = activeRoute?.id ?? null;
+        activeFallbackType = index === 0 ? 'none' : 'same_canonical_route';
+        let preparedAdapterRequest: PreparedImageAdapterRequest | null;
+        try {
+          preparedAdapterRequest = activeAdapterRoute
+            ? prepareRouteImageAdapterRequest(activeProvider, activeInput, activeAdapterRoute)
+            : null;
+          activeEndpoint = preparedAdapterRequest?.endpoint ?? null;
+        } catch (error) {
+          activeEndpoint = error instanceof ImageAdapterError ? error.endpoint ?? null : null;
+          throw error;
+        }
         console.info('[image_generation_upstream_dispatch]', {
           clientRequestId: input.clientRequestId,
           requestedModel: input.model,
@@ -4022,17 +4210,19 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
           submittedUpstreamModel: activeInput.model,
           routeId: activeRoute?.id ?? null,
           providerChannelId: activeProvider.id,
+          adapterKey: activeAdapterKey,
           usageContext: 'image_generation',
           resolution: validatedInput.resolution ?? null,
           aspectRatio: validatedInput.aspectRatio,
-          fallbackType: index === 0 ? 'none' : 'same_canonical_route',
+          endpoint: activeEndpoint,
+          fallbackType: activeFallbackType,
           catalogSeedMs: catalogSeededAt - requestStartedAt,
           catalogResolveMs: catalogResolvedAt - catalogSeededAt,
           referenceResolveMs: referencesResolvedAt - catalogResolvedAt,
           reservationMs: reservationReadyAt - referencesResolvedAt,
           preflightDurationMs: reservationReadyAt - requestStartedAt,
         });
-        const images = await generateImagesFromProvider(activeProvider, activeInput);
+        const images = await generateImagesFromProvider(activeProvider, activeInput, activeAdapterRoute);
         const charged = await settleImageCredits(
           prisma,
           activeInput,
@@ -4065,6 +4255,8 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
           actualProviderChannelId: activeProvider.id,
           actualProviderChannelName: activeProvider.name,
           routeId: activeRoute?.id ?? '',
+          adapterKey: activeAdapterKey,
+          endpoint: activeEndpoint,
           reservationDurationMs: reservedAt - requestStartedAt,
           generationDurationMs: Date.now() - reservedAt,
           totalDurationMs: Date.now() - requestStartedAt,
@@ -4107,9 +4299,17 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       requestedProviderChannelId: input.providerChannelId ?? '',
       requestedResolution: input.resolution ?? '',
       requestedAspectRatio: input.aspectRatio,
+      requestedCanonicalModel,
+      resolvedCanonicalModel: canonicalModelKey,
       canonicalModelKey,
       submittedUpstreamModel: activeInput.model,
       initialUpstreamModel: reservationInput.model,
+      upstreamModel: activeInput.model,
+      routeId: activeRouteId,
+      channelId: activeProvider.id,
+      adapterKey: activeAdapterKey,
+      endpoint: activeEndpoint,
+      fallbackType: activeFallbackType,
       lastProviderId: activeProvider.id,
       lastProviderName: activeProvider.name,
       totalDurationMs: Date.now() - requestStartedAt,
@@ -4117,6 +4317,12 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     });
     await releaseImageCredits(prisma, reservationInput, reservation.requestId, reservation.estimated);
     if (error instanceof CloudAiError || error instanceof ModelCatalogError) throw error;
+    if (error instanceof ImageAdapterError) {
+      const statusCode = error.code === 'PROVIDER_REFERENCE_EDIT_UNSUPPORTED'
+        ? 502
+        : error.code === 'IMAGE_ADAPTER_CONFIG_INVALID' ? 400 : 409;
+      throw new CloudAiError(error.code, error.message, statusCode);
+    }
     if (error instanceof UpstreamImageError) {
       if (activeProvider.kind === 'NEW_API' && isNewApiParamOverrideCopyError(error)) {
         throw new CloudAiError(

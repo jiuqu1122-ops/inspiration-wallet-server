@@ -43,6 +43,7 @@ import {
   providerSupportsVideoModel,
   resolveBigmodelImageModel,
   resolveImageModel,
+  resolveImageAdapterResponse,
   resolveMikotoImageModel,
   mikotoKlingModelCandidates,
   mikotoSoraV3ProVideoBody,
@@ -1075,6 +1076,27 @@ describe('wallet image provider normalization', () => {
     )).resolves.toEqual([`data:image/png;base64,${generated}`]);
   });
 
+  it('does not normalize route upstreamModel inside an explicit Nano Banana wrapper', async () => {
+    const generated = 'iVBORw0KGgo' + 'p'.repeat(40);
+    const fetchMock = vi.fn(async (source: RequestInfo | URL) => {
+      expect(String(source)).toBe('https://api.mikoto.example/v1beta/models/Nano%20Banana%20Pro:generateContent');
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: generated } }] } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateMikotoBananaImages(
+      { baseUrl: 'https://api.mikoto.example', name: 'Mikoto', kind: 'MIKOTO' } as never,
+      { apiKey: 'sk-mikoto', headers: {} },
+      {
+        userId: 'user-1', clientRequestId: 'request-explicit-nano', model: 'Nano Banana Pro', prompt: 'a red apple',
+        inputImages: [], aspectRatio: '1:1', resolution: '1k', outputFormat: 'jpg', count: 1,
+      },
+      true,
+    )).resolves.toEqual([`data:image/png;base64,${generated}`]);
+  });
+
   it('calls USELG Gemini through its native v1beta endpoint', async () => {
     const generated = 'iVBORw0KGgo' + 'c'.repeat(40);
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -1169,6 +1191,42 @@ describe('wallet image provider normalization', () => {
     expect(fetchMock.mock.calls[1]?.[0]).toBe(
       'https://api.ai-media.vip/v1/images/tasks/gemini-task-123?view=summary',
     );
+  });
+
+  it('polls explicit image adapters through status_url and result_url', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        task_id: 'seedream-task-123',
+        status: 'success',
+        result_url: '/v1/custom-results/seedream-task-123',
+        poll_after_ms: 1,
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [{ b64_json: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB' }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const wait = vi.fn(async () => undefined);
+
+    await expect(resolveImageAdapterResponse(
+      { baseUrl: 'https://provider.example', kind: 'NEW_API' } as never,
+      { apiKey: 'test-key', headers: {} },
+      {
+        task_id: 'seedream-task-123',
+        status: 'queued',
+        status_url: '/v1/custom-status/seedream-task-123',
+        poll_after_ms: 1,
+      },
+      [],
+      1,
+      wait,
+    )).resolves.toEqual(['data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB']);
+
+    expect(wait).toHaveBeenCalledWith(2_000);
+    expect(fetchMock.mock.calls.map(([source]) => String(source))).toEqual([
+      'https://provider.example/v1/custom-status/seedream-task-123',
+      'https://provider.example/v1/custom-results/seedream-task-123',
+    ]);
+    expect(fetchMock.mock.calls.some(([source]) => String(source).includes('/v1/images/generations/'))).toBe(false);
   });
 
   it('extracts URL and Base64 image results while excluding reference inputs', () => {
@@ -1488,29 +1546,40 @@ describe('wallet image provider normalization', () => {
     });
   });
 
-  it.each([
+  it('keeps the full GPT Image 2 / 2.5 exact-size table unchanged', () => {
+    const cases = [
     ['1K', '1:1', '1024x1024'],
     ['1K', '16:9', '1280x720'],
     ['1K', '9:16', '720x1280'],
     ['1K', '3:2', '1152x768'],
+    ['1K', '2:3', '768x1152'],
+    ['1K', '4:3', '1024x768'],
     ['1K', '3:4', '768x1024'],
     ['2K', '1:1', '2048x2048'],
     ['2K', '16:9', '2048x1152'],
     ['2K', '9:16', '1152x2048'],
     ['2K', '3:2', '2064x1376'],
+    ['2K', '2:3', '1376x2064'],
+    ['2K', '4:3', '2048x1536'],
     ['2K', '3:4', '1536x2048'],
     ['4K', '1:1', '2880x2880'],
     ['4K', '16:9', '3840x2160'],
     ['4K', '9:16', '2160x3840'],
     ['4K', '3:2', '3520x2352'],
+    ['4K', '2:3', '2352x3520'],
+    ['4K', '4:3', '3312x2480'],
     ['4K', '3:4', '2480x3312'],
-  ] as const)('maps GPT Image 2.5 %s %s to exact upstream size %s', (resolution, ratio, size) => {
-    expect(newApiImageRequestParams('gpt-image-2.5', 1, ratio, resolution)).toMatchObject({
-      n: 1,
-      size,
-      aspect_ratio: ratio,
-      quality: 'medium',
-    });
+    ] as const;
+    for (const model of ['gpt-image-2', 'gpt-image-2.5'] as const) {
+      for (const [resolution, ratio, size] of cases) {
+        expect(newApiImageRequestParams(model, 1, ratio, resolution)).toMatchObject({
+          n: 1,
+          size,
+          aspect_ratio: ratio,
+          quality: 'medium',
+        });
+      }
+    }
   });
 
   it('keeps NewAPI image references on the public URL path', () => {

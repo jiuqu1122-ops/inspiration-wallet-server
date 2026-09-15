@@ -559,6 +559,8 @@ model AiModelRoute {
   lastSyncedAt         DateTime?
   costProfile          Json?
   capabilitiesOverride Json?
+  adapterKey           String?
+  adapterConfig        Json?
   metadata             Json?
   pricingSyncStatus    String                @default("UNKNOWN")
   costUpdatedAt        DateTime?

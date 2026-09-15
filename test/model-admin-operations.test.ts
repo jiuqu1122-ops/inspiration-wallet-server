@@ -93,6 +93,55 @@ describe('AI Model Center route operations', () => {
     }));
   });
 
+  it('updates image adapter fields only when an administrator supplies them', async () => {
+    const route = {
+      id: 'route-seedream',
+      canonicalModelId: 'model-seedream',
+      canonicalModel: { modality: 'image' },
+      enabled: false,
+      costProfile: null,
+      metadata: null,
+      adapterKey: null,
+      adapterConfig: null,
+      updatedAt,
+    };
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const transaction = {
+      aiModelRoute: {
+        findUnique: vi.fn(async () => route),
+        updateMany,
+        findUniqueOrThrow: vi.fn(async () => route),
+      },
+    };
+
+    await updateAdminAiRoute(withTransaction(transaction), route.id, {
+      priority: 20,
+      expectedUpdatedAt: updatedAt.toISOString(),
+    }, context);
+    expect(updateMany.mock.calls[0]?.[0].data).toEqual({ priority: 20 });
+
+    updateMany.mockClear();
+    await updateAdminAiRoute(withTransaction(transaction), route.id, {
+      adapterKey: 'SEEDREAM_IMAGES_API',
+      adapterConfig: {
+        resolutionParameter: 'size',
+        resolutionValueMode: 'label',
+        aspectRatioParameter: 'aspect_ratio',
+        async: true,
+      },
+      expectedUpdatedAt: updatedAt.toISOString(),
+    }, context);
+    expect(updateMany.mock.calls[0]?.[0].data).toEqual({
+      adapterKey: 'SEEDREAM_IMAGES_API',
+      adapterConfig: {
+        resolutionParameter: 'size',
+        resolutionValueMode: 'label',
+        aspectRatioParameter: 'aspect_ratio',
+        async: true,
+      },
+    });
+  });
+
   it('deletes only an unused hidden draft model and records the operation', async () => {
     const model = {
       id: 'model-unused',
