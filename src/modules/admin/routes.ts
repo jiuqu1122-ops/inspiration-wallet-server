@@ -5,6 +5,7 @@ import { LicenseVerificationError } from '../auth/license-verifier.js';
 import {
   AdminServiceError,
   getAdminOverview,
+  getAdminUsage,
   getAdminTodayUsage,
   getAdminUser,
   grantAdminCredits,
@@ -190,19 +191,42 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
+const membershipQuotaSchema = z.object({
+  type: z.enum(['IMAGE_COUNT', 'LLM_TOKENS']),
+  canonicalModelId: z.string().trim().min(1).max(64),
+  period: z.enum(['DAILY', 'MONTHLY']),
+  limit: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+}).strict();
+const membershipFreeQuotaSchema = z.object({
+  quotas: z.array(membershipQuotaSchema).max(100),
+}).strict().superRefine((value, context) => {
+  const seen = new Set<string>();
+  value.quotas.forEach((quota, index) => {
+    const key = `${quota.type}:${quota.canonicalModelId}:${quota.period}`;
+    if (seen.has(key)) {
+      context.addIssue({
+        code: 'custom',
+        path: ['quotas', index],
+        message: 'Membership quota entries must be unique',
+      });
+    }
+    seen.add(key);
+  });
+});
+
 const membershipPlanCreateSchema = z.object({
   code: z.string().trim().min(2).max(64).regex(/^[a-zA-Z0-9_-]+$/),
   name: z.string().trim().min(1).max(100),
   description: z.string().trim().max(500).nullable().optional(),
   prices: z.record(z.string(), z.unknown()),
-  freeQuota: z.record(z.string(), z.unknown()).nullable().optional(),
+  freeQuota: membershipFreeQuotaSchema.nullable().optional(),
 }).strict();
 const membershipPlanUpdateSchema = z.object({
   name: z.string().trim().min(1).max(100).optional(),
   description: z.string().trim().max(500).nullable().optional(),
   active: z.boolean().optional(),
   prices: z.record(z.string(), z.unknown()).optional(),
-  freeQuota: z.record(z.string(), z.unknown()).nullable().optional(),
+  freeQuota: membershipFreeQuotaSchema.nullable().optional(),
 }).strict();
 const membershipGrantSchema = z.object({
   planId: z.string().min(1).max(64),
@@ -232,7 +256,7 @@ const referralRuleSchema = z.object({
       const plan = await createMembershipPlan(app.prisma, {
         ...parsed.data,
         prices: parsed.data.prices as Prisma.InputJsonValue,
-        freeQuota: parsed.data.freeQuota as Prisma.InputJsonValue | null | undefined,
+        freeQuota: parsed.data.freeQuota,
       });
       return reply.code(201).send(plan);
     } catch (error) {
@@ -249,7 +273,7 @@ const referralRuleSchema = z.object({
       return await updateMembershipPlan(app.prisma, params.data.planId, {
         ...parsed.data,
         prices: parsed.data.prices as Prisma.InputJsonValue | undefined,
-        freeQuota: parsed.data.freeQuota as Prisma.InputJsonValue | null | undefined,
+        freeQuota: parsed.data.freeQuota,
       });
     } catch (error) {
       if (error instanceof ReferralServiceError) return reply.code(error.statusCode).send({ error: error.code, message: error.message });
@@ -315,6 +339,18 @@ const referralRuleSchema = z.object({
     '/usage/today',
     { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } },
     async () => getAdminTodayUsage(app.prisma),
+  );
+
+  app.get(
+    '/usage',
+    { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const parsed = z.object({
+        days: z.coerce.number().int().min(1).max(30).default(1),
+      }).strict().safeParse(request.query);
+      if (!parsed.success) return invalid(reply, 'Usage range must be between 1 and 30 days');
+      return getAdminUsage(app.prisma, parsed.data.days);
+    },
   );
 
   app.get('/users', async (request, reply) => {

@@ -368,6 +368,37 @@ export function parseMembershipQuotaDefinitions(value: unknown): MembershipQuota
   return definitions;
 }
 
+async function validateMembershipQuotaModels(
+  transaction: Prisma.TransactionClient,
+  freeQuota: unknown,
+) {
+  const definitions = parseMembershipQuotaDefinitions(freeQuota);
+  if (definitions.length === 0) return;
+  const models = await transaction.aiModel.findMany({
+    where: { id: { in: [...new Set(definitions.map(quota => quota.canonicalModelId))] } },
+    select: { id: true, modality: true },
+  });
+  const modalities = new Map(models.map(model => [model.id, model.modality]));
+  for (const quota of definitions) {
+    const modality = modalities.get(quota.canonicalModelId);
+    if (!modality) {
+      throw new ReferralServiceError(
+        'quota_model_not_found',
+        'The canonical model configured for this membership quota was not found',
+        400,
+      );
+    }
+    const expectedModality = quota.type === 'IMAGE_COUNT' ? 'image' : 'chat';
+    if (modality !== expectedModality) {
+      throw new ReferralServiceError(
+        'quota_model_mismatch',
+        `${quota.type} cannot be configured for a ${modality} canonical model`,
+        400,
+      );
+    }
+  }
+}
+
 export function membershipQuotaPeriodRange(
   period: MembershipQuotaPeriod,
   now = new Date(),
@@ -567,6 +598,7 @@ export async function createMembershipPlan(
   input: { code: string; name: string; description?: string | null | undefined; prices: Prisma.InputJsonValue; freeQuota?: Prisma.InputJsonValue | null | undefined },
 ) {
   return prisma.$transaction(async (transaction) => {
+    await validateMembershipQuotaModels(transaction, input.freeQuota);
     const plan = await transaction.membershipPlan.create({
       data: {
         code: input.code.trim().toLowerCase(),
@@ -588,6 +620,9 @@ export async function updateMembershipPlan(
   return prisma.$transaction(async (transaction) => {
     const plan = await transaction.membershipPlan.findUnique({ where: { id: planId } });
     if (!plan) throw new ReferralServiceError('plan_not_found', 'Membership plan was not found', 404);
+    if (input.freeQuota !== undefined) {
+      await validateMembershipQuotaModels(transaction, input.freeQuota);
+    }
     const update = await transaction.membershipPlan.update({
       where: { id: planId },
       data: {

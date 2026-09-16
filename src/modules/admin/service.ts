@@ -91,16 +91,24 @@ const usageCount = (value: unknown) => {
   return /^\d+$/.test(text) ? BigInt(text) : 0n;
 };
 
-const chinaStandardDayRange = (now: Date) => {
+const chinaStandardUsageRange = (days: number, now: Date) => {
   const shifted = new Date(now.getTime() + CHINA_STANDARD_TIME_OFFSET_MS);
   const shiftedStart = Date.UTC(
     shifted.getUTCFullYear(),
     shifted.getUTCMonth(),
     shifted.getUTCDate(),
   );
-  const start = new Date(shiftedStart - CHINA_STANDARD_TIME_OFFSET_MS);
-  const end = new Date(start.getTime() + 24 * 60 * 60 * 1_000);
-  return { start, end, date: shifted.toISOString().slice(0, 10) };
+  const currentDayStart = new Date(shiftedStart - CHINA_STANDARD_TIME_OFFSET_MS);
+  const end = new Date(currentDayStart.getTime() + 24 * 60 * 60 * 1_000);
+  const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1_000);
+  const endDate = shifted.toISOString().slice(0, 10);
+  const shiftedRangeStart = new Date(start.getTime() + CHINA_STANDARD_TIME_OFFSET_MS);
+  return {
+    start,
+    end,
+    startDate: shiftedRangeStart.toISOString().slice(0, 10),
+    endDate,
+  };
 };
 
 const tokenUsageFromBreakdown = (value: unknown) => {
@@ -121,8 +129,11 @@ const tokenUsageFromBreakdown = (value: unknown) => {
   };
 };
 
-export async function getAdminTodayUsage(prisma: PrismaClient, now = new Date()) {
-  const range = chinaStandardDayRange(now);
+export async function getAdminUsage(prisma: PrismaClient, days = 1, now = new Date()) {
+  if (!Number.isInteger(days) || days < 1 || days > 30) {
+    throw new AdminServiceError('invalid_usage_range', 'Usage range must be between 1 and 30 days', 400);
+  }
+  const range = chinaStandardUsageRange(days, now);
   const requests = await prisma.aiRequest.findMany({
     where: {
       status: 'SUCCEEDED',
@@ -265,7 +276,10 @@ export async function getAdminTodayUsage(prisma: PrismaClient, now = new Date())
   }
 
   return {
-    date: range.date,
+    date: range.endDate,
+    days,
+    startDate: range.startDate,
+    endDate: range.endDate,
     timeZone: 'Asia/Shanghai',
     range: { start: range.start.toISOString(), end: range.end.toISOString() },
     generatedAt: now.toISOString(),
@@ -281,6 +295,10 @@ export async function getAdminTodayUsage(prisma: PrismaClient, now = new Date())
     },
     items: rows.map(serializeCounts),
   };
+}
+
+export async function getAdminTodayUsage(prisma: PrismaClient, now = new Date()) {
+  return getAdminUsage(prisma, 1, now);
 }
 
 export async function getAdminOverview(prisma: PrismaClient) {

@@ -1,6 +1,6 @@
 import type { PrismaClient } from '@prisma/client';
 import { describe, expect, it, vi } from 'vitest';
-import { getAdminTodayUsage } from '../src/modules/admin/service.js';
+import { getAdminTodayUsage, getAdminUsage } from '../src/modules/admin/service.js';
 
 describe('administrator daily AI usage statistics', () => {
   it('aggregates generated images and reported tokens by China Standard Time day', async () => {
@@ -93,6 +93,33 @@ describe('administrator daily AI usage statistics', () => {
       userId: 'user-b',
       imageCount: '0',
       totalTokens: '60',
+    });
+  });
+
+  it('queries thirty China Standard Time calendar days including today', async () => {
+    const findMany = vi.fn(async () => []);
+    const prisma = { aiRequest: { findMany } } as unknown as PrismaClient;
+    const now = new Date('2026-09-15T01:30:00.000Z');
+
+    const result = await getAdminUsage(prisma, 30, now);
+
+    expect(findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        createdAt: {
+          gte: new Date('2026-08-16T16:00:00.000Z'),
+          lt: new Date('2026-09-15T16:00:00.000Z'),
+        },
+      }),
+    }));
+    expect(result).toMatchObject({
+      date: '2026-09-15',
+      days: 30,
+      startDate: '2026-08-17',
+      endDate: '2026-09-15',
+      range: {
+        start: '2026-08-16T16:00:00.000Z',
+        end: '2026-09-15T16:00:00.000Z',
+      },
     });
   });
 });

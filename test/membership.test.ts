@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Prisma } from '@prisma/client';
 import {
+  createMembershipPlan,
   getMembershipForUser,
   getReferralBindingEligibility,
   membershipQuotaPeriodRange,
@@ -171,6 +172,67 @@ describe('membership and referral helpers', () => {
       start: new Date('2026-09-15T16:00:00.000Z'),
       end: new Date('2026-09-16T16:00:00.000Z'),
     });
+  });
+
+  it('stores free quotas only against matching canonical model modalities', async () => {
+    const create = vi.fn().mockResolvedValue({ id: 'plan-1' });
+    const transaction = {
+      aiModel: {
+        findMany: vi.fn().mockResolvedValue([
+          { id: 'model-image', modality: 'image' },
+          { id: 'model-chat', modality: 'chat' },
+        ]),
+      },
+      membershipPlan: { create },
+    };
+    const prisma = {
+      $transaction: vi.fn(async (callback) => callback(transaction)),
+    } as never;
+    const freeQuota = {
+      quotas: [
+        { type: 'IMAGE_COUNT', canonicalModelId: 'model-image', period: 'DAILY', limit: 20 },
+        { type: 'LLM_TOKENS', canonicalModelId: 'model-chat', period: 'MONTHLY', limit: 1_000_000 },
+      ],
+    } as Prisma.InputJsonValue;
+
+    await expect(createMembershipPlan(prisma, {
+      code: 'pro',
+      name: 'Pro',
+      prices: {},
+      freeQuota,
+    })).resolves.toEqual({ id: 'plan-1' });
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        versions: { create: expect.objectContaining({ freeQuota }) },
+      }),
+    }));
+  });
+
+  it('rejects a token quota bound to an image canonical model', async () => {
+    const transaction = {
+      aiModel: {
+        findMany: vi.fn().mockResolvedValue([{ id: 'model-image', modality: 'image' }]),
+      },
+      membershipPlan: { create: vi.fn() },
+    };
+    const prisma = {
+      $transaction: vi.fn(async (callback) => callback(transaction)),
+    } as never;
+
+    await expect(createMembershipPlan(prisma, {
+      code: 'pro',
+      name: 'Pro',
+      prices: {},
+      freeQuota: {
+        quotas: [{
+          type: 'LLM_TOKENS',
+          canonicalModelId: 'model-image',
+          period: 'MONTHLY',
+          limit: 1_000_000,
+        }],
+      },
+    })).rejects.toMatchObject({ code: 'quota_model_mismatch', statusCode: 400 });
+    expect(transaction.membershipPlan.create).not.toHaveBeenCalled();
   });
 
   it('blocks binding after credits have been granted', async () => {
