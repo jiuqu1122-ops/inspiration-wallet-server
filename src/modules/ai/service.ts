@@ -36,6 +36,15 @@ import {
   resolveAgentUsageContext,
 } from './usage-context.js';
 import {
+  applyMembershipQuotaCharge,
+  membershipQuotaFromPricingSnapshot,
+  membershipQuotaSettlementUnits,
+  releaseMembershipQuota,
+  reserveMembershipQuota,
+  settleMembershipQuota,
+  withMembershipQuota,
+} from '../membership/quota-billing.js';
+import {
   resolveUsageModelBinding,
   type AiUsageModelKey,
 } from './usage-model-binding.js';
@@ -1174,7 +1183,7 @@ async function reserveCredits(
     routeId?: string | null | undefined;
   },
 ) {
-  const credits = creditDecimal(input.credits);
+  const requestedCredits = creditDecimal(input.credits);
   return prisma.$transaction(async (transaction) => {
     const existing = await transaction.aiRequest.findUnique({
       where: {
@@ -1187,6 +1196,20 @@ async function reserveCredits(
     if (existing) {
       throw new CloudAiError('duplicate_request', '该 Agent 请求已经提交过', 409);
     }
+    const membershipQuota = input.capability === 'LLM' && input.pricingSnapshot
+      ? await reserveMembershipQuota(transaction, {
+        userId: input.userId,
+        snapshot: input.pricingSnapshot,
+        requestedUnits: 0n,
+      })
+      : null;
+    const reservationSnapshot = input.pricingSnapshot
+      ? withMembershipQuota(input.pricingSnapshot, membershipQuota)
+      : undefined;
+    // LLM quota usage is only known after the provider returns its complete
+    // token accounting. Requests with remaining quota are therefore settled
+    // after usage instead of requiring wallet balance up front.
+    const credits = membershipQuota ? creditDecimal(0) : requestedCredits;
     const updated = await transaction.wallet.updateMany({
       where: { userId: input.userId, availableCredits: { gte: credits } },
       data: {
@@ -1198,8 +1221,8 @@ async function reserveCredits(
       throw new CloudAiError('insufficient_credits', '授权钱包余额不足', 402);
     }
     const wallet = await transaction.wallet.findUniqueOrThrow({ where: { userId: input.userId } });
-    const canonicalModelId = input.pricingSnapshot?.canonicalModelId ?? input.canonicalModelId;
-    const routeId = input.pricingSnapshot?.routeId ?? input.routeId;
+    const canonicalModelId = reservationSnapshot?.canonicalModelId ?? input.canonicalModelId;
+    const routeId = reservationSnapshot?.routeId ?? input.routeId;
     const request = await transaction.aiRequest.create({
       data: {
         userId: input.userId,
@@ -1209,9 +1232,9 @@ async function reserveCredits(
         ...(canonicalModelId ? {
           canonicalModelId,
           ...(routeId !== undefined ? { routeId } : {}),
-          ...(input.pricingSnapshot ? {
-          priceVersionId: input.pricingSnapshot.priceVersionId,
-          pricingSnapshot: toInputJson(input.pricingSnapshot),
+          ...(reservationSnapshot ? {
+          priceVersionId: reservationSnapshot.priceVersionId,
+          pricingSnapshot: toInputJson(reservationSnapshot),
           } : {}),
         } : {}),
         status: 'RESERVED',
@@ -1252,7 +1275,20 @@ async function settleCredits(
     });
     if (!request) return;
     const reserved = creditDecimal(request.estimatedCredits);
-    const charged = creditDecimal(settlement?.chargedCredits ?? reserved);
+    const quota = membershipQuotaFromPricingSnapshot(request.pricingSnapshot);
+    const actualUnits = quota?.type === 'LLM_TOKENS' && settlement?.billingResult
+      ? membershipQuotaSettlementUnits('LLM_TOKENS', settlement.billingResult)
+      : 0n;
+    const freeUnits = await settleMembershipQuota(
+      transaction,
+      userId,
+      request.pricingSnapshot,
+      actualUnits,
+    );
+    const billingResult = settlement?.billingResult
+      ? applyMembershipQuotaCharge(settlement.billingResult, quota, actualUnits, freeUnits)
+      : undefined;
+    const charged = creditDecimal(billingResult?.totalCredits ?? settlement?.chargedCredits ?? reserved);
     const release = reserved.gt(charged) ? reserved.minus(charged) : creditDecimal(0);
     const extra = charged.gt(reserved) ? charged.minus(reserved) : creditDecimal(0);
     const requestUpdate: Prisma.AiRequestUpdateManyMutationInput = {
@@ -1261,8 +1297,8 @@ async function settleCredits(
       completedAt: new Date(),
       ...(settlement?.logicalModel ? { logicalModel: settlement.logicalModel } : {}),
       ...(settlement?.actualRouteId !== undefined ? { routeId: settlement.actualRouteId } : {}),
-      ...(settlement?.billingResult
-        ? { result: toInputJson(settlement.billingResult), chargeBreakdown: toInputJson(settlement.billingResult) }
+      ...(billingResult
+        ? { result: toInputJson(billingResult), chargeBreakdown: toInputJson(billingResult) }
         : {}),
     };
     const claimed = await transaction.aiRequest.updateMany({
@@ -1270,15 +1306,15 @@ async function settleCredits(
       data: requestUpdate,
     });
     if (claimed.count !== 1) return;
-    if (settlement?.billingResult && catalogDelegateAvailable(prisma)) {
+    if (billingResult && catalogDelegateAvailable(prisma)) {
       await transaction.aiBillingSettlement.create({
         data: {
           requestId,
           canonicalModelId: request.canonicalModelId,
-          routeId: settlement.actualRouteId ?? request.routeId,
+          routeId: settlement?.actualRouteId ?? request.routeId,
           priceVersionId: request.priceVersionId,
           chargedCredits: charged,
-          breakdown: toInputJson(settlement.billingResult),
+          breakdown: toInputJson(billingResult),
         },
       });
     }
@@ -1340,6 +1376,7 @@ async function releaseCredits(prisma: PrismaClient, userId: string, requestId: s
   await prisma.$transaction(async (transaction) => {
     const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
     if (!request || request.userId !== userId || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
+    await releaseMembershipQuota(transaction, request.pricingSnapshot);
     const claimed = await transaction.aiRequest.updateMany({
       where: { id: requestId, status: { in: ['RESERVED', 'PROCESSING'] } },
       data: { status: 'FAILED', completedAt: new Date() },

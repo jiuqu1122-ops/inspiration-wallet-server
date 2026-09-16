@@ -295,8 +295,8 @@ function serializeMembership(value: {
   };
 }
 
-type MembershipQuotaType = 'IMAGE_COUNT' | 'LLM_TOKENS';
-type MembershipQuotaPeriod = 'DAILY' | 'MONTHLY';
+export type MembershipQuotaType = 'IMAGE_COUNT' | 'LLM_TOKENS';
+export type MembershipQuotaPeriod = 'DAILY' | 'MONTHLY';
 
 type MembershipQuotaDefinition = {
   type: MembershipQuotaType;

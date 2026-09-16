@@ -8,6 +8,7 @@ import type { ImageModelCreditPrice, VideoModelCreditPrice } from './pricing.js'
 import { catalogDelegateAvailable, isGptImage2CatalogIdentity, type AiModality } from './model-catalog.js';
 import { env } from '../../config/env.js';
 import { isFixedCanvasLlmUsageContext } from './usage-context.js';
+import type { MembershipQuotaReservationSnapshot } from '../membership/quota-billing.js';
 
 const CREDIT_SCALE = 1_000_000n;
 const TOKENS_PER_MILLION = 1_000_000n;
@@ -32,6 +33,8 @@ export type PricingSnapshot = {
   capturedAt: string;
   membershipPlanId?: string;
   membershipPlanVersionId?: string;
+  membershipId?: string;
+  membershipQuota?: MembershipQuotaReservationSnapshot;
 };
 
 export type ChargeBreakdown = {
@@ -353,6 +356,7 @@ export async function capturePricingSnapshot(
   }
   let membershipPlanId: string | undefined;
   let membershipPlanVersionId: string | undefined;
+  let membershipId: string | undefined;
   if (userId) {
     const membership = await prisma.userMembership.findFirst({
       where: { userId, status: 'ACTIVE', startsAt: { lte: new Date() }, expiresAt: { gt: new Date() } },
@@ -360,6 +364,11 @@ export async function capturePricingSnapshot(
       include: { plan: { include: { versions: { orderBy: { version: 'desc' }, take: 1 } } } },
     });
     const version = membership?.plan.versions[0];
+    if (membership && version) {
+      membershipId = membership.id;
+      membershipPlanId = membership.planId;
+      membershipPlanVersionId = version.id;
+    }
     const rawPrices = plainObject(version?.prices);
     if (rawPrices) {
       const models = plainObject(rawPrices.models);
@@ -435,6 +444,7 @@ export async function capturePricingSnapshot(
     capturedAt: new Date().toISOString(),
     ...(membershipPlanId ? { membershipPlanId } : {}),
     ...(membershipPlanVersionId ? { membershipPlanVersionId } : {}),
+    ...(membershipId ? { membershipId } : {}),
   };
 }
 

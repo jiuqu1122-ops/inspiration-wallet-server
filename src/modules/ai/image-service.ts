@@ -53,6 +53,15 @@ import {
   toInputJson,
 } from './pricing-center.js';
 import {
+  applyMembershipQuotaCharge,
+  membershipQuotaFromPricingSnapshot,
+  membershipQuotaSettlementUnits,
+  releaseMembershipQuota,
+  reserveMembershipQuota,
+  settleMembershipQuota,
+  withMembershipQuota,
+} from '../membership/quota-billing.js';
+import {
   ImageAdapterError,
   getImageModelAdapter,
   prepareImageAdapterRequest,
@@ -3581,13 +3590,15 @@ async function reserveImageCredits(
       input.resolution,
       capabilities,
     );
-  const estimated = pricingSnapshot
-    ? estimateSnapshotCredits(pricingSnapshot)
-    : (legacyUnitCredits! * BigInt(input.count)).toString();
+  const fullEstimate = pricingSnapshot
+    ? calculateSnapshotCharge(pricingSnapshot)
+    : null;
+  const legacyEstimated = legacyUnitCredits
+    ? (legacyUnitCredits * BigInt(input.count)).toString()
+    : null;
   const unitCredits = pricingSnapshot
     ? calculateSnapshotCharge({ ...pricingSnapshot, request: { ...pricingSnapshot.request, count: 1 } }).totalCredits
     : legacyUnitCredits!.toString();
-  const estimatedCredits = creditDecimal(estimated);
   const reservation = await prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({
       where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } },
@@ -3603,6 +3614,25 @@ async function reserveImageCredits(
       : null;
     if (reusableRequest) existing = null;
     if (existing) throw new CloudAiError('duplicate_request', '该生图请求已经提交过', 409);
+    const membershipQuota = pricingSnapshot
+      ? await reserveMembershipQuota(transaction, {
+        userId: input.userId,
+        snapshot: pricingSnapshot,
+        requestedUnits: BigInt(input.count),
+      })
+      : null;
+    const reservationSnapshot = pricingSnapshot
+      ? withMembershipQuota(pricingSnapshot, membershipQuota)
+      : undefined;
+    const estimated = fullEstimate
+      ? applyMembershipQuotaCharge(
+        fullEstimate,
+        membershipQuota,
+        BigInt(input.count),
+        BigInt(membershipQuota?.reservedUnits ?? '0'),
+      ).totalCredits
+      : legacyEstimated!;
+    const estimatedCredits = creditDecimal(estimated);
     const updated = await transaction.wallet.updateMany({
       where: { userId: input.userId, availableCredits: { gte: estimatedCredits } },
       data: { availableCredits: { decrement: estimatedCredits }, reservedCredits: { increment: estimatedCredits } },
@@ -3615,11 +3645,11 @@ async function reserveImageCredits(
         data: {
           status: 'RESERVED',
           logicalModel: canonicalModelKey ?? input.model,
-          ...(pricingSnapshot ? {
-            canonicalModelId: pricingSnapshot.canonicalModelId,
-            routeId: pricingSnapshot.routeId,
-            priceVersionId: pricingSnapshot.priceVersionId,
-            pricingSnapshot: toInputJson(pricingSnapshot),
+          ...(reservationSnapshot ? {
+            canonicalModelId: reservationSnapshot.canonicalModelId,
+            routeId: reservationSnapshot.routeId,
+            priceVersionId: reservationSnapshot.priceVersionId,
+            pricingSnapshot: toInputJson(reservationSnapshot),
           } : {}),
           estimatedCredits,
           chargedCredits: creditDecimal(0),
@@ -3638,7 +3668,7 @@ async function reserveImageCredits(
           description: '生图重试预扣',
         },
       });
-      return request.id;
+      return { requestId: request.id, estimated, unitCredits, pricingSnapshot: reservationSnapshot };
     }
     const request = await transaction.aiRequest.create({
       data: {
@@ -3646,11 +3676,11 @@ async function reserveImageCredits(
         clientRequestId: input.clientRequestId,
         capability: 'IMAGE',
         logicalModel: canonicalModelKey ?? input.model,
-        ...(pricingSnapshot ? {
-          canonicalModelId: pricingSnapshot.canonicalModelId,
-          routeId: pricingSnapshot.routeId,
-          priceVersionId: pricingSnapshot.priceVersionId,
-          pricingSnapshot: toInputJson(pricingSnapshot),
+        ...(reservationSnapshot ? {
+          canonicalModelId: reservationSnapshot.canonicalModelId,
+          routeId: reservationSnapshot.routeId,
+          priceVersionId: reservationSnapshot.priceVersionId,
+          pricingSnapshot: toInputJson(reservationSnapshot),
         } : {}),
         status: 'RESERVED',
         estimatedCredits,
@@ -3666,17 +3696,16 @@ async function reserveImageCredits(
         description: `生图预扣 ${input.count} 张`,
       },
     });
-    return request.id;
+    return { requestId: request.id, estimated, unitCredits, pricingSnapshot: reservationSnapshot };
   });
-  if (typeof reservation !== 'string') return reservation;
-  return { requestId: reservation, estimated, unitCredits };
+  if ('replayResult' in reservation) return reservation;
+  return reservation;
 }
 
 async function settleImageCredits(
   prisma: PrismaClient,
   input: ImageInput,
   requestId: string,
-  estimated: string,
   unitCredits: string,
   generatedCount: number,
   result: Omit<WalletImageGenerationResult, 'chargedCredits'>,
@@ -3686,7 +3715,7 @@ async function settleImageCredits(
   const billingSnapshot = pricingSnapshot && actualRouteId !== undefined
     ? { ...pricingSnapshot, routeId: actualRouteId }
     : pricingSnapshot;
-  const breakdown = billingSnapshot
+  const fullBreakdown = billingSnapshot
     ? calculateSnapshotCharge(billingSnapshot, { generatedCount })
     : {
       schemaVersion: 1 as const,
@@ -3701,10 +3730,24 @@ async function settleImageCredits(
       totalCredits: creditDecimal(unitCredits).mul(generatedCount).toFixed(6),
       details: { resolution: input.resolution ?? '2k', generatedCount },
     };
-  const estimatedCredits = creditDecimal(estimated);
-  const chargedCredits = creditDecimal(breakdown.totalCredits);
-  const refundCredits = estimatedCredits.minus(chargedCredits);
+  let settledCredits = creditDecimal(0);
   await prisma.$transaction(async (transaction) => {
+    const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
+    if (!request
+      || request.userId !== input.userId
+      || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
+    const quota = membershipQuotaFromPricingSnapshot(request.pricingSnapshot);
+    const actualUnits = membershipQuotaSettlementUnits('IMAGE_COUNT', fullBreakdown);
+    const freeUnits = await settleMembershipQuota(
+      transaction,
+      input.userId,
+      request.pricingSnapshot,
+      actualUnits,
+    );
+    const breakdown = applyMembershipQuotaCharge(fullBreakdown, quota, actualUnits, freeUnits);
+    const estimatedCredits = creditDecimal(request.estimatedCredits);
+    const chargedCredits = creditDecimal(breakdown.totalCredits);
+    const refundCredits = estimatedCredits.minus(chargedCredits);
     const claimed = await transaction.aiRequest.updateMany({
       where: { id: requestId, userId: input.userId, status: { in: ['RESERVED', 'PROCESSING'] } },
       data: {
@@ -3720,6 +3763,7 @@ async function settleImageCredits(
       },
     });
     if (claimed.count !== 1) return;
+    settledCredits = chargedCredits;
     if (billingSnapshot && catalogDelegateAvailable(prisma)) {
       await transaction.aiBillingSettlement.create({
         data: {
@@ -3763,7 +3807,7 @@ async function settleImageCredits(
       });
     }
   });
-  return serializeCredit(chargedCredits);
+  return serializeCredit(settledCredits);
 }
 
 async function releaseImageCredits(
@@ -3776,6 +3820,7 @@ async function releaseImageCredits(
   await prisma.$transaction(async (transaction) => {
     const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
     if (!request || request.userId !== input.userId || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
+    await releaseMembershipQuota(transaction, request.pricingSnapshot);
     const claimed = await transaction.aiRequest.updateMany({
       where: { id: requestId, userId: input.userId, status: { in: ['RESERVED', 'PROCESSING'] } },
       data: { status: 'FAILED', result: Prisma.DbNull, completedAt: new Date() },
@@ -4227,7 +4272,6 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
           prisma,
           activeInput,
           reservation.requestId,
-          reservation.estimated,
           reservation.unitCredits,
           images.length,
           {
@@ -4237,7 +4281,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
             providerChannelName: activeProvider.name,
             model: canonicalModelKey,
           },
-          pricingSnapshot,
+          reservation.pricingSnapshot,
           activeRoute?.id ?? null,
         );
         console.info('[image_generation_complete]', {
