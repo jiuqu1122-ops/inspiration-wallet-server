@@ -3,7 +3,9 @@ import { Prisma } from '@prisma/client';
 import {
   getMembershipForUser,
   getReferralBindingEligibility,
+  membershipQuotaPeriodRange,
   normalizeInviteCode,
+  parseMembershipQuotaDefinitions,
   rewardReferralOnRecharge,
   validateReferralCode,
 } from '../src/modules/membership/service.js';
@@ -26,6 +28,149 @@ describe('membership and referral helpers', () => {
       userMembership: { findFirst: vi.fn().mockResolvedValue(null) },
     } as never;
     await expect(getMembershipForUser(prisma, 'user-1')).resolves.toBeNull();
+  });
+
+  it('returns an empty quota list when the active plan has no quota configuration', async () => {
+    const prisma = {
+      userMembership: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: 'membership-1',
+          status: 'ACTIVE',
+          startsAt: new Date('2026-09-01T00:00:00.000Z'),
+          expiresAt: new Date('2026-10-01T00:00:00.000Z'),
+          source: 'ADMIN',
+          note: null,
+          plan: {
+            id: 'plan-1',
+            code: 'pro',
+            name: 'Pro',
+            description: null,
+            versions: [{ freeQuota: null }],
+          },
+        }),
+      },
+    } as never;
+
+    await expect(getMembershipForUser(
+      prisma,
+      'user-1',
+      new Date('2026-09-16T02:00:00.000Z'),
+    )).resolves.toMatchObject({
+      plan: { id: 'plan-1', code: 'pro', name: 'Pro' },
+      quotas: [],
+    });
+  });
+
+  it('summarizes settled image and token usage by canonical model and CST period', async () => {
+    const findManyModels = vi.fn().mockResolvedValue([
+      { id: 'model-image', displayName: 'Seedream 5 Pro' },
+      { id: 'model-chat', displayName: 'GPT-5.6 Sol' },
+    ]);
+    const findManySettlements = vi.fn().mockResolvedValue([
+      {
+        canonicalModelId: 'model-image',
+        breakdown: { quantity: '9', details: { generatedCount: 7 } },
+        createdAt: new Date('2026-09-16T01:00:00.000Z'),
+      },
+      {
+        canonicalModelId: 'model-image',
+        breakdown: { details: { generatedCount: 5 } },
+        createdAt: new Date('2026-09-15T15:59:59.000Z'),
+      },
+      {
+        canonicalModelId: 'model-chat',
+        breakdown: {
+          details: {
+            usage: {
+              inputTokens: '300000',
+              cachedInputTokens: '90000',
+              cacheWriteTokens: '53000',
+              outputTokens: '120000',
+            },
+          },
+        },
+        createdAt: new Date('2026-09-10T01:00:00.000Z'),
+      },
+    ]);
+    const prisma = {
+      userMembership: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: 'membership-1',
+          status: 'ACTIVE',
+          startsAt: new Date('2026-09-01T00:00:00.000Z'),
+          expiresAt: new Date('2026-10-01T00:00:00.000Z'),
+          source: 'ADMIN',
+          note: null,
+          plan: {
+            id: 'plan-1',
+            code: 'pro',
+            name: 'Pro',
+            description: null,
+            versions: [{
+              freeQuota: {
+                quotas: [
+                  { type: 'IMAGE_COUNT', canonicalModelId: 'model-image', period: 'DAILY', limit: 20 },
+                  { type: 'LLM_TOKENS', canonicalModelId: 'model-chat', period: 'MONTHLY', limit: 1_000_000 },
+                ],
+              },
+            }],
+          },
+        }),
+      },
+      aiModel: { findMany: findManyModels },
+      aiBillingSettlement: { findMany: findManySettlements },
+    } as never;
+
+    const membership = await getMembershipForUser(
+      prisma,
+      'user-1',
+      new Date('2026-09-16T02:00:00.000Z'),
+    );
+
+    expect(findManySettlements).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ request: { userId: 'user-1' } }),
+    }));
+    expect(membership?.quotas).toEqual([{
+      type: 'IMAGE_COUNT',
+      canonicalModelId: 'model-image',
+      modelName: 'Seedream 5 Pro',
+      period: 'DAILY',
+      limit: 20,
+      used: 7,
+      remaining: 13,
+      resetAt: '2026-09-16T16:00:00.000Z',
+    }, {
+      type: 'LLM_TOKENS',
+      canonicalModelId: 'model-chat',
+      modelName: 'GPT-5.6 Sol',
+      period: 'MONTHLY',
+      limit: 1_000_000,
+      used: 473_000,
+      remaining: 527_000,
+      resetAt: '2026-09-30T16:00:00.000Z',
+    }]);
+    expect(membership?.plan).toEqual({ id: 'plan-1', code: 'pro', name: 'Pro', description: null });
+    expect(membership).not.toHaveProperty('provider');
+    expect(membership).not.toHaveProperty('routeId');
+  });
+
+  it('validates quota definitions and calculates CST boundaries on the server', () => {
+    expect(parseMembershipQuotaDefinitions({
+      quotas: [
+        { type: 'IMAGE_COUNT', canonicalModelId: 'model-image', period: 'MONTHLY', limit: '300' },
+        { type: 'IMAGE_COUNT', canonicalModelId: 'model-image', period: 'MONTHLY', limit: 300 },
+        { type: 'LLM_TOKENS', canonicalModelId: '', period: 'DAILY', limit: 10 },
+      ],
+    })).toEqual([
+      { type: 'IMAGE_COUNT', canonicalModelId: 'model-image', period: 'MONTHLY', limit: 300 },
+    ]);
+    expect(membershipQuotaPeriodRange(
+      'DAILY',
+      new Date('2026-09-16T02:00:00.000Z'),
+    )).toEqual({
+      start: new Date('2026-09-15T16:00:00.000Z'),
+      end: new Date('2026-09-16T16:00:00.000Z'),
+    });
   });
 
   it('blocks binding after credits have been granted', async () => {

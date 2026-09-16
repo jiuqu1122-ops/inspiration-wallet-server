@@ -270,8 +270,14 @@ function serializeMembership(value: {
   expiresAt: Date;
   source: string;
   note: string | null;
-  plan: { id: string; code: string; name: string; description: string | null };
-}) {
+  plan: {
+    id: string;
+    code: string;
+    name: string;
+    description: string | null;
+    versions: Array<{ freeQuota: unknown }>;
+  };
+}, quotas: MembershipQuotaSummary[]) {
   return {
     id: value.id,
     status: value.status,
@@ -279,8 +285,182 @@ function serializeMembership(value: {
     expiresAt: value.expiresAt.toISOString(),
     source: value.source,
     note: value.note,
-    plan: value.plan,
+    plan: {
+      id: value.plan.id,
+      code: value.plan.code,
+      name: value.plan.name,
+      description: value.plan.description,
+    },
+    quotas,
   };
+}
+
+type MembershipQuotaType = 'IMAGE_COUNT' | 'LLM_TOKENS';
+type MembershipQuotaPeriod = 'DAILY' | 'MONTHLY';
+
+type MembershipQuotaDefinition = {
+  type: MembershipQuotaType;
+  canonicalModelId: string;
+  period: MembershipQuotaPeriod;
+  limit: number;
+};
+
+type MembershipQuotaSummary = MembershipQuotaDefinition & {
+  modelName: string;
+  used: number;
+  remaining: number;
+  resetAt: string;
+};
+
+const CST_OFFSET_MS = 8 * 60 * 60 * 1_000;
+
+const quotaObject = (value: unknown): Record<string, unknown> | null => (
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+);
+
+const quotaCount = (value: unknown) => {
+  if (typeof value === 'bigint') return value >= 0n ? value : 0n;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || value <= 0) return 0n;
+    return BigInt(Math.trunc(value));
+  }
+  if (typeof value !== 'string' || !/^\d+$/.test(value.trim())) return 0n;
+  try {
+    return BigInt(value.trim());
+  } catch {
+    return 0n;
+  }
+};
+
+export function parseMembershipQuotaDefinitions(value: unknown): MembershipQuotaDefinition[] {
+  const root = quotaObject(value);
+  const candidates = Array.isArray(value)
+    ? value
+    : Array.isArray(root?.quotas)
+      ? root.quotas
+      : [];
+  const seen = new Set<string>();
+  const definitions: MembershipQuotaDefinition[] = [];
+
+  for (const candidate of candidates) {
+    const quota = quotaObject(candidate);
+    const type = quota?.type;
+    const canonicalModelId = typeof quota?.canonicalModelId === 'string'
+      ? quota.canonicalModelId.trim()
+      : '';
+    const period = quota?.period;
+    const numericLimit = typeof quota?.limit === 'string'
+      ? Number(quota.limit.trim())
+      : quota?.limit;
+    if ((type !== 'IMAGE_COUNT' && type !== 'LLM_TOKENS')
+      || (period !== 'DAILY' && period !== 'MONTHLY')
+      || !canonicalModelId
+      || typeof numericLimit !== 'number'
+      || !Number.isSafeInteger(numericLimit)
+      || numericLimit <= 0) continue;
+    const key = `${type}:${canonicalModelId}:${period}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    definitions.push({ type, canonicalModelId, period, limit: numericLimit });
+  }
+  return definitions;
+}
+
+export function membershipQuotaPeriodRange(
+  period: MembershipQuotaPeriod,
+  now = new Date(),
+) {
+  const shifted = new Date(now.getTime() + CST_OFFSET_MS);
+  const year = shifted.getUTCFullYear();
+  const month = shifted.getUTCMonth();
+  const day = shifted.getUTCDate();
+  const startMs = period === 'DAILY'
+    ? Date.UTC(year, month, day) - CST_OFFSET_MS
+    : Date.UTC(year, month, 1) - CST_OFFSET_MS;
+  const endMs = period === 'DAILY'
+    ? Date.UTC(year, month, day + 1) - CST_OFFSET_MS
+    : Date.UTC(year, month + 1, 1) - CST_OFFSET_MS;
+  return { start: new Date(startMs), end: new Date(endMs) };
+}
+
+const settledImageCount = (value: unknown) => {
+  const breakdown = quotaObject(value);
+  const details = quotaObject(breakdown?.details);
+  return quotaCount(details?.generatedCount ?? breakdown?.quantity);
+};
+
+const settledTokenCount = (value: unknown) => {
+  const breakdown = quotaObject(value);
+  const details = quotaObject(breakdown?.details);
+  const usage = quotaObject(details?.usage) ?? quotaObject(breakdown?.usage);
+  if (!usage) return 0n;
+  return quotaCount(usage.inputTokens)
+    + quotaCount(usage.outputTokens)
+    + quotaCount(usage.cacheWriteTokens);
+};
+
+const safeQuotaNumber = (value: bigint) => Number(
+  value > BigInt(Number.MAX_SAFE_INTEGER) ? BigInt(Number.MAX_SAFE_INTEGER) : value,
+);
+
+async function summarizeMembershipQuotas(
+  prisma: PrismaClient,
+  userId: string,
+  membershipStartsAt: Date,
+  definitions: MembershipQuotaDefinition[],
+  now: Date,
+): Promise<MembershipQuotaSummary[]> {
+  if (definitions.length === 0) return [];
+  const canonicalModelIds = [...new Set(definitions.map(quota => quota.canonicalModelId))];
+  const ranges = definitions.map(quota => membershipQuotaPeriodRange(quota.period, now));
+  const earliestStart = ranges.reduce(
+    (earliest, range) => range.start < earliest ? range.start : earliest,
+    ranges[0]!.start,
+  );
+  const usageStart = membershipStartsAt > earliestStart ? membershipStartsAt : earliestStart;
+  const [models, settlements] = await Promise.all([
+    prisma.aiModel.findMany({
+      where: { id: { in: canonicalModelIds } },
+      select: { id: true, displayName: true },
+    }),
+    prisma.aiBillingSettlement.findMany({
+      where: {
+        canonicalModelId: { in: canonicalModelIds },
+        createdAt: { gte: usageStart, lt: ranges.reduce(
+          (latest, range) => range.end > latest ? range.end : latest,
+          ranges[0]!.end,
+        ) },
+        request: { userId },
+      },
+      select: { canonicalModelId: true, breakdown: true, createdAt: true },
+    }),
+  ]);
+  const names = new Map(models.map(model => [model.id, model.displayName]));
+
+  return definitions.flatMap((definition) => {
+    const modelName = names.get(definition.canonicalModelId)?.trim();
+    if (!modelName) return [];
+    const range = membershipQuotaPeriodRange(definition.period, now);
+    const start = membershipStartsAt > range.start ? membershipStartsAt : range.start;
+    const usedBigInt = settlements.reduce((total, settlement) => {
+      if (settlement.canonicalModelId !== definition.canonicalModelId
+        || settlement.createdAt < start
+        || settlement.createdAt >= range.end) return total;
+      return total + (definition.type === 'IMAGE_COUNT'
+        ? settledImageCount(settlement.breakdown)
+        : settledTokenCount(settlement.breakdown));
+    }, 0n);
+    const used = safeQuotaNumber(usedBigInt);
+    return [{
+      ...definition,
+      modelName,
+      used,
+      remaining: Math.max(0, definition.limit - used),
+      resetAt: range.end.toISOString(),
+    }];
+  });
 }
 
 export async function getMembershipPlans(prisma: PrismaClient) {
@@ -305,13 +485,28 @@ export async function getMembershipPlans(prisma: PrismaClient) {
   }));
 }
 
-export async function getMembershipForUser(prisma: PrismaClient, userId: string) {
+export async function getMembershipForUser(prisma: PrismaClient, userId: string, now = new Date()) {
   const membership = await prisma.userMembership.findFirst({
-    where: { userId, status: 'ACTIVE', expiresAt: { gt: new Date() } },
+    where: { userId, status: 'ACTIVE', expiresAt: { gt: now } },
     orderBy: { expiresAt: 'desc' },
-    include: { plan: true },
+    include: {
+      plan: {
+        include: {
+          versions: { orderBy: { version: 'desc' }, take: 1, select: { freeQuota: true } },
+        },
+      },
+    },
   });
-  return membership ? serializeMembership(membership) : null;
+  if (!membership) return null;
+  const definitions = parseMembershipQuotaDefinitions(membership.plan.versions[0]?.freeQuota);
+  const quotas = await summarizeMembershipQuotas(
+    prisma,
+    userId,
+    membership.startsAt,
+    definitions,
+    now,
+  );
+  return serializeMembership(membership, quotas);
 }
 
 export async function getReferralSnapshot(prisma: PrismaClient, userId: string) {
