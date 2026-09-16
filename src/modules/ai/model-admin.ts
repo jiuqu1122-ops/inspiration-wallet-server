@@ -640,7 +640,6 @@ async function mapDiscoveryToCanonicalTransaction(
   transaction: Prisma.TransactionClient,
   discoveryId: string,
   canonicalModelKey: string,
-  expectedUpdatedAt?: string,
   context: AdminMutationContext = { actor: 'admin-api', requestId: randomUUID() },
 ) {
   const [discovery, model] = await Promise.all([
@@ -649,8 +648,7 @@ async function mapDiscoveryToCanonicalTransaction(
   ]);
   if (!discovery) throw new AiModelAdminError('NOT_FOUND', 'Upstream discovery was not found', 404);
   if (!model) throw new AiModelAdminError('NOT_FOUND', 'Canonical model was not found', 404);
-  if (discovery.status !== 'UNMAPPED'
-    || (expectedUpdatedAt && asIso(discovery.updatedAt) !== asIso(expectedUpdatedAt))) {
+  if (discovery.status !== 'UNMAPPED') {
     throw new AiModelAdminError('CONFLICT', 'Upstream mapping was modified by another administrator', 409);
   }
   if (discovery.suggestedModality && discovery.suggestedModality !== model.modality) {
@@ -707,7 +705,7 @@ async function mapDiscoveryToCanonicalTransaction(
     });
   }
   const discoveryUpdate = await transaction.aiUpstreamDiscovery.updateMany({
-    where: { id: discovery.id, status: 'UNMAPPED', updatedAt: discovery.updatedAt },
+    where: { id: discovery.id, status: 'UNMAPPED' },
     data: { status: 'MAPPED', suggestedModelId: model.id },
   });
   if (discoveryUpdate.count !== 1) {
@@ -732,12 +730,14 @@ export async function mapDiscoveryToCanonical(
   expectedUpdatedAt?: string,
   context: AdminMutationContext = { actor: 'admin-api', requestId: randomUUID() },
 ) {
+  // Retained for compatibility with older callers. Discovery timestamps are
+  // synchronization state and must not participate in the mapping CAS.
+  void expectedUpdatedAt;
   return prisma.$transaction(
     transaction => mapDiscoveryToCanonicalTransaction(
       transaction,
       discoveryId,
       canonicalModelKey,
-      expectedUpdatedAt,
       context,
     ),
     { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
@@ -763,8 +763,7 @@ export async function createCanonicalFromDiscovery(
   return prisma.$transaction(async (transaction) => {
     const discovery = await transaction.aiUpstreamDiscovery.findUnique({ where: { id: discoveryId } });
     if (!discovery) throw new AiModelAdminError('NOT_FOUND', 'Upstream discovery was not found', 404);
-    if (discovery.status !== 'UNMAPPED'
-      || (input.expectedUpdatedAt && asIso(discovery.updatedAt) !== asIso(input.expectedUpdatedAt))) {
+    if (discovery.status !== 'UNMAPPED') {
       throw new AiModelAdminError('CONFLICT', 'Upstream mapping was modified by another administrator', 409);
     }
     if (discovery.suggestedModality && discovery.suggestedModality !== input.modality) {
@@ -805,7 +804,6 @@ export async function createCanonicalFromDiscovery(
       transaction,
       discoveryId,
       canonicalModelKey,
-      input.expectedUpdatedAt,
       context,
     );
     return model;

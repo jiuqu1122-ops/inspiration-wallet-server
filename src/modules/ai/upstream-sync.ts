@@ -262,7 +262,13 @@ export async function syncUpstreamModels(prisma: PrismaClient, providerId: strin
           after: item.cost,
         });
       }
-      if (!existingRoute.canonicalModelId) {
+      const currentRoute = !existingRoute.canonicalModelId
+        ? await prisma.aiModelRoute.findUnique({
+          where: { id: existingRoute.id },
+          select: { canonicalModelId: true },
+        })
+        : existingRoute;
+      if (currentRoute && !currentRoute.canonicalModelId) {
         const knownDiscovery = await prisma.aiUpstreamDiscovery.findUnique({
           where: { channelId_upstreamModelId: { channelId: provider.id, upstreamModelId: item.upstreamModelId } },
         });
@@ -291,8 +297,6 @@ export async function syncUpstreamModels(prisma: PrismaClient, providerId: strin
             ...(item.duration ? { duration: item.duration } : {}),
             ...(item.cost ? { discoveredCost: item.cost } : {}),
             metadata: item.metadata,
-            status: 'UNMAPPED',
-            suggestedModelId: null,
             lastSyncedAt: new Date(),
           },
         });

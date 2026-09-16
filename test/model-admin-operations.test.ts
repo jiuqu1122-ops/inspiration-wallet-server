@@ -1,5 +1,6 @@
-import type { PrismaClient } from '@prisma/client';
-import { describe, expect, it, vi } from 'vitest';
+import type { AiProviderChannel, PrismaClient } from '@prisma/client';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { encryptProviderSecrets } from '../src/lib/provider-secrets.js';
 import {
   AiModelAdminError,
   createCanonicalFromDiscovery,
@@ -10,6 +11,7 @@ import {
   updateAdminAiModel,
   updateAdminAiRoute,
 } from '../src/modules/ai/model-admin.js';
+import { syncUpstreamModels } from '../src/modules/ai/upstream-sync.js';
 
 const context = { actor: 'admin-api', requestId: 'request-test' };
 const updatedAt = new Date('2026-09-09T08:00:00.000Z');
@@ -19,6 +21,10 @@ function withTransaction<T extends object>(transaction: T) {
     $transaction: vi.fn(async (callback: (client: T) => unknown) => callback(transaction)),
   } as unknown as PrismaClient;
 }
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe('AI Model Center route operations', () => {
   it('preserves administrator-selected GPT Image 2.5 resolutions', async () => {
@@ -231,10 +237,11 @@ describe('AI Model Center route operations', () => {
       provider: discovery.provider,
       upstreamModelId: discovery.upstreamModelId,
     }));
+    const discoveryUpdate = vi.fn(async () => ({ count: 1 }));
     const transaction = {
       aiUpstreamDiscovery: {
         findUnique: vi.fn(async () => discovery),
-        updateMany: vi.fn(async () => ({ count: 1 })),
+        updateMany: discoveryUpdate,
       },
       aiModel: {
         create: modelCreate,
@@ -257,12 +264,16 @@ describe('AI Model Center route operations', () => {
       displayName: model.displayName,
       modality: 'image',
       billingType: 'image_resolution',
-      expectedUpdatedAt: updatedAt.toISOString(),
+      expectedUpdatedAt: '2026-09-09T07:59:59.000Z',
     }, context);
 
     expect(transactionRunner).toHaveBeenCalledTimes(1);
     expect(modelCreate).toHaveBeenCalledOnce();
     expect(routeUpsert).toHaveBeenCalledOnce();
+    expect(discoveryUpdate).toHaveBeenCalledWith({
+      where: { id: discovery.id, status: 'UNMAPPED' },
+      data: { status: 'MAPPED', suggestedModelId: model.id },
+    });
     expect(result).toEqual(model);
   });
 
@@ -535,5 +546,316 @@ describe('AI Model Center route operations', () => {
     expect(routeUpsert).toHaveBeenCalled();
     expect(aliasUpdate).not.toHaveBeenCalled();
     expect(aliasDelete).not.toHaveBeenCalled();
+  });
+
+  it('unmaps, syncs, and remaps the same route after discovery synchronization changes its timestamp', async () => {
+    const sourceModel = {
+      id: 'model-round-trip-source',
+      canonicalModelKey: 'round-trip-source',
+      displayName: 'Round Trip Source',
+      modality: 'image',
+      defaultRouteId: null,
+    };
+    const targetModel = {
+      id: 'model-round-trip-target',
+      canonicalModelKey: 'round-trip-target',
+      displayName: 'Round Trip Target',
+      modality: 'image',
+      defaultRouteId: null,
+    };
+    let route = {
+      id: 'route-round-trip',
+      canonicalModelId: sourceModel.id as string | null,
+      canonicalModel: sourceModel,
+      channelId: 'channel-round-trip',
+      channel: { id: 'channel-round-trip', priority: 17 },
+      provider: 'NEW_API',
+      upstreamModelId: 'vendor/image-round-trip',
+      enabled: true,
+      priority: 17,
+      upstreamAvailable: true,
+      healthStatus: 'HEALTHY',
+      capabilitiesOverride: { supportedResolutions: ['2k', '4k'] },
+      costProfile: { cnyPerImageByResolution: { '2k': 0.18, '4k': 0.32 } },
+      metadata: { upstreamLabel: 'Round Trip Image' },
+      lastSyncedAt: new Date('2026-09-09T07:30:00.000Z'),
+      updatedAt,
+    };
+    const original = {
+      id: route.id,
+      upstreamModelId: route.upstreamModelId,
+      channelId: route.channelId,
+      costProfile: route.costProfile,
+      priority: route.priority,
+    };
+    let discovery: Record<string, unknown> | null = null;
+    let alias: Record<string, unknown> | null = {
+      id: 'alias-round-trip',
+      canonicalModelId: sourceModel.id,
+      source: 'ROUTE_MAPPING',
+    };
+    const discoveryUpdate = vi.fn(async ({ where, data }: {
+      where: { id: string; status: string };
+      data: Record<string, unknown>;
+    }) => {
+      if (!discovery || discovery.id !== where.id || discovery.status !== where.status) return { count: 0 };
+      discovery = { ...discovery, ...data, updatedAt: new Date('2026-09-09T08:10:00.000Z') };
+      return { count: 1 };
+    });
+    const transaction = {
+      aiModelRoute: {
+        findUnique: vi.fn(async () => route),
+        updateMany: vi.fn(async ({ where, data }: {
+          where: { id: string; canonicalModelId: string; updatedAt: Date };
+          data: { canonicalModelId: null; enabled: false };
+        }) => {
+          if (where.id !== route.id
+            || where.canonicalModelId !== route.canonicalModelId
+            || where.updatedAt !== route.updatedAt) return { count: 0 };
+          route = {
+            ...route,
+            ...data,
+            canonicalModel: sourceModel,
+            updatedAt: new Date('2026-09-09T08:01:00.000Z'),
+          };
+          return { count: 1 };
+        }),
+        findFirst: vi.fn(async () => null),
+        findUniqueOrThrow: vi.fn(async () => route),
+        upsert: vi.fn(async ({ update }: { update: { canonicalModelId: string; enabled: false } }) => {
+          route = {
+            ...route,
+            ...update,
+            canonicalModel: targetModel,
+            updatedAt: new Date('2026-09-09T08:10:00.000Z'),
+          };
+          return route;
+        }),
+      },
+      aiModel: {
+        findUnique: vi.fn(async ({ where, include }: {
+          where: { id?: string; canonicalModelKey?: string };
+          include?: object;
+        }) => {
+          const model = where.canonicalModelKey === targetModel.canonicalModelKey || where.id === targetModel.id
+            ? targetModel
+            : where.id === sourceModel.id ? sourceModel : null;
+          return model && include ? { ...model, pricing: null, routes: [] } : model;
+        }),
+        update: vi.fn(async () => ({})),
+      },
+      aiModelAlias: {
+        findUnique: vi.fn(async () => alias),
+        delete: vi.fn(async () => { alias = null; }),
+        create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
+          alias = { id: 'alias-round-trip-remapped', ...data };
+          return alias;
+        }),
+      },
+      aiUpstreamDiscovery: {
+        findUnique: vi.fn(async () => discovery && { ...discovery, channel: route.channel }),
+        upsert: vi.fn(async ({ create, update }: {
+          create: Record<string, unknown>;
+          update: Record<string, unknown>;
+        }) => {
+          discovery = discovery
+            ? { ...discovery, ...update, updatedAt: new Date('2026-09-09T08:01:00.000Z') }
+            : { id: 'discovery-round-trip', ...create, updatedAt: new Date('2026-09-09T08:01:00.000Z') };
+          return discovery;
+        }),
+        updateMany: discoveryUpdate,
+      },
+      adminOperation: { create: vi.fn(async () => ({})) },
+    };
+    const prisma = withTransaction(transaction);
+
+    await unmapAdminAiRoute(prisma, route.id, {
+      currentCanonicalModelId: sourceModel.id,
+      expectedUpdatedAt: updatedAt.toISOString(),
+    }, context);
+
+    expect(route).toMatchObject({ id: original.id, canonicalModelId: null, enabled: false });
+    expect(discovery).toMatchObject({ status: 'UNMAPPED' });
+    const pageUpdatedAt = (discovery as { updatedAt: Date }).updatedAt;
+    const syncedAt = new Date('2026-09-09T08:05:00.000Z');
+    discovery = {
+      ...discovery,
+      updatedAt: syncedAt,
+      lastSyncedAt: syncedAt,
+      metadata: { upstreamLabel: 'Round Trip Image', syncRevision: 2 },
+    };
+
+    await expect(mapDiscoveryToCanonical(
+      prisma,
+      (discovery as { id: string }).id,
+      targetModel.canonicalModelKey,
+      pageUpdatedAt.toISOString(),
+      context,
+    )).resolves.toMatchObject({ id: original.id, canonicalModelId: targetModel.id });
+
+    expect(route).toMatchObject({
+      id: original.id,
+      upstreamModelId: original.upstreamModelId,
+      channelId: original.channelId,
+      costProfile: original.costProfile,
+      priority: original.priority,
+      canonicalModelId: targetModel.id,
+      enabled: false,
+    });
+    expect(discovery).toMatchObject({
+      status: 'MAPPED',
+      suggestedModelId: targetModel.id,
+      lastSyncedAt: syncedAt,
+      metadata: { upstreamLabel: 'Round Trip Image', syncRevision: 2 },
+    });
+    expect(discoveryUpdate).toHaveBeenCalledWith({
+      where: { id: 'discovery-round-trip', status: 'UNMAPPED' },
+      data: { status: 'MAPPED', suggestedModelId: targetModel.id },
+    });
+  });
+
+  it('allows only one of two concurrent mappings to claim an unmapped discovery', async () => {
+    const models = [{ id: 'model-concurrent-a', canonicalModelKey: 'concurrent-a', modality: 'image' }, {
+      id: 'model-concurrent-b', canonicalModelKey: 'concurrent-b', modality: 'image',
+    }];
+    let discoveryStatus = 'UNMAPPED';
+    let discoveryReads = 0;
+    let releaseReads!: () => void;
+    const bothReadsStarted = new Promise<void>((resolve) => { releaseReads = resolve; });
+    const discoveryUpdate = vi.fn(async ({ where, data }: {
+      where: { id: string; status: string };
+      data: { status: string };
+    }) => {
+      if (where.id !== 'discovery-concurrent' || discoveryStatus !== where.status) return { count: 0 };
+      discoveryStatus = data.status;
+      return { count: 1 };
+    });
+    const transaction = {
+      aiUpstreamDiscovery: {
+        findUnique: vi.fn(async () => {
+          discoveryReads += 1;
+          if (discoveryReads === 2) releaseReads();
+          await bothReadsStarted;
+          return {
+            id: 'discovery-concurrent',
+            status: 'UNMAPPED',
+            updatedAt,
+            provider: 'NEW_API',
+            channelId: 'channel-concurrent',
+            upstreamModelId: 'vendor/concurrent-image',
+            suggestedModality: 'image',
+            availability: 'AVAILABLE',
+            lastSyncedAt: updatedAt,
+            channel: { priority: 9 },
+          };
+        }),
+        updateMany: discoveryUpdate,
+      },
+      aiModel: {
+        findUnique: vi.fn(async ({ where, include }: {
+          where: { id?: string; canonicalModelKey?: string };
+          include?: object;
+        }) => {
+          const model = models.find(item => item.id === where.id || item.canonicalModelKey === where.canonicalModelKey) ?? null;
+          return model && include ? { ...model, pricing: null, routes: [] } : model;
+        }),
+      },
+      aiModelRoute: {
+        upsert: vi.fn(async ({ update }: { update: { canonicalModelId: string } }) => ({
+          id: 'route-concurrent',
+          canonicalModelId: update.canonicalModelId,
+          provider: 'NEW_API',
+          upstreamModelId: 'vendor/concurrent-image',
+        })),
+      },
+      aiModelAlias: {
+        findUnique: vi.fn(async () => null),
+        create: vi.fn(async () => ({})),
+      },
+      adminOperation: { create: vi.fn(async () => ({})) },
+    };
+    const prisma = withTransaction(transaction);
+
+    const results = await Promise.allSettled(models.map((model, index) => mapDiscoveryToCanonical(
+      prisma,
+      'discovery-concurrent',
+      model.canonicalModelKey,
+      updatedAt.toISOString(),
+      { actor: 'admin-api', requestId: `concurrent-${index}` },
+    )));
+
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find(result => result.status === 'rejected');
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      reason: expect.objectContaining({ code: 'CONFLICT', statusCode: 409 }),
+    });
+    expect(discoveryStatus).toBe('MAPPED');
+    expect(discoveryUpdate).toHaveBeenCalledTimes(2);
+    for (const [call] of discoveryUpdate.mock.calls) {
+      expect(call.where).toEqual({ id: 'discovery-concurrent', status: 'UNMAPPED' });
+    }
+  });
+
+  it('does not let a late sync downgrade a discovery after its route was remapped', async () => {
+    const provider = {
+      id: 'provider-sync-race',
+      name: 'provider-sync-race',
+      kind: 'NEW_API',
+      status: 'ACTIVE',
+      priority: 10,
+      baseUrl: 'https://8.8.8.8',
+      defaultModel: null,
+      allowInsecureHttp: false,
+      encryptedSecrets: encryptProviderSecrets({ apiKey: 'sk-test', headers: {} }),
+      apiKeyLast4: 'test',
+      capabilities: ['IMAGE'],
+      paramOverrides: null,
+      lastTestStatus: null,
+      lastTestMessage: null,
+      lastTestModelCount: null,
+      lastTestedAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as AiProviderChannel;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      data: [{ id: 'vendor/sync-race-image' }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+    const staleRoute = {
+      id: 'route-sync-race',
+      canonicalModelId: null,
+      upstreamAvailable: true,
+      healthStatus: 'HEALTHY',
+      costProfile: null,
+      metadata: null,
+    };
+    const discovery = { id: 'discovery-sync-race', status: 'MAPPED', suggestedModelId: 'model-remapped' };
+    const discoveryUpsert = vi.fn();
+    const routeRecheck = vi.fn(async () => ({ canonicalModelId: 'model-remapped' }));
+    const prisma = {
+      aiProviderChannel: { findUnique: vi.fn(async () => provider) },
+      aiModelRoute: {
+        findFirst: vi.fn(async () => staleRoute),
+        findUnique: routeRecheck,
+        update: vi.fn(async () => ({})),
+      },
+      aiUpstreamDiscovery: {
+        findUnique: vi.fn(async () => discovery),
+        upsert: discoveryUpsert,
+      },
+    } as unknown as PrismaClient;
+
+    await expect(syncUpstreamModels(prisma, provider.id)).resolves.toMatchObject({ mapped: 1, unmapped: 0 });
+
+    expect(routeRecheck).toHaveBeenCalledWith({
+      where: { id: staleRoute.id },
+      select: { canonicalModelId: true },
+    });
+    expect(discoveryUpsert).not.toHaveBeenCalled();
+    expect(discovery).toEqual({
+      id: 'discovery-sync-race',
+      status: 'MAPPED',
+      suggestedModelId: 'model-remapped',
+    });
   });
 });
