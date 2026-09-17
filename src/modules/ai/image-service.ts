@@ -391,6 +391,19 @@ export type ImageInput = {
   count: number;
 };
 
+type UselgImageDiagnosticContext = {
+  clientRequestId: string;
+  providerId: string;
+  model: string;
+};
+
+type UselgImageResolveSourceType =
+  | 'immediate'
+  | 'status'
+  | 'result_url'
+  | 'signed_url'
+  | 'asset_content';
+
 type ImageAdapterRouteContext = {
   adapterKey: string | null;
   adapterConfig: unknown;
@@ -1225,11 +1238,17 @@ export async function generateUselgGeminiImages(
   input: ImageInput,
   preserveUpstreamModel = false,
 ) {
+  const model = preserveUpstreamModel ? input.model : resolveUselgImageModel(input.model);
+  const diagnosticContext: UselgImageDiagnosticContext = {
+    clientRequestId: input.clientRequestId,
+    providerId: provider.id,
+    model,
+  };
   return generateGeminiImageConfigImages(
     provider,
     secrets,
     input,
-    preserveUpstreamModel ? input.model : resolveUselgImageModel(input.model),
+    model,
     'uselg Gemini',
     true,
     (started) => resolveUselgImageResponse(
@@ -1238,8 +1257,11 @@ export async function generateUselgGeminiImages(
       started,
       input.inputImages,
       1,
+      undefined,
+      diagnosticContext,
     ),
     (outputIndex) => uselgImageRequestHeaders(input, outputIndex),
+    diagnosticContext,
   );
 }
 
@@ -1252,6 +1274,7 @@ async function generateGeminiImageConfigImages(
   preferUrlResults = false,
   resolvePendingResponse?: (started: unknown) => Promise<string[]>,
   requestHeaders?: (outputIndex: number) => Record<string, string> | undefined,
+  diagnosticContext?: UselgImageDiagnosticContext,
 ) {
   const materialized = await Promise.all(input.inputImages.map(materializeNewApiReferenceImage));
   const parts = [
@@ -1261,6 +1284,15 @@ async function generateGeminiImageConfigImages(
   const images: string[] = [];
   for (let index = 0; index < input.count; index += 1) {
     let value: unknown;
+    const generateStartedAt = Date.now();
+    if (diagnosticContext) {
+      console.info('[uselg_gemini_generate_started]', {
+        clientRequestId: diagnosticContext.clientRequestId,
+        providerId: diagnosticContext.providerId,
+        model: diagnosticContext.model,
+        timestamp: new Date(generateStartedAt).toISOString(),
+      });
+    }
     try {
       value = await bigmodelRequest(
         provider,
@@ -1287,6 +1319,19 @@ async function generateGeminiImageConfigImages(
       continue;
     }
     const immediate = selectUniqueImages(value, input.inputImages, 1, preferUrlResults);
+    if (diagnosticContext) {
+      console.info('[uselg_gemini_generate_response]', {
+        clientRequestId: diagnosticContext.clientRequestId,
+        providerId: diagnosticContext.providerId,
+        model: diagnosticContext.model,
+        durationMs: Date.now() - generateStartedAt,
+        hasImmediateImage: immediate.length > 0,
+        hasTaskId: Boolean(getTaskId(value)),
+        taskState: newApiImageTaskState(value),
+        hasStatusUrl: Boolean(nestedStringByKeys(value, new Set(['status_url', 'poll_url']))),
+        hasResultUrl: Boolean(nestedStringByKeys(value, new Set(['result_url']))),
+      });
+    }
     images.push(...(
       immediate.length > 0 || !resolvePendingResponse
         ? immediate
@@ -1916,29 +1961,80 @@ export async function resolveUselgImageResponse(
   wait: (milliseconds: number) => Promise<unknown> = (
     milliseconds,
   ) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  diagnosticContext?: UselgImageDiagnosticContext,
 ) {
+  const resolveStartedAt = Date.now();
   const immediate = uniqueUselgImages(started, inputImages, count);
-  if (immediate.length) return immediate;
   const taskId = getTaskId(started);
+  const initialState = newApiImageTaskState(started);
+  const initialStatusUrl = nestedStringByKeys(started, new Set(['status_url', 'poll_url']));
+  const initialResultUrl = nestedStringByKeys(started, new Set(['result_url']));
+  const initialPollAfterMs = uselgPollAfterMs(started);
+  const complete = (images: string[], sourceType: UselgImageResolveSourceType) => {
+    if (diagnosticContext) {
+      console.info('[uselg_image_resolve_complete]', {
+        clientRequestId: diagnosticContext.clientRequestId,
+        taskId,
+        durationMs: Date.now() - resolveStartedAt,
+        sourceType,
+      });
+    }
+    return images;
+  };
+  if (diagnosticContext) {
+    console.info('[uselg_image_resolve_started]', {
+      clientRequestId: diagnosticContext.clientRequestId,
+      taskId,
+      initialState,
+      hasStatusUrl: Boolean(initialStatusUrl),
+      hasResultUrl: Boolean(initialResultUrl),
+      pollAfterMs: initialPollAfterMs,
+    });
+  }
+  if (immediate.length) return complete(immediate, 'immediate');
   if (!taskId) throw new Error('uselg 没有返回图片数据或 task_id');
 
-  let statusUrl = nestedStringByKeys(started, new Set(['status_url', 'poll_url']))
+  let statusUrl = initialStatusUrl
     || `/v1/images/tasks/${encodeURIComponent(taskId)}?view=summary`;
-  let resultUrl = nestedStringByKeys(started, new Set(['result_url']));
-  let pollAfterMs = uselgPollAfterMs(started);
+  let resultUrl = initialResultUrl;
+  let pollAfterMs = initialPollAfterMs;
   let lastStatus: unknown = started;
   let lastPollError: unknown = null;
+  let attempt = 0;
   const deadline = Date.now() + IMAGE_GENERATION_TIMEOUT_MS;
 
   while (Date.now() < deadline) {
-    await wait(pollAfterMs);
+    const currentPollAfterMs = pollAfterMs;
+    await wait(currentPollAfterMs);
+    attempt += 1;
+    const pollStartedAt = Date.now();
+    if (diagnosticContext) {
+      console.info('[uselg_image_poll_started]', {
+        clientRequestId: diagnosticContext.clientRequestId,
+        taskId,
+        attempt,
+        pollAfterMs: currentPollAfterMs,
+        targetType: 'status',
+      });
+    }
     try {
       lastStatus = await providerRequest(provider, secrets, statusUrl, undefined, 45_000);
       lastPollError = null;
     } catch (error) {
       const errorImages = imagesFromUpstreamError(error, inputImages, count);
-      if (errorImages.length) return errorImages;
-      if (!isRetryableNewApiTaskPollError(error)) throw error;
+      const retryable = isRetryableNewApiTaskPollError(error);
+      if (diagnosticContext) {
+        console.warn('[uselg_image_poll_failed]', {
+          clientRequestId: diagnosticContext.clientRequestId,
+          taskId,
+          attempt,
+          durationMs: Date.now() - pollStartedAt,
+          errorName: error instanceof Error ? error.name : 'unknown',
+          retryable,
+        });
+      }
+      if (errorImages.length) return complete(errorImages, 'status');
+      if (!retryable) throw error;
       lastPollError = error;
       continue;
     }
@@ -1947,10 +2043,28 @@ export async function resolveUselgImageResponse(
     resultUrl = nestedStringByKeys(lastStatus, new Set(['result_url'])) || resultUrl;
     pollAfterMs = uselgPollAfterMs(lastStatus);
     const images = uniqueUselgImages(lastStatus, inputImages, count);
-    if (images.length) return images;
+    const state = newApiImageTaskState(lastStatus);
+    const assets = collectUselgTaskAssets(lastStatus);
+    if (diagnosticContext) {
+      console.info('[uselg_image_poll_complete]', {
+        clientRequestId: diagnosticContext.clientRequestId,
+        taskId,
+        attempt,
+        durationMs: Date.now() - pollStartedAt,
+        state,
+        hasImage: images.length > 0,
+        hasResultUrl: Boolean(resultUrl),
+        assetCount: assets.length,
+      });
+    }
+    if (images.length) {
+      const sourceType = assets.some(asset => (
+        asset.key === 'signed_url' && images.includes(asset.value)
+      )) ? 'signed_url' : 'status';
+      return complete(images, sourceType);
+    }
     const failure = getFailure(lastStatus);
     if (failure) throw new UpstreamImageError(502, failure, lastStatus);
-    const state = newApiImageTaskState(lastStatus);
     if (/^(?:failed|failure|error|cancelled|canceled|uncertain|client_disconnected)$/.test(state)) {
       throw new UpstreamImageError(
         502,
@@ -1962,27 +2076,89 @@ export async function resolveUselgImageResponse(
 
     const completedStatus = lastStatus;
     if (resultUrl) {
+      const resultFetchStartedAt = Date.now();
+      if (diagnosticContext) {
+        console.info('[uselg_image_result_fetch_started]', {
+          clientRequestId: diagnosticContext.clientRequestId,
+          taskId,
+        });
+      }
       try {
         const result = await providerRequest(provider, secrets, resultUrl, undefined, 45_000);
         const resultImages = uniqueUselgImages(result, inputImages, count);
-        if (resultImages.length) return resultImages;
+        if (diagnosticContext) {
+          console.info('[uselg_image_result_fetch_complete]', {
+            clientRequestId: diagnosticContext.clientRequestId,
+            taskId,
+            durationMs: Date.now() - resultFetchStartedAt,
+            hasImage: resultImages.length > 0,
+          });
+        }
+        if (resultImages.length) return complete(resultImages, 'result_url');
       } catch (error) {
         const resultImages = imagesFromUpstreamError(error, inputImages, count);
-        if (resultImages.length) return resultImages;
+        if (diagnosticContext) {
+          console.warn('[uselg_image_result_fetch_failed]', {
+            clientRequestId: diagnosticContext.clientRequestId,
+            taskId,
+            durationMs: Date.now() - resultFetchStartedAt,
+            errorName: error instanceof Error ? error.name : 'unknown',
+          });
+        }
+        if (resultImages.length) return complete(resultImages, 'result_url');
       }
     }
 
     const resolvedAssets: string[] = [];
+    let resolvedAssetSourceType: UselgImageResolveSourceType = 'signed_url';
     for (const asset of collectUselgTaskAssets(completedStatus)) {
       if (asset.key === 'signed_url' && /^https?:\/\//i.test(asset.value)) {
         resolvedAssets.push(asset.value);
       } else {
-        const content = await providerImageContentRequest(provider, secrets, asset.value);
-        resolvedAssets.push(...uniqueUselgImages(content, inputImages, count));
+        const assetFetchStartedAt = Date.now();
+        if (diagnosticContext) {
+          console.info('[uselg_image_asset_fetch_started]', {
+            clientRequestId: diagnosticContext.clientRequestId,
+            taskId,
+            assetType: asset.key,
+          });
+        }
+        try {
+          const content = await providerImageContentRequest(provider, secrets, asset.value);
+          const assetImages = uniqueUselgImages(content, inputImages, count);
+          if (diagnosticContext) {
+            console.info('[uselg_image_asset_fetch_complete]', {
+              clientRequestId: diagnosticContext.clientRequestId,
+              taskId,
+              assetType: asset.key,
+              durationMs: Date.now() - assetFetchStartedAt,
+              hasImage: assetImages.length > 0,
+            });
+          }
+          if (assetImages.length) resolvedAssetSourceType = 'asset_content';
+          resolvedAssets.push(...assetImages);
+        } catch (error) {
+          if (diagnosticContext) {
+            console.warn('[uselg_image_asset_fetch_failed]', {
+              clientRequestId: diagnosticContext.clientRequestId,
+              taskId,
+              assetType: asset.key,
+              durationMs: Date.now() - assetFetchStartedAt,
+              hasImage: imagesFromUpstreamError(error, inputImages, count).length > 0,
+              errorName: error instanceof Error ? error.name : 'unknown',
+            });
+          }
+          throw error;
+        }
       }
       if (resolvedAssets.length >= count) break;
     }
-    if (resolvedAssets.length) return Array.from(new Set(resolvedAssets)).slice(0, count);
+    if (resolvedAssets.length) {
+      return complete(
+        Array.from(new Set(resolvedAssets)).slice(0, count),
+        resolvedAssetSourceType,
+      );
+    }
     throw new Error(`uselg 图片任务已成功但没有返回可下载资产：${taskId}`);
   }
 

@@ -1191,11 +1191,12 @@ describe('wallet image provider normalization', () => {
       }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
-      }));
+    }));
     vi.stubGlobal('fetch', fetchMock);
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
 
     await expect(generateUselgGeminiImages(
-      { baseUrl: 'https://api.ai-media.vip', name: 'uselg', kind: 'USELG' } as never,
+      { id: 'uselg-provider-1', baseUrl: 'https://api.ai-media.vip', name: 'uselg', kind: 'USELG' } as never,
       { apiKey: 'sk-uselg', headers: {} },
       {
         userId: 'user-1', clientRequestId: 'request-uselg-async', model: 'Nano Banana Pro', prompt: 'a red apple',
@@ -1209,6 +1210,62 @@ describe('wallet image provider normalization', () => {
     expect(fetchMock.mock.calls[1]?.[0]).toBe(
       'https://api.ai-media.vip/v1/images/tasks/gemini-task-123?view=summary',
     );
+    expect(info).toHaveBeenCalledWith('[uselg_gemini_generate_started]', expect.objectContaining({
+      clientRequestId: 'request-uselg-async',
+      providerId: 'uselg-provider-1',
+      model: 'gemini-3-pro-image-preview',
+      timestamp: expect.any(String),
+    }));
+    expect(info).toHaveBeenCalledWith('[uselg_gemini_generate_response]', expect.objectContaining({
+      clientRequestId: 'request-uselg-async',
+      providerId: 'uselg-provider-1',
+      model: 'gemini-3-pro-image-preview',
+      durationMs: expect.any(Number),
+      hasImmediateImage: false,
+      hasTaskId: true,
+      taskState: 'processing',
+      hasStatusUrl: true,
+      hasResultUrl: false,
+    }));
+    expect(info).toHaveBeenCalledWith('[uselg_image_resolve_started]', expect.objectContaining({
+      clientRequestId: 'request-uselg-async',
+      taskId: 'gemini-task-123',
+      initialState: 'processing',
+      hasStatusUrl: true,
+      hasResultUrl: false,
+      pollAfterMs: 2_000,
+    }));
+    expect(info).toHaveBeenCalledWith('[uselg_image_poll_started]', expect.objectContaining({
+      clientRequestId: 'request-uselg-async',
+      taskId: 'gemini-task-123',
+      attempt: 1,
+      pollAfterMs: 2_000,
+      targetType: 'status',
+    }));
+    expect(info).toHaveBeenCalledWith('[uselg_image_poll_complete]', expect.objectContaining({
+      clientRequestId: 'request-uselg-async',
+      taskId: 'gemini-task-123',
+      attempt: 1,
+      durationMs: expect.any(Number),
+      state: 'success',
+      hasImage: true,
+      hasResultUrl: false,
+      assetCount: 1,
+    }));
+    expect(info).toHaveBeenCalledWith('[uselg_image_resolve_complete]', expect.objectContaining({
+      clientRequestId: 'request-uselg-async',
+      taskId: 'gemini-task-123',
+      durationMs: expect.any(Number),
+      sourceType: 'signed_url',
+    }));
+    const responseOrder = info.mock.calls.findIndex(([event]) => event === '[uselg_gemini_generate_response]');
+    const resolveOrder = info.mock.calls.findIndex(([event]) => event === '[uselg_image_resolve_started]');
+    expect(responseOrder).toBeGreaterThanOrEqual(0);
+    expect(resolveOrder).toBeGreaterThan(responseOrder);
+    const serializedLogs = JSON.stringify(info.mock.calls);
+    expect(serializedLogs).not.toContain(resultUrl);
+    expect(serializedLogs).not.toContain('a red apple');
+    expect(serializedLogs).not.toContain('sk-uselg');
   });
 
   it('polls explicit image adapters through status_url and result_url', async () => {
@@ -2497,6 +2554,120 @@ describe('wallet image provider normalization', () => {
       async () => {},
     )).resolves.toEqual(['https://cdn.example.test/generated.png']);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('times USELG result_url fetching without logging the result URL', async () => {
+    const resultUrl = '/v1/images/tasks/imgtask-result/result?token=secret-result-token';
+    const outputUrl = 'https://cdn.example.test/generated-result.png?signature=secret-signature';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        task_id: 'imgtask-result',
+        status: 'success',
+        result_url: resultUrl,
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [{ url: outputUrl }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+
+    await expect(resolveUselgImageResponse(
+      { id: 'uselg-provider-result', baseUrl: 'https://api.ai-media.vip', name: 'uselg', kind: 'USELG' } as never,
+      { apiKey: 'sk-uselg-result', headers: {} },
+      {
+        task_id: 'imgtask-result',
+        status: 'queued',
+        status_url: '/v1/images/tasks/imgtask-result?view=summary',
+        poll_after_ms: 2_000,
+      },
+      [],
+      1,
+      async () => {},
+      {
+        clientRequestId: 'request-uselg-result',
+        providerId: 'uselg-provider-result',
+        model: 'gemini-3-pro-image-preview',
+      },
+    )).resolves.toEqual([outputUrl]);
+
+    expect(info).toHaveBeenCalledWith('[uselg_image_result_fetch_started]', {
+      clientRequestId: 'request-uselg-result',
+      taskId: 'imgtask-result',
+    });
+    expect(info).toHaveBeenCalledWith('[uselg_image_result_fetch_complete]', expect.objectContaining({
+      clientRequestId: 'request-uselg-result',
+      taskId: 'imgtask-result',
+      durationMs: expect.any(Number),
+      hasImage: true,
+    }));
+    expect(info).toHaveBeenCalledWith('[uselg_image_resolve_complete]', expect.objectContaining({
+      clientRequestId: 'request-uselg-result',
+      taskId: 'imgtask-result',
+      durationMs: expect.any(Number),
+      sourceType: 'result_url',
+    }));
+    const serializedLogs = JSON.stringify(info.mock.calls);
+    expect(serializedLogs).not.toContain(resultUrl);
+    expect(serializedLogs).not.toContain(outputUrl);
+    expect(serializedLogs).not.toContain('sk-uselg-result');
+  });
+
+  it('times USELG asset content fetching without logging the asset URL', async () => {
+    const assetUrl = '/v1/images/assets/imgtask-asset/content?token=secret-asset-token';
+    const output = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        task_id: 'imgtask-asset',
+        status: 'success',
+        assets: [{ download_url: assetUrl }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ output }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+
+    await expect(resolveUselgImageResponse(
+      { id: 'uselg-provider-asset', baseUrl: 'https://api.ai-media.vip', name: 'uselg', kind: 'USELG' } as never,
+      { apiKey: 'sk-uselg-asset', headers: {} },
+      {
+        task_id: 'imgtask-asset',
+        status: 'queued',
+        status_url: '/v1/images/tasks/imgtask-asset?view=summary',
+        poll_after_ms: 2_000,
+      },
+      [],
+      1,
+      async () => {},
+      {
+        clientRequestId: 'request-uselg-asset',
+        providerId: 'uselg-provider-asset',
+        model: 'gemini-3-pro-image-preview',
+      },
+    )).resolves.toEqual([output]);
+
+    expect(info).toHaveBeenCalledWith('[uselg_image_asset_fetch_started]', {
+      clientRequestId: 'request-uselg-asset',
+      taskId: 'imgtask-asset',
+      assetType: 'download_url',
+    });
+    expect(info).toHaveBeenCalledWith('[uselg_image_asset_fetch_complete]', expect.objectContaining({
+      clientRequestId: 'request-uselg-asset',
+      taskId: 'imgtask-asset',
+      assetType: 'download_url',
+      durationMs: expect.any(Number),
+      hasImage: true,
+    }));
+    expect(info).toHaveBeenCalledWith('[uselg_image_resolve_complete]', expect.objectContaining({
+      clientRequestId: 'request-uselg-asset',
+      taskId: 'imgtask-asset',
+      durationMs: expect.any(Number),
+      sourceType: 'asset_content',
+    }));
+    const serializedLogs = JSON.stringify(info.mock.calls);
+    expect(serializedLogs).not.toContain(assetUrl);
+    expect(serializedLogs).not.toContain('sk-uselg-asset');
   });
 
   it('keeps async task content images when the content endpoint reports a post-processing error', async () => {
