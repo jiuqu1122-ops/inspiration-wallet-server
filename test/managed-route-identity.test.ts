@@ -1,6 +1,7 @@
 import type { AiProviderChannel, PrismaClient } from '@prisma/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { encryptProviderSecrets } from '../src/lib/provider-secrets.js';
+import { storageService } from '../src/modules/storage/service.js';
 import { creditDecimal } from '../src/modules/wallets/credit-amount.js';
 
 vi.mock('../src/modules/ai/catalog-seed.js', () => ({
@@ -275,10 +276,17 @@ describe('managed canonical route identity', () => {
       aiProviderChannel: { findMany: findLegacyProviders },
       $transaction: vi.fn(async (operation: (tx: typeof transaction) => unknown) => operation(transaction)),
     } as unknown as PrismaClient;
-    const resultUrl = 'https://api.example.test/v1/ai/image-results/model-a.png';
+    const resultUrl = 'https://208.67.222.222/model-a.png';
+    const storedUrl = 'https://storage.example/generated-images/model-a.png?signature=redacted';
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    vi.spyOn(storageService, 'uploadMedia').mockResolvedValue('generated-images/model-a.png');
+    vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(storedUrl);
     const submissions: Array<{ url: string; model: string; body: Record<string, unknown> }> = [];
     vi.stubGlobal('fetch', vi.fn(async (source: RequestInfo | URL, init?: RequestInit) => {
       const url = String(source);
+      if (url === resultUrl) {
+        return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } });
+      }
       const body = JSON.parse(String(init?.body)) as { generationConfig?: { model?: string }; model?: string } & Record<string, unknown>;
       submissions.push({ url, model: body.model ?? body.generationConfig?.model ?? '', body });
       if (url.startsWith(routeA1Provider.baseUrl)) {
@@ -306,7 +314,7 @@ describe('managed canonical route identity', () => {
       outputFormat: 'png',
       count: 1,
     })).resolves.toMatchObject({
-      images: [resultUrl],
+      images: [storedUrl],
       providerChannelId: routeA2Provider.id,
       model: 'image-model-a',
     });
@@ -394,10 +402,17 @@ describe('managed canonical route identity', () => {
       aiProviderChannel: { findMany: findLegacyProviders },
       $transaction: vi.fn(async (operation: (tx: typeof transaction) => unknown) => operation(transaction)),
     } as unknown as PrismaClient;
-    const resultUrl = 'https://api.example.test/v1/ai/image-results/grok-fallback.png';
+    const resultUrl = 'https://208.67.222.222/grok-fallback.png';
+    const storedUrl = 'https://storage.example/generated-images/grok-fallback.png?signature=redacted';
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    vi.spyOn(storageService, 'uploadMedia').mockResolvedValue('generated-images/grok-fallback.png');
+    vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(storedUrl);
     const submissions: Array<{ url: string; body: Record<string, unknown> }> = [];
     vi.stubGlobal('fetch', vi.fn(async (source: RequestInfo | URL, init?: RequestInit) => {
       const url = String(source);
+      if (url === resultUrl) {
+        return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } });
+      }
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       submissions.push({ url, body });
       if (url.startsWith(primary.baseUrl)) {
@@ -424,7 +439,7 @@ describe('managed canonical route identity', () => {
       outputFormat: 'png',
       count: 1,
     })).resolves.toMatchObject({
-      images: [resultUrl],
+      images: [storedUrl],
       providerChannelId: fallback.id,
       model: 'grok-image',
     });
@@ -447,5 +462,125 @@ describe('managed canonical route identity', () => {
       routeId: 'route-grok-fallback',
       status: 'SUCCEEDED',
     });
+  });
+
+  it('refunds a prepared adapter result when storage persistence fails without regenerating or failing over', async () => {
+    const primary = provider('grok-persistence-primary', 'https://1.1.1.1', 'NEW_API', ['IMAGE']);
+    const fallback = provider('grok-persistence-fallback', 'https://8.8.8.8', 'NEW_API', ['IMAGE']);
+    const route = (id: string, channel: AiProviderChannel, priority: number) => ({
+      id,
+      canonicalModelId: 'model-grok-persistence',
+      provider: 'NEW_API',
+      channelId: channel.id,
+      upstreamModelId: 'grok-imagine-image-quality',
+      adapterKey: 'GROK_IMAGES_API',
+      adapterConfig: null,
+      enabled: true,
+      upstreamAvailable: true,
+      healthStatus: 'HEALTHY',
+      priority,
+      capabilitiesOverride: null,
+      metadata: null,
+      channel,
+    });
+    const model = {
+      id: 'model-grok-persistence',
+      canonicalModelKey: 'grok-image',
+      displayName: 'Grok Image',
+      modality: 'image',
+      enabled: true,
+      visible: true,
+      status: 'PUBLISHED',
+      routingMode: 'MANAGED',
+      billingType: 'image_resolution',
+      capabilities: {
+        supportedResolutions: ['2k'],
+        supportedAspectRatios: ['16:9'],
+      },
+      defaultRouteId: 'route-grok-persistence-primary',
+      routes: [
+        route('route-grok-persistence-primary', primary, 0),
+        route('route-grok-persistence-fallback', fallback, 10),
+      ],
+    };
+    const { transaction, getRequest } = walletTransaction('image-request-grok-persistence');
+    const prisma = {
+      userMembership: { findFirst: vi.fn(async () => null) },
+      aiModel: { findUnique: vi.fn(async () => model) },
+      aiModelPricing: {
+        findUnique: vi.fn(async () => ({
+          currentVersion: {
+            id: 'image-price-grok-persistence',
+            version: 1,
+            publishedAt: new Date(0),
+            pricing: {
+              billingType: 'image_resolution',
+              creditsPerImageByResolution: { '2k': '10', '4k': '20' },
+            },
+          },
+        })),
+      },
+      aiProviderChannel: { findMany: vi.fn(async () => []) },
+      $transaction: vi.fn(async (operation: (tx: typeof transaction) => unknown) => operation(transaction)),
+    } as unknown as PrismaClient;
+    const providerResultUrl = 'https://208.67.222.222/grok-persistence.png';
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    const fetchMock = vi.fn(async (source: RequestInfo | URL) => {
+      const url = String(source);
+      if (url === providerResultUrl) {
+        return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } });
+      }
+      if (url === 'https://1.1.1.1/v1/images/generations') {
+        return new Response(JSON.stringify({ data: [{ url: providerResultUrl }] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const uploadMedia = vi.spyOn(storageService, 'uploadMedia')
+      .mockRejectedValue(new Error('COS unavailable'));
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(executeWalletImageGeneration(prisma, {
+      userId: 'user-1',
+      clientRequestId: 'managed-grok-persistence',
+      model: 'grok-image',
+      prompt: 'a red apple',
+      inputImages: [],
+      aspectRatio: '16:9',
+      resolution: '2k',
+      outputFormat: 'png',
+      count: 1,
+    })).rejects.toMatchObject({
+      code: 'IMAGE_RESULT_PERSISTENCE_FAILED',
+      statusCode: 502,
+    });
+
+    expect(fetchMock.mock.calls.map(([source]) => String(source))).toEqual([
+      'https://1.1.1.1/v1/images/generations',
+      providerResultUrl,
+    ]);
+    expect(uploadMedia).toHaveBeenCalledTimes(3);
+    expect(info.mock.calls.some(([event]) => event === '[image_generation_complete]')).toBe(false);
+    expect(info).toHaveBeenCalledWith('[image_generation_timing]', expect.objectContaining({
+      upstreamDurationMs: expect.any(Number),
+      mirrorDurationMs: expect.any(Number),
+      totalDurationMs: expect.any(Number),
+    }));
+    expect(warn).toHaveBeenCalledWith('[image_result_storage_upload_failed]', expect.objectContaining({
+      clientRequestId: 'managed-grok-persistence',
+      canonicalModel: 'grok-image',
+      routeId: 'route-grok-persistence-primary',
+      providerId: primary.id,
+      adapterKey: 'GROK_IMAGES_API',
+      index: 0,
+      durationMs: expect.any(Number),
+      final: true,
+    }));
+    expect(getRequest()).toMatchObject({ status: 'FAILED' });
+    expect(transaction.wallet.update).toHaveBeenCalledTimes(1);
   });
 });

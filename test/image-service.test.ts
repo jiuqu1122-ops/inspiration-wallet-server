@@ -71,7 +71,8 @@ import {
   videoRouteSupportsRequest,
   xaisAttachmentRegistrationUrls,
 } from '../src/modules/ai/image-service.js';
-import { getImageResult } from '../src/modules/ai/image-result-store.js';
+import { createImageResultFromResponse, getImageResult } from '../src/modules/ai/image-result-store.js';
+import { storageService } from '../src/modules/storage/service.js';
 import { encryptProviderSecrets } from '../src/lib/provider-secrets.js';
 
 describe('Mikoto Seedance model mapping', () => {
@@ -423,8 +424,15 @@ describe('wallet image provider normalization', () => {
       aiPricingConfig: { findUnique: vi.fn(async () => null) },
       $transaction: vi.fn(async (callback: (tx: typeof transaction) => unknown) => callback(transaction)),
     };
-    const resultUrl = 'https://api.example.test/v1/ai/image-results/fallback.png';
+    const resultUrl = 'https://9.9.9.9/fallback.png';
+    const storedUrl = 'https://storage.example/generated-images/fallback.png?signature=redacted';
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    vi.spyOn(storageService, 'uploadMedia').mockResolvedValue('generated-images/fallback.png');
+    vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(storedUrl);
     const fetchMock = vi.fn(async (source: RequestInfo | URL) => {
+      if (String(source) === resultUrl) {
+        return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } });
+      }
       if (String(source).startsWith(primary.baseUrl)) {
         return new Response(JSON.stringify({ error: { message: 'temporarily unavailable' } }), {
           status: 503,
@@ -453,13 +461,14 @@ describe('wallet image provider normalization', () => {
       outputFormat: 'png',
       count: 1,
     })).resolves.toMatchObject({
-      images: [resultUrl],
+      images: [storedUrl],
       providerChannelId: fallback.id,
       providerChannelName: fallback.name,
     });
     expect(fetchMock.mock.calls.map(([source]) => String(source))).toEqual([
       'https://1.1.1.1/v1beta/models/gemini-3-pro-image-preview:generateContent',
       'https://8.8.8.8/v1beta/models/gemini-3-pro-image-preview:generateContent',
+      resultUrl,
     ]);
   });
 
@@ -511,9 +520,17 @@ describe('wallet image provider normalization', () => {
       aiPricingConfig: { findUnique: vi.fn(async () => null) },
       $transaction: vi.fn(async (callback: (tx: typeof transaction) => unknown) => callback(transaction)),
     };
-    const resultUrl = 'https://api.example.test/v1/ai/image-results/fallback-after-task-failure.png';
+    const resultUrl = 'https://9.9.9.9/fallback-after-task-failure.png';
+    const storedUrl = 'https://storage.example/generated-images/fallback-after-task-failure.png?signature=redacted';
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    vi.spyOn(storageService, 'uploadMedia')
+      .mockResolvedValue('generated-images/fallback-after-task-failure.png');
+    vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(storedUrl);
     const fetchMock = vi.fn(async (source: RequestInfo | URL) => {
       const url = String(source);
+      if (url === resultUrl) {
+        return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } });
+      }
       if (url === 'https://1.1.1.1/v1beta/models/gemini-3-pro-image-preview:generateContent') {
         return new Response(JSON.stringify({
           task_id: 'uselg-failed-task',
@@ -557,7 +574,7 @@ describe('wallet image provider normalization', () => {
       outputFormat: 'png',
       count: 1,
     })).resolves.toMatchObject({
-      images: [resultUrl],
+      images: [storedUrl],
       providerChannelId: fallback.id,
       providerChannelName: fallback.name,
     });
@@ -565,6 +582,7 @@ describe('wallet image provider normalization', () => {
       'https://1.1.1.1/v1beta/models/gemini-3-pro-image-preview:generateContent',
       'https://1.1.1.1/v1/images/tasks/uselg-failed-task?view=summary',
       'https://8.8.8.8/v1beta/models/gemini-3-pro-image-preview:generateContent',
+      resultUrl,
     ]);
   });
 
@@ -1400,18 +1418,17 @@ describe('wallet image provider normalization', () => {
     expect(mirror).toHaveBeenCalledTimes(2);
   });
 
-  it('falls back to the XAIS source URL when result mirroring fails', async () => {
+  it('fails XAIS persistence instead of returning the upstream source URL', async () => {
     const source = 'https://xais.example.test/result.png';
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const mirror = vi.fn(async () => { throw new Error('OSS unavailable'); });
 
     await expect(mirrorXaisImageResults([source], 'xais-primary', mirror))
-      .resolves.toEqual([source]);
+      .rejects.toMatchObject({ code: 'IMAGE_RESULT_PERSISTENCE_FAILED' });
     expect(warn).toHaveBeenCalledWith(
-      '[xais_image_result_mirror_failed]',
+      '[image_result_mirror_failed]',
       expect.objectContaining({ provider: 'xais-primary', index: 0 }),
     );
-    warn.mockRestore();
   });
 
   it('normalizes Mikoto Gemini aliases to its native model IDs', () => {
@@ -1430,17 +1447,115 @@ describe('wallet image provider normalization', () => {
       .toBe('gemini-3-pro-image-preview');
   });
 
-  it('mirrors inline and stable image results for every non-XAIS image channel', async () => {
+  it('sends prepared adapter public, inline, and stored results through the common mirror', async () => {
     const mirror = vi.fn(async (source: string, index: number) => (
       `https://api.unmind.art/v1/ai/image-results/mirrored-${index + 1}.png?source=${encodeURIComponent(source.slice(0, 12))}`
     ));
     const inline = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB';
     const stable = 'https://api.unmind.art/v1/ai/image-results/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png';
-    const publicUrl = 'https://bigmodel.example/generated.png';
+    const publicUrl = 'https://provider.example/image.png';
 
     await expect(mirrorGeneratedImageResults([inline, stable, publicUrl], 'Bigmodel', mirror))
       .resolves.toHaveLength(3);
     expect(mirror).toHaveBeenCalledTimes(3);
+    expect(mirror).toHaveBeenNthCalledWith(3, publicUrl, 2, expect.any(Object));
+  });
+
+  it('persists public, inline, and local stored results and returns only storage URLs', async () => {
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    const publicUrl = 'https://1.0.0.1/image.png';
+    const inline = `data:image/png;base64,${png.toString('base64')}`;
+    const uploadedPaths: string[] = [];
+    const uploadMedia = vi.spyOn(storageService, 'uploadMedia').mockImplementation(async (input) => {
+      uploadedPaths.push(String(input.source));
+      return `${input.namespace}/${input.filename}`;
+    });
+    vi.spyOn(storageService, 'getDownloadUrl').mockImplementation(
+      objectName => `https://storage.example/${objectName}?token=test`,
+    );
+    const fetchMock = vi.fn(async () => new Response(png, {
+      status: 200,
+      headers: { 'content-type': 'image/png', 'content-length': String(png.byteLength) },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+
+    const stored = await createImageResultFromResponse(new Response(png, {
+      headers: { 'content-type': 'image/png', 'content-length': String(png.byteLength) },
+    }));
+    const context = {
+      clientRequestId: 'prepared-adapter-result-1',
+      canonicalModel: 'seedream-4.5',
+      routeId: 'route-seedream',
+      providerId: 'provider-seedream',
+      adapterKey: 'SEEDREAM_IMAGES_API',
+    };
+
+    try {
+      const publicResult = await mirrorGeneratedImageResults([publicUrl], 'prepared', undefined, context);
+      const inlineResult = await mirrorGeneratedImageResults([inline], 'prepared', undefined, context);
+      const storedResult = await mirrorGeneratedImageResults([stored], 'prepared', undefined, context);
+
+      for (const result of [publicResult[0], inlineResult[0], storedResult[0]]) {
+        expect(result).toMatch(/^https:\/\/storage\.example\/generated-images\//);
+      }
+      expect(publicResult[0]).not.toBe(publicUrl);
+      expect(inlineResult[0]).not.toBe(inline);
+      expect(storedResult[0]).not.toBe(stored);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(uploadMedia).toHaveBeenCalledTimes(3);
+      expect(uploadMedia).toHaveBeenCalledWith(expect.objectContaining({ namespace: 'generated-images' }));
+      for (const event of [
+        '[image_result_download_started]',
+        '[image_result_download_complete]',
+        '[image_result_storage_upload_started]',
+        '[image_result_storage_upload_complete]',
+      ]) {
+        expect(info).toHaveBeenCalledWith(event, expect.objectContaining({
+          clientRequestId: context.clientRequestId,
+          canonicalModel: context.canonicalModel,
+          routeId: context.routeId,
+          providerId: context.providerId,
+          adapterKey: context.adapterKey,
+          index: 0,
+          durationMs: expect.any(Number),
+        }));
+      }
+    } finally {
+      await Promise.all(Array.from(new Set(uploadedPaths)).map(path => rm(path, { force: true })));
+    }
+  });
+
+  it('retries only the result download after an adapter has already generated the image', async () => {
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    const uploadedPaths: string[] = [];
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('temporary', { status: 503 }))
+      .mockResolvedValueOnce(new Response('temporary', { status: 503 }))
+      .mockResolvedValueOnce(new Response(png, {
+        status: 200,
+        headers: { 'content-type': 'image/png', 'content-length': String(png.byteLength) },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(storageService, 'uploadMedia').mockImplementation(async (input) => {
+      uploadedPaths.push(String(input.source));
+      return `${input.namespace}/${input.filename}`;
+    });
+    vi.spyOn(storageService, 'getDownloadUrl')
+      .mockReturnValue('https://storage.example/generated-images/retried.png?token=test');
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+
+    try {
+      await expect(mirrorGeneratedImageResults([
+        'https://1.0.0.1/retried.png',
+      ], 'prepared')).resolves.toEqual([
+        'https://storage.example/generated-images/retried.png?token=test',
+      ]);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(storageService.uploadMedia).toHaveBeenCalledTimes(1);
+    } finally {
+      await Promise.all(Array.from(new Set(uploadedPaths)).map(path => rm(path, { force: true })));
+    }
   });
 
   it('resolves a completed XAIS image directly from its task ID when the wait response is stale', async () => {

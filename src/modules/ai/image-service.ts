@@ -89,6 +89,9 @@ const XAIS_REFERENCE_DOWNLOAD_RETRY_DELAYS_MS = [500, 1_500];
 const XAIS_IMAGE_TASK_POLL_INTERVAL_MS = 1_200;
 const XAIS_IMAGE_TASK_POLL_REQUEST_TIMEOUT_MS = 6_000;
 const XAIS_RESULT_MIRROR_TIMEOUT_MS = 30_000;
+const IMAGE_RESULT_DOWNLOAD_ATTEMPTS = 3;
+const IMAGE_RESULT_STORAGE_UPLOAD_ATTEMPTS = 3;
+const IMAGE_RESULT_RETRY_BASE_DELAY_MS = 250;
 const MAX_GENERATED_IMAGE_BYTES = 64 * 1024 * 1024;
 const GPT_IMAGE_2_CHROMA_KEY = { red: 255, green: 0, blue: 255 } as const;
 const imageReferenceCache = new Map<string, { dataUrl: string; expiresAt: number }>();
@@ -399,6 +402,23 @@ type ImageAdapterRouteContext = {
   channelId: string;
   upstreamModel: string;
 };
+
+export type ImageResultPersistenceContext = {
+  clientRequestId: string;
+  canonicalModel: string;
+  routeId: string | null;
+  providerId: string;
+  adapterKey: string;
+};
+
+export class ImageResultPersistenceError extends Error {
+  readonly code = 'IMAGE_RESULT_PERSISTENCE_FAILED';
+
+  constructor(cause?: unknown) {
+    super('Generated image result could not be persisted to object storage', { cause });
+    this.name = 'ImageResultPersistenceError';
+  }
+}
 
 class UpstreamImageError extends Error {
   constructor(
@@ -2184,116 +2204,223 @@ async function stageNewApiEditImage(
   }
 }
 
+function imageResultPersistenceLogFields(
+  context: ImageResultPersistenceContext,
+  index: number,
+  durationMs: number,
+) {
+  return {
+    clientRequestId: context.clientRequestId,
+    canonicalModel: context.canonicalModel,
+    routeId: context.routeId,
+    providerId: context.providerId,
+    adapterKey: context.adapterKey,
+    index,
+    durationMs,
+  };
+}
+
+function defaultImageResultPersistenceContext(providerId: string): ImageResultPersistenceContext {
+  return {
+    clientRequestId: '',
+    canonicalModel: '',
+    routeId: null,
+    providerId,
+    adapterKey: 'LEGACY',
+  };
+}
+
+function waitForImageResultRetry(attempt: number) {
+  return new Promise((resolve) => setTimeout(
+    resolve,
+    IMAGE_RESULT_RETRY_BASE_DELAY_MS * (2 ** Math.max(0, attempt - 1)),
+  ));
+}
+
+async function withImageResultDownloadLogging<T>(
+  context: ImageResultPersistenceContext,
+  index: number,
+  operation: () => Promise<T>,
+) {
+  const startedAt = Date.now();
+  console.info('[image_result_download_started]', imageResultPersistenceLogFields(context, index, 0));
+  const result = await operation();
+  console.info(
+    '[image_result_download_complete]',
+    imageResultPersistenceLogFields(context, index, Date.now() - startedAt),
+  );
+  return result;
+}
+
 async function stagePublicGeneratedImageResult(source: string, index: number) {
   const directory = await mkdtemp(join(tmpdir(), 'inspiration-generated-result-'));
   const path = join(directory, 'result.bin');
+  let lastError: unknown = null;
   try {
-    const staged = await downloadPublicImageReferenceToFile(
-      source,
-      path,
-      XAIS_RESULT_MIRROR_TIMEOUT_MS,
-    );
-    const fileSize = (await stat(path)).size;
-    if (fileSize !== staged.size) {
-      throw new Error(`generated image temporary file size mismatch: expected ${staged.size}, received ${fileSize}`);
+    for (let attempt = 0; attempt < IMAGE_RESULT_DOWNLOAD_ATTEMPTS; attempt += 1) {
+      if (attempt > 0) await waitForImageResultRetry(attempt);
+      try {
+        const staged = await downloadPublicImageReferenceToFile(
+          source,
+          path,
+          XAIS_RESULT_MIRROR_TIMEOUT_MS,
+        );
+        const fileSize = (await stat(path)).size;
+        if (fileSize !== staged.size) {
+          throw new Error(`generated image temporary file size mismatch: expected ${staged.size}, received ${fileSize}`);
+        }
+        return {
+          filename: `generated-${index + 1}.${newApiImageExtension(staged.mime)}`,
+          path,
+          mime: staged.mime,
+          size: staged.size,
+          cleanup: () => rm(directory, { recursive: true, force: true }),
+        } satisfies StagedNewApiEditImage;
+      } catch (error) {
+        lastError = error;
+        await rm(path, { force: true }).catch(() => {});
+        if (attempt >= IMAGE_RESULT_DOWNLOAD_ATTEMPTS - 1) throw error;
+      }
     }
-    return {
-      filename: `generated-${index + 1}.${newApiImageExtension(staged.mime)}`,
-      path,
-      mime: staged.mime,
-      size: staged.size,
-      cleanup: () => rm(directory, { recursive: true, force: true }),
-    } satisfies StagedNewApiEditImage;
+    throw lastError instanceof Error ? lastError : new Error('generated image download failed');
   } catch (error) {
     await rm(directory, { recursive: true, force: true }).catch(() => {});
     throw error;
   }
 }
 
-async function uploadStoredImageResultToStorage(stableUrl: string) {
+export async function uploadStoredImageResultToStorage(
+  stableUrl: string,
+  index = 0,
+  context: ImageResultPersistenceContext = defaultImageResultPersistenceContext(''),
+  logResultAcquisition = true,
+) {
   const key = new URL(stableUrl).pathname.split('/').filter(Boolean).pop();
-  const stored = key ? await getImageResult(key) : null;
+  const reopenStoredResult = async () => key ? getImageResult(key) : null;
+  const stored = logResultAcquisition
+    ? await withImageResultDownloadLogging(context, index, reopenStoredResult)
+    : await reopenStoredResult();
   if (!key || !stored) throw new Error('generated image mirror could not reopen the stored result');
-  const objectName = await storageService.uploadMedia({
-    namespace: 'generated-images',
-    filename: key,
-    source: stored.path,
-    mime: stored.mime,
-  });
-  // A successful provider upload is already the commit acknowledgement. Avoid
-  // routing the freshly generated image back through /image-results, where
-  // another one or two COS HEAD requests can delay the first desktop preview.
-  // Recovery lookups re-sign this provider URL before returning it again.
-  return storageService.getDownloadUrl(objectName);
+  const startedAt = Date.now();
+  console.info(
+    '[image_result_storage_upload_started]',
+    imageResultPersistenceLogFields(context, index, 0),
+  );
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < IMAGE_RESULT_STORAGE_UPLOAD_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) await waitForImageResultRetry(attempt);
+    try {
+      const objectName = await storageService.uploadMedia({
+        namespace: 'generated-images',
+        filename: key,
+        source: stored.path,
+        mime: stored.mime,
+      });
+      // A successful provider upload is already the commit acknowledgement. Avoid
+      // routing the freshly generated image back through /image-results, where
+      // another one or two COS HEAD requests can delay the first desktop preview.
+      // Recovery lookups re-sign this provider URL before returning it again.
+      const downloadUrl = storageService.getDownloadUrl(objectName);
+      console.info('[image_result_storage_upload_complete]', {
+        ...imageResultPersistenceLogFields(context, index, Date.now() - startedAt),
+        attempt: attempt + 1,
+      });
+      return downloadUrl;
+    } catch (error) {
+      lastError = error;
+      console.warn('[image_result_storage_upload_failed]', {
+        ...imageResultPersistenceLogFields(context, index, Date.now() - startedAt),
+        attempt: attempt + 1,
+        final: attempt >= IMAGE_RESULT_STORAGE_UPLOAD_ATTEMPTS - 1,
+        errorName: error instanceof Error ? error.name : 'unknown',
+      });
+    }
+  }
+  throw new ImageResultPersistenceError(lastError);
 }
 
-async function mirrorPublicGeneratedImageResultToStorage(source: string, index: number) {
-  const staged = await stagePublicGeneratedImageResult(source, index);
+export async function mirrorPublicGeneratedImageResultToStorage(
+  source: string,
+  index: number,
+  context: ImageResultPersistenceContext = defaultImageResultPersistenceContext(''),
+) {
+  const staged = await withImageResultDownloadLogging(
+    context,
+    index,
+    () => stagePublicGeneratedImageResult(source, index),
+  );
   try {
     if (!staged.path) throw new Error('generated image mirror did not create a temporary file');
     const stableUrl = await createImageResultFromFile(staged.path, staged.mime);
-    return uploadStoredImageResultToStorage(stableUrl);
+    return uploadStoredImageResultToStorage(stableUrl, index, context, false);
   } finally {
     await staged.cleanup().catch(() => {});
   }
 }
 
-async function mirrorInlineGeneratedImageResultToStorage(source: string) {
-  const inline = dataUrlImageBytes(source, MAX_GENERATED_IMAGE_BYTES);
-  const stableUrl = await createImageResultFromResponse(new Response(inline.bytes, {
-    headers: {
-      'content-type': inline.mime,
-      'content-length': String(inline.bytes.byteLength),
-    },
-  }));
-  return uploadStoredImageResultToStorage(stableUrl);
+export async function mirrorInlineGeneratedImageResultToStorage(
+  source: string,
+  index = 0,
+  context: ImageResultPersistenceContext = defaultImageResultPersistenceContext(''),
+) {
+  const stableUrl = await withImageResultDownloadLogging(context, index, async () => {
+    const inline = dataUrlImageBytes(source, MAX_GENERATED_IMAGE_BYTES);
+    return createImageResultFromResponse(new Response(inline.bytes, {
+      headers: {
+        'content-type': inline.mime,
+        'content-length': String(inline.bytes.byteLength),
+      },
+    }));
+  });
+  return uploadStoredImageResultToStorage(stableUrl, index, context, false);
 }
 
-async function mirrorGeneratedImageResultToStorage(source: string, index: number) {
-  if (isStoredImageResultUrl(source)) return uploadStoredImageResultToStorage(source);
-  if (/^data:image\//i.test(source.trim())) return mirrorInlineGeneratedImageResultToStorage(source);
-  return mirrorPublicGeneratedImageResultToStorage(source, index);
+export async function mirrorGeneratedImageResultToStorage(
+  source: string,
+  index: number,
+  context: ImageResultPersistenceContext = defaultImageResultPersistenceContext(''),
+) {
+  if (isStoredImageResultUrl(source)) return uploadStoredImageResultToStorage(source, index, context);
+  if (/^data:image\//i.test(source.trim())) {
+    return mirrorInlineGeneratedImageResultToStorage(source, index, context);
+  }
+  return mirrorPublicGeneratedImageResultToStorage(source, index, context);
 }
+
+type GeneratedImageMirror = (
+  source: string,
+  index: number,
+  context: ImageResultPersistenceContext,
+) => Promise<string>;
 
 export async function mirrorXaisImageResults(
   images: string[],
   providerName: string,
-  mirrorImage: (source: string, index: number) => Promise<string> = mirrorPublicGeneratedImageResultToStorage,
+  mirrorImage: GeneratedImageMirror = mirrorGeneratedImageResultToStorage,
+  context: ImageResultPersistenceContext = defaultImageResultPersistenceContext(providerName),
 ) {
-  return Promise.all(images.map(async (source, index) => {
-    if (!isPublicNewApiImageReference(source) || isStoredImageResultUrl(source)) return source;
-    try {
-      return await mirrorImage(source, index);
-    } catch (error) {
-      console.warn('[xais_image_result_mirror_failed]', {
-        provider: providerName,
-        index,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return source;
-    }
-  }));
+  return mirrorGeneratedImageResults(images, providerName, mirrorImage, context);
 }
 
 export async function mirrorGeneratedImageResults(
   images: string[],
   providerName: string,
-  mirrorImage: (source: string, index: number) => Promise<string> = mirrorGeneratedImageResultToStorage,
+  mirrorImage: GeneratedImageMirror = mirrorGeneratedImageResultToStorage,
+  context: ImageResultPersistenceContext = defaultImageResultPersistenceContext(providerName),
 ) {
   return Promise.all(images.map(async (source, index) => {
     const trimmed = source.trim();
-    if (!isStoredImageResultUrl(trimmed)
-      && !isPublicNewApiImageReference(trimmed)
-      && !/^data:image\//i.test(trimmed)) return source;
     try {
-      return await mirrorImage(trimmed, index);
+      return await mirrorImage(trimmed, index, context);
     } catch (error) {
       console.warn('[image_result_mirror_failed]', {
         provider: providerName,
-        index,
-        error: error instanceof Error ? error.message : String(error),
+        ...imageResultPersistenceLogFields(context, index, 0),
+        errorName: error instanceof Error ? error.name : 'unknown',
       });
-      return source;
+      throw error instanceof ImageResultPersistenceError
+        ? error
+        : new ImageResultPersistenceError(error);
     }
   }));
 }
@@ -3981,23 +4108,40 @@ async function generateImagesFromProvider(
   }
   const upstreamCompletedAt = Date.now();
   const boundedProviderImages = boundProviderImageResults(providerImages, effectiveInput.count);
-  const images = provider.kind === 'XAIS'
-    ? await mirrorXaisImageResults(boundedProviderImages, provider.name)
-    : await mirrorGeneratedImageResults(boundedProviderImages, provider.name);
-  const mirrorCompletedAt = Date.now();
-  console.info('[image_generation_timing]', {
+  const persistenceContext: ImageResultPersistenceContext = {
     clientRequestId: effectiveInput.clientRequestId,
+    canonicalModel: adapterRoute?.canonicalModelKey ?? effectiveInput.model,
+    routeId: adapterRoute?.routeId ?? null,
     providerId: provider.id,
-    provider: provider.name,
-    model: effectiveInput.model,
-    resolution: effectiveInput.resolution ?? '',
-    upstreamDurationMs: upstreamCompletedAt - startedAt,
-    mirrorDurationMs: mirrorCompletedAt - upstreamCompletedAt,
-    totalDurationMs: mirrorCompletedAt - startedAt,
-    resultCount: images.length,
-  });
-  if (!images.length) throw new Error('渠道没有返回图片数据');
-  return images;
+    adapterKey: adapterRoute?.adapterKey?.trim() || 'LEGACY',
+  };
+  let images: string[] = [];
+  try {
+    images = await mirrorGeneratedImageResults(
+      boundedProviderImages,
+      provider.name,
+      mirrorGeneratedImageResultToStorage,
+      persistenceContext,
+    );
+    if (!images.length) throw new Error('渠道没有返回图片数据');
+    return images;
+  } finally {
+    const mirrorCompletedAt = Date.now();
+    console.info('[image_generation_timing]', {
+      clientRequestId: effectiveInput.clientRequestId,
+      canonicalModel: persistenceContext.canonicalModel,
+      routeId: persistenceContext.routeId,
+      providerId: provider.id,
+      provider: provider.name,
+      adapterKey: persistenceContext.adapterKey,
+      model: effectiveInput.model,
+      resolution: effectiveInput.resolution ?? '',
+      upstreamDurationMs: upstreamCompletedAt - startedAt,
+      mirrorDurationMs: mirrorCompletedAt - upstreamCompletedAt,
+      totalDurationMs: mirrorCompletedAt - startedAt,
+      resultCount: images.length,
+    });
+  }
 }
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
@@ -4361,6 +4505,9 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     });
     await releaseImageCredits(prisma, reservationInput, reservation.requestId, reservation.estimated);
     if (error instanceof CloudAiError || error instanceof ModelCatalogError) throw error;
+    if (error instanceof ImageResultPersistenceError) {
+      throw new CloudAiError(error.code, error.message, 502);
+    }
     if (error instanceof ImageAdapterError) {
       const statusCode = error.code === 'PROVIDER_REFERENCE_EDIT_UNSUPPORTED'
         ? 502
