@@ -634,9 +634,33 @@ function providerRequestUrl(provider: Pick<AiProviderChannel, 'baseUrl'>, pathOr
 }
 
 function parseProviderValue(text: string): unknown {
-  const trimmed = text.trim();
-  if (!trimmed) return null;
-  const eventValues = Array.from(trimmed.matchAll(/^data:\s*(.+)$/gmi))
+  let firstContentIndex = 0;
+  while (firstContentIndex < text.length && /\s/.test(text[firstContentIndex]!)) {
+    firstContentIndex += 1;
+  }
+  if (firstContentIndex === text.length) return null;
+
+  const firstCharacter = text[firstContentIndex]!;
+  let jsonParseAttempted = false;
+  if (firstCharacter === '{' || firstCharacter === '[' || firstCharacter === '"'
+    || firstCharacter === '-' || /[0-9tfn]/.test(firstCharacter)) {
+    jsonParseAttempted = true;
+    try {
+      // JSON.parse accepts ordinary surrounding JSON whitespace. Passing the
+      // original string avoids copying a large inline image via trim().
+      return JSON.parse(text) as unknown;
+    } catch {
+      // A leading BOM is JSON whitespace to our detector but not to JSON.parse.
+      if (firstContentIndex > 0) {
+        try { return JSON.parse(text.slice(firstContentIndex)) as unknown; } catch { /* fall through */ }
+      }
+    }
+  }
+
+  // Only reach the SSE scan after a JSON fast-path failed (or when the body
+  // did not look like JSON), so successful multi-megabyte JSON is not scanned
+  // by an unrelated line-oriented regular expression.
+  const eventValues = Array.from(text.matchAll(/^data:\s*(.+)$/gmi))
     .map((match) => match[1]?.trim())
     .filter((value): value is string => Boolean(value && value !== '[DONE]'));
   if (eventValues.length) {
@@ -644,7 +668,11 @@ function parseProviderValue(text: string): unknown {
       try { return JSON.parse(value) as unknown; } catch { return value; }
     });
   }
-  try { return JSON.parse(trimmed) as unknown; } catch { return trimmed; }
+
+  if (!jsonParseAttempted) {
+    try { return JSON.parse(text) as unknown; } catch { /* fall through */ }
+  }
+  return text.trim();
 }
 
 async function providerRequest(
@@ -683,31 +711,96 @@ async function providerRequest(
   }
 }
 
+const IMAGE_DATA_URL_PREFIX = /^data:image\/[a-zA-Z0-9.+-]+;base64,/i;
+const RAW_IMAGE_BASE64_CONTEXT_KEYS = new Set([
+  'data',
+  'base64',
+  'b64_json',
+  'image_base64',
+  'inlinedata',
+  'inline_data',
+]);
+const EXPLICIT_IMAGE_BASE64_CONTEXT_KEYS = new Set([
+  'base64',
+  'b64_json',
+  'image_base64',
+]);
+const INLINE_IMAGE_PAYLOAD_KEYS = new Set([
+  'data',
+  'base64',
+  'b64_json',
+  'image_base64',
+  'inlinedata',
+  'inline_data',
+]);
+
+function rawImageBase64Prefix(value: string) {
+  let prefix = '';
+  for (let index = 0; index < value.length && prefix.length < 12; index += 1) {
+    const character = value[index]!;
+    if (!/\s/.test(character)) prefix += character;
+  }
+  return prefix;
+}
+
 function looksLikeRawImageBase64(value: string) {
-  const compact = value.replace(/\s+/g, '');
-  return compact.length >= 32 && /^(?:iVBORw0KGgo|\/9j\/|R0lGOD|UklGR)/.test(compact);
+  if (value.length < 32) return false;
+  return /^(?:iVBORw0KGgo|\/9j\/|R0lGOD|UklGR)/.test(rawImageBase64Prefix(value));
 }
 
 function rawImageBase64Mime(value: string) {
-  const compact = value.replace(/\s+/g, '');
-  if (compact.startsWith('/9j/')) return 'image/jpeg';
-  if (compact.startsWith('R0lGOD')) return 'image/gif';
-  if (compact.startsWith('UklGR')) return 'image/webp';
+  const prefix = rawImageBase64Prefix(value);
+  if (prefix.startsWith('/9j/')) return 'image/jpeg';
+  if (prefix.startsWith('R0lGOD')) return 'image/gif';
+  if (prefix.startsWith('UklGR')) return 'image/webp';
   return 'image/png';
 }
 
-function collectImageStrings(value: unknown, output: string[] = [], contextKey = ''): string[] {
+function appendImageString(value: string, output: string[], contextKey: string) {
+  if (IMAGE_DATA_URL_PREFIX.test(value)) {
+    output.push(value);
+    return;
+  }
+  const normalizedContextKey = contextKey.toLowerCase();
+  if (value && EXPLICIT_IMAGE_BASE64_CONTEXT_KEYS.has(normalizedContextKey)) {
+    output.push(`data:${rawImageBase64Mime(value)};base64,${value}`);
+    return;
+  }
+  if (looksLikeRawImageBase64(value)) {
+    if (RAW_IMAGE_BASE64_CONTEXT_KEYS.has(normalizedContextKey)
+      || /(?:image|result|output|data|base64|source)/i.test(normalizedContextKey)) {
+      output.push(`data:${rawImageBase64Mime(value)};base64,${value}`);
+    }
+    return;
+  }
+  const dataUrls = value.match(/data:image\/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=]+/g);
+  if (dataUrls) output.push(...dataUrls);
+  output.push(...Array.from(value.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)).map((match) => match[1] ?? ''));
+  const urls = value.match(/https?:\/\/[^\s"'<>)}\]]+/gi);
+  if (urls) output.push(...urls.map((url) => url.replace(/[.,;，。；]+$/g, '')));
+}
+
+function appendInlineImage(record: Record<string, unknown>, output: string[]) {
+  const inlineMime = record.mime_type ?? record.mimeType ?? record.media_type ?? record.mediaType;
+  const inlineData = record.data
+    ?? record.base64
+    ?? record.b64_json
+    ?? record.image_base64
+    ?? record.inlineData
+    ?? record.inline_data;
+  if (typeof inlineMime !== 'string' || !inlineMime.startsWith('image/') || typeof inlineData !== 'string') {
+    return false;
+  }
+  output.push(IMAGE_DATA_URL_PREFIX.test(inlineData)
+    ? inlineData
+    : `data:${inlineMime};base64,${inlineData}`);
+  return true;
+}
+
+export function collectImageStrings(value: unknown, output: string[] = [], contextKey = ''): string[] {
   if (!value) return output;
   if (typeof value === 'string') {
-    const dataUrls = value.match(/data:image\/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=]+/g);
-    if (dataUrls) output.push(...dataUrls);
-    output.push(...Array.from(value.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)).map((match) => match[1] ?? ''));
-    const urls = value.match(/https?:\/\/[^\s"'<>)}\]]+/gi);
-    if (!dataUrls && !urls && /(?:image|result|output|data|base64|source)/i.test(contextKey) && looksLikeRawImageBase64(value)) {
-      const compact = value.replace(/\s+/g, '');
-      output.push(`data:${rawImageBase64Mime(compact)};base64,${compact}`);
-    }
-    if (urls) output.push(...urls.map((url) => url.replace(/[.,;，。；]+$/g, '')));
+    appendImageString(value, output, contextKey);
     return output;
   }
   if (Array.isArray(value)) {
@@ -716,27 +809,23 @@ function collectImageStrings(value: unknown, output: string[] = [], contextKey =
   }
   if (typeof value === 'object') {
     const record = value as Record<string, unknown>;
-    const inlineMime = record.mime_type ?? record.mimeType ?? record.media_type ?? record.mediaType;
-    const inlineData = record.data ?? record.base64 ?? record.b64_json;
-    if (typeof inlineMime === 'string' && inlineMime.startsWith('image/') && typeof inlineData === 'string') {
-      output.push(`data:${inlineMime};base64,${inlineData.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '')}`);
-    }
-    for (const [key, nested] of Object.entries(record)) {
+    const hasInlineImage = appendInlineImage(record, output);
+    for (const key of Object.keys(record)) {
       const normalized = key.toLowerCase();
-      if (typeof nested === 'string') {
-        if (normalized === 'b64_json' || normalized === 'image_base64' || normalized === 'base64') {
-          output.push(`data:image/png;base64,${nested.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '')}`);
-          continue;
-        }
-        if (/^https?:\/\//i.test(nested) && /(url|uri|href|download|output|image|file|result)/i.test(normalized)) {
-          output.push(nested);
-          continue;
-        }
+      if (hasInlineImage && INLINE_IMAGE_PAYLOAD_KEYS.has(normalized)) {
+        continue;
       }
+      const nested = record[key];
       collectImageStrings(nested, output, normalized);
     }
   }
   return output;
+}
+
+function normalizeCollectedImageString(value: string) {
+  if (!value) return '';
+  if (IMAGE_DATA_URL_PREFIX.test(value) && !/\s/.test(value[value.length - 1]!)) return value;
+  return value.trim();
 }
 
 export function collectProviderModelIds(value: unknown) {
@@ -1357,8 +1446,8 @@ function selectUniqueImages(
   count: number,
   preferUrls: boolean,
 ) {
-  const inputs = new Set(inputImages.map((value) => value.trim()));
-  const images = Array.from(new Set(collectImageStrings(value).map((value) => value.trim()).filter(Boolean)))
+  const inputs = new Set(inputImages.map(normalizeCollectedImageString));
+  const images = Array.from(new Set(collectImageStrings(value).map(normalizeCollectedImageString).filter(Boolean)))
     .filter((value) => !inputs.has(value));
   if (preferUrls) {
     images.sort((left, right) => Number(!/^https?:\/\//i.test(left)) - Number(!/^https?:\/\//i.test(right)));
@@ -1918,15 +2007,15 @@ function isUselgTaskControlUrl(value: string) {
 }
 
 function uniqueUselgImages(value: unknown, inputImages: string[], count: number) {
-  const inputs = new Set(inputImages.map((item) => item.trim()).filter(Boolean));
-  return Array.from(new Set(collectImageStrings(value).map((item) => item.trim()).filter(Boolean)))
+  const inputs = new Set(inputImages.map(normalizeCollectedImageString).filter(Boolean));
+  return Array.from(new Set(collectImageStrings(value).map(normalizeCollectedImageString).filter(Boolean)))
     .filter((source) => !inputs.has(source) && !isUselgTaskControlUrl(source))
     .slice(0, Math.max(1, count));
 }
 
 type UselgTaskAsset = { key: 'signed_url' | 'download_url' | 'url'; value: string };
 
-function collectUselgTaskAssets(value: unknown, output: UselgTaskAsset[] = [], depth = 0) {
+export function collectUselgTaskAssets(value: unknown, output: UselgTaskAsset[] = [], depth = 0) {
   if (!value || typeof value !== 'object' || depth > 8) return output;
   if (Array.isArray(value)) {
     value.forEach((item) => collectUselgTaskAssets(item, output, depth + 1));
@@ -1947,9 +2036,158 @@ function collectUselgTaskAssets(value: unknown, output: UselgTaskAsset[] = [], d
     }
   }
   for (const key of ['data', 'result', 'task', 'response']) {
-    collectUselgTaskAssets(record[key], output, depth + 1);
+    const nested = record[key];
+    if (typeof nested === 'string'
+      && (IMAGE_DATA_URL_PREFIX.test(nested) || looksLikeRawImageBase64(nested))) {
+      continue;
+    }
+    collectUselgTaskAssets(nested, output, depth + 1);
   }
   return output;
+}
+
+const USELG_STATUS_URL_KEYS = new Set(['status_url', 'poll_url']);
+const USELG_RESULT_URL_KEYS = new Set(['result_url']);
+const USELG_TASK_CONTAINER_KEYS = new Set([
+  'data',
+  'result',
+  'results',
+  'task',
+  'tasks',
+  'response',
+]);
+
+type UselgImageStatusSummary = {
+  taskId: string;
+  state: string;
+  statusUrl: string;
+  resultUrl: string;
+  pollAfterMs: number;
+  images: string[];
+  assets: UselgTaskAsset[];
+};
+
+function directUselgTaskId(record: Record<string, unknown>) {
+  for (const key of ['task_id', 'taskId', 'taskid', 'id']) {
+    const candidate = record[key];
+    if (typeof candidate === 'number') return String(candidate).trim();
+    if (typeof candidate !== 'string'
+      || IMAGE_DATA_URL_PREFIX.test(candidate)
+      || looksLikeRawImageBase64(candidate)) {
+      continue;
+    }
+    const normalized = candidate.trim();
+    if (normalized) return normalized;
+  }
+  return '';
+}
+
+function uniqueUselgImageCandidates(candidates: string[], inputImages: string[], count: number) {
+  const inputs = inputImages.map(normalizeCollectedImageString).filter(Boolean);
+  const images: string[] = [];
+  for (const candidate of candidates) {
+    const source = normalizeCollectedImageString(candidate);
+    if (!source
+      || inputs.includes(source)
+      || images.includes(source)
+      || isUselgTaskControlUrl(source)) {
+      continue;
+    }
+    images.push(source);
+    if (images.length >= Math.max(1, count)) break;
+  }
+  return images;
+}
+
+/**
+ * Extract the task controls and final images in one traversal. In particular,
+ * an inline image payload is inspected by prefix once and is never revisited as
+ * ordinary text after it has been recognized.
+ */
+export function summarizeUselgImageStatus(
+  value: unknown,
+  inputImages: string[],
+  count: number,
+): UselgImageStatusSummary {
+  let taskId = '';
+  let state = '';
+  let statusUrl = '';
+  let resultUrl = '';
+  const imageCandidates: string[] = [];
+  const assets: UselgTaskAsset[] = [];
+  const visited = new Set<object>();
+
+  const visit = (nested: unknown, contextKey = '', taskScope = true) => {
+    if (!nested) return;
+    if (typeof nested === 'string') {
+      appendImageString(nested, imageCandidates, contextKey);
+      if (!taskId && taskScope && USELG_TASK_CONTAINER_KEYS.has(contextKey)
+        && !IMAGE_DATA_URL_PREFIX.test(nested) && !looksLikeRawImageBase64(nested)) {
+        taskId = nested.trim();
+      }
+      return;
+    }
+    if (typeof nested !== 'object' || visited.has(nested)) return;
+    visited.add(nested);
+    if (Array.isArray(nested)) {
+      for (const item of nested) visit(item, contextKey, taskScope);
+      return;
+    }
+
+    const record = nested as Record<string, unknown>;
+    if (taskScope) {
+      taskId ||= directUselgTaskId(record);
+      const directState = record.status ?? record.state;
+      if (!state && typeof directState === 'string') state = directState.trim().toLowerCase();
+      if (Array.isArray(record.assets)) {
+        for (const asset of record.assets) {
+          if (!asset || typeof asset !== 'object') continue;
+          const assetRecord = asset as Record<string, unknown>;
+          for (const key of ['signed_url', 'download_url', 'url'] as const) {
+            const candidate = assetRecord[key];
+            if (typeof candidate === 'string' && candidate.trim()) {
+              assets.push({ key, value: candidate.trim() });
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    for (const key of Object.keys(record)) {
+      const normalizedKey = key.toLowerCase();
+      if (!statusUrl && USELG_STATUS_URL_KEYS.has(normalizedKey)) {
+        const candidate = record[key];
+        if (typeof candidate === 'string' && candidate.trim()) statusUrl = candidate.trim();
+      }
+      if (!resultUrl && USELG_RESULT_URL_KEYS.has(normalizedKey)) {
+        const candidate = record[key];
+        if (typeof candidate === 'string' && candidate.trim()) resultUrl = candidate.trim();
+      }
+    }
+
+    const hasInlineImage = appendInlineImage(record, imageCandidates);
+    for (const key of Object.keys(record)) {
+      const normalizedKey = key.toLowerCase();
+      if (hasInlineImage && INLINE_IMAGE_PAYLOAD_KEYS.has(normalizedKey)) continue;
+      visit(
+        record[key],
+        normalizedKey,
+        taskScope && USELG_TASK_CONTAINER_KEYS.has(normalizedKey),
+      );
+    }
+  };
+
+  visit(value);
+  return {
+    taskId,
+    state,
+    statusUrl,
+    resultUrl,
+    pollAfterMs: uselgPollAfterMs(value),
+    images: uniqueUselgImageCandidates(imageCandidates, inputImages, count),
+    assets,
+  };
 }
 
 export async function resolveUselgImageResponse(
@@ -1964,12 +2202,13 @@ export async function resolveUselgImageResponse(
   diagnosticContext?: UselgImageDiagnosticContext,
 ) {
   const resolveStartedAt = Date.now();
-  const immediate = uniqueUselgImages(started, inputImages, count);
-  const taskId = getTaskId(started);
-  const initialState = newApiImageTaskState(started);
-  const initialStatusUrl = nestedStringByKeys(started, new Set(['status_url', 'poll_url']));
-  const initialResultUrl = nestedStringByKeys(started, new Set(['result_url']));
-  const initialPollAfterMs = uselgPollAfterMs(started);
+  const initialSummary = summarizeUselgImageStatus(started, inputImages, count);
+  const immediate = initialSummary.images;
+  const taskId = initialSummary.taskId;
+  const initialState = initialSummary.state;
+  const initialStatusUrl = initialSummary.statusUrl;
+  const initialResultUrl = initialSummary.resultUrl;
+  const initialPollAfterMs = initialSummary.pollAfterMs;
   const complete = (images: string[], sourceType: UselgImageResolveSourceType) => {
     if (diagnosticContext) {
       console.info('[uselg_image_resolve_complete]', {
@@ -2039,12 +2278,11 @@ export async function resolveUselgImageResponse(
       continue;
     }
 
-    statusUrl = nestedStringByKeys(lastStatus, new Set(['status_url', 'poll_url'])) || statusUrl;
-    resultUrl = nestedStringByKeys(lastStatus, new Set(['result_url'])) || resultUrl;
-    pollAfterMs = uselgPollAfterMs(lastStatus);
-    const images = uniqueUselgImages(lastStatus, inputImages, count);
-    const state = newApiImageTaskState(lastStatus);
-    const assets = collectUselgTaskAssets(lastStatus);
+    const statusSummary = summarizeUselgImageStatus(lastStatus, inputImages, count);
+    statusUrl = statusSummary.statusUrl || statusUrl;
+    resultUrl = statusSummary.resultUrl || resultUrl;
+    pollAfterMs = statusSummary.pollAfterMs;
+    const { images, state, assets } = statusSummary;
     if (diagnosticContext) {
       console.info('[uselg_image_poll_complete]', {
         clientRequestId: diagnosticContext.clientRequestId,
@@ -2074,7 +2312,6 @@ export async function resolveUselgImageResponse(
     }
     if (!/^(?:completed|complete|succeeded|success|finished|done)$/.test(state)) continue;
 
-    const completedStatus = lastStatus;
     if (resultUrl) {
       const resultFetchStartedAt = Date.now();
       if (diagnosticContext) {
@@ -2111,7 +2348,7 @@ export async function resolveUselgImageResponse(
 
     const resolvedAssets: string[] = [];
     let resolvedAssetSourceType: UselgImageResolveSourceType = 'signed_url';
-    for (const asset of collectUselgTaskAssets(completedStatus)) {
+    for (const asset of assets) {
       if (asset.key === 'signed_url' && /^https?:\/\//i.test(asset.value)) {
         resolvedAssets.push(asset.value);
       } else {

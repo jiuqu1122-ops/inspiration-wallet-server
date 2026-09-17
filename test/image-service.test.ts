@@ -9,6 +9,8 @@ import {
   catalogModelSupportsVideoRequest,
   buildUselgImage2VariationPrompt,
   chooseProviderForCapability,
+  collectImageStrings,
+  collectUselgTaskAssets,
   collectGeneratedVideoStrings,
   collectProviderModelIds,
   confirmXaisReferenceAttachment,
@@ -65,6 +67,7 @@ import {
   sizeFromRatio,
   splitTabletImageProviderInputs,
   stageXaisPublicReference,
+  summarizeUselgImageStatus,
   uniqueImages,
   uselgImageRequestHeaders,
   videoCapabilityForModel,
@@ -1113,6 +1116,49 @@ describe('wallet image provider normalization', () => {
       },
       true,
     )).resolves.toEqual([`data:image/png;base64,${generated}`]);
+  });
+
+  it('extracts a multi-megabyte Gemini inline image without revisiting its payload', () => {
+    const generated = `iVBORw0KGgo${'A'.repeat(4 * 1024 * 1024)}`;
+    let payloadReads = 0;
+    const inlineData = {
+      mimeType: 'image/png',
+      get data() {
+        payloadReads += 1;
+        return generated;
+      },
+    };
+    const response = { candidates: [{ content: { parts: [{ inlineData }] } }] };
+
+    const images = collectImageStrings(response);
+
+    expect(payloadReads).toBe(1);
+    expect(images).toHaveLength(1);
+    expect(images[0]?.startsWith('data:image/png;base64,iVBORw0KGgo')).toBe(true);
+    expect(images[0]?.length).toBe('data:image/png;base64,'.length + generated.length);
+    expect(images).not.toContain(generated);
+  });
+
+  it('does not collect inline image bodies as USELG task assets', () => {
+    const generated = `iVBORw0KGgo${'B'.repeat(3 * 1024 * 1024)}`;
+    const signedUrl = 'https://cdn.example.test/final.png';
+    const response = {
+      data: {
+        candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: generated } }] } }],
+        result: { assets: [{ signed_url: signedUrl }] },
+      },
+    };
+
+    expect(collectUselgTaskAssets(response)).toEqual([{ key: 'signed_url', value: signedUrl }]);
+    const summary = summarizeUselgImageStatus(response, [], 1);
+    expect(summary.assets).toEqual([{ key: 'signed_url', value: signedUrl }]);
+    expect(summary.images).toHaveLength(1);
+    expect(summary.images[0]?.startsWith('data:image/png;base64,')).toBe(true);
+  });
+
+  it('keeps URL-based image responses unchanged', () => {
+    const imageUrl = 'https://cdn.example.test/image2-result.png';
+    expect(uniqueImages({ data: [{ url: imageUrl }] }, [], 1)).toEqual([imageUrl]);
   });
 
   it('calls USELG Gemini through its native v1beta endpoint', async () => {
@@ -2553,6 +2599,66 @@ describe('wallet image provider normalization', () => {
       1,
       async () => {},
     )).resolves.toEqual(['https://cdn.example.test/generated.png']);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns a large inline image immediately even when the USELG task state is processing', async () => {
+    const generated = `iVBORw0KGgo${'C'.repeat(3 * 1024 * 1024)}`;
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      task_id: 'imgtask-inline-processing',
+      status: 'processing',
+      candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: generated } }] } }],
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const images = await resolveUselgImageResponse(
+      { baseUrl: 'https://api.ai-media.vip', name: 'uselg', kind: 'USELG' } as never,
+      { apiKey: 'sk-uselg', headers: {} },
+      {
+        task_id: 'imgtask-inline-processing',
+        status: 'queued',
+        status_url: '/v1/images/tasks/imgtask-inline-processing?view=summary',
+        poll_after_ms: 2_000,
+      },
+      [],
+      1,
+      async () => {},
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(images).toHaveLength(1);
+    expect(images[0]?.startsWith('data:image/png;base64,iVBORw0KGgo')).toBe(true);
+    expect(images[0]?.length).toBe('data:image/png;base64,'.length + generated.length);
+  });
+
+  it('returns a signed asset immediately even when the USELG task state is processing', async () => {
+    const signedUrl = 'https://cdn.example.test/generated-processing.png';
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      task_id: 'imgtask-signed-processing',
+      status: 'processing',
+      assets: [{ signed_url: signedUrl }],
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(resolveUselgImageResponse(
+      { baseUrl: 'https://api.ai-media.vip', name: 'uselg', kind: 'USELG' } as never,
+      { apiKey: 'sk-uselg', headers: {} },
+      {
+        task_id: 'imgtask-signed-processing',
+        status: 'queued',
+        status_url: '/v1/images/tasks/imgtask-signed-processing?view=summary',
+        poll_after_ms: 2_000,
+      },
+      [],
+      1,
+      async () => {},
+    )).resolves.toEqual([signedUrl]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
