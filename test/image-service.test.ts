@@ -1256,6 +1256,9 @@ describe('wallet image provider normalization', () => {
     expect(fetchMock.mock.calls[1]?.[0]).toBe(
       'https://api.ai-media.vip/v1/images/tasks/gemini-task-123?view=summary',
     );
+    expect(fetchMock.mock.calls.filter(([source]) => (
+      String(source).includes(':generateContent')
+    ))).toHaveLength(1);
     expect(info).toHaveBeenCalledWith('[uselg_gemini_generate_started]', expect.objectContaining({
       clientRequestId: 'request-uselg-async',
       providerId: 'uselg-provider-1',
@@ -1312,6 +1315,101 @@ describe('wallet image provider normalization', () => {
     expect(serializedLogs).not.toContain(resultUrl);
     expect(serializedLogs).not.toContain('a red apple');
     expect(serializedLogs).not.toContain('sk-uselg');
+  });
+
+  it('probes a USELG result_url while the task is still dispatching', async () => {
+    const statusUrl = '/v1/images/tasks/gemini-dispatching?view=summary';
+    const resultUrl = 'https://api.ai-media.vip/v1/images/tasks/gemini-dispatching/result';
+    const outputUrl = 'https://cdn.example.test/generated-dispatching.png';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        task_id: 'gemini-dispatching',
+        status: 'dispatching',
+        status_url: statusUrl,
+        result_url: resultUrl,
+        poll_after_ms: 2_000,
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [{ url: outputUrl }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const wait = vi.fn(async () => undefined);
+
+    await expect(resolveUselgImageResponse(
+      { baseUrl: 'https://api.ai-media.vip', name: 'uselg', kind: 'USELG' } as never,
+      { apiKey: 'sk-uselg', headers: {} },
+      {
+        task_id: 'gemini-dispatching',
+        status: 'queued',
+        status_url: statusUrl,
+        poll_after_ms: 2_000,
+      },
+      [],
+      1,
+      wait,
+    )).resolves.toEqual([outputUrl]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.map(([source]) => String(source))).toEqual([
+      `https://api.ai-media.vip${statusUrl}`,
+      resultUrl,
+    ]);
+    expect(wait).toHaveBeenCalledTimes(1);
+    expect(wait).toHaveBeenCalledWith(2_000);
+  });
+
+  it('keeps polling the same USELG task when result_url returns 202 pending', async () => {
+    const statusUrl = '/v1/images/tasks/gemini-result-pending?view=summary';
+    const resultUrl = '/v1/images/tasks/gemini-result-pending/result';
+    const outputUrl = 'https://cdn.example.test/generated-after-pending.png';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        task_id: 'gemini-result-pending',
+        status: 'dispatching',
+        status_url: statusUrl,
+        result_url: resultUrl,
+        poll_after_ms: 2_000,
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'pending' }), {
+        status: 202,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        task_id: 'gemini-result-pending',
+        status: 'dispatching',
+        status_url: statusUrl,
+        result_url: resultUrl,
+        poll_after_ms: 2_000,
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [{ url: outputUrl }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const wait = vi.fn(async () => undefined);
+
+    await expect(resolveUselgImageResponse(
+      { baseUrl: 'https://api.ai-media.vip', name: 'uselg', kind: 'USELG' } as never,
+      { apiKey: 'sk-uselg', headers: {} },
+      {
+        task_id: 'gemini-result-pending',
+        status: 'queued',
+        status_url: statusUrl,
+        poll_after_ms: 2_000,
+      },
+      [],
+      1,
+      wait,
+    )).resolves.toEqual([outputUrl]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock.mock.calls.map(([source]) => String(source))).toEqual([
+      'https://api.ai-media.vip/v1/images/tasks/gemini-result-pending?view=summary',
+      'https://api.ai-media.vip/v1/images/tasks/gemini-result-pending/result',
+      'https://api.ai-media.vip/v1/images/tasks/gemini-result-pending?view=summary',
+      'https://api.ai-media.vip/v1/images/tasks/gemini-result-pending/result',
+    ]);
+    expect(wait).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenCalledWith(2_000);
   });
 
   it('polls explicit image adapters through status_url and result_url', async () => {

@@ -509,6 +509,21 @@ function isRetryableNewApiTaskPollError(error: unknown) {
     && (error.status === 0 || error.status === 429 || error.status >= 500);
 }
 
+function isUselgResultNotReadyStatus(status: number) {
+  return status === 0
+    || status === 202
+    || [404, 408, 409, 425, 429].includes(status)
+    || status >= 500;
+}
+
+function isUselgPendingTaskState(state: string) {
+  return /^(?:pending|processing|dispatching|queued|queue|running|in_progress|waiting)$/.test(state);
+}
+
+function isUselgResultNotReadyError(error: unknown) {
+  return error instanceof UpstreamImageError && isUselgResultNotReadyStatus(error.status);
+}
+
 async function selectImageProviders(
   prisma: PrismaClient,
   providerChannelId: string | undefined,
@@ -682,6 +697,7 @@ async function providerRequest(
   body?: unknown,
   timeoutOverrideMs?: number,
   extraHeaders?: Record<string, string>,
+  onResponseStatus?: (status: number) => void,
 ) {
   const controller = new AbortController();
   const timeoutMs = timeoutOverrideMs ?? (/(?:video|workerTask)/i.test(path) ? 10 * 60_000 : 4 * 60_000);
@@ -694,6 +710,7 @@ async function providerRequest(
       redirect: 'error',
       signal: controller.signal,
     });
+    onResponseStatus?.(response.status);
     const text = await response.text();
     if (!response.ok) {
       throw new UpstreamImageError(
@@ -2082,13 +2099,20 @@ function directUselgTaskId(record: Record<string, unknown>) {
   return '';
 }
 
-function uniqueUselgImageCandidates(candidates: string[], inputImages: string[], count: number) {
+function uniqueUselgImageCandidates(
+  candidates: string[],
+  inputImages: string[],
+  count: number,
+  controlUrls: string[],
+) {
   const inputs = inputImages.map(normalizeCollectedImageString).filter(Boolean);
+  const controls = controlUrls.map(normalizeCollectedImageString).filter(Boolean);
   const images: string[] = [];
   for (const candidate of candidates) {
     const source = normalizeCollectedImageString(candidate);
     if (!source
       || inputs.includes(source)
+      || controls.includes(source)
       || images.includes(source)
       || isUselgTaskControlUrl(source)) {
       continue;
@@ -2185,7 +2209,12 @@ export function summarizeUselgImageStatus(
     statusUrl,
     resultUrl,
     pollAfterMs: uselgPollAfterMs(value),
-    images: uniqueUselgImageCandidates(imageCandidates, inputImages, count),
+    images: uniqueUselgImageCandidates(
+      imageCandidates,
+      inputImages,
+      count,
+      [statusUrl, resultUrl],
+    ),
     assets,
   };
 }
@@ -2301,17 +2330,8 @@ export async function resolveUselgImageResponse(
       )) ? 'signed_url' : 'status';
       return complete(images, sourceType);
     }
-    const failure = getFailure(lastStatus);
-    if (failure) throw new UpstreamImageError(502, failure, lastStatus);
-    if (/^(?:failed|failure|error|cancelled|canceled|uncertain|client_disconnected)$/.test(state)) {
-      throw new UpstreamImageError(
-        502,
-        `uselg 图片任务失败（${state}）：${taskId}`,
-        lastStatus,
-      );
-    }
-    if (!/^(?:completed|complete|succeeded|success|finished|done)$/.test(state)) continue;
 
+    let resultProbeNotReady = false;
     if (resultUrl) {
       const resultFetchStartedAt = Date.now();
       if (diagnosticContext) {
@@ -2321,8 +2341,18 @@ export async function resolveUselgImageResponse(
         });
       }
       try {
-        const result = await providerRequest(provider, secrets, resultUrl, undefined, 45_000);
-        const resultImages = uniqueUselgImages(result, inputImages, count);
+        let resultResponseStatus = 0;
+        const result = await providerRequest(
+          provider,
+          secrets,
+          resultUrl,
+          undefined,
+          45_000,
+          undefined,
+          status => { resultResponseStatus = status; },
+        );
+        const resultSummary = summarizeUselgImageStatus(result, inputImages, count);
+        const resultImages = resultSummary.images;
         if (diagnosticContext) {
           console.info('[uselg_image_result_fetch_complete]', {
             clientRequestId: diagnosticContext.clientRequestId,
@@ -2332,6 +2362,8 @@ export async function resolveUselgImageResponse(
           });
         }
         if (resultImages.length) return complete(resultImages, 'result_url');
+        resultProbeNotReady = isUselgResultNotReadyStatus(resultResponseStatus)
+          || isUselgPendingTaskState(resultSummary.state);
       } catch (error) {
         const resultImages = imagesFromUpstreamError(error, inputImages, count);
         if (diagnosticContext) {
@@ -2343,8 +2375,20 @@ export async function resolveUselgImageResponse(
           });
         }
         if (resultImages.length) return complete(resultImages, 'result_url');
+        resultProbeNotReady = isUselgResultNotReadyError(error);
       }
     }
+
+    const failure = getFailure(lastStatus);
+    if (failure) throw new UpstreamImageError(502, failure, lastStatus);
+    if (/^(?:failed|failure|error|cancelled|canceled|uncertain|client_disconnected)$/.test(state)) {
+      throw new UpstreamImageError(
+        502,
+        `uselg 图片任务失败（${state}）：${taskId}`,
+        lastStatus,
+      );
+    }
+    if (!/^(?:completed|complete|succeeded|success|finished|done)$/.test(state)) continue;
 
     const resolvedAssets: string[] = [];
     let resolvedAssetSourceType: UselgImageResolveSourceType = 'signed_url';
@@ -2396,6 +2440,7 @@ export async function resolveUselgImageResponse(
         resolvedAssetSourceType,
       );
     }
+    if (resultProbeNotReady) continue;
     throw new Error(`uselg 图片任务已成功但没有返回可下载资产：${taskId}`);
   }
 
