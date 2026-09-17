@@ -1,4 +1,5 @@
 import { genericOpenAiImageAdapter } from './generic-openai-image.js';
+import { geminiNativeImageAdapter } from './gemini-native.js';
 import { gptImageAdapter } from './gpt-image.js';
 import { grokImagesApiAdapter } from './grok.js';
 import { nanoBananaAdapter } from './nano-banana.js';
@@ -19,6 +20,7 @@ const adapters = new Map<ImageAdapterKey, ImageModelAdapter>([
   ['LEGACY', legacyAdapter],
   ['GPT_IMAGE', gptImageAdapter],
   ['NANO_BANANA', nanoBananaAdapter],
+  ['GEMINI_NATIVE_IMAGE', geminiNativeImageAdapter],
   ['SEEDREAM_IMAGES_API', seedreamImagesApiAdapter],
   ['GROK_IMAGES_API', grokImagesApiAdapter],
   ['GENERIC_OPENAI_IMAGE', genericOpenAiImageAdapter],

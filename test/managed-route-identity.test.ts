@@ -341,6 +341,153 @@ describe('managed canonical route identity', () => {
     });
   });
 
+  it('uses Gemini Native protocol for an explicit adapter route and persists inline output', async () => {
+    const channel = provider(
+      'gemini-native-channel',
+      'https://1.1.1.1',
+      'NEW_API',
+      ['IMAGE_NANO_BANANA_2'],
+    );
+    const route = {
+      id: 'route-gemini-native',
+      canonicalModelId: 'model-nano-banana-2',
+      provider: 'NEW_API',
+      channelId: channel.id,
+      upstreamModelId: 'gemini-3.1-flash-image',
+      adapterKey: 'GEMINI_NATIVE_IMAGE',
+      adapterConfig: null,
+      enabled: true,
+      upstreamAvailable: true,
+      healthStatus: 'HEALTHY',
+      priority: 0,
+      capabilitiesOverride: null,
+      metadata: null,
+      channel,
+    };
+    const model = {
+      id: 'model-nano-banana-2',
+      canonicalModelKey: 'nano-banana-2',
+      displayName: 'Nano Banana 2',
+      modality: 'image',
+      enabled: true,
+      visible: true,
+      status: 'PUBLISHED',
+      routingMode: 'MANAGED',
+      billingType: 'image_resolution',
+      capabilities: {
+        supportedResolutions: ['1k', '2k', '4k'],
+        supportedAspectRatios: ['16:9'],
+        supportsReferenceImages: true,
+      },
+      defaultRouteId: route.id,
+      routes: [route],
+    };
+    const { transaction, getRequest } = walletTransaction('image-request-gemini-native');
+    const findLegacyProviders = vi.fn(async () => []);
+    const prisma = {
+      userMembership: { findFirst: vi.fn(async () => null) },
+      aiModel: { findUnique: vi.fn(async () => model) },
+      aiModelPricing: {
+        findUnique: vi.fn(async () => ({
+          currentVersion: {
+            id: 'image-price-gemini-native',
+            version: 1,
+            publishedAt: new Date(0),
+            pricing: {
+              billingType: 'image_resolution',
+              creditsPerImageByResolution: { '1k': '8', '2k': '10', '4k': '20' },
+            },
+          },
+        })),
+      },
+      aiProviderChannel: { findMany: findLegacyProviders },
+      $transaction: vi.fn(async (operation: (tx: typeof transaction) => unknown) => operation(transaction)),
+    } as unknown as PrismaClient;
+    const referenceUrl = 'https://1.0.0.2/reference.png';
+    const pngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
+    const png = Buffer.from(pngBase64, 'base64');
+    const storedUrl = 'https://storage.example/generated-images/gemini-native.png?signature=redacted';
+    vi.spyOn(storageService, 'uploadMedia').mockResolvedValue('generated-images/gemini-native.png');
+    vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(storedUrl);
+    const submissions: Array<{
+      url: string;
+      body: Record<string, unknown>;
+      headers: Headers;
+    }> = [];
+    const fetchMock = vi.fn(async (source: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(source);
+      if (url === referenceUrl) {
+        return new Response(png, {
+          status: 200,
+          headers: { 'content-type': 'image/png', 'content-length': String(png.byteLength) },
+        });
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      submissions.push({ url, body, headers: new Headers(init?.headers) });
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: pngBase64 } }] } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(executeWalletImageGeneration(prisma, {
+      userId: 'user-1',
+      clientRequestId: 'managed-gemini-native',
+      model: 'nano-banana-2',
+      prompt: 'a red apple',
+      inputImages: [referenceUrl],
+      aspectRatio: '16:9',
+      resolution: '4k',
+      outputFormat: 'png',
+      count: 1,
+    })).resolves.toMatchObject({
+      images: [storedUrl],
+      providerChannelId: channel.id,
+      model: 'nano-banana-2',
+    });
+
+    expect(findLegacyProviders).not.toHaveBeenCalled();
+    expect(submissions).toHaveLength(1);
+    expect(submissions[0]?.url).toBe(
+      'https://1.1.1.1/v1beta/models/gemini-3.1-flash-image:generateContent',
+    );
+    expect(submissions[0]?.headers.get('x-goog-api-key')).toBe('sk-route-test');
+    expect(submissions[0]?.body).toMatchObject({
+      contents: [{
+        role: 'user',
+        parts: [
+          { text: expect.any(String) },
+          { inlineData: { mimeType: 'image/png', data: pngBase64 } },
+        ],
+      }],
+      generationConfig: {
+        responseModalities: ['TEXT', 'IMAGE'],
+        imageConfig: { aspectRatio: '16:9', imageSize: '4K' },
+      },
+    });
+    for (const forbidden of [
+      'model',
+      'prompt',
+      'size',
+      'quality',
+      'output_resolution',
+      'image_size',
+      'aspect_ratio',
+    ]) {
+      expect(submissions[0]?.body).not.toHaveProperty(forbidden);
+    }
+    expect(fetchMock.mock.calls.some(([source]) => (
+      /\/v1\/images\/(?:generations|edits)/.test(String(source))
+    ))).toBe(false);
+    expect(storageService.uploadMedia).toHaveBeenCalledTimes(1);
+    expect(getRequest()).toMatchObject({
+      canonicalModelId: model.id,
+      logicalModel: model.canonicalModelKey,
+      routeId: route.id,
+      status: 'SUCCEEDED',
+    });
+  });
+
   it('keeps an explicit Grok adapter on the selected route SKU during same-canonical failover', async () => {
     const primary = provider('grok-primary', 'https://1.1.1.1', 'NEW_API', ['IMAGE']);
     const fallback = provider('grok-fallback', 'https://8.8.8.8', 'NEW_API', ['IMAGE']);

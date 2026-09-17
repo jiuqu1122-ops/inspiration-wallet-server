@@ -33,6 +33,8 @@ export const seedreamImagesApiAdapter: ImageModelAdapter = {
     serializeConfiguredReferences(body, input.references, config, endpoint);
     return {
       adapterKey: 'SEEDREAM_IMAGES_API',
+      execution: 'images-api',
+      submittedModel: input.upstreamModel,
       endpoint,
       method: 'POST',
       contentType: 'application/json',

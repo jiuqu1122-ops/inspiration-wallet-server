@@ -1124,9 +1124,13 @@ async function bigmodelRequest(
   path: string,
   body?: unknown,
   extraHeaders?: Record<string, string>,
+  timeoutOverrideMs?: number,
 ) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), IMAGE_GENERATION_TIMEOUT_MS);
+  const timeout = setTimeout(
+    () => controller.abort(),
+    timeoutOverrideMs ?? IMAGE_GENERATION_TIMEOUT_MS,
+  );
   try {
     const response = await fetch(providerRequestUrl(provider, path), {
       method: body === undefined ? 'GET' : 'POST',
@@ -2467,6 +2471,17 @@ export async function resolveImageAdapterResponse(
   wait: (milliseconds: number) => Promise<unknown> = (
     milliseconds,
   ) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  request: (
+    path: string,
+    body?: unknown,
+    timeoutOverrideMs?: number,
+  ) => Promise<unknown> = (path, body, timeoutOverrideMs) => providerRequest(
+    provider,
+    secrets,
+    path,
+    body,
+    timeoutOverrideMs,
+  ),
 ) {
   const immediate = uniqueImageAdapterImages(started, inputImages, count);
   if (immediate.length) return immediate;
@@ -2488,7 +2503,7 @@ export async function resolveImageAdapterResponse(
 
   while (Date.now() < deadline) {
     await wait(pollAfterMs);
-    lastStatus = await providerRequest(provider, secrets, statusUrl, undefined, 45_000);
+    lastStatus = await request(statusUrl, undefined, 45_000);
     statusUrl = nestedStringByKeys(lastStatus, new Set(['status_url', 'poll_url'])) || statusUrl;
     resultUrl = nestedStringByKeys(lastStatus, new Set(['result_url'])) || resultUrl;
     pollAfterMs = uselgPollAfterMs(lastStatus);
@@ -2505,7 +2520,7 @@ export async function resolveImageAdapterResponse(
     if (!resultUrl) {
       throw new UpstreamImageError(502, `Image adapter task completed without an image or result_url: ${taskId}`, lastStatus);
     }
-    const result = await providerRequest(provider, secrets, resultUrl, undefined, 45_000);
+    const result = await request(resultUrl, undefined, 45_000);
     const resultImages = uniqueImageAdapterImages(result, inputImages, count);
     if (resultImages.length) return resultImages;
     throw new UpstreamImageError(502, `Image adapter result_url returned no image: ${taskId}`, result);
@@ -4479,7 +4494,7 @@ export function boundProviderImageResults(images: string[], count: number) {
   return Array.from(new Set(images)).slice(0, Math.max(0, count));
 }
 
-function prepareRouteImageAdapterRequest(
+async function prepareRouteImageAdapterRequest(
   provider: AiProviderChannel,
   input: ImageInput,
   route: ImageAdapterRouteContext,
@@ -4491,6 +4506,9 @@ function prepareRouteImageAdapterRequest(
     );
   }
   const adapter = getImageModelAdapter(route.adapterKey);
+  const references = adapter.execution === 'gemini-native'
+    ? await Promise.all(input.inputImages.map(materializeNewApiReferenceImage))
+    : input.inputImages;
   return prepareImageAdapterRequest(adapter, {
     requestedCanonicalModel: route.requestedCanonicalModel,
     resolvedCanonicalModel: route.resolvedCanonicalModel,
@@ -4501,7 +4519,7 @@ function prepareRouteImageAdapterRequest(
     upstreamModel: route.upstreamModel,
     prompt: promptWithConstraints(input, provider.kind),
     ...(input.negativePrompt ? { negativePrompt: input.negativePrompt } : {}),
-    references: input.inputImages,
+    references,
     ...(input.resolution ? { resolution: input.resolution } : {}),
     aspectRatio: input.aspectRatio,
     count: input.count,
@@ -4517,20 +4535,41 @@ async function generatePreparedImageAdapterImages(
   input: ImageInput,
   prepared: PreparedImageAdapterRequest,
 ) {
-  const started = await providerRequest(
-    provider,
-    secrets,
-    prepared.endpoint,
-    prepared.body,
-    IMAGE_GENERATION_TIMEOUT_MS,
-  );
-  return resolveImageAdapterResponse(
-    provider,
-    secrets,
-    started,
-    input.inputImages,
-    input.count,
-  );
+  const request = prepared.execution === 'gemini-native'
+    ? (path: string, body?: unknown, timeoutOverrideMs?: number) => bigmodelRequest(
+      provider,
+      secrets,
+      path,
+      body,
+      undefined,
+      timeoutOverrideMs,
+    )
+    : (path: string, body?: unknown, timeoutOverrideMs?: number) => providerRequest(
+      provider,
+      secrets,
+      path,
+      body,
+      timeoutOverrideMs,
+    );
+  const images: string[] = [];
+  const requestCount = prepared.execution === 'gemini-native' ? input.count : 1;
+  for (let index = 0; index < requestCount; index += 1) {
+    const started = await request(
+      prepared.endpoint,
+      prepared.body,
+      IMAGE_GENERATION_TIMEOUT_MS,
+    );
+    images.push(...await resolveImageAdapterResponse(
+      provider,
+      secrets,
+      started,
+      input.inputImages,
+      prepared.execution === 'gemini-native' ? 1 : input.count,
+      undefined,
+      request,
+    ));
+  }
+  return images;
 }
 
 async function generateImagesFromProvider(
@@ -4551,7 +4590,7 @@ async function generateImagesFromProvider(
           : generateNewApiImages(provider, secrets, input);
   const generateBatch = async (input: ImageInput) => {
     const prepared = adapterRoute
-      ? prepareRouteImageAdapterRequest(provider, input, adapterRoute)
+      ? await prepareRouteImageAdapterRequest(provider, input, adapterRoute)
       : null;
     return prepared
       ? generatePreparedImageAdapterImages(provider, secrets, input, prepared)
@@ -4839,7 +4878,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         let preparedAdapterRequest: PreparedImageAdapterRequest | null;
         try {
           preparedAdapterRequest = activeAdapterRoute
-            ? prepareRouteImageAdapterRequest(activeProvider, activeInput, activeAdapterRoute)
+            ? await prepareRouteImageAdapterRequest(activeProvider, activeInput, activeAdapterRoute)
             : null;
           activeEndpoint = preparedAdapterRequest?.endpoint ?? null;
         } catch (error) {

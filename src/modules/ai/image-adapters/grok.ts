@@ -30,6 +30,8 @@ export const grokImagesApiAdapter: ImageModelAdapter = {
     serializeConfiguredReferences(body, input.references, config, endpoint);
     return {
       adapterKey: 'GROK_IMAGES_API',
+      execution: 'images-api',
+      submittedModel: input.upstreamModel,
       endpoint,
       method: 'POST',
       contentType: 'application/json',

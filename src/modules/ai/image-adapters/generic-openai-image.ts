@@ -23,6 +23,8 @@ export const genericOpenAiImageAdapter: ImageModelAdapter = {
     serializeConfiguredReferences(body, input.references, config, endpoint);
     return {
       adapterKey: 'GENERIC_OPENAI_IMAGE',
+      execution: 'images-api',
+      submittedModel: input.upstreamModel,
       endpoint,
       method: 'POST',
       contentType: 'application/json',

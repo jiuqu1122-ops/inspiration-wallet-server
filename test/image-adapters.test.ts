@@ -49,6 +49,8 @@ describe('image adapter registry', () => {
     );
     expect(prepared).toEqual({
       adapterKey: 'SEEDREAM_IMAGES_API',
+      execution: 'images-api',
+      submittedModel: 'seedream-5.0-pro',
       endpoint: '/v1/images/generations',
       method: 'POST',
       contentType: 'application/json',
@@ -90,6 +92,53 @@ describe('image adapter registry', () => {
     expect(prepared?.body).not.toHaveProperty('image_size');
     expect(JSON.stringify(prepared?.body)).not.toContain('1792x1024');
     expect(JSON.stringify(prepared?.body)).not.toContain('2048x1152');
+  });
+
+  it('builds Gemini Native generateContent with the exact route SKU and image config', () => {
+    const prepared = prepareImageAdapterRequest(
+      getImageModelAdapter('GEMINI_NATIVE_IMAGE'),
+      input({
+        requestedCanonicalModel: 'nano-banana-2',
+        resolvedCanonicalModel: 'nano-banana-2',
+        canonicalModelId: 'canonical-nano-banana-2',
+        canonicalModelKey: 'nano-banana-2',
+        routeId: 'route-gemini-native',
+        upstreamModel: 'gemini-3.1-flash-image',
+        references: ['data:image/webp;base64,UklGRgAAAAA='],
+        resolution: '4k',
+        aspectRatio: '16:9',
+      }),
+    );
+
+    expect(prepared).toEqual({
+      adapterKey: 'GEMINI_NATIVE_IMAGE',
+      execution: 'gemini-native',
+      submittedModel: 'gemini-3.1-flash-image',
+      endpoint: '/v1beta/models/gemini-3.1-flash-image:generateContent',
+      method: 'POST',
+      contentType: 'application/json',
+      body: {
+        contents: [{
+          role: 'user',
+          parts: [
+            { text: 'A red apple on a white table' },
+            { inlineData: { mimeType: 'image/webp', data: 'UklGRgAAAAA=' } },
+          ],
+        }],
+        generationConfig: {
+          responseModalities: ['TEXT', 'IMAGE'],
+          imageConfig: { aspectRatio: '16:9', imageSize: '4K' },
+        },
+      },
+      asyncMode: 'provider',
+    });
+    expect(prepared?.body).not.toHaveProperty('model');
+    expect(prepared?.body).not.toHaveProperty('prompt');
+    expect(prepared?.body).not.toHaveProperty('size');
+    expect(prepared?.body).not.toHaveProperty('quality');
+    expect(prepared?.body).not.toHaveProperty('output_resolution');
+    expect(prepared?.body).not.toHaveProperty('image_size');
+    expect(prepared?.body).not.toHaveProperty('aspect_ratio');
   });
 
   it('uses exact dimensions only when the route supplies an exact mapping', () => {
@@ -221,6 +270,8 @@ describe('image adapter registry', () => {
       execution: 'images-api' as const,
       buildRequest: () => ({
         adapterKey: 'GROK_IMAGES_API' as const,
+        execution: 'images-api' as const,
+        submittedModel: 'grok-imagine-image-edit',
         endpoint: '/v1/images/generations',
         method: 'POST' as const,
         contentType: 'application/json' as const,

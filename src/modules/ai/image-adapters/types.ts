@@ -2,6 +2,7 @@ export const IMAGE_ADAPTER_KEYS = [
   'LEGACY',
   'GPT_IMAGE',
   'NANO_BANANA',
+  'GEMINI_NATIVE_IMAGE',
   'SEEDREAM_IMAGES_API',
   'GROK_IMAGES_API',
   'GENERIC_OPENAI_IMAGE',
@@ -41,16 +42,18 @@ export type ImageAdapterInput = {
 
 export type PreparedImageAdapterRequest = {
   adapterKey: ImageAdapterKey;
+  execution: 'images-api' | 'gemini-native';
+  submittedModel: string;
   endpoint: string;
   method: 'POST';
   contentType: 'application/json';
-  body: Record<string, unknown> & { model: string; prompt: string };
+  body: Record<string, unknown>;
   asyncMode: 'provider' | 'task';
 };
 
 export interface ImageModelAdapter {
   readonly key: ImageAdapterKey;
-  readonly execution: 'legacy' | 'images-api';
+  readonly execution: 'legacy' | 'images-api' | 'gemini-native';
   validateModel?(upstreamModel: string): void;
   buildRequest?(input: ImageAdapterInput): PreparedImageAdapterRequest;
 }
@@ -173,10 +176,25 @@ export function assertPreparedImageIdentity(
       `Requested canonical model ${input.requestedCanonicalModel} resolved as ${input.resolvedCanonicalModel}`,
     );
   }
-  if (prepared.body.model !== input.upstreamModel) {
+  if (prepared.submittedModel !== input.upstreamModel) {
     throw new ImageAdapterError(
       'IMAGE_MODEL_IDENTITY_MISMATCH',
-      `Prepared upstream model ${prepared.body.model} does not match route model ${input.upstreamModel}`,
+      `Prepared upstream model ${prepared.submittedModel} does not match route model ${input.upstreamModel}`,
+      prepared.endpoint,
+    );
+  }
+  if (prepared.execution === 'images-api' && prepared.body.model !== input.upstreamModel) {
+    throw new ImageAdapterError(
+      'IMAGE_MODEL_IDENTITY_MISMATCH',
+      `Prepared Images API request model does not match route model ${input.upstreamModel}`,
+      prepared.endpoint,
+    );
+  }
+  const expectedGeminiEndpoint = `/v1beta/models/${encodeURIComponent(input.upstreamModel)}:generateContent`;
+  if (prepared.execution === 'gemini-native' && prepared.endpoint !== expectedGeminiEndpoint) {
+    throw new ImageAdapterError(
+      'IMAGE_MODEL_IDENTITY_MISMATCH',
+      `Prepared Gemini endpoint ${prepared.endpoint} does not match route model ${input.upstreamModel}`,
       prepared.endpoint,
     );
   }
