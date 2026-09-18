@@ -18,6 +18,8 @@ import {
   validatePricingProfile,
   type CatalogPricingProfile,
 } from './pricing-center.js';
+import { validateGenericAsyncVideoConfig } from './video-adapters/generic-async-video.js';
+import { assertVideoCapabilitiesSubset } from './video-capabilities.js';
 
 export type AdminMutationContext = {
   actor: string;
@@ -339,7 +341,7 @@ export async function updateAdminAiRoute(
   return prisma.$transaction(async (transaction) => {
     const current = await transaction.aiModelRoute.findUnique({
       where: { id: routeId },
-      include: { canonicalModel: { select: { modality: true } } },
+      include: { canonicalModel: { select: { modality: true, capabilities: true } } },
     });
     if (!current) throw new AiModelAdminError('NOT_FOUND', 'Model route was not found', 404);
     if (input.expectedUpdatedAt && asIso(current.updatedAt) !== asIso(input.expectedUpdatedAt)) {
@@ -361,6 +363,10 @@ export async function updateAdminAiRoute(
     if (input.healthStatus !== undefined) data.healthStatus = input.healthStatus;
     if (input.upstreamAvailable !== undefined) data.upstreamAvailable = input.upstreamAvailable;
     if (input.capabilitiesOverride !== undefined) {
+      if (input.capabilitiesOverride !== null
+        && current.canonicalModel?.modality === 'video') {
+        assertVideoCapabilitiesSubset(current.canonicalModel.capabilities, input.capabilitiesOverride);
+      }
       data.capabilitiesOverride = input.capabilitiesOverride === null
         ? Prisma.JsonNull
         : normalizeModelCapabilities(input.capabilitiesOverride);
@@ -371,7 +377,12 @@ export async function updateAdminAiRoute(
     }
     if (input.adapterKey !== undefined) data.adapterKey = input.adapterKey;
     if (input.adapterConfig !== undefined) {
-      data.adapterConfig = input.adapterConfig === null ? Prisma.DbNull : input.adapterConfig;
+      const nextAdapterKey = input.adapterKey === undefined ? current.adapterKey : input.adapterKey;
+      data.adapterConfig = input.adapterConfig === null
+        ? Prisma.DbNull
+        : nextAdapterKey === 'GENERIC_ASYNC_VIDEO' || nextAdapterKey === 'AI_MEDIA_VIDEOS_API'
+          ? toInputJson(validateGenericAsyncVideoConfig(input.adapterConfig))
+          : input.adapterConfig;
     }
     if (input.costProfile !== undefined) {
       data.costProfile = input.costProfile === null ? Prisma.JsonNull : input.costProfile;

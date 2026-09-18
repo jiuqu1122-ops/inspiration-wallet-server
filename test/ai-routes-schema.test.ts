@@ -198,14 +198,20 @@ describe('wallet AI request compatibility', () => {
     expect(normalized.inputImages).toHaveLength(9);
   });
 
-  it('rejects more than nine MiniMax H3 image references', () => {
-    expect(() => normalizeVideoRequestBody({
+  it('leaves MiniMax capability limits to the catalog while enforcing the transport ceiling', () => {
+    const normalized = normalizeVideoRequestBody({
       clientRequestId: 'canvas-video-request-minimax-limit',
       provider: 'minimax',
       model: 'MiniMax-H3',
       prompt: 'use the references',
       inputImages: Array.from({ length: 10 }, (_, index) => `https://example.com/image-${index}.png`),
       count: 1,
+    });
+    expect(normalized.inputImages).toHaveLength(10);
+    expect(() => normalizeVideoRequestBody({
+      ...normalized,
+      clientRequestId: 'canvas-video-request-safety-limit',
+      inputImages: Array.from({ length: 33 }, (_, index) => `https://example.com/image-${index}.png`),
     })).toThrow();
   });
 
@@ -221,14 +227,15 @@ describe('wallet AI request compatibility', () => {
     expect(normalized.inputImages).toHaveLength(13);
   });
 
-  it('rejects more than nine images for every Seedance 2.0 alias', () => {
-    expect(() => normalizeVideoRequestBody({
+  it('does not infer managed Seedance limits from the model name in the transport schema', () => {
+    const normalized = normalizeVideoRequestBody({
       clientRequestId: 'canvas-video-request-seedance-limit',
       provider: 'new-api',
       model: 'seedance2.0',
       prompt: 'use the references',
       inputImages: Array.from({ length: 10 }, (_, index) => `https://example.com/image-${index}.png`),
       count: 1,
-    })).toThrow();
+    });
+    expect(normalized.inputImages).toHaveLength(10);
   });
 });

@@ -66,6 +66,19 @@ import {
   prepareImageAdapterRequest,
   type PreparedImageAdapterRequest,
 } from './image-adapters/registry.js';
+import { normalizeManagedVideoRequest, ManagedVideoRequestError, type NormalizedVideoRequest } from './video-request.js';
+import { resolveVideoCapabilities, videoAspectRatioAllowed, videoCapabilitiesSupportRequest, videoDurationAllowed } from './video-capabilities.js';
+import { selectManagedVideoRoutes } from './video-routing.js';
+import { getVideoAdapter } from './video-adapters/registry.js';
+import {
+  clampVideoPollAfterMs,
+  createVideoTasks,
+  publicVideoTask,
+  recordVideoTaskFailure,
+  recordVideoTaskSubmission,
+  settleVideoRequestIfTerminal,
+  videoOutputIdempotencyKey,
+} from './video-task-service.js';
 
 export const IMAGE_GENERATION_TIMEOUT_MS = 15 * 60_000;
 const longImageRequestDispatcher = new Agent({
@@ -5060,7 +5073,7 @@ export type VideoInput = {
   inputImages: string[];
   inputVideos: string[];
   inputAudios: string[];
-  aspectRatio: string;
+  aspectRatio: string | undefined;
   resolution?: string | undefined;
   duration?: number | undefined;
   inputMode?: 'REF' | 'FLF' | undefined;
@@ -5224,54 +5237,23 @@ export function catalogModelSupportsVideoRequest(
   duration?: number,
   aspectRatio?: string,
 ) {
-  const capabilities = normalizePublicModelCapabilities(capabilitiesValue);
+  const capabilities = resolveVideoCapabilities(capabilitiesValue);
   const requestedResolution = String(resolution || '').trim().toLowerCase();
-  const supportedResolutions = Array.isArray(capabilities.resolutions)
-    ? capabilities.resolutions.map(item => String(item).trim().toLowerCase())
-    : [];
   if (requestedResolution
-    && supportedResolutions.length > 0
-    && !supportedResolutions.includes(requestedResolution)) return false;
-  const supportedDurations = Array.isArray(capabilities.durations)
-    ? capabilities.durations.map(Number).filter(item => Number.isFinite(item))
-    : [];
-  if (duration !== undefined
-    && supportedDurations.length > 0
-    && !supportedDurations.includes(duration)) return false;
-  const requestedAspectRatio = String(aspectRatio || '').trim().toLowerCase();
-  const supportedAspectRatios = Array.isArray(capabilities.aspectRatios)
-    ? capabilities.aspectRatios.map(item => String(item).trim().toLowerCase())
-    : [];
-  return !requestedAspectRatio
-    || supportedAspectRatios.length === 0
-    || supportedAspectRatios.includes(requestedAspectRatio);
+    && capabilities.resolutions.length > 0
+    && !capabilities.resolutions.includes(requestedResolution)) return false;
+  if (duration !== undefined && !videoDurationAllowed(capabilities, duration)) return false;
+  return videoAspectRatioAllowed(capabilities, aspectRatio);
 }
 
 export function catalogModelSupportsVideoInputs(
   capabilitiesValue: unknown,
   input: Pick<VideoInput, 'prompt' | 'inputImages' | 'inputVideos' | 'inputAudios' | 'inputMode'>,
 ) {
-  const capabilities = normalizePublicModelCapabilities(capabilitiesValue);
-  if (input.prompt.trim() && capabilities.supportsTextPrompt === false) return false;
-  if (input.inputMode === 'FLF') {
-    if (input.inputImages.length > 1
-      && capabilities.supportsFirstLastFrame === false) return false;
-    if (input.inputImages.length === 1
-      && capabilities.supportsFirstFrame === false
-      && capabilities.supportsFirstLastFrame === false) return false;
-  } else if (input.inputImages.length > 0 && capabilities.supportsReferenceImages === false) {
-    return false;
-  }
-  if (input.inputVideos.length > 0 && capabilities.supportsReferenceVideo === false) return false;
-  if (input.inputAudios.length > 0
-    && capabilities.supportsReferenceAudio === false
-    && capabilities.supportsAudioReference === false) return false;
-  const exceeds = (value: number, maximum: unknown) => (
-    typeof maximum === 'number' && Number.isFinite(maximum) && value > maximum
-  );
-  return !exceeds(input.inputImages.length, capabilities.maxReferenceImages)
-    && !exceeds(input.inputVideos.length, capabilities.maxReferenceVideos)
-    && !exceeds(input.inputAudios.length, capabilities.maxReferenceAudios);
+  return videoCapabilitiesSupportRequest(capabilitiesValue, {
+    ...input,
+    count: 1,
+  });
 }
 
 export async function selectVideoProvider(
@@ -5786,6 +5768,29 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       usageContext: 'video_generation',
     });
   }
+  let normalizedManagedRequest: NormalizedVideoRequest | null = null;
+  if (managedRouting && catalogResolution) {
+    try {
+      normalizedManagedRequest = normalizeManagedVideoRequest(
+        input,
+        canonicalModelKey,
+        catalogResolution.model.capabilities,
+      );
+    } catch (error) {
+      if (error instanceof ManagedVideoRequestError) {
+        throw new CloudAiError(error.code, error.message, error.statusCode);
+      }
+      throw error;
+    }
+    input = {
+      ...input,
+      resolution: normalizedManagedRequest.resolution,
+      duration: normalizedManagedRequest.duration,
+      aspectRatio: normalizedManagedRequest.aspectRatio,
+      inputMode: normalizedManagedRequest.inputMode,
+      count: normalizedManagedRequest.count,
+    };
+  }
   if (!catalogResolution && isSeedance20VideoModel(input.model)
     && (input.inputImages.length > 9 || input.inputVideos.length > 3 || input.inputAudios.length > 3)) {
     throw new CloudAiError('invalid_request', 'Seedance 2.0 supports 9 images, 3 videos, and 3 audios at most', 400);
@@ -5794,7 +5799,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
     && (input.inputImages.length > 9 || input.inputVideos.length > 3 || input.inputAudios.length > 3)) {
     throw new CloudAiError('invalid_request', 'MiniMax H3 supports 9 images, 3 videos, and 3 audios at most', 400);
   }
-  if (catalogResolution
+  if (catalogResolution && !managedRouting
     && !catalogModelSupportsVideoRequest(
       catalogResolution.model.capabilities,
       input.resolution,
@@ -5803,7 +5808,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
     )) {
     throw new CloudAiError('invalid_request', '所选视频模型不支持该分辨率、时长或画面比例', 400);
   }
-  if (catalogResolution
+  if (catalogResolution && !managedRouting
     && !catalogModelSupportsVideoInputs(catalogResolution.model.capabilities, input)) {
     throw new CloudAiError('invalid_request', '所选视频模型不支持当前输入素材或输入模式', 400);
   }
@@ -5811,17 +5816,35 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
     ...input,
     inputImages: await resolveReferenceImageSources(prisma, input.userId, input.inputImages),
   };
-  const compatibleCatalogRoutes = catalogResolution?.enabledRoutes.filter(route => (
-    videoRouteSupportsRequest(
-      route,
-      canonicalModelKey,
-      input.resolution,
-      input.duration,
-      managedRouting,
-      input.aspectRatio,
-      input,
-    )
-  )) ?? [];
+  if (normalizedManagedRequest) {
+    normalizedManagedRequest = { ...normalizedManagedRequest, inputImages: input.inputImages };
+  }
+  const compatibleCatalogRoutes = catalogResolution
+    ? managedRouting && normalizedManagedRequest
+      ? selectManagedVideoRoutes(
+        catalogResolution.enabledRoutes.map(route => ({
+          ...route,
+          // Video route overrides are the actual upstream SKU boundary. Do
+          // not discard a persisted override based on legacy discovery metadata.
+          capabilitiesOverride: route.capabilitiesOverride,
+        })),
+        catalogResolution.model.id,
+        catalogResolution.model.capabilities,
+        normalizedManagedRequest,
+        catalogResolution.model.defaultRouteId,
+      )
+      : catalogResolution.enabledRoutes.filter(route => (
+        videoRouteSupportsRequest(
+          route,
+          canonicalModelKey,
+          input.resolution,
+          input.duration,
+          false,
+          input.aspectRatio,
+          input,
+        )
+      ))
+    : [];
   if (!managedRouting
     && input.providerChannelId
     && catalogResolution
@@ -5872,14 +5895,16 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
   };
   const pricingSnapshot = catalogResolution
     ? await capturePricingSnapshot(prisma, catalogResolution.model, route?.id ?? null, {
-      duration: input.duration ?? 15,
-      resolution: input.resolution ?? '720p',
+      ...(input.duration !== undefined ? { duration: input.duration } : {}),
+      ...(input.resolution ? { resolution: input.resolution } : {}),
       count: input.count,
       inputMode: input.inputMode ?? 'REF',
       referenceImageCount: input.inputImages.length,
       referenceVideoCount: input.inputVideos.length,
-      referenceVideoSeconds: (input.duration ?? 15) * input.inputVideos.length,
-      referenceVideoResolution: input.resolution ?? '720p',
+      ...(input.duration !== undefined
+        ? { referenceVideoSeconds: input.duration * input.inputVideos.length }
+        : {}),
+      ...(input.resolution ? { referenceVideoResolution: input.resolution } : {}),
     }, input.userId)
     : undefined;
   const reservation = await reserveVideo(prisma, upstreamInput, pricingSnapshot, canonicalModelKey);
@@ -5895,6 +5920,58 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       aspectRatio: input.aspectRatio ?? null,
       fallbackType: 'none',
     });
+    const managedAdapter = managedRouting && route ? getVideoAdapter(route.adapterKey) : undefined;
+    if (managedRouting && route && normalizedManagedRequest && managedAdapter?.executionMode === 'async-task') {
+      const tasks = await createVideoTasks(prisma, reservation.requestId, route.id, normalizedManagedRequest.count);
+      const genericRoutes = compatibleCatalogRoutes.filter(candidate => (
+        getVideoAdapter(candidate.adapterKey)?.executionMode === 'async-task' && candidate.channel
+      ));
+      for (const task of tasks) {
+        let lastError: unknown = new Error('No compatible generic video route is available');
+        for (const candidate of genericRoutes) {
+          const candidateAdapter = getVideoAdapter(candidate.adapterKey);
+          if (!candidateAdapter || !candidate.channel) continue;
+          try {
+            const submission = await candidateAdapter.submit(
+              { route: candidate, provider: candidate.channel },
+              normalizedManagedRequest,
+              task.outputIndex,
+              videoOutputIdempotencyKey(input.clientRequestId, task.outputIndex),
+            );
+            if (candidate.id !== task.routeId) {
+              await prisma.aiVideoTask.update({ where: { id: task.id }, data: { routeId: candidate.id } });
+            }
+            await recordVideoTaskSubmission(prisma, task.id, submission);
+            lastError = null;
+            break;
+          } catch (error) {
+            lastError = error;
+            console.warn('[managed_video_route_submit_failed]', {
+              canonicalModel: canonicalModelKey,
+              routeId: candidate.id,
+              outputIndex: task.outputIndex,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+        if (lastError) await recordVideoTaskFailure(prisma, task.id, lastError);
+      }
+      await settleVideoRequestIfTerminal(prisma, reservation.requestId);
+      const persistedTasks = await prisma.aiVideoTask.findMany({
+        where: { requestId: reservation.requestId },
+        orderBy: { outputIndex: 'asc' },
+      });
+      return {
+        status: persistedTasks.some(task => task.status === 'PROCESSING') ? 'processing' : 'failed',
+        results: persistedTasks.map(publicVideoTask),
+        provider: 'managed',
+        model: canonicalModelKey,
+        chargedCredits: '0.000000',
+      };
+    }
+    if (managedRouting && managedAdapter?.executionMode !== 'legacy-delegate') {
+      throw new CloudAiError('video_adapter_unavailable', 'The selected video route adapter is unavailable', 503);
+    }
     if (provider.kind === 'MIKOTO' && isKlingVideoModel(upstreamInput.model)) {
       const maxImages = /omni/i.test(upstreamInput.model) ? 3 : 2;
       if (upstreamInput.inputImages.length > maxImages || upstreamInput.inputVideos.length > 0 || upstreamInput.inputAudios.length > 0) {
@@ -6001,6 +6078,107 @@ export async function executeWalletVideoStatus(
   prisma: PrismaClient,
   input: { userId: string; provider?: VideoInput['provider']; providerChannelId?: string | undefined; taskId: string; clientRequestId?: string | undefined },
 ) {
+  const managedTask = await prisma.aiVideoTask.findUnique({
+    where: { id: input.taskId },
+    include: {
+      request: true,
+      route: { include: { channel: true } },
+    },
+  });
+  if (managedTask) {
+    if (managedTask.request.userId !== input.userId) {
+      throw new CloudAiError('video_task_not_found', 'Video task was not found', 404);
+    }
+    if (managedTask.status === 'SUCCEEDED' || managedTask.status === 'FAILED') {
+      return publicVideoTask(managedTask);
+    }
+    const managedRoute = managedTask.route;
+    const managedProvider = managedRoute?.channel;
+    const adapter = getVideoAdapter(managedRoute?.adapterKey);
+    if (!managedRoute || !managedProvider || !adapter || adapter.executionMode !== 'async-task') {
+      await recordVideoTaskFailure(prisma, managedTask.id, 'Managed video adapter or route is unavailable');
+      await settleVideoRequestIfTerminal(prisma, managedTask.requestId);
+      return publicVideoTask(await prisma.aiVideoTask.findUniqueOrThrow({ where: { id: managedTask.id } }));
+    }
+    if (!managedTask.upstreamTaskId) {
+      await recordVideoTaskFailure(prisma, managedTask.id, 'Video task has no upstream task ID');
+      await settleVideoRequestIfTerminal(prisma, managedTask.requestId);
+      return publicVideoTask(await prisma.aiVideoTask.findUniqueOrThrow({ where: { id: managedTask.id } }));
+    }
+    const context = { route: managedRoute, provider: managedProvider };
+    const status = managedTask.status === 'PERSISTENCE_PENDING'
+      ? {
+        state: 'completed' as const,
+        upstreamStatus: 'completed',
+        upstreamPayload: managedTask.upstreamPayload,
+        videoAvailable: true,
+        ...(managedTask.assetState ? { assetState: managedTask.assetState } : {}),
+        ...(managedTask.pollAfterMs !== null ? { pollAfterMs: managedTask.pollAfterMs } : {}),
+      }
+      : await adapter.poll(context, managedTask.upstreamTaskId);
+    await prisma.aiVideoTask.update({
+      where: { id: managedTask.id },
+      data: {
+        status: status.state === 'failed' ? 'FAILED' : status.state === 'completed' ? 'PERSISTENCE_PENDING' : 'PROCESSING',
+        assetState: status.assetState ?? null,
+        videoAvailable: status.videoAvailable ?? null,
+        pollAfterMs: status.pollAfterMs === undefined ? managedTask.pollAfterMs : clampVideoPollAfterMs(status.pollAfterMs),
+        lastPolledAt: new Date(),
+        upstreamPayload: toInputJson(status.upstreamPayload),
+        lastError: ('error' in status ? status.error : undefined) ?? null,
+        ...(status.state === 'failed' ? { completedAt: new Date() } : {}),
+      },
+    });
+    if (status.state === 'failed') {
+      await settleVideoRequestIfTerminal(prisma, managedTask.requestId);
+      return publicVideoTask(await prisma.aiVideoTask.findUniqueOrThrow({ where: { id: managedTask.id } }));
+    }
+    if (status.state === 'completed') {
+      try {
+        const content = await adapter.fetchContent(context, managedTask.upstreamTaskId, status);
+        const resultUrl = await mirrorGeneratedVideoResultToStorage(
+          content.source,
+          content.requestHeaders,
+          `${managedRoute.id}:${managedTask.upstreamTaskId}`,
+        );
+        let resultObjectKey: string | null = null;
+        try {
+          const pathname = new URL(resultUrl, 'https://wallet.invalid').pathname;
+          const match = pathname.match(/\/video-results\/([^/?#]+)/);
+          resultObjectKey = match?.[1] ? `generated-videos/${match[1]}` : null;
+        } catch {
+          resultObjectKey = null;
+        }
+        await prisma.aiVideoTask.update({
+          where: { id: managedTask.id },
+          data: {
+            status: 'SUCCEEDED',
+            assetState: 'available',
+            videoAvailable: true,
+            resultUrl,
+            resultObjectKey,
+            lastError: null,
+            completedAt: new Date(),
+          },
+        });
+        await settleVideoRequestIfTerminal(prisma, managedTask.requestId);
+      } catch (error) {
+        // The upstream generation already exists. Keep the task retryable and
+        // retry persistence only; never submit a second generation.
+        await prisma.aiVideoTask.update({
+          where: { id: managedTask.id },
+          data: {
+            status: 'PERSISTENCE_PENDING',
+            assetState: 'failed',
+            videoAvailable: true,
+            lastError: error instanceof Error ? error.message : String(error),
+            pollAfterMs: clampVideoPollAfterMs(managedTask.pollAfterMs),
+          },
+        });
+      }
+    }
+    return publicVideoTask(await prisma.aiVideoTask.findUniqueOrThrow({ where: { id: managedTask.id } }));
+  }
   const requestRoute = input.clientRequestId
     ? (await prisma.aiRequest.findUnique({
       where: {

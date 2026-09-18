@@ -443,6 +443,7 @@ model AiRequest {
   route             AiModelRoute?        @relation(fields: [routeId], references: [id], onDelete: SetNull)
   priceVersion      AiPriceVersion?      @relation(fields: [priceVersionId], references: [id], onDelete: SetNull)
   billingSettlement AiBillingSettlement?
+  videoTasks         AiVideoTask[]
 
   @@unique([userId, clientRequestId])
   @@index([userId, createdAt])
@@ -573,6 +574,7 @@ model AiModelRoute {
   requests             AiRequest[]
   costHistory          AiRouteCostHistory[]
   billingSettlements   AiBillingSettlement[]
+  videoTasks           AiVideoTask[]
 
   @@unique([provider, channelId, upstreamModelId])
   @@index([canonicalModelId, enabled, priority])
@@ -686,6 +688,36 @@ model AiBillingSettlement {
   @@index([canonicalModelId, createdAt])
   @@index([routeId, createdAt])
   @@index([priceVersionId])
+}
+
+/// One independently pollable upstream task per requested video output.
+/// This is additive: historical AiRequest rows remain unchanged.
+model AiVideoTask {
+  id                String       @id @default(cuid())
+  requestId         String
+  routeId           String?
+  outputIndex       Int
+  upstreamTaskId    String?
+  status            String       @default("RESERVED")
+  assetState        String?
+  videoAvailable    Boolean?
+  pollAfterMs       Int?
+  lastPolledAt      DateTime?
+  resultObjectKey   String?
+  resultUrl         String?
+  upstreamPayload   Json?
+  lastError         String?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  completedAt       DateTime?
+  request           AiRequest    @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  route             AiModelRoute? @relation(fields: [routeId], references: [id], onDelete: SetNull)
+
+  @@unique([requestId, outputIndex])
+  @@unique([routeId, upstreamTaskId])
+  @@index([requestId, status])
+  @@index([routeId, status])
+  @@index([status, lastPolledAt])
 }
 
 model ChatPricingConfig {

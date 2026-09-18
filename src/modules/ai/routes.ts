@@ -64,20 +64,6 @@ const taskRequestParamsSchema = z.object({
 const optionalString = (max: number) => z.string().trim().max(max).nullish()
   .transform((value) => value ?? undefined);
 
-const isSeedance20VideoModel = (model: string) => {
-  const token = model.trim().toLowerCase().replace(/[\s_.-]+/g, '');
-  return token === 'seedance2'
-    || token === 'seedance20'
-    || token === 'seedance2fast'
-    || token === 'seedance20fast'
-    || token === 'sourcemix20'
-    || token === 'sourcemix20fast';
-};
-
-const isMiniMaxH3VideoModel = (model: string) => (
-  model.trim().toLowerCase().replace(/[\s_.-]+/g, '') === 'minimaxh3'
-);
-
 const imageAspectRatioSchema = z.string().trim().min(3).max(20).superRefine((value, context) => {
   const normalized = value.replace(/×/g, 'x');
   const match = normalized.match(/^([1-9]\d{0,4})(:|x)([1-9]\d{0,4})$/i);
@@ -125,29 +111,15 @@ const videoSchema = z.object({
     .transform((value) => value ?? undefined),
   model: z.string().trim().min(1).max(200),
   prompt: z.string().trim().min(1).max(50_000),
-  inputImages: z.array(z.string().min(1).max(12_000_000)).max(13).default([]),
-  inputVideos: z.array(z.string().min(1).max(12_000_000)).max(3).default([]),
-  inputAudios: z.array(z.string().min(1).max(12_000_000)).max(3).default([]),
-  aspectRatio: z.string().trim().max(20).default('16:9'),
+  inputImages: z.array(z.string().min(1).max(12_000_000)).max(32).default([]),
+  inputVideos: z.array(z.string().min(1).max(12_000_000)).max(8).default([]),
+  inputAudios: z.array(z.string().min(1).max(12_000_000)).max(8).default([]),
+  aspectRatio: z.string().trim().min(3).max(20).nullish().transform((value) => value ?? undefined),
   resolution: optionalString(20),
-  duration: z.number().positive().max(120).nullish().transform((value) => value ?? undefined),
+  duration: z.number().int().positive().max(600).nullish().transform((value) => value ?? undefined),
   inputMode: z.enum(['REF', 'FLF']).nullish().transform((value) => value ?? undefined),
-  count: z.number().int().min(1).max(4).default(1),
-}).strict().superRefine((value, context) => {
-  const isSeedance = isSeedance20VideoModel(value.model);
-  const isMinimax = isMiniMaxH3VideoModel(value.model);
-  if (!isSeedance && !isMinimax) return;
-  const label = isSeedance ? 'Seedance 2.0' : 'MiniMax H3';
-  if (value.inputImages.length > 9) {
-    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 9, inclusive: true, path: ['inputImages'], message: `${label} supports at most 9 reference images` });
-  }
-  if (value.inputVideos.length > 3) {
-    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 3, inclusive: true, path: ['inputVideos'], message: `${label} supports at most 3 reference videos` });
-  }
-  if (value.inputAudios.length > 3) {
-    context.addIssue({ code: z.ZodIssueCode.too_big, origin: 'array', maximum: 3, inclusive: true, path: ['inputAudios'], message: `${label} supports at most 3 reference audios` });
-  }
-});
+  count: z.number().int().min(1).max(16).default(1),
+}).strict();
 
 const videoStatusSchema = z.object({
   provider: z.enum(['new-api', 'xais-chat', 'mikoto', 'minimax']).nullish()

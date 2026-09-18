@@ -545,10 +545,13 @@ function imageCharge(snapshot: PricingSnapshot, generatedCount?: number): Charge
   };
 }
 
-function videoCharge(snapshot: PricingSnapshot): ChargeBreakdown {
+function videoCharge(snapshot: PricingSnapshot, generatedCount?: number): ChargeBreakdown {
   const pricing = snapshot.pricing;
   const duration = Math.max(1, Math.ceil(Number(snapshot.request.duration) || 15));
-  const count = Math.max(1, Math.ceil(Number(snapshot.request.count) || 1));
+  const requestedCount = Math.max(1, Math.ceil(Number(snapshot.request.count) || 1));
+  const count = generatedCount === undefined
+    ? requestedCount
+    : Math.max(0, Math.min(requestedCount, Math.floor(generatedCount)));
   const resolution = (scalarText(snapshot.request.resolution) || '720p').toLowerCase();
   const imageCount = Math.max(0, Math.floor(Number(snapshot.request.referenceImageCount) || 0));
   const videoCount = Math.max(0, Math.floor(Number(snapshot.request.referenceVideoCount) || 0));
@@ -559,16 +562,20 @@ function videoCharge(snapshot: PricingSnapshot): ChargeBreakdown {
   const referenceByResolution = plainObject(pricing.referenceVideoCreditsByResolution) ?? {};
   const referenceResolution = (scalarText(snapshot.request.referenceVideoResolution) || resolution).toLowerCase();
   const inputMode = (scalarText(snapshot.request.inputMode) || 'REF').toUpperCase();
-  const countOverride = byCount[String(count)];
+  const countOverride = count > 0 ? byCount[String(count)] : undefined;
   const perSecond = pricing.creditsPerSecond ?? pricing.credits ?? '0';
   const durationBase = byDuration[String(duration)] === undefined
     ? multiplyCredits(perSecond, BigInt(duration))
     : creditMicros(byDuration[String(duration)]);
-  const perVideo = creditMicros(pricing.creditsPerVideo ?? '0');
+  const perVideo = creditMicros(pricing.creditsPerVideo
+    ?? (pricing.billingType === 'video_flat' ? pricing.credits : undefined)
+    ?? '0');
   const inputModeCharge = creditMicros(byInputMode[inputMode.toLowerCase()] ?? byInputMode[inputMode] ?? '0');
   const resolutionCharge = multiplyCredits(byResolution[resolution] ?? '0', BigInt(duration));
   const outputBase = countOverride === undefined
-    ? (durationBase + perVideo + inputModeCharge + resolutionCharge) * BigInt(count)
+    ? (pricing.billingType === 'video_flat'
+      ? perVideo * BigInt(count)
+      : (durationBase + perVideo + inputModeCharge + resolutionCharge) * BigInt(count))
     : creditMicros(countOverride);
   const includedImages = Math.max(0, Math.floor(Number(pricing.includedReferenceImages) || 0));
   const extraImages = Math.max(0, imageCount - includedImages);
@@ -595,7 +602,7 @@ function videoCharge(snapshot: PricingSnapshot): ChargeBreakdown {
     baseCharge: microsToCredit(outputBase),
     surcharges,
     totalCredits: microsToCredit(total),
-    details: { duration, resolution, count, inputMode, referenceImageCount: imageCount, referenceVideoCount: videoCount, referenceVideoSeconds, referenceVideoResolution: referenceResolution },
+    details: { duration, resolution, requestedCount, generatedCount: count, count, inputMode, referenceImageCount: imageCount, referenceVideoCount: videoCount, referenceVideoSeconds, referenceVideoResolution: referenceResolution },
   };
 }
 
@@ -701,7 +708,7 @@ export function calculateSnapshotCharge(
 ) {
   if (snapshot.modality === 'chat') return chatCharge(snapshot, options.usage);
   if (snapshot.modality === 'image') return imageCharge(snapshot, options.generatedCount);
-  return videoCharge(snapshot);
+  return videoCharge(snapshot, options.generatedCount);
 }
 
 export function estimateSnapshotCredits(snapshot: PricingSnapshot) {

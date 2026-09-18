@@ -292,7 +292,7 @@ export function normalizeModelCapabilities(value: Prisma.InputJsonValue): Prisma
     normalized[key] = Array.from(new Set(values));
   };
   normalizeStrings('supportedResolutions', /^[a-z0-9][a-z0-9._+-]{0,31}$/);
-  normalizeStrings('supportedAspectRatios', /^\d{1,5}:\d{1,5}$/);
+  normalizeStrings('supportedAspectRatios', /^[1-9]\d{0,4}:[1-9]\d{0,4}$/);
   if (source.supportedDurations !== undefined) {
     if (!Array.isArray(source.supportedDurations)) throw new Error('supportedDurations must be an array');
     const durations = source.supportedDurations.map(Number);
@@ -301,6 +301,141 @@ export function normalizeModelCapabilities(value: Prisma.InputJsonValue): Prisma
       throw new Error('supportedDurations must contain positive integers no greater than 600');
     }
     normalized.supportedDurations = Array.from(new Set(durations)).sort((left, right) => left - right);
+  }
+  const durationMode = source.durationMode;
+  if (durationMode !== undefined) {
+    if (durationMode !== 'list' && durationMode !== 'range' && durationMode !== 'fixed') {
+      throw new Error('durationMode must be list, range, or fixed');
+    }
+    normalized.durationMode = durationMode;
+  }
+  if (source.durationRange !== undefined) {
+    if (!source.durationRange || typeof source.durationRange !== 'object' || Array.isArray(source.durationRange)) {
+      throw new Error('durationRange must be an object');
+    }
+    const range = source.durationRange as Prisma.JsonObject;
+    const min = Number(range.min);
+    const max = Number(range.max);
+    const step = range.step === undefined ? undefined : Number(range.step);
+    if (!Number.isSafeInteger(min) || min <= 0 || min > 600
+      || !Number.isSafeInteger(max) || max <= 0 || max > 600
+      || min > max
+      || (step !== undefined && (!Number.isSafeInteger(step) || step < 1 || step > 600))) {
+      throw new Error('durationRange must use positive integers no greater than 600 with min <= max and step >= 1');
+    }
+    normalized.durationRange = { min, max, ...(step === undefined ? {} : { step }) };
+  }
+  const durations = Array.isArray(normalized.supportedDurations)
+    ? normalized.supportedDurations.map(Number)
+    : [];
+  if (durationMode === 'fixed' && durations.length !== 1) {
+    throw new Error('durationMode=fixed requires exactly one supported duration');
+  }
+  if (durationMode === 'list' && durations.length === 0) {
+    throw new Error('durationMode=list requires at least one supported duration');
+  }
+  if (durationMode === 'range' && normalized.durationRange === undefined) {
+    throw new Error('durationMode=range requires durationRange');
+  }
+  const range = normalized.durationRange && typeof normalized.durationRange === 'object'
+    ? normalized.durationRange as Prisma.JsonObject
+    : undefined;
+  const durationAllowed = (candidate: number) => {
+    if (durationMode === 'range' && range) {
+      const min = Number(range.min);
+      const max = Number(range.max);
+      const step = Number(range.step ?? 1);
+      return candidate >= min && candidate <= max && (candidate - min) % step === 0;
+    }
+    return durations.length === 0 || durations.includes(candidate);
+  };
+  if (source.defaultDurationSeconds !== undefined) {
+    const defaultDurationSeconds = Number(source.defaultDurationSeconds);
+    if (!Number.isSafeInteger(defaultDurationSeconds) || defaultDurationSeconds <= 0
+      || defaultDurationSeconds > 600 || !durationAllowed(defaultDurationSeconds)) {
+      throw new Error('defaultDurationSeconds must be a valid supported duration');
+    }
+    normalized.defaultDurationSeconds = defaultDurationSeconds;
+  }
+  if (source.defaultResolution !== undefined) {
+    if (typeof source.defaultResolution !== 'string') {
+      throw new Error('defaultResolution must be a string');
+    }
+    const defaultResolution = source.defaultResolution.trim().toLowerCase();
+    const resolutions = Array.isArray(normalized.supportedResolutions)
+      ? normalized.supportedResolutions.map(String)
+      : [];
+    if (!defaultResolution || !resolutions.includes(defaultResolution)) {
+      throw new Error('defaultResolution must belong to supportedResolutions');
+    }
+    normalized.defaultResolution = defaultResolution;
+  }
+  const aspectRatioMode = source.aspectRatioMode;
+  if (aspectRatioMode !== undefined) {
+    if (aspectRatioMode !== 'list' && aspectRatioMode !== 'any' && aspectRatioMode !== 'unspecified') {
+      throw new Error('aspectRatioMode must be list, any, or unspecified');
+    }
+    const aspectRatios = Array.isArray(normalized.supportedAspectRatios)
+      ? normalized.supportedAspectRatios.map(String)
+      : [];
+    if (aspectRatioMode === 'list' && aspectRatios.length === 0) {
+      throw new Error('aspectRatioMode=list requires supportedAspectRatios');
+    }
+    normalized.aspectRatioMode = aspectRatioMode;
+  }
+  if (source.defaultAspectRatio !== undefined) {
+    if (typeof source.defaultAspectRatio !== 'string') {
+      throw new Error('defaultAspectRatio must be a string');
+    }
+    const defaultAspectRatio = source.defaultAspectRatio.trim().toLowerCase();
+    if (!/^[1-9]\d{0,4}:[1-9]\d{0,4}$/.test(defaultAspectRatio)) {
+      throw new Error('defaultAspectRatio must be a valid W:H ratio');
+    }
+    const aspectRatios = Array.isArray(normalized.supportedAspectRatios)
+      ? normalized.supportedAspectRatios.map(String)
+      : [];
+    if (aspectRatioMode === 'unspecified'
+      || (aspectRatioMode === 'list' && !aspectRatios.includes(defaultAspectRatio))) {
+      throw new Error('defaultAspectRatio is not allowed by aspectRatioMode');
+    }
+    normalized.defaultAspectRatio = defaultAspectRatio;
+  }
+  const referenceKinds = [
+    ['Images', 'supportsReferenceImage', 'supportsReferenceImages'],
+    ['Videos', 'supportsReferenceVideo', 'supportsVideoReference'],
+    ['Audios', 'supportsReferenceAudio', 'supportsAudioReference'],
+  ] as const;
+  for (const [suffix, supportKey, supportAlias] of referenceKinds) {
+    const transportLimit = suffix === 'Images' ? 32 : 8;
+    const minKey = `minReference${suffix}`;
+    const maxKey = `maxReference${suffix}`;
+    const minValue = source[minKey] === undefined ? undefined : Number(source[minKey]);
+    const maxValue = source[maxKey] === undefined ? undefined : Number(source[maxKey]);
+    if (minValue !== undefined && (!Number.isSafeInteger(minValue) || minValue < 0 || minValue > transportLimit)) {
+      throw new Error(`${minKey} must be a non-negative integer`);
+    }
+    if (maxValue !== undefined && (!Number.isSafeInteger(maxValue) || maxValue < 0 || maxValue > transportLimit)) {
+      throw new Error(`${maxKey} must be a non-negative integer`);
+    }
+    if (minValue !== undefined && maxValue !== undefined && minValue > maxValue) {
+      throw new Error(`${minKey} must not exceed ${maxKey}`);
+    }
+    if ((minValue ?? 0) > 0 && maxValue === undefined) {
+      throw new Error(`${minKey} requires ${maxKey}`);
+    }
+    const supported = source[supportKey] ?? source[supportAlias];
+    if (supported === false && ((minValue ?? 0) > 0 || (maxValue ?? 0) > 0)) {
+      throw new Error(`${supportKey}=false cannot expose usable reference limits`);
+    }
+    if (minValue !== undefined) normalized[minKey] = minValue;
+    if (maxValue !== undefined) normalized[maxKey] = maxValue;
+  }
+  if (source.maxOutputs !== undefined) {
+    const maxOutputs = Number(source.maxOutputs);
+    if (!Number.isSafeInteger(maxOutputs) || maxOutputs < 1 || maxOutputs > 16) {
+      throw new Error('maxOutputs must be an integer between 1 and 16');
+    }
+    normalized.maxOutputs = maxOutputs;
   }
   return normalized;
 }
@@ -368,10 +503,20 @@ export function normalizePublicModelCapabilities(value: unknown) {
       'supportedAspectRatiosByResolution',
     ),
     durations: numberArray('durations', 'supportedDurations'),
+    durationMode: typeof source.durationMode === 'string' ? source.durationMode : undefined,
+    durationRange: source.durationRange && typeof source.durationRange === 'object' && !Array.isArray(source.durationRange)
+      ? source.durationRange
+      : undefined,
+    defaultDurationSeconds: numberValue('defaultDurationSeconds'),
+    aspectRatioMode: typeof source.aspectRatioMode === 'string' ? source.aspectRatioMode : undefined,
+    defaultAspectRatio: typeof source.defaultAspectRatio === 'string' ? source.defaultAspectRatio : undefined,
+    defaultResolution: typeof source.defaultResolution === 'string' ? source.defaultResolution : undefined,
     maxReferenceImages: numberValue('maxReferenceImages'),
     maxReferenceVideos: numberValue('maxReferenceVideos'),
     maxReferenceAudios: numberValue('maxReferenceAudios'),
     minReferenceImages: numberValue('minReferenceImages'),
+    minReferenceVideos: numberValue('minReferenceVideos'),
+    minReferenceAudios: numberValue('minReferenceAudios'),
     supportsReferenceImages: booleanValue('supportsReferenceImages', 'supportsReferenceImage'),
     supportsReferenceVideo: booleanValue('supportsReferenceVideo', 'supportsVideoReference'),
     supportsReferenceAudio: booleanValue('supportsReferenceAudio', 'supportsAudioReference'),
