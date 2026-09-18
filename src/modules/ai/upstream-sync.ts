@@ -57,24 +57,77 @@ function modelId(item: unknown) {
   return typeof raw === 'string' ? raw.replace(/^models\//, '').trim() : '';
 }
 
-function providerModalityHints(provider: AiProviderChannel) {
-  const hints: AiModality[] = [];
-  if (provider.capabilities.some(capability => capability === 'LLM' || capability === 'VISION')) hints.push('chat');
-  if (provider.capabilities.some(capability => capability.startsWith('IMAGE'))) hints.push('image');
-  if (provider.capabilities.some(capability => capability.startsWith('VIDEO'))) hints.push('video');
-  return hints;
+function providerModalityHints(provider: Pick<AiProviderChannel, 'capabilities'>) {
+  const hints = new Set<AiModality>();
+  if (provider.capabilities.some(capability => capability === 'LLM' || capability === 'VISION')) hints.add('chat');
+  if (provider.capabilities.some(capability => capability.startsWith('IMAGE'))) hints.add('image');
+  if (provider.capabilities.some(capability => capability.startsWith('VIDEO'))) hints.add('video');
+  return [...hints];
 }
 
-function suggestedModality(provider: AiProviderChannel, id: string): AiModality | null {
-  const hints = providerModalityHints(provider);
+const explicitModalityFields = [
+  'modality',
+  'type',
+  'model_type',
+  'modelType',
+  'category',
+  'task_type',
+  'taskType',
+] as const;
+
+export function explicitUpstreamModality(item: unknown): AiModality | null {
+  const record = objectValue(item);
+  if (!record) return null;
+  for (const field of explicitModalityFields) {
+    const value = record[field];
+    if (typeof value !== 'string') continue;
+    const normalized = value.trim().toLowerCase().replace(/\s+/g, '_');
+    if (new Set(['image', 'image_generation', 'image-generation', 'text-to-image', 'text_to_image']).has(normalized)) {
+      return 'image';
+    }
+    if (new Set(['video', 'video_generation', 'video-generation', 'text-to-video', 'text_to_video', 'image-to-video', 'image_to_video']).has(normalized)) {
+      return 'video';
+    }
+    if (new Set(['chat', 'llm', 'text', 'completion', 'text_generation', 'text-generation']).has(normalized)) {
+      return 'chat';
+    }
+  }
+  return null;
+}
+
+export function providerSpecificModality(
+  provider: Pick<AiProviderChannel, 'kind'>,
+  upstreamModelId: string,
+): AiModality | null {
+  if (provider.kind.toUpperCase() !== 'USELG') return null;
+  const id = upstreamModelId.trim().toLowerCase();
+  if (/^sd[-_.]?2[._-][05](?:[-_.]|$)/.test(id) || /^sd-2-fast(?:[-_.]|$)/.test(id)) return 'video';
+  if (/^seedance(?:[-_.]?2(?:[._-][05])?)(?:[-_.]|$)/.test(id)) return 'video';
+  if (/^minimax[-_]h3(?:[-_.]|$)/.test(id)) return 'video';
+  return null;
+}
+
+export function genericModelNameModality(id: string): AiModality | null {
   const token = catalogAliasKey(id);
   // This is advisory only. It never maps or opens a model.
   // Model discovery must not be constrained by the legacy channel enum: a
   // newly launched model may not have a matching enum value yet.
   if (/(?:image|imagen|img|banana|flux|dalle|recraft)/.test(token)) return 'image';
+  if (/(?:stablediffusion|sdxl)/.test(token) || /^sd3(?:[-_.]|$)/i.test(id.trim())) return 'image';
   if (/(?:video|sora|veo|kling|seedance|minimaxh3)/.test(token)) return 'video';
-  if (hints.length === 1) return hints[0]!;
-  return hints.includes('chat') ? 'chat' : null;
+  return null;
+}
+
+export function inferSuggestedModality(
+  provider: Pick<AiProviderChannel, 'kind' | 'capabilities'>,
+  id: string,
+  item?: unknown,
+): AiModality | null {
+  const hints = providerModalityHints(provider);
+  return explicitUpstreamModality(item)
+    ?? providerSpecificModality(provider, id)
+    ?? genericModelNameModality(id)
+    ?? (hints.length === 1 ? hints[0]! : null);
 }
 
 function preservesConfiguredRouteCapabilities(metadata: unknown) {
@@ -95,6 +148,7 @@ function normalizeModel(provider: AiProviderChannel, item: unknown): NormalizedU
   const upstreamModelId = modelId(item);
   if (!upstreamModelId) return null;
   const record = objectValue(item) ?? {};
+  const modality = inferSuggestedModality(provider, upstreamModelId, item);
   const availableValue = record.available ?? record.enabled ?? record.active;
   const availability = availableValue === false
     ? 'UNAVAILABLE'
@@ -102,14 +156,18 @@ function normalizeModel(provider: AiProviderChannel, item: unknown): NormalizedU
   return {
     provider: provider.kind,
     upstreamModelId,
-    modality: suggestedModality(provider, upstreamModelId),
+    modality,
     availability,
     capabilities: jsonValue(record.capabilities),
     context: jsonValue(record.context ?? record.context_window ?? record.contextWindow),
     resolution: jsonValue(record.resolution ?? record.resolutions),
     duration: jsonValue(record.duration ?? record.durations),
     cost: jsonValue(record.cost ?? record.pricing ?? record.price),
-    metadata: jsonValue({ raw: record, adapter: provider.kind === 'BIGMODEL' ? 'gemini' : 'openai' }) ?? {},
+    metadata: jsonValue({
+      raw: record,
+      adapter: provider.kind === 'BIGMODEL' ? 'gemini' : 'openai',
+      inferredModality: modality,
+    }) ?? {},
   };
 }
 
@@ -194,7 +252,7 @@ async function confirmedMappedModel(
   provider: AiProviderChannel,
   item: NormalizedUpstreamModel,
 ) {
-  const modalities = item.modality ? [item.modality] : providerModalityHints(provider);
+  const modalities = item.modality ? [item.modality] : [];
   for (const modality of modalities) {
     const explicitKey = explicitCanonicalModelKey(modality, item.upstreamModelId, provider.capabilities);
     if (explicitKey) {

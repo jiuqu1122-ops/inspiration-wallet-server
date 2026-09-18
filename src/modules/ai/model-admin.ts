@@ -20,6 +20,7 @@ import {
 } from './pricing-center.js';
 import { validateGenericAsyncVideoConfig } from './video-adapters/generic-async-video.js';
 import { assertVideoCapabilitiesSubset } from './video-capabilities.js';
+import { effectiveDiscoveryModality } from './discovery-modality.js';
 
 export type AdminMutationContext = {
   actor: string;
@@ -425,11 +426,36 @@ export async function updateAdminAiRoute(
 }
 
 export async function listUnmappedModels(prisma: PrismaClient) {
-  return prisma.aiUpstreamDiscovery.findMany({
+  const discoveries = await prisma.aiUpstreamDiscovery.findMany({
     where: { status: 'UNMAPPED' },
     include: { channel: { select: { id: true, name: true, kind: true, status: true } } },
     orderBy: [{ lastSyncedAt: 'desc' }, { provider: 'asc' }, { upstreamModelId: 'asc' }],
   });
+  return discoveries.map(discovery => ({
+    ...discovery,
+    effectiveModality: effectiveDiscoveryModality(discovery),
+  }));
+}
+
+export async function updateDiscoveryModalityOverride(
+  prisma: PrismaClient,
+  discoveryId: string,
+  modalityOverride: AiModality | null,
+) {
+  const discovery = await prisma.aiUpstreamDiscovery.findUnique({ where: { id: discoveryId } });
+  if (!discovery) throw new AiModelAdminError('NOT_FOUND', 'Upstream discovery was not found', 404);
+  if (discovery.status !== 'UNMAPPED') {
+    throw new AiModelAdminError('CONFLICT', 'Upstream discovery is no longer awaiting review', 409);
+  }
+  const updated = await prisma.aiUpstreamDiscovery.update({
+    where: { id: discoveryId },
+    data: { modalityOverride },
+    include: { channel: { select: { id: true, name: true, kind: true, status: true } } },
+  });
+  return {
+    ...updated,
+    effectiveModality: effectiveDiscoveryModality(updated),
+  };
 }
 
 async function updateRouteGeneratedAlias(
@@ -665,7 +691,11 @@ async function mapDiscoveryToCanonicalTransaction(
   if (discovery.status !== 'UNMAPPED') {
     throw new AiModelAdminError('CONFLICT', 'Upstream mapping was modified by another administrator', 409);
   }
-  if (discovery.suggestedModality && discovery.suggestedModality !== model.modality) {
+  const effectiveModality = effectiveDiscoveryModality(discovery);
+  if (!effectiveModality) {
+    throw new AiModelAdminError('INVALID_REQUEST', 'Discovery modality must be confirmed before mapping', 400);
+  }
+  if (effectiveModality !== model.modality) {
     throw new AiModelAdminError('INVALID_REQUEST', 'Discovery modality does not match the canonical model', 400);
   }
   const route = await transaction.aiModelRoute.upsert({
@@ -780,7 +810,11 @@ export async function createCanonicalFromDiscovery(
     if (discovery.status !== 'UNMAPPED') {
       throw new AiModelAdminError('CONFLICT', 'Upstream mapping was modified by another administrator', 409);
     }
-    if (discovery.suggestedModality && discovery.suggestedModality !== input.modality) {
+    const effectiveModality = effectiveDiscoveryModality(discovery);
+    if (!effectiveModality) {
+      throw new AiModelAdminError('INVALID_REQUEST', 'Discovery modality must be confirmed before creating a model', 400);
+    }
+    if (effectiveModality !== input.modality) {
       throw new AiModelAdminError('INVALID_REQUEST', 'Discovery modality does not match the requested canonical model', 400);
     }
     const canonicalModelKey = input.canonicalModelKey?.trim().toLowerCase()

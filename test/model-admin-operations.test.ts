@@ -10,6 +10,7 @@ import {
   unmapAdminAiRoute,
   updateAdminAiModel,
   updateAdminAiRoute,
+  updateDiscoveryModalityOverride,
 } from '../src/modules/ai/model-admin.js';
 import { syncUpstreamModels } from '../src/modules/ai/upstream-sync.js';
 
@@ -211,7 +212,7 @@ describe('AI Model Center route operations', () => {
     expect(transaction.adminOperation.create).not.toHaveBeenCalled();
   });
 
-  it('creates a canonical model and maps its discovery in one transaction', async () => {
+  it('creates a canonical model using the manual discovery modality override', async () => {
     const discovery = {
       id: 'discovery-create',
       status: 'UNMAPPED',
@@ -219,7 +220,8 @@ describe('AI Model Center route operations', () => {
       provider: 'NEW_API',
       channelId: 'channel-create',
       upstreamModelId: 'vendor/new-image',
-      suggestedModality: 'image',
+      suggestedModality: 'video',
+      modalityOverride: 'image',
       availability: 'AVAILABLE',
       lastSyncedAt: updatedAt,
       channel: { priority: 6 },
@@ -275,6 +277,59 @@ describe('AI Model Center route operations', () => {
       data: { status: 'MAPPED', suggestedModelId: model.id },
     });
     expect(result).toEqual(model);
+  });
+
+  it('requires an effective discovery modality before creating a canonical model', async () => {
+    const modelCreate = vi.fn();
+    const transaction = {
+      aiUpstreamDiscovery: {
+        findUnique: vi.fn(async () => ({
+          id: 'discovery-unknown',
+          status: 'UNMAPPED',
+          suggestedModality: null,
+          modalityOverride: null,
+        })),
+      },
+      aiModel: { create: modelCreate },
+    };
+
+    await expect(createCanonicalFromDiscovery(
+      withTransaction(transaction),
+      'discovery-unknown',
+      { modality: 'image', billingType: 'image_flat' },
+      context,
+    )).rejects.toMatchObject<AiModelAdminError>({ code: 'INVALID_REQUEST', statusCode: 400 });
+    expect(modelCreate).not.toHaveBeenCalled();
+  });
+
+  it('persists a manual discovery modality separately from the automatic suggestion', async () => {
+    const discovery = {
+      id: 'discovery-override',
+      status: 'UNMAPPED',
+      suggestedModality: 'video',
+      modalityOverride: null,
+    };
+    const update = vi.fn(async ({ data }: { data: { modalityOverride: string | null } }) => ({
+      ...discovery,
+      ...data,
+      channel: { id: 'channel-override', name: 'Provider', kind: 'USELG', status: 'ACTIVE' },
+    }));
+    const prisma = {
+      aiUpstreamDiscovery: {
+        findUnique: vi.fn(async () => discovery),
+        update,
+      },
+    } as unknown as PrismaClient;
+
+    await expect(updateDiscoveryModalityOverride(prisma, discovery.id, 'image')).resolves.toMatchObject({
+      suggestedModality: 'video',
+      modalityOverride: 'image',
+      effectiveModality: 'image',
+    });
+    expect(update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: discovery.id },
+      data: { modalityOverride: 'image' },
+    }));
   });
 
   it('remaps only the route owner while preserving cost, priority, enabled state, and price history', async () => {

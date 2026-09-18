@@ -639,6 +639,7 @@ model AiUpstreamDiscovery {
   channelId         String
   upstreamModelId   String
   suggestedModality String?
+  modalityOverride  String?
   availability      String            @default("UNKNOWN")
   capabilities      Json?
   context           Json?

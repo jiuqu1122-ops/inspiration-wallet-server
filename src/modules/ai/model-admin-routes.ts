@@ -19,6 +19,7 @@ import {
   unmapAdminAiRoute,
   updateAdminAiModel,
   updateAdminAiRoute,
+  updateDiscoveryModalityOverride,
   updatePricingPolicy,
 } from './model-admin.js';
 import { toInputJson } from './pricing-center.js';
@@ -74,6 +75,9 @@ const deleteModelSchema = z.object({
 const routeParamsSchema = z.object({ routeId: idSchema }).strict();
 const providerParamsSchema = z.object({ providerId: idSchema }).strict();
 const discoveryParamsSchema = z.object({ discoveryId: idSchema }).strict();
+const updateDiscoverySchema = z.object({
+  modalityOverride: modalitySchema.nullable(),
+}).strict();
 
 const updateModelSchema = z.object({
   displayName: z.string().trim().min(1).max(120).optional(),
@@ -188,6 +192,17 @@ export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
   });
 
   app.get('/unmapped', async () => ({ items: await listUnmappedModels(app.prisma) }));
+
+  app.patch('/unmapped/:discoveryId', async (request, reply) => {
+    const params = discoveryParamsSchema.safeParse(request.params);
+    const body = updateDiscoverySchema.safeParse(request.body);
+    if (!params.success || !body.success) return invalid(reply, 'Discovery modality override is invalid');
+    return adminOperation(reply, () => updateDiscoveryModalityOverride(
+      app.prisma,
+      params.data.discoveryId,
+      body.data.modalityOverride,
+    ));
+  });
 
   app.get('/usage-model-bindings', async () => listAdminUsageModelBindings(app.prisma));
 
