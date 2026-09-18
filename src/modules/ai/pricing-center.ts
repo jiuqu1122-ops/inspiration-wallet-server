@@ -5,7 +5,12 @@ import type {
   ChatTokenUsage,
 } from './chat-pricing.js';
 import type { ImageModelCreditPrice, VideoModelCreditPrice } from './pricing.js';
-import { catalogDelegateAvailable, isGptImage2CatalogIdentity, type AiModality } from './model-catalog.js';
+import {
+  ModelCatalogError,
+  catalogDelegateAvailable,
+  isGptImage2CatalogIdentity,
+  type AiModality,
+} from './model-catalog.js';
 import { env } from '../../config/env.js';
 import { isFixedCanvasLlmUsageContext } from './usage-context.js';
 import type { MembershipQuotaReservationSnapshot } from '../membership/quota-billing.js';
@@ -145,7 +150,7 @@ export async function resolveMembershipContextCredits(
   prisma: PrismaClient,
   userId: string,
   context: string,
-  fallback: bigint,
+  fallback: unknown,
 ) {
   // Keep lightweight/legacy Prisma test doubles and pre-membership deployments safe.
   if (!prisma.userMembership) return microsToCredit(creditMicros(fallback));
@@ -338,9 +343,42 @@ export function validatePricingProfile(modality: AiModality, profile: unknown): 
   return pricing as CatalogPricingProfile;
 }
 
+const normalizedCapabilityResolutions = (capabilities: unknown) => {
+  const source = plainObject(capabilities);
+  if (!Array.isArray(source?.supportedResolutions)) return [];
+  return Array.from(new Set(source.supportedResolutions
+    .filter((value): value is string => typeof value === 'string')
+    .map(value => value.trim().toLowerCase())
+    .filter(Boolean)));
+};
+
+export function validatePricingCapabilities(
+  modality: AiModality,
+  profile: CatalogPricingProfile,
+  capabilities: unknown,
+) {
+  const resolutions = normalizedCapabilityResolutions(capabilities);
+  if (resolutions.length === 0) return profile;
+  const priceMap = modality === 'image' && profile.billingType === 'image_resolution'
+    ? plainObject(profile.creditsPerImageByResolution)
+    : modality === 'video' && profile.billingType === 'video_resolution_duration'
+      ? plainObject(profile.creditsByResolution)
+      : null;
+  if (!priceMap) return profile;
+  const normalizedPrices = new Map(Object.entries(priceMap).map(([key, value]) => [key.trim().toLowerCase(), value]));
+  const missing = resolutions.filter(resolution => {
+    const value = scalarText(normalizedPrices.get(resolution));
+    return !creditPattern.test(value);
+  });
+  if (missing.length > 0) {
+    throw new Error(`Published pricing is missing for supported resolution: ${missing.join(', ')}`);
+  }
+  return profile;
+}
+
 export async function capturePricingSnapshot(
   prisma: PrismaClient,
-  model: { id: string; canonicalModelKey: string; modality: string; billingType: string },
+  model: { id: string; canonicalModelKey: string; modality: string; billingType: string; capabilities?: unknown },
   routeId: string | null,
   request: Prisma.InputJsonObject,
   userId?: string,
@@ -349,10 +387,33 @@ export async function capturePricingSnapshot(
     where: { canonicalModelId: model.id },
     include: { currentVersion: true },
   });
-  if (!pricing?.currentVersion) throw new Error(`Published pricing is missing for ${model.canonicalModelKey}`);
-  let profile = validatePricingProfile(model.modality as AiModality, pricing.currentVersion.pricing);
+  if (!pricing?.currentVersion) {
+    throw new ModelCatalogError(
+      'PRICING_NOT_AVAILABLE',
+      `Published pricing is missing for ${model.canonicalModelKey}`,
+      503,
+    );
+  }
+  let profile: CatalogPricingProfile;
+  try {
+    profile = validatePricingCapabilities(
+      model.modality as AiModality,
+      validatePricingProfile(model.modality as AiModality, pricing.currentVersion.pricing),
+      model.capabilities,
+    );
+  } catch (error) {
+    throw new ModelCatalogError(
+      'PRICING_NOT_AVAILABLE',
+      error instanceof Error ? error.message : `Published pricing is invalid for ${model.canonicalModelKey}`,
+      503,
+    );
+  }
   if (profile.billingType !== model.billingType) {
-    throw new Error(`Published billing type does not match ${model.canonicalModelKey}`);
+    throw new ModelCatalogError(
+      'PRICING_NOT_AVAILABLE',
+      `Published billing type does not match ${model.canonicalModelKey}`,
+      503,
+    );
   }
   let membershipPlanId: string | undefined;
   let membershipPlanVersionId: string | undefined;
@@ -554,7 +615,7 @@ function chatCharge(snapshot: PricingSnapshot, usage?: ChatTokenUsage | null): C
     };
   })() : null;
   if (isFixedCanvasLlmUsageContext(usageContext)) {
-    const total = creditMicros(snapshot.request.fallbackCredits ?? '0');
+    const total = creditMicros(snapshot.request.fixedUsageCredits ?? snapshot.request.fallbackCredits ?? '0');
     return {
       schemaVersion: 1,
       model: snapshot.canonicalModelKey,
@@ -692,9 +753,17 @@ export async function publishPendingPrice(
   prisma: PrismaClient,
   canonicalModelKey: string,
   publishedBy?: string,
+  onPublished?: (
+    transaction: Prisma.TransactionClient,
+    result: Awaited<ReturnType<typeof publishPendingPriceTransaction>>,
+  ) => Promise<void>,
 ) {
   return prisma.$transaction(
-    transaction => publishPendingPriceTransaction(transaction, canonicalModelKey, publishedBy),
+    async (transaction) => {
+      const result = await publishPendingPriceTransaction(transaction, canonicalModelKey, publishedBy);
+      if (onPublished) await onPublished(transaction, result);
+      return result;
+    },
     { maxWait: 5_000, timeout: 30_000 },
   );
 }
@@ -709,7 +778,11 @@ async function publishPendingPriceTransaction(
     include: { pricing: { include: { currentVersion: true } } },
   });
   if (!model?.pricing?.pendingPrice) throw new Error('Pending price is missing');
-  const pricing = validatePricingProfile(model.modality as AiModality, model.pricing.pendingPrice);
+  const pricing = validatePricingCapabilities(
+    model.modality as AiModality,
+    validatePricingProfile(model.modality as AiModality, model.pricing.pendingPrice),
+    model.capabilities,
+  );
   if (pricing.billingType !== model.billingType) throw new Error('Pricing billing type does not match the canonical model');
   const latest = await transaction.aiPriceVersion.aggregate({
     where: { canonicalModelId: model.id },
@@ -731,36 +804,31 @@ async function publishPendingPriceTransaction(
   return { model: model.canonicalModelKey, version: version.version, pricing: version.pricing };
 }
 
-export async function publishPendingPriceAndSyncLegacy(
-  prisma: PrismaClient,
-  canonicalModelKey: string,
-  publishedBy?: string,
-  onPublished?: (
-    transaction: Prisma.TransactionClient,
-    result: Awaited<ReturnType<typeof publishPendingPriceTransaction>>,
-  ) => Promise<void>,
-) {
-  return prisma.$transaction(
-    async (transaction) => {
-      const result = await publishPendingPriceTransaction(transaction, canonicalModelKey, publishedBy);
-      await syncLegacyPricingTablesFromCatalog(transaction as unknown as PrismaClient);
-      if (onPublished) await onPublished(transaction, result);
-      return result;
-    },
-    { maxWait: 5_000, timeout: 30_000 },
-  );
-}
-
-export async function legacyPricingFromCatalog(prisma: PrismaClient) {
-  if (!catalogDelegateAvailable(prisma)) return null;
-  const models = await prisma.aiModel.findMany({
-    where: { status: 'PUBLISHED' },
-    include: { pricing: { include: { currentVersion: true } } },
-    orderBy: [{ sortOrder: 'asc' }, { canonicalModelKey: 'asc' }],
-  });
+export async function buildClientPricingProjection(prisma: PrismaClient) {
+  const fallback = {
+    agentRequestCredits: String(env.AGENT_REQUEST_CREDITS),
+    inspirationAnalysisCredits: '1.000000',
+    canvasTextAgentCredits: '1.000000',
+    imageDefaultCredits: String(env.IMAGE_REQUEST_CREDITS),
+    videoDefaultCredits: String(env.VIDEO_REQUEST_CREDITS),
+    imageModels: [] as ImageModelCreditPrice[],
+    videoModels: [] as VideoModelCreditPrice[],
+    updatedAt: null as string | null,
+  };
+  if (!catalogDelegateAvailable(prisma)) return fallback;
+  const [models, bindings] = await Promise.all([
+    prisma.aiModel.findMany({
+      where: { status: 'PUBLISHED' },
+      include: { pricing: { include: { currentVersion: true } } },
+      orderBy: [{ sortOrder: 'asc' }, { canonicalModelKey: 'asc' }],
+    }),
+    prisma.aiUsageModelBinding.findMany({
+      where: { key: { in: ['IMAGE_ANALYSIS', 'CANVAS_TEXT'] } },
+      select: { key: true, fixedCredits: true, updatedAt: true },
+    }),
+  ]);
   const imageModels: ImageModelCreditPrice[] = [];
   const videoModels: VideoModelCreditPrice[] = [];
-  const chatModels: ChatModelCreditPrice[] = [];
   for (const model of models) {
     const raw = model.pricing?.currentVersion?.pricing;
     if (!raw) continue;
@@ -770,52 +838,36 @@ export async function legacyPricingFromCatalog(prisma: PrismaClient) {
       if (legacy) imageModels.push(legacy);
     } else if (model.modality === 'video') {
       const legacy = catalogProfileToVideoPrice(model.canonicalModelKey, profile);
-      if (legacy) videoModels.push(legacy);
-    } else if (model.modality === 'chat') {
-      const legacy = catalogProfileToChatPrice(model.canonicalModelKey, profile);
-      if (legacy) chatModels.push(legacy);
+      if (legacy) {
+        const supported = new Set(normalizedCapabilityResolutions(model.capabilities));
+        const filterMap = (value: Record<string, string> | undefined) => {
+          if (!value) return undefined;
+          const entries = Object.entries(value)
+            .filter(([key]) => supported.has(key.trim().toLowerCase()))
+            .map(([key, amount]) => [key.trim().toLowerCase(), amount] as const);
+          return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+        };
+        videoModels.push({
+          ...legacy,
+          creditsByResolution: filterMap(legacy.creditsByResolution),
+          referenceVideoCreditsByResolution: filterMap(legacy.referenceVideoCreditsByResolution),
+        });
+      }
     }
   }
-  const updatedAt = models.reduce<Date | null>((latest, model) => {
-    const candidate = model.pricing?.currentVersion?.publishedAt;
+  const updatedAt = [...models.map(model => model.pricing?.currentVersion?.publishedAt ?? null), ...bindings.map(binding => binding.updatedAt)]
+    .reduce<Date | null>((latest, candidate) => {
     return candidate && (!latest || candidate > latest) ? candidate : latest;
   }, null);
-  return { imageModels, videoModels, chatModels, updatedAt: updatedAt?.toISOString() ?? null };
-}
-
-export async function syncLegacyPricingTablesFromCatalog(prisma: PrismaClient) {
-  const legacy = await legacyPricingFromCatalog(prisma);
-  if (!legacy) return false;
-  const existing = await prisma.aiPricingConfig.findUnique({ where: { id: 'default' } });
-  await prisma.aiPricingConfig.upsert({
-    where: { id: 'default' },
-    create: {
-      id: 'default',
-      agentRequestCredits: BigInt(env.AGENT_REQUEST_CREDITS),
-      inspirationAnalysisCredits: 0n,
-      canvasTextAgentCredits: 1n,
-      imageDefaultCredits: BigInt(env.IMAGE_REQUEST_CREDITS),
-      videoDefaultCredits: BigInt(env.VIDEO_REQUEST_CREDITS),
-      imageModelPrices: legacy.imageModels,
-      videoModelPrices: legacy.videoModels,
-    },
-    update: {
-      // Global non-model prices remain owned by the legacy configuration.
-      imageModelPrices: legacy.imageModels,
-      videoModelPrices: legacy.videoModels,
-      ...(existing ? {} : {
-        agentRequestCredits: BigInt(env.AGENT_REQUEST_CREDITS),
-        inspirationAnalysisCredits: 0n,
-        canvasTextAgentCredits: 1n,
-        imageDefaultCredits: BigInt(env.IMAGE_REQUEST_CREDITS),
-        videoDefaultCredits: BigInt(env.VIDEO_REQUEST_CREDITS),
-      }),
-    },
-  });
-  await prisma.chatPricingConfig.upsert({
-    where: { id: 'default' },
-    create: { id: 'default', modelPrices: legacy.chatModels },
-    update: { modelPrices: legacy.chatModels },
-  });
-  return true;
+  const byKey = new Map(bindings.map(binding => [binding.key, binding]));
+  return {
+    ...fallback,
+    inspirationAnalysisCredits: byKey.get('IMAGE_ANALYSIS')?.fixedCredits?.toFixed(6)
+      ?? fallback.inspirationAnalysisCredits,
+    canvasTextAgentCredits: byKey.get('CANVAS_TEXT')?.fixedCredits?.toFixed(6)
+      ?? fallback.canvasTextAgentCredits,
+    imageModels,
+    videoModels,
+    updatedAt: updatedAt?.toISOString() ?? null,
+  };
 }

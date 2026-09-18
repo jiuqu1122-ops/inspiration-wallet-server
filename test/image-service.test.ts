@@ -1054,6 +1054,16 @@ describe('wallet image provider normalization', () => {
       channel: minimax,
       capabilitiesOverride: { supportedResolutions: ['768p'], supportedDurations: [5] },
     }, 'MiniMax-H3', '1080p', 5)).toBe(false);
+    expect(videoRouteSupportsRequest({
+      channel: minimax,
+      capabilitiesOverride: { supportedAspectRatios: ['16:9'], supportsReferenceAudio: false },
+    }, 'MiniMax-H3', '768p', 5, false, '16:9', {
+      prompt: 'demo',
+      inputImages: [],
+      inputVideos: [],
+      inputAudios: ['https://example.com/audio.mp3'],
+      inputMode: 'REF',
+    })).toBe(false);
     expect(catalogModelSupportsVideoRequest({ supportedResolutions: ['720p'], supportedDurations: [5, 10] }, '720p', 15)).toBe(false);
 
     const findMany = vi.fn(async () => [minimax, generic]);

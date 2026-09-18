@@ -4,11 +4,6 @@ import { env } from '../../config/env.js';
 import { decryptProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
 import { MIN_AI_IMAGE_TAGS, normalizeImageTagAnalysis } from './tag-analysis.js';
-import {
-  configuredAgentRequestCredits,
-  configuredCanvasTextAgentCredits,
-  configuredInspirationAnalysisCredits,
-} from './pricing.js';
 import { extractChatTokenUsage } from './chat-pricing.js';
 import { creditDecimal } from '../wallets/credit-amount.js';
 import { proxyAgentChatReferenceImages } from './reference-upload-service.js';
@@ -45,6 +40,7 @@ import {
   withMembershipQuota,
 } from '../membership/quota-billing.js';
 import {
+  getUsageFixedCredits,
   resolveUsageModelBinding,
   type AiUsageModelKey,
 } from './usage-model-binding.js';
@@ -1149,7 +1145,13 @@ export async function listWalletAgentModels(prisma: PrismaClient) {
   if (catalogDelegateAvailable(prisma)) {
     await ensureAiCatalogSeeded(prisma);
     const models = await prisma.aiModel.findMany({
-      where: { modality: 'chat', enabled: true, visible: true, status: 'PUBLISHED' },
+      where: {
+        modality: 'chat',
+        enabled: true,
+        visible: true,
+        status: 'PUBLISHED',
+        pricing: { is: { currentVersionId: { not: null } } },
+      },
       orderBy: [{ sortOrder: 'asc' }, { canonicalModelKey: 'asc' }],
       select: { canonicalModelKey: true },
     });
@@ -1434,17 +1436,17 @@ export async function executeWalletAgentChat(
 ) {
   const usageContext = resolveAgentUsageContext(input.usageContext, input.clientRequestId);
   const isFixedCanvasLlm = isFixedCanvasLlmUsageContext(usageContext);
-  const configuredFallbackCredits = isFixedCanvasLlm
-    ? await configuredCanvasTextAgentCredits(prisma)
-    : await configuredAgentRequestCredits(prisma);
+  await ensureAiCatalogSeeded(prisma);
+  const usageBindingKey = usageModelBindingKeyForAgentContext(usageContext);
+  const configuredFallbackCredits = usageBindingKey
+    ? await getUsageFixedCredits(prisma, usageBindingKey, '1.000000')
+    : REQUEST_CREDITS;
   const fallbackCredits = await resolveMembershipContextCredits(
     prisma,
     input.userId,
     usageContext,
     configuredFallbackCredits,
   );
-  await ensureAiCatalogSeeded(prisma);
-  const usageBindingKey = usageModelBindingKeyForAgentContext(usageContext);
   const automaticModelSelection = !usageBindingKey && isDefaultAgentModelSentinel(input.model);
   let resolved:
     | ResolvedCatalogModel
@@ -1508,6 +1510,7 @@ export async function executeWalletAgentChat(
   const pricingSnapshot = canonicalModel
     ? await capturePricingSnapshot(prisma, canonicalModel, route?.id ?? null, {
       fallbackCredits: fallbackCredits.toString(),
+      ...(isFixedCanvasLlm ? { fixedUsageCredits: fallbackCredits.toString() } : {}),
       usageContext,
     }, input.userId)
     : undefined;
@@ -1868,7 +1871,7 @@ export async function executeWalletInspirationAnalysis(
 ) {
   await ensureAiCatalogSeeded(prisma);
   const resolved = await resolveUsageModelBinding(prisma, 'IMAGE_ANALYSIS');
-  const configuredCredits = await configuredInspirationAnalysisCredits(prisma);
+  const configuredCredits = await getUsageFixedCredits(prisma, 'IMAGE_ANALYSIS', '1.000000');
   const credits = await resolveMembershipContextCredits(
     prisma,
     input.userId,

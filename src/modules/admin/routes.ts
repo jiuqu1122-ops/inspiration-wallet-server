@@ -15,20 +15,8 @@ import {
 } from './service.js';
 import { providerAdminRoutes } from '../providers/routes.js';
 import { createRedemptionCodes, listRedemptionCodes } from '../wallets/redemption.js';
-import {
-  aiPricingModelToken,
-  getAiPricingConfig,
-} from '../ai/pricing.js';
-import {
-  chatPricingModelToken,
-  getChatPricingConfig,
-} from '../ai/chat-pricing.js';
 import { inspirationSpaceAdminRoutes } from '../inspiration-space/admin-routes.js';
 import { aiModelAdminRoutes } from '../ai/model-admin-routes.js';
-import {
-  updateLegacyAiPricingAndPublish,
-  updateLegacyChatPricingAndPublish,
-} from '../ai/catalog-seed.js';
 import {
   createMembershipPlan,
   extendMembership,
@@ -85,87 +73,6 @@ const createRedemptionCodesSchema = z.object({
   note: z.string().trim().max(200).nullable().optional(),
 }).strict();
 
-const pricingCreditsSchema = z.string()
-  .regex(/^(?:0|[1-9]\d{0,6})$/)
-  .refine((value) => BigInt(value) <= 1_000_000n, 'Credits must not exceed 1000000');
-const imageModelPriceSchema = z.object({
-  model: z.string().trim().min(1).max(200),
-  credits1k: pricingCreditsSchema.optional(),
-  credits2k: pricingCreditsSchema,
-  credits4k: pricingCreditsSchema,
-}).strict();
-const videoModelPriceSchema = z.object({
-  model: z.string().trim().min(1).max(200),
-  credits: pricingCreditsSchema,
-  creditsPerSecond: pricingCreditsSchema.optional(),
-  creditsPerVideo: pricingCreditsSchema.optional(),
-  creditsByDuration: z.record(z.string().trim().min(1).max(20), pricingCreditsSchema).optional(),
-  creditsByResolution: z.record(z.string().trim().min(1).max(20), pricingCreditsSchema).optional(),
-  creditsByCount: z.record(z.string().trim().min(1).max(20), pricingCreditsSchema).optional(),
-  includedReferenceImages: z.number().int().min(0).max(100).optional(),
-  creditsPerExtraReferenceImage: pricingCreditsSchema.optional(),
-  creditsPerReferenceVideoSecond: pricingCreditsSchema.optional(),
-  referenceVideoCreditsByResolution: z.record(z.string().trim().min(1).max(20), pricingCreditsSchema).optional(),
-}).strict();
-const pricingSchema = z.object({
-  agentRequestCredits: pricingCreditsSchema,
-  inspirationAnalysisCredits: pricingCreditsSchema,
-  canvasTextAgentCredits: pricingCreditsSchema.optional(),
-  imageDefaultCredits: pricingCreditsSchema,
-  videoDefaultCredits: pricingCreditsSchema,
-  imageModels: z.array(imageModelPriceSchema).max(100),
-  videoModels: z.array(videoModelPriceSchema).max(100),
-}).strict().superRefine((value, context) => {
-  for (const [path, models] of [
-    ['imageModels', value.imageModels],
-    ['videoModels', value.videoModels],
-  ] as const) {
-    const normalized = models.map((item) => aiPricingModelToken(item.model));
-    if (new Set(normalized).size !== normalized.length) {
-      context.addIssue({
-        code: 'custom',
-        path: [path],
-        message: '模型积分配置包含重复模型',
-      });
-    }
-  }
-});
-
-const chatTokenRatesSchema = z.object({
-  inputCreditsPerMillion: pricingCreditsSchema,
-  outputCreditsPerMillion: pricingCreditsSchema,
-  cachedInputCreditsPerMillion: pricingCreditsSchema,
-  cacheWriteCreditsPerMillion: pricingCreditsSchema,
-}).strict();
-
-const chatModelPriceSchema = z.discriminatedUnion('billingMode', [
-  z.object({
-    model: z.string().trim().min(1).max(200),
-    billingMode: z.literal('token'),
-    contextThresholdTokens: z.number().int().min(1).max(10_000_000),
-    standard: chatTokenRatesSchema,
-    extended: chatTokenRatesSchema,
-  }).strict(),
-  z.object({
-    model: z.string().trim().min(1).max(200),
-    billingMode: z.literal('request'),
-    creditsPerRequest: pricingCreditsSchema,
-  }).strict(),
-]);
-
-const chatPricingSchema = z.object({
-  models: z.array(chatModelPriceSchema).min(1).max(100),
-}).strict().superRefine((value, context) => {
-  const normalized = value.models.map(item => chatPricingModelToken(item.model));
-  if (new Set(normalized).size !== normalized.length) {
-    context.addIssue({
-      code: 'custom',
-      path: ['models'],
-      message: 'Chat 模型积分配置包含重复模型',
-    });
-  }
-});
-
 function invalid(reply: FastifyReply, message: string) {
   return reply.code(400).send({ error: 'invalid_request', message });
 }
@@ -176,20 +83,6 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
   await app.register(providerAdminRoutes, { prefix: '/providers' });
   await app.register(inspirationSpaceAdminRoutes, { prefix: '/inspiration-space' });
   await app.register(aiModelAdminRoutes, { prefix: '/ai-models' });
-
-  app.get('/pricing', async () => getAiPricingConfig(app.prisma));
-
-  app.patch(
-    '/pricing',
-    { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
-    async (request, reply) => {
-      const parsed = pricingSchema.safeParse(request.body);
-      if (!parsed.success) {
-        return invalid(reply, parsed.error.issues[0]?.message ?? 'AI pricing is invalid');
-      }
-      return updateLegacyAiPricingAndPublish(app.prisma, parsed.data);
-    },
-  );
 
 const membershipQuotaSchema = z.object({
   type: z.enum(['IMAGE_COUNT', 'LLM_TOKENS']),
@@ -245,8 +138,6 @@ const referralRuleSchema = z.object({
   active: z.boolean().optional(),
 }).strict();
 
-  app.get('/chat-pricing', async () => getChatPricingConfig(app.prisma));
-
   app.get('/membership/plans', async () => ({ items: await listMembershipPlansAdmin(app.prisma) }));
 
   app.post('/membership/plans', async (request, reply) => {
@@ -287,18 +178,6 @@ const referralRuleSchema = z.object({
     if (!parsed.success) return invalid(reply, 'Referral rule data is invalid');
     return upsertReferralRule(app.prisma, parsed.data);
   });
-
-  app.patch(
-    '/chat-pricing',
-    { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
-    async (request, reply) => {
-      const parsed = chatPricingSchema.safeParse(request.body);
-      if (!parsed.success) {
-        return invalid(reply, parsed.error.issues[0]?.message ?? 'Chat pricing is invalid');
-      }
-      return updateLegacyChatPricingAndPublish(app.prisma, parsed.data);
-    },
-  );
 
   app.get('/redemption-codes', async (request, reply) => {
     const parsed = z.object({ limit: z.coerce.number().int().min(1).max(500).default(100) })

@@ -1,4 +1,4 @@
-import type { AiProviderChannel, PrismaClient } from '@prisma/client';
+import { Prisma, type AiProviderChannel, type PrismaClient } from '@prisma/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { encryptProviderSecrets } from '../src/lib/provider-secrets.js';
 import {
@@ -7,16 +7,19 @@ import {
   defaultModelCapabilities,
   explicitCanonicalModelKey,
   getPublicAiCatalog,
+  normalizeModelCapabilities,
   resolveAutomaticChatModel,
   resolveCatalogModel,
 } from '../src/modules/ai/model-catalog.js';
 import {
+  buildClientPricingProjection,
   calculateSnapshotCharge,
   capturePricingSnapshot,
   estimateSnapshotCredits,
   publishPendingPrice,
   resolveMembershipContextCredits,
   setPendingPrice,
+  validatePricingCapabilities,
   validatePricingProfile,
   type CatalogPricingProfile,
   type PricingSnapshot,
@@ -513,6 +516,8 @@ describe('versioned server-side pricing', () => {
       ...data,
     }));
     const updateWorkspace = vi.fn(async (input: unknown) => input);
+    const legacyAiWrite = vi.fn();
+    const legacyChatWrite = vi.fn();
     const transaction = {
       aiModel: {
         findUnique: vi.fn(async () => ({
@@ -528,6 +533,8 @@ describe('versioned server-side pricing', () => {
         create: createVersion,
       },
       aiModelPricing: { update: updateWorkspace },
+      aiPricingConfig: { upsert: legacyAiWrite },
+      chatPricingConfig: { upsert: legacyChatWrite },
     };
     const publishPrisma = {
       $transaction: vi.fn(async (operation: (tx: typeof transaction) => unknown) => operation(transaction)),
@@ -540,6 +547,40 @@ describe('versioned server-side pricing', () => {
     expect(updateWorkspace).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ currentVersionId: 'price-11' }),
     }));
+    expect(legacyAiWrite).not.toHaveBeenCalled();
+    expect(legacyChatWrite).not.toHaveBeenCalled();
+  });
+
+  it('requires a price for every supported video resolution before publish', () => {
+    expect(() => validatePricingCapabilities('video', {
+      billingType: 'video_resolution_duration',
+      creditsByResolution: { '768p': '10' },
+    }, {
+      supportedResolutions: ['768p', '2k'],
+    })).toThrow(/2k/);
+  });
+
+  it('returns an explicit pricing error when a canonical model has no published version', async () => {
+    const prisma = {
+      aiModelPricing: { findUnique: vi.fn(async () => null) },
+    } as unknown as PrismaClient;
+    await expect(capturePricingSnapshot(prisma, {
+      id: 'video-model',
+      canonicalModelKey: 'future-video',
+      modality: 'video',
+      billingType: 'video_resolution_duration',
+      capabilities: { supportedResolutions: ['768p'] },
+    }, null, {})).rejects.toMatchObject({ code: 'PRICING_NOT_AVAILABLE', statusCode: 503 });
+  });
+
+  it('accepts dynamic resolution and duration capabilities', () => {
+    expect(normalizeModelCapabilities({
+      supportedResolutions: ['576P', '864p', '1536p'],
+      supportedDurations: [3, 7, 20],
+    })).toMatchObject({
+      supportedResolutions: ['576p', '864p', '1536p'],
+      supportedDurations: [3, 7, 20],
+    });
   });
 
   it('computes markup pricing as a suggestion without publishing it', async () => {
@@ -600,6 +641,48 @@ describe('versioned server-side pricing', () => {
 });
 
 describe('catalog exposure and upstream discovery safety', () => {
+  it('projects only capability-backed MiniMax H3 prices for old clients', async () => {
+    const prisma = {
+      aiModel: {
+        findMany: vi.fn(async () => [{
+          canonicalModelKey: 'minimax-h3',
+          modality: 'video',
+          capabilities: { supportedResolutions: ['768p', '2k'] },
+          pricing: {
+            currentVersion: {
+              publishedAt: new Date('2026-09-18T00:00:00.000Z'),
+              pricing: {
+                billingType: 'video_resolution_duration',
+                creditsByResolution: { '768p': '10', '1080p': '99', '2k': '20' },
+              },
+            },
+          },
+        }]),
+      },
+      aiUsageModelBinding: {
+        findMany: vi.fn(async () => [{
+          key: 'IMAGE_ANALYSIS',
+          fixedCredits: new Prisma.Decimal('1.25'),
+          updatedAt: new Date('2026-09-18T01:00:00.000Z'),
+        }]),
+      },
+    } as unknown as PrismaClient;
+
+    const projection = await buildClientPricingProjection(prisma);
+    expect(projection.videoModels).toEqual([expect.objectContaining({
+      model: 'minimax-h3',
+      creditsByResolution: { '768p': '10', '2k': '20' },
+    })]);
+    expect(projection.videoModels[0]?.creditsByResolution).not.toHaveProperty('1080p');
+    expect(projection.inspirationAnalysisCredits).toBe('1.250000');
+  });
+
+  it('defines MiniMax H3 capabilities without 1080p', () => {
+    expect(defaultModelCapabilities('minimax-h3', 'video')).toMatchObject({
+      supportedResolutions: ['768p', '2k'],
+    });
+  });
+
   it('replaces legacy ratios without expanding configured GPT Image 2.5 resolutions', async () => {
     const prisma = {
       aiModel: {
@@ -1147,96 +1230,31 @@ describe('billing idempotency', () => {
   });
 });
 
-describe('legacy pricing migration', () => {
-  it('seeds immutable v1 prices from effective database values without resetting them to defaults', async () => {
-    const createdVersions: Array<Record<string, unknown>> = [];
-    const models = new Map<string, { id: string; canonicalModelKey: string }>();
+describe('catalog bootstrap isolation', () => {
+  it('does not read legacy pricing or publish a price when the catalog already exists', async () => {
+    const legacyAiRead = vi.fn(async () => { throw new Error('legacy AI pricing must not be read'); });
+    const legacyChatRead = vi.fn(async () => { throw new Error('legacy Chat pricing must not be read'); });
+    const createVersion = vi.fn();
     const transaction = {
-      chatPricingConfig: {
-        findUnique: vi.fn(async () => ({
-          id: 'default',
-          modelPrices: [{
-            model: 'gpt-5.6-sol',
-            billingMode: 'token',
-            contextThresholdTokens: 272_000,
-            standard: {
-              inputCreditsPerMillion: '201',
-              outputCreditsPerMillion: '1201',
-              cachedInputCreditsPerMillion: '21',
-              cacheWriteCreditsPerMillion: '251',
-            },
-            extended: {
-              inputCreditsPerMillion: '401',
-              outputCreditsPerMillion: '1801',
-              cachedInputCreditsPerMillion: '41',
-              cacheWriteCreditsPerMillion: '501',
-            },
-          }],
-          createdAt: new Date('2026-09-01T00:00:00.000Z'),
-          updatedAt: new Date('2026-09-01T00:00:00.000Z'),
-        })),
-      },
-      aiPricingConfig: {
-        findUnique: vi.fn(async () => ({
-          id: 'default',
-          agentRequestCredits: creditDecimal(10),
-          inspirationAnalysisCredits: creditDecimal(0),
-          imageDefaultCredits: creditDecimal(15),
-          videoDefaultCredits: creditDecimal(20),
-          imageModelPrices: [{
-            model: 'nano-banana-pro',
-            credits1k: '122',
-            credits2k: '123',
-            credits4k: '124',
-          }],
-          videoModelPrices: [{ model: 'seedance2', credits: '77' }],
-          createdAt: new Date('2026-09-01T00:00:00.000Z'),
-          updatedAt: new Date('2026-09-01T00:00:00.000Z'),
-        })),
-      },
       aiModel: {
-        upsert: vi.fn(async ({ create }: { create: { canonicalModelKey: string } }) => {
-          const model = { id: `id-${create.canonicalModelKey}`, canonicalModelKey: create.canonicalModelKey };
-          models.set(create.canonicalModelKey, model);
-          return model;
-        }),
-        findUnique: vi.fn(async ({ where }: { where: { canonicalModelKey: string } }) => (
-          models.get(where.canonicalModelKey) ?? null
-        )),
-      },
-      aiModelAlias: { upsert: vi.fn(async (input: unknown) => input) },
-      aiModelPricing: {
+        count: vi.fn(async () => 1),
         findUnique: vi.fn(async () => null),
-        upsert: vi.fn(async (input: unknown) => input),
+        findMany: vi.fn(async () => []),
       },
-      aiPriceVersion: {
-        aggregate: vi.fn(async () => ({ _max: { version: null } })),
-        create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
-          createdVersions.push(data);
-          return { id: `version-${createdVersions.length}`, ...data };
-        }),
-      },
-      aiModelRoute: {
-        findFirst: vi.fn(async () => null),
-        upsert: vi.fn(async ({ create }: { create: Record<string, unknown> }) => create),
-      },
-      aiRouteCostHistory: { upsert: vi.fn(async (input: unknown) => input) },
+      aiModelAlias: { upsert: vi.fn() },
+      aiPriceVersion: { create: createVersion },
+      aiUsageModelBinding: { findUnique: vi.fn(async () => null) },
+      aiPricingConfig: { findUnique: legacyAiRead },
+      chatPricingConfig: { findUnique: legacyChatRead },
     };
     const prisma = {
       ...transaction,
       $transaction: vi.fn(async (operation: (tx: typeof transaction) => unknown) => operation(transaction)),
     } as unknown as PrismaClient;
+
     await expect(ensureAiCatalogSeeded(prisma)).resolves.toBe(true);
-    const solVersion = createdVersions.find(version => version.canonicalModelId === 'id-gpt-5.6-sol');
-    const imageVersion = createdVersions.find(version => version.canonicalModelId === 'id-nano-banana-pro');
-    const videoVersion = createdVersions.find(version => version.canonicalModelId === 'id-seedance-2');
-    expect(solVersion?.pricing).toMatchObject({
-      standard: { inputCreditsPerMillion: '201', outputCreditsPerMillion: '1201' },
-    });
-    expect(imageVersion?.pricing).toMatchObject({
-      creditsPerImageByResolution: { '1k': '122', '2k': '123', '4k': '124' },
-    });
-    expect(videoVersion?.pricing).toMatchObject({ credits: '77' });
-    expect(createdVersions.every(version => version.source === 'LEGACY_MIGRATION')).toBe(true);
+    expect(legacyAiRead).not.toHaveBeenCalled();
+    expect(legacyChatRead).not.toHaveBeenCalled();
+    expect(createVersion).not.toHaveBeenCalled();
   });
 });

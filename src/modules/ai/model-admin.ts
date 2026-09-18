@@ -5,6 +5,7 @@ import {
   catalogAliasKey,
   defaultModelCapabilities,
   isGptImage2CatalogIdentity,
+  normalizeModelCapabilities,
   safeCanonicalModelKey,
   withGptImage2DimensionCapabilities,
   type AiModality,
@@ -12,7 +13,7 @@ import {
 import {
   roundSuggestedPoints,
   setPendingPrice,
-  publishPendingPriceAndSyncLegacy,
+  publishPendingPrice,
   toInputJson,
   validatePricingProfile,
   type CatalogPricingProfile,
@@ -272,13 +273,13 @@ export async function updateAdminAiModel(
     if (input.capabilities !== undefined
       || (current.modality === 'image'
         && isGptImage2CatalogIdentity(current.canonicalModelKey, nextDisplayName))) {
-      data.capabilities = (current.modality === 'image'
+      data.capabilities = normalizeModelCapabilities((current.modality === 'image'
         ? withGptImage2DimensionCapabilities(
           input.capabilities ?? current.capabilities,
           current.canonicalModelKey,
           nextDisplayName,
         )
-        : input.capabilities) as Prisma.InputJsonValue;
+        : input.capabilities) as Prisma.InputJsonValue);
     }
     if (input.defaultRouteId !== undefined) data.defaultRouteId = input.defaultRouteId;
     const updated = await transaction.aiModel.updateMany({
@@ -349,8 +350,8 @@ export async function updateAdminAiRoute(
     }
     if ((input.adapterKey !== undefined && input.adapterKey !== null
       || input.adapterConfig !== undefined && input.adapterConfig !== null)
-      && current.canonicalModel?.modality !== 'image') {
-      throw new AiModelAdminError('INVALID_REQUEST', 'Image adapters may only be configured on image model routes', 400);
+      && current.canonicalModel?.modality === 'chat') {
+      throw new AiModelAdminError('INVALID_REQUEST', 'Media adapters may only be configured on image or video model routes', 400);
     }
     const costChanged = input.costProfile !== undefined
       && JSON.stringify(current.costProfile) !== JSON.stringify(input.costProfile);
@@ -360,7 +361,9 @@ export async function updateAdminAiRoute(
     if (input.healthStatus !== undefined) data.healthStatus = input.healthStatus;
     if (input.upstreamAvailable !== undefined) data.upstreamAvailable = input.upstreamAvailable;
     if (input.capabilitiesOverride !== undefined) {
-      data.capabilitiesOverride = input.capabilitiesOverride === null ? Prisma.JsonNull : input.capabilitiesOverride;
+      data.capabilitiesOverride = input.capabilitiesOverride === null
+        ? Prisma.JsonNull
+        : normalizeModelCapabilities(input.capabilitiesOverride);
       data.metadata = {
         ...jsonObject(current.metadata),
         capabilitiesOverrideSource: input.capabilitiesOverride === null ? 'INHERIT' : 'MANUAL',
@@ -775,14 +778,14 @@ export async function createCanonicalFromDiscovery(
       || canonicalDisplayName(canonicalModelKey, discovery.upstreamModelId);
     const initialCapabilities = input.capabilities
       ?? defaultModelCapabilities(canonicalModelKey, input.modality);
-    const capabilities = (input.modality === 'image'
+    const capabilities = normalizeModelCapabilities((input.modality === 'image'
       ? withGptImage2DimensionCapabilities(
         initialCapabilities,
         canonicalModelKey,
         displayName,
         discovery.upstreamModelId,
       )
-      : initialCapabilities) as Prisma.InputJsonValue;
+      : initialCapabilities) as Prisma.InputJsonValue);
     const model = await transaction.aiModel.create({
       data: {
         canonicalModelKey,
@@ -1074,7 +1077,7 @@ export async function publishAdminPendingPrice(
   });
   if (!model) throw new AiModelAdminError('NOT_FOUND', 'Canonical model was not found', 404);
   const beforeVersion = model.pricing?.currentVersion?.version ?? null;
-  return publishPendingPriceAndSyncLegacy(
+  return publishPendingPrice(
     prisma,
     canonicalModelKey,
     publishedBy,

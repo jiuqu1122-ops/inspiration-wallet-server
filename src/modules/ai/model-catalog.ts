@@ -19,7 +19,7 @@ export const routeCanReceiveTraffic = (route: {
 
 export class ModelCatalogError extends Error {
   constructor(
-    public readonly code: 'MODEL_NOT_AVAILABLE' | 'MODEL_NOT_FOUND' | 'MODEL_ROUTE_NOT_AVAILABLE' | 'MODEL_IDENTITY_MISMATCH',
+    public readonly code: 'MODEL_NOT_AVAILABLE' | 'MODEL_NOT_FOUND' | 'MODEL_ROUTE_NOT_AVAILABLE' | 'MODEL_IDENTITY_MISMATCH' | 'PRICING_NOT_AVAILABLE',
     message: string,
     public readonly statusCode = 404,
   ) {
@@ -253,13 +253,20 @@ export function defaultModelCapabilities(key: string, modality: AiModality): Pri
   }
   if (key === 'seedance-2' || key === 'seedance-2-fast' || key === 'minimax-h3') {
     return {
-      supportedResolutions: key === 'minimax-h3' ? ['768p', '1080p', '2k'] : ['480p', '720p', '1080p'],
+      supportedResolutions: key === 'minimax-h3' ? ['768p', '2k'] : ['480p', '720p', '1080p'],
       supportedDurations: [4, 5, 10, 15],
       supportedAspectRatios: ['1:1', '3:4', '4:3', '9:16', '16:9'],
+      supportsTextPrompt: true,
+      supportsReferenceImage: true,
+      supportsReferenceVideo: true,
+      supportsReferenceAudio: true,
+      supportsFirstFrame: true,
+      supportsLastFrame: true,
       maxReferenceImages: 9,
       maxReferenceVideos: 3,
       maxReferenceAudios: 3,
       supportsFirstLastFrame: true,
+      // Compatibility aliases remain in the public projection for older clients.
       supportsAudioReference: true,
       supportsVideoReference: true,
       supportedInputModes: ['REF', 'FLF'],
@@ -267,6 +274,35 @@ export function defaultModelCapabilities(key: string, modality: AiModality): Pri
     };
   }
   return {};
+}
+
+export function normalizeModelCapabilities(value: Prisma.InputJsonValue): Prisma.InputJsonValue {
+  const source = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Prisma.InputJsonObject
+    : {};
+  const normalized = { ...source };
+  const normalizeStrings = (key: 'supportedResolutions' | 'supportedAspectRatios', pattern: RegExp) => {
+    const candidate = source[key];
+    if (candidate === undefined) return;
+    if (!Array.isArray(candidate)) throw new Error(`${key} must be an array`);
+    const values = candidate.map(item => String(item).trim().toLowerCase()).filter(Boolean);
+    if (values.length > 100 || values.some(item => !pattern.test(item))) {
+      throw new Error(`${key} contains an invalid value`);
+    }
+    normalized[key] = Array.from(new Set(values));
+  };
+  normalizeStrings('supportedResolutions', /^[a-z0-9][a-z0-9._+-]{0,31}$/);
+  normalizeStrings('supportedAspectRatios', /^\d{1,5}:\d{1,5}$/);
+  if (source.supportedDurations !== undefined) {
+    if (!Array.isArray(source.supportedDurations)) throw new Error('supportedDurations must be an array');
+    const durations = source.supportedDurations.map(Number);
+    if (durations.length > 100
+      || durations.some(duration => !Number.isSafeInteger(duration) || duration <= 0 || duration > 600)) {
+      throw new Error('supportedDurations must contain positive integers no greater than 600');
+    }
+    normalized.supportedDurations = Array.from(new Set(durations)).sort((left, right) => left - right);
+  }
+  return normalized;
 }
 
 export function normalizePublicModelCapabilities(value: unknown) {
@@ -338,7 +374,11 @@ export function normalizePublicModelCapabilities(value: unknown) {
     minReferenceImages: numberValue('minReferenceImages'),
     supportsReferenceImages: booleanValue('supportsReferenceImages', 'supportsReferenceImage'),
     supportsReferenceVideo: booleanValue('supportsReferenceVideo', 'supportsVideoReference'),
-    supportsAudioReference: booleanValue('supportsAudioReference'),
+    supportsReferenceAudio: booleanValue('supportsReferenceAudio', 'supportsAudioReference'),
+    supportsAudioReference: booleanValue('supportsAudioReference', 'supportsReferenceAudio'),
+    supportsTextPrompt: booleanValue('supportsTextPrompt'),
+    supportsFirstFrame: booleanValue('supportsFirstFrame'),
+    supportsLastFrame: booleanValue('supportsLastFrame'),
     supportsFirstLastFrame: booleanValue('supportsFirstLastFrame'),
     supportedInputModes: stringArray('supportedInputModes'),
     supportedOutputFormats: stringArray('supportedOutputFormats'),
@@ -354,7 +394,12 @@ export function catalogDelegateAvailable(prisma: PrismaClient) {
 
 export async function getPublicAiCatalog(prisma: PrismaClient) {
   const models = await prisma.aiModel.findMany({
-    where: { enabled: true, visible: true, status: 'PUBLISHED' },
+    where: {
+      enabled: true,
+      visible: true,
+      status: 'PUBLISHED',
+      pricing: { is: { currentVersionId: { not: null } } },
+    },
     include: {
       pricing: { include: { currentVersion: true } },
       aliases: { where: { confirmed: true }, orderBy: { createdAt: 'asc' } },
@@ -484,7 +529,13 @@ export function assertCanonicalModelIdentity(
 export async function resolveAutomaticChatModel(prisma: PrismaClient) {
   if (!catalogDelegateAvailable(prisma)) return null;
   const models = await prisma.aiModel.findMany({
-    where: { modality: 'chat', enabled: true, visible: true, status: 'PUBLISHED' },
+    where: {
+      modality: 'chat',
+      enabled: true,
+      visible: true,
+      status: 'PUBLISHED',
+      pricing: { is: { currentVersionId: { not: null } } },
+    },
     include: { routes: { include: { channel: true }, orderBy: [{ priority: 'asc' }, { id: 'asc' }] } },
     orderBy: [{ sortOrder: 'asc' }, { canonicalModelKey: 'asc' }],
   });

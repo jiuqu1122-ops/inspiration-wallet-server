@@ -4,6 +4,7 @@ import { routeCanReceiveTraffic } from './model-catalog.js';
 
 export const AI_USAGE_MODEL_KEYS = ['IMAGE_ANALYSIS', 'CANVAS_TEXT'] as const;
 export type AiUsageModelKey = typeof AI_USAGE_MODEL_KEYS[number];
+export const DEFAULT_USAGE_FIXED_CREDITS = '1.000000';
 
 export class UsageModelBindingError extends Error {
   constructor(
@@ -91,9 +92,26 @@ export async function resolveUsageModelBinding(prisma: PrismaClient, key: AiUsag
   return { binding, model, route, enabledRoutes };
 }
 
+export async function getUsageFixedCredits(
+  prisma: PrismaClient,
+  key: AiUsageModelKey,
+  fallback: string | number | bigint = DEFAULT_USAGE_FIXED_CREDITS,
+) {
+  const delegate = (prisma as PrismaClient & {
+    aiUsageModelBinding?: { findUnique?: unknown };
+  }).aiUsageModelBinding;
+  if (typeof delegate?.findUnique !== 'function') return String(fallback);
+  const binding = await prisma.aiUsageModelBinding.findUnique({
+    where: { key },
+    select: { fixedCredits: true },
+  });
+  return binding?.fixedCredits?.toFixed(6) ?? String(fallback);
+}
+
 const usageBindingView = (key: AiUsageModelKey, binding: {
   key: string;
   canonicalModelId: string;
+  fixedCredits: Prisma.Decimal | null;
   updatedAt: Date;
   canonicalModel: UsageModel;
 } | null) => {
@@ -103,6 +121,7 @@ const usageBindingView = (key: AiUsageModelKey, binding: {
   return {
     key,
     canonicalModelId: binding?.canonicalModelId ?? null,
+    fixedCredits: binding?.fixedCredits?.toFixed(6) ?? null,
     canonicalModelKey: binding?.canonicalModel.canonicalModelKey ?? null,
     displayName: binding?.canonicalModel.displayName ?? null,
     updatedAt: binding?.updatedAt ?? null,
@@ -156,10 +175,11 @@ export async function listAdminUsageModelBindings(prisma: PrismaClient) {
 export async function updateAdminUsageModelBinding(
   prisma: PrismaClient,
   key: AiUsageModelKey,
-  canonicalModelId: string,
+  input: { canonicalModelId: string; fixedCredits: string },
   context: AdminMutationContext,
 ) {
   return prisma.$transaction(async (transaction) => {
+    const { canonicalModelId, fixedCredits } = input;
     const model = await transaction.aiModel.findUnique({
       where: { id: canonicalModelId },
       include: includeUsageRoutes,
@@ -185,8 +205,8 @@ export async function updateAdminUsageModelBinding(
     const before = await transaction.aiUsageModelBinding.findUnique({ where: { key } });
     const binding = await transaction.aiUsageModelBinding.upsert({
       where: { key },
-      create: { key, canonicalModelId },
-      update: { canonicalModelId },
+      create: { key, canonicalModelId, fixedCredits },
+      update: { canonicalModelId, fixedCredits },
     });
     await recordAdminOperation(
       transaction,
@@ -197,6 +217,8 @@ export async function updateAdminUsageModelBinding(
         usageKey: key,
         beforeCanonicalModelId: before?.canonicalModelId ?? null,
         afterCanonicalModelId: canonicalModelId,
+        beforeFixedCredits: before?.fixedCredits?.toFixed(6) ?? null,
+        afterFixedCredits: new Prisma.Decimal(fixedCredits).toFixed(6),
       },
     );
     return usageBindingView(key, {
@@ -224,14 +246,24 @@ export async function ensureDefaultUsageModelBindings(transaction: Prisma.Transa
   });
   for (const key of AI_USAGE_MODEL_KEYS) {
     const existing = await transaction.aiUsageModelBinding.findUnique({ where: { key } });
-    if (existing) continue;
+    if (existing) {
+      if (existing.fixedCredits === null) {
+        await transaction.aiUsageModelBinding.update({
+          where: { key },
+          data: { fixedCredits: DEFAULT_USAGE_FIXED_CREDITS },
+        });
+      }
+      continue;
+    }
     const model = preferred.find(candidate => (
       candidate.enabled
       && candidate.status === 'PUBLISHED'
       && operationalUsageRoutes(key, candidate).length > 0
     ));
     if (model) {
-      await transaction.aiUsageModelBinding.create({ data: { key, canonicalModelId: model.id } });
+      await transaction.aiUsageModelBinding.create({
+        data: { key, canonicalModelId: model.id, fixedCredits: DEFAULT_USAGE_FIXED_CREDITS },
+      });
     }
   }
 }

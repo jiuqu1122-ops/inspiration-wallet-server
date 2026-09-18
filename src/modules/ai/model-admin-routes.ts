@@ -46,6 +46,19 @@ const adapterConfigSchema = z.object({
   ).optional(),
   referenceSerializer: z.enum(['json_image', 'json_images']).optional(),
 }).strict();
+const videoAdapterKeys = [
+  'LEGACY_VIDEO',
+  'MINIMAX_NATIVE_VIDEO',
+  'SEEDANCE_VIDEO',
+  'VEO_VIDEO',
+  'KLING_VIDEO',
+  'GENERIC_ASYNC_VIDEO',
+  'OPENAI_COMPATIBLE_VIDEO',
+] as const;
+const adapterKeySchema = z.union([
+  z.enum(IMAGE_ADAPTER_KEYS),
+  z.enum(videoAdapterKeys),
+]);
 const modelKeySchema = z.string().trim().min(1).max(160).regex(/^[a-z0-9][a-z0-9._-]*$/);
 const idSchema = z.string().trim().min(1).max(128);
 
@@ -81,8 +94,8 @@ const updateRouteSchema = z.object({
   upstreamAvailable: z.boolean().optional(),
   costProfile: jsonObjectSchema.nullable().optional(),
   capabilitiesOverride: jsonObjectSchema.nullable().optional(),
-  adapterKey: z.enum(IMAGE_ADAPTER_KEYS).nullable().optional(),
-  adapterConfig: adapterConfigSchema.nullable().optional(),
+  adapterKey: adapterKeySchema.nullable().optional(),
+  adapterConfig: z.union([adapterConfigSchema, jsonObjectSchema]).nullable().optional(),
   expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
 }).strict().refine(value => Object.keys(value).length > 0, 'No route changes were supplied');
 
@@ -133,7 +146,11 @@ const pricingPolicySchema = z.object({
   markupMultiplier: z.string().regex(/^(?:0|[1-9]\d{0,2})(?:\.\d{1,6})?$/),
 }).strict();
 const usageBindingParamsSchema = z.object({ key: z.enum(AI_USAGE_MODEL_KEYS) }).strict();
-const updateUsageBindingSchema = z.object({ canonicalModelId: idSchema }).strict();
+const fixedCreditsSchema = z.string().regex(/^(?:0|[1-9]\d{0,11})(?:\.\d{1,6})?$/);
+const updateUsageBindingSchema = z.object({
+  canonicalModelId: idSchema,
+  fixedCredits: fixedCreditsSchema,
+}).strict();
 
 function invalid(reply: FastifyReply, message: string) {
   return reply.code(400).send({ error: 'invalid_request', message });
@@ -181,7 +198,7 @@ export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
     return adminOperation(reply, () => updateAdminUsageModelBinding(
       app.prisma,
       params.data.key,
-      body.data.canonicalModelId,
+      body.data,
       mutationContext(request),
     ));
   });

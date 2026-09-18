@@ -8,15 +8,14 @@ import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import sharp from 'sharp';
 import { Agent } from 'undici';
+import { env } from '../../config/env.js';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
 import { CloudAiError } from './service.js';
 import {
   aiPricingModelToken as imageModelToken,
-  configuredImageUnitCredits,
-  configuredVideoRequestCredits,
+  calculateVideoRequestCredits,
   defaultImageUnitCredits,
-  getAiPricingConfig,
   type PricedImageResolution,
 } from './pricing.js';
 import {
@@ -49,7 +48,7 @@ import {
   capturePricingSnapshot,
   estimateSnapshotCredits,
   type PricingSnapshot,
-  legacyPricingFromCatalog,
+  buildClientPricingProjection,
   toInputJson,
 } from './pricing-center.js';
 import {
@@ -901,11 +900,10 @@ export async function listWalletImageModels(
   prisma: PrismaClient,
 ) {
   await ensureAiCatalogSeeded(prisma);
-  const [legacyImageProviders, legacyVideoProviders, legacyPricing, catalogPricing, publicCatalog, routes] = await Promise.all([
+  const [legacyImageProviders, legacyVideoProviders, pricing, publicCatalog, routes] = await Promise.all([
     listImageProviders(prisma),
     listVideoProviders(prisma),
-    getAiPricingConfig(prisma),
-    catalogDelegateAvailable(prisma) ? legacyPricingFromCatalog(prisma) : null,
+    buildClientPricingProjection(prisma),
     catalogDelegateAvailable(prisma) ? getPublicAiCatalog(prisma) : null,
     catalogDelegateAvailable(prisma) ? prisma.aiModelRoute.findMany({
       where: { enabled: true, upstreamAvailable: true },
@@ -1059,14 +1057,6 @@ export async function listWalletImageModels(
   const firstAvailable = channels.find((channel) => !channel.error && channel.models.length > 0)
     ?? channels.find(channel => !channel.error)
     ?? channels[0]!;
-  const pricing = catalogPricing
-    ? {
-      ...legacyPricing,
-      imageModels: catalogPricing.imageModels,
-      videoModels: catalogPricing.videoModels,
-      updatedAt: catalogPricing.updatedAt ?? legacyPricing.updatedAt,
-    }
-    : legacyPricing;
   const videoChannels = videoProviders.map((provider) => ({
     id: provider.id,
     name: provider.name,
@@ -4180,25 +4170,21 @@ async function generateXaisImages(
 async function reserveImageCredits(
   prisma: PrismaClient,
   input: ImageInput,
-  capabilities?: readonly string[],
   pricingSnapshot?: PricingSnapshot,
   canonicalModelKey?: string,
 ) {
-  const legacyUnitCredits = pricingSnapshot ? null : await configuredImageUnitCredits(
-      prisma,
-      canonicalModelKey ?? input.model,
-      input.resolution,
-      capabilities,
-    );
+  const fallbackUnitCredits = pricingSnapshot
+    ? null
+    : defaultImageUnitCredits(canonicalModelKey ?? input.model, input.resolution);
   const fullEstimate = pricingSnapshot
     ? calculateSnapshotCharge(pricingSnapshot)
     : null;
-  const legacyEstimated = legacyUnitCredits
-    ? (legacyUnitCredits * BigInt(input.count)).toString()
+  const fallbackEstimated = fallbackUnitCredits
+    ? (fallbackUnitCredits * BigInt(input.count)).toString()
     : null;
   const unitCredits = pricingSnapshot
     ? calculateSnapshotCharge({ ...pricingSnapshot, request: { ...pricingSnapshot.request, count: 1 } }).totalCredits
-    : legacyUnitCredits!.toString();
+    : fallbackUnitCredits!.toString();
   const reservation = await prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({
       where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } },
@@ -4231,7 +4217,7 @@ async function reserveImageCredits(
         BigInt(input.count),
         BigInt(membershipQuota?.reservedUnits ?? '0'),
       ).totalCredits
-      : legacyEstimated!;
+      : fallbackEstimated!;
     const estimatedCredits = creditDecimal(estimated);
     const updated = await transaction.wallet.updateMany({
       where: { userId: input.userId, availableCredits: { gte: estimatedCredits } },
@@ -4800,7 +4786,6 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
   const reservation = await reserveImageCredits(
     prisma,
     reservationInput,
-    primaryProvider.capabilities,
     pricingSnapshot,
     canonicalModelKey,
   );
@@ -5223,31 +5208,21 @@ export function videoRouteSupportsRequest<T extends {
   resolution?: string,
   duration?: number,
   managedRouting = false,
+  aspectRatio?: string,
+  input?: Pick<VideoInput, 'prompt' | 'inputImages' | 'inputVideos' | 'inputAudios' | 'inputMode'>,
 ) {
   if (!route.channel) return false;
   if (!managedRouting && !providerSupportsVideoModel(route.channel, model)) return false;
-  const capabilities = normalizePublicModelCapabilities(
-    effectiveRouteCapabilitiesOverride(route, managedRouting),
-  );
-  const requestedResolution = String(resolution || '').trim().toLowerCase();
-  const supportedResolutions = Array.isArray(capabilities.resolutions)
-    ? capabilities.resolutions.map(item => String(item).trim().toLowerCase())
-    : [];
-  if (requestedResolution
-    && supportedResolutions.length > 0
-    && !supportedResolutions.includes(requestedResolution)) return false;
-  const supportedDurations = Array.isArray(capabilities.durations)
-    ? capabilities.durations.map(Number).filter(item => Number.isFinite(item))
-    : [];
-  return duration === undefined
-    || supportedDurations.length === 0
-    || supportedDurations.includes(duration);
+  const capabilities = effectiveRouteCapabilitiesOverride(route, managedRouting);
+  if (!catalogModelSupportsVideoRequest(capabilities, resolution, duration, aspectRatio)) return false;
+  return !input || catalogModelSupportsVideoInputs(capabilities, input);
 }
 
 export function catalogModelSupportsVideoRequest(
   capabilitiesValue: unknown,
   resolution?: string,
   duration?: number,
+  aspectRatio?: string,
 ) {
   const capabilities = normalizePublicModelCapabilities(capabilitiesValue);
   const requestedResolution = String(resolution || '').trim().toLowerCase();
@@ -5260,9 +5235,43 @@ export function catalogModelSupportsVideoRequest(
   const supportedDurations = Array.isArray(capabilities.durations)
     ? capabilities.durations.map(Number).filter(item => Number.isFinite(item))
     : [];
-  return duration === undefined
-    || supportedDurations.length === 0
-    || supportedDurations.includes(duration);
+  if (duration !== undefined
+    && supportedDurations.length > 0
+    && !supportedDurations.includes(duration)) return false;
+  const requestedAspectRatio = String(aspectRatio || '').trim().toLowerCase();
+  const supportedAspectRatios = Array.isArray(capabilities.aspectRatios)
+    ? capabilities.aspectRatios.map(item => String(item).trim().toLowerCase())
+    : [];
+  return !requestedAspectRatio
+    || supportedAspectRatios.length === 0
+    || supportedAspectRatios.includes(requestedAspectRatio);
+}
+
+export function catalogModelSupportsVideoInputs(
+  capabilitiesValue: unknown,
+  input: Pick<VideoInput, 'prompt' | 'inputImages' | 'inputVideos' | 'inputAudios' | 'inputMode'>,
+) {
+  const capabilities = normalizePublicModelCapabilities(capabilitiesValue);
+  if (input.prompt.trim() && capabilities.supportsTextPrompt === false) return false;
+  if (input.inputMode === 'FLF') {
+    if (input.inputImages.length > 1
+      && capabilities.supportsFirstLastFrame === false) return false;
+    if (input.inputImages.length === 1
+      && capabilities.supportsFirstFrame === false
+      && capabilities.supportsFirstLastFrame === false) return false;
+  } else if (input.inputImages.length > 0 && capabilities.supportsReferenceImages === false) {
+    return false;
+  }
+  if (input.inputVideos.length > 0 && capabilities.supportsReferenceVideo === false) return false;
+  if (input.inputAudios.length > 0
+    && capabilities.supportsReferenceAudio === false
+    && capabilities.supportsAudioReference === false) return false;
+  const exceeds = (value: number, maximum: unknown) => (
+    typeof maximum === 'number' && Number.isFinite(maximum) && value > maximum
+  );
+  return !exceeds(input.inputImages.length, capabilities.maxReferenceImages)
+    && !exceeds(input.inputVideos.length, capabilities.maxReferenceVideos)
+    && !exceeds(input.inputAudios.length, capabilities.maxReferenceAudios);
 }
 
 export async function selectVideoProvider(
@@ -5578,9 +5587,9 @@ async function reserveVideo(
 ) {
   const estimated = pricingSnapshot
     ? estimateSnapshotCredits(pricingSnapshot)
-    : (await configuredVideoRequestCredits(
-      prisma,
-      canonicalModelKey ?? input.model,
+    : calculateVideoRequestCredits(
+      undefined,
+      String(env.VIDEO_REQUEST_CREDITS),
       input.duration,
       input.resolution,
       input.count,
@@ -5588,7 +5597,7 @@ async function reserveVideo(
         imageCount: input.inputImages.length,
         videoCount: input.inputVideos.length,
       },
-    )).toString();
+    ).toString();
   const estimatedCredits = creditDecimal(estimated);
   return prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({ where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } } });
@@ -5777,11 +5786,11 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       usageContext: 'video_generation',
     });
   }
-  if (isSeedance20VideoModel(input.model)
+  if (!catalogResolution && isSeedance20VideoModel(input.model)
     && (input.inputImages.length > 9 || input.inputVideos.length > 3 || input.inputAudios.length > 3)) {
     throw new CloudAiError('invalid_request', 'Seedance 2.0 supports 9 images, 3 videos, and 3 audios at most', 400);
   }
-  if (isMiniMaxH3VideoModel(input.model)
+  if (!catalogResolution && isMiniMaxH3VideoModel(input.model)
     && (input.inputImages.length > 9 || input.inputVideos.length > 3 || input.inputAudios.length > 3)) {
     throw new CloudAiError('invalid_request', 'MiniMax H3 supports 9 images, 3 videos, and 3 audios at most', 400);
   }
@@ -5790,8 +5799,13 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       catalogResolution.model.capabilities,
       input.resolution,
       input.duration,
+      input.aspectRatio,
     )) {
-    throw new CloudAiError('invalid_request', '所选视频模型不支持该分辨率或时长', 400);
+    throw new CloudAiError('invalid_request', '所选视频模型不支持该分辨率、时长或画面比例', 400);
+  }
+  if (catalogResolution
+    && !catalogModelSupportsVideoInputs(catalogResolution.model.capabilities, input)) {
+    throw new CloudAiError('invalid_request', '所选视频模型不支持当前输入素材或输入模式', 400);
   }
   input = {
     ...input,
@@ -5804,6 +5818,8 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       input.resolution,
       input.duration,
       managedRouting,
+      input.aspectRatio,
+      input,
     )
   )) ?? [];
   if (!managedRouting

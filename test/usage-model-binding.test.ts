@@ -62,8 +62,8 @@ describe('usage model binding routing', () => {
 
     expect(create).toHaveBeenCalledTimes(2);
     expect(create.mock.calls.map(([call]) => call.data)).toEqual([
-      { key: 'IMAGE_ANALYSIS', canonicalModelId: 'model-eligible' },
-      { key: 'CANVAS_TEXT', canonicalModelId: 'model-eligible' },
+      { key: 'IMAGE_ANALYSIS', canonicalModelId: 'model-eligible', fixedCredits: '1.000000' },
+      { key: 'CANVAS_TEXT', canonicalModelId: 'model-eligible', fixedCredits: '1.000000' },
     ]);
   });
 

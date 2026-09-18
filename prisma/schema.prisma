@@ -539,6 +539,7 @@ model AiModel {
 model AiUsageModelBinding {
   key              String   @id
   canonicalModelId String
+  fixedCredits     Decimal? @db.Decimal(18, 6)
   updatedAt        DateTime @updatedAt
   canonicalModel   AiModel  @relation(fields: [canonicalModelId], references: [id], onDelete: Restrict)
 

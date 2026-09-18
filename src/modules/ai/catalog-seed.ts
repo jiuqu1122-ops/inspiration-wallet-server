@@ -1,16 +1,12 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
 import {
-  getChatPricingConfig,
-  updateChatPricingConfig,
+  defaultChatPricingConfig,
   type ChatModelCreditPrice,
-  type ChatPricingConfigInput,
 } from './chat-pricing.js';
 import {
-  getAiPricingConfig,
+  defaultAiPricingConfig,
   imagePricingModelToken,
-  updateAiPricingConfig,
   videoPricingModelToken,
-  type AiPricingConfigInput,
   type ImageModelCreditPrice,
   type VideoModelCreditPrice,
 } from './pricing.js';
@@ -115,19 +111,16 @@ async function ensureAlias(
   });
 }
 
-const sameJson = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
-
 async function ensurePrice(
   prisma: CatalogTransaction,
   modelId: string,
   pricing: CatalogPricingProfile,
-  publishChanges: boolean,
 ) {
   const workspace = await prisma.aiModelPricing.findUnique({
     where: { canonicalModelId: modelId },
     include: { currentVersion: true },
   });
-  if (workspace?.currentVersion && (!publishChanges || sameJson(workspace.currentVersion.pricing, pricing))) return;
+  if (workspace?.currentVersion) return;
   const latest = await prisma.aiPriceVersion.aggregate({
     where: { canonicalModelId: modelId },
     _max: { version: true },
@@ -137,7 +130,7 @@ async function ensurePrice(
       canonicalModelId: modelId,
       version: (latest._max.version ?? 0) + 1,
       pricing: toInputJson(pricing),
-      source: publishChanges ? 'LEGACY_ADMIN_PUBLISH' : 'LEGACY_MIGRATION',
+      source: 'INITIAL_BOOTSTRAP',
     },
   });
   await prisma.aiModelPricing.upsert({
@@ -198,12 +191,9 @@ async function seedAstraCost(prisma: CatalogTransaction, modelId: string) {
   });
 }
 
-async function seedCatalog(prisma: CatalogTransaction, publishChanges: boolean) {
-  const pricingClient = prisma as unknown as PrismaClient;
-  const [chatPricing, aiPricing] = await Promise.all([
-    getChatPricingConfig(pricingClient),
-    getAiPricingConfig(pricingClient),
-  ]);
+async function bootstrapEmptyCatalog(prisma: CatalogTransaction) {
+  const chatPricing = defaultChatPricingConfig();
+  const aiPricing = defaultAiPricingConfig();
   const seeds = seedModels(chatPricing.models, aiPricing.imageModels, aiPricing.videoModels);
   for (const seed of seeds) {
     const model = await prisma.aiModel.upsert({
@@ -222,25 +212,33 @@ async function seedCatalog(prisma: CatalogTransaction, publishChanges: boolean) 
       },
       update: {},
     });
-    for (const alias of seed.aliases) await ensureAlias(prisma, model.id, seed.modality, alias, 'LEGACY_MIGRATION');
-    await ensurePrice(prisma, model.id, seed.pricing, publishChanges);
+    for (const alias of seed.aliases) await ensureAlias(prisma, model.id, seed.modality, alias, 'INITIAL_BOOTSTRAP');
+    await ensurePrice(prisma, model.id, seed.pricing);
     if (seed.canonicalModelKey === 'gpt-6-astra') await seedAstraCost(prisma, model.id);
   }
+}
 
+async function ensureCompatibilityAliases(prisma: CatalogTransaction) {
   for (const modality of ['chat', 'image', 'video'] as const) {
     for (const [aliasKey, canonicalModelKey] of Object.entries(EXPLICIT_LEGACY_ALIASES[modality])) {
       const model = await prisma.aiModel.findUnique({ where: { canonicalModelKey } });
       if (model) await ensureAlias(prisma, model.id, modality, aliasKey, 'EXPLICIT_COMPATIBILITY_MAP');
     }
   }
+}
+
+async function ensureCatalog(prisma: CatalogTransaction) {
+  const modelCount = await prisma.aiModel.count();
+  if (modelCount === 0) await bootstrapEmptyCatalog(prisma);
+  await ensureCompatibilityAliases(prisma);
   await ensureDefaultUsageModelBindings(prisma);
   return true;
 }
 
-async function seedCatalogTransaction(prisma: PrismaClient, publishChanges: boolean) {
+async function ensureCatalogTransaction(prisma: PrismaClient) {
   try {
     return await prisma.$transaction(
-      transaction => seedCatalog(transaction, publishChanges),
+      transaction => ensureCatalog(transaction),
       { maxWait: 5_000, timeout: 30_000 },
     );
   } catch (error) {
@@ -248,7 +246,7 @@ async function seedCatalogTransaction(prisma: PrismaClient, publishChanges: bool
     // Another application instance may have bootstrapped the same unique rows.
     // Retry once after that transaction has won the race.
     return prisma.$transaction(
-      transaction => seedCatalog(transaction, publishChanges),
+      transaction => ensureCatalog(transaction),
       { maxWait: 5_000, timeout: 30_000 },
     );
   }
@@ -258,54 +256,10 @@ export async function ensureAiCatalogSeeded(prisma: PrismaClient) {
   if (!catalogDelegateAvailable(prisma)) return false;
   const cached = bootstrapPromises.get(prisma);
   if (cached) return cached;
-  const operation = seedCatalogTransaction(prisma, false).catch((error) => {
+  const operation = ensureCatalogTransaction(prisma).catch((error) => {
     bootstrapPromises.delete(prisma);
     throw error;
   });
   bootstrapPromises.set(prisma, operation);
   return operation;
-}
-
-export async function publishLegacyPricingToCatalog(prisma: PrismaClient) {
-  if (!catalogDelegateAvailable(prisma)) return false;
-  bootstrapPromises.delete(prisma);
-  const result = await seedCatalogTransaction(prisma, true);
-  bootstrapPromises.set(prisma, Promise.resolve(result));
-  return result;
-}
-
-export async function updateLegacyAiPricingAndPublish(
-  prisma: PrismaClient,
-  input: AiPricingConfigInput,
-) {
-  bootstrapPromises.delete(prisma);
-  const result = await prisma.$transaction(
-    async (transaction) => {
-      const client = transaction as unknown as PrismaClient;
-      const updated = await updateAiPricingConfig(client, input);
-      await seedCatalog(transaction, true);
-      return updated;
-    },
-    { maxWait: 5_000, timeout: 30_000 },
-  );
-  bootstrapPromises.set(prisma, Promise.resolve(true));
-  return result;
-}
-
-export async function updateLegacyChatPricingAndPublish(
-  prisma: PrismaClient,
-  input: ChatPricingConfigInput,
-) {
-  bootstrapPromises.delete(prisma);
-  const result = await prisma.$transaction(
-    async (transaction) => {
-      const client = transaction as unknown as PrismaClient;
-      const updated = await updateChatPricingConfig(client, input);
-      await seedCatalog(transaction, true);
-      return updated;
-    },
-    { maxWait: 5_000, timeout: 30_000 },
-  );
-  bootstrapPromises.set(prisma, Promise.resolve(true));
-  return result;
 }
