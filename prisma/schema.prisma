@@ -162,8 +162,22 @@ model User {
   receivedReferral     ReferralRelation?        @relation("ReferralInvitee")
   sentReferralRewards  ReferralRewardEvent[]    @relation("ReferralRewardInviter")
   receivedReferralRewards ReferralRewardEvent[] @relation("ReferralRewardInvitee")
+  rechargeSessions     RechargeSession[]
 
   @@index([status])
+}
+
+model RechargeSession {
+  id         String    @id @default(cuid())
+  tokenHash  String    @unique
+  userId     String
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
 }
 
 model MembershipPlan {
