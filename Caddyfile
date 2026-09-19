@@ -33,7 +33,7 @@ api.unmind.art {
             dial_timeout 10s
             # Image/video compatibility endpoints remain synchronous. Agent and
             # inspiration analysis now return a task id immediately.
-            response_header_timeout 11m
+            response_header_timeout 17m
         }
     }
 
