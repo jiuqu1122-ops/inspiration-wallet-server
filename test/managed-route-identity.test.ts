@@ -547,7 +547,7 @@ describe('managed canonical route identity', () => {
             publishedAt: new Date(0),
             pricing: {
               billingType: 'image_resolution',
-              creditsPerImageByResolution: { '2k': '10' },
+              creditsPerImageByResolution: { '2k': '10', '4k': '10' },
             },
           },
         })),
