@@ -753,7 +753,7 @@ describe('wallet image provider normalization', () => {
     expect(calls.slice(1).map(call => call.path)).toEqual(Array(6).fill(
       '/v1/images/tasks/imgtask_test?view=summary',
     ));
-    expect(calls.slice(1).every(call => call.timeoutMs === 45_000)).toBe(true);
+    expect(calls.slice(1).every(call => call.timeoutMs === 10_000)).toBe(true);
     expect(now - 1_800_000_000_000).toBe(120_000);
     expect(info).toHaveBeenCalledWith('[image_adapter_submit_started]', expect.objectContaining({
       clientRequestId: 'request-task-1',

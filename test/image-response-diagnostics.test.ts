@@ -242,6 +242,7 @@ describe('USELG image response diagnostics', () => {
     let getCount = 0;
     let postCount = 0;
     const polledUrls: string[] = [];
+    const statusTimeouts: Array<number | undefined> = [];
     const baseUrl = await localServer((requestUrl, method, response) => {
       expect(method).toBe('GET');
       getCount += 1;
@@ -260,7 +261,7 @@ describe('USELG image response diagnostics', () => {
     });
     const provider = { id: 'diagnostic-provider', baseUrl, kind: 'USELG' } as never;
     const secrets = { apiKey: 'secret-api-key', headers: {} };
-    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
     vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     await expect(generatePreparedImageAdapterImages(
@@ -307,7 +308,7 @@ describe('USELG image response diagnostics', () => {
       },
       {
         wait: async () => undefined,
-        request: async (path, body, _timeout, _headers, onResponseStatus, scope) => {
+        request: async (path, body, timeoutMs, _headers, onResponseStatus, scope) => {
           if (body !== undefined) {
             postCount += 1;
             return {
@@ -317,6 +318,7 @@ describe('USELG image response diagnostics', () => {
               poll_after_ms: 1,
             };
           }
+          statusTimeouts.push(timeoutMs);
           return providerRequest(
             provider,
             secrets,
@@ -333,14 +335,25 @@ describe('USELG image response diagnostics', () => {
 
     expect(getCount).toBe(2);
     expect(postCount).toBe(1);
+    expect(statusTimeouts).toEqual([10_000, 10_000]);
     expect(polledUrls).toEqual([
       '/v1/images/tasks/same-task?view=summary',
       '/v1/images/tasks/same-task?view=summary',
     ]);
+    expect(info).toHaveBeenCalledWith(
+      '[image_response_diagnostic]',
+      expect.objectContaining({
+        event: 'request_started',
+        phase: 'status',
+        taskId: 'same-task',
+        timeoutMs: 10_000,
+      }),
+    );
   });
 
   it('uses a completed summary result_url without reverting to the full status URL', async () => {
     const requestedPaths: string[] = [];
+    const requestedTimeouts: Array<number | undefined> = [];
     let statusPoll = 0;
 
     await expect(resolveUselgImageResponse(
@@ -356,8 +369,9 @@ describe('USELG image response diagnostics', () => {
       1,
       async () => undefined,
       undefined,
-      async (path) => {
+      async (path, _body, timeoutMs) => {
         requestedPaths.push(path);
+        requestedTimeouts.push(timeoutMs);
         if (path.startsWith('/v1/images/tasks/result-task/result')) {
           return { data: [{ url: 'https://cdn.example.test/result-task.png' }] };
         }
@@ -383,6 +397,7 @@ describe('USELG image response diagnostics', () => {
       '/v1/images/tasks/result-task?view=summary',
       '/v1/images/tasks/result-task/result?download=1',
     ]);
+    expect(requestedTimeouts).toEqual([10_000, 10_000, 45_000]);
   });
 
   it('retries a timed-out USELG result body by polling the same task again', async () => {

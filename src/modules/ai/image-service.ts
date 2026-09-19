@@ -98,6 +98,7 @@ import {
 
 export const IMAGE_GENERATION_TIMEOUT_MS = 15 * 60_000;
 export { IMAGE_ADAPTER_SUBMIT_TIMEOUT_MS } from './image-execution.js';
+const USELG_IMAGE_STATUS_POLL_TIMEOUT_MS = 10_000;
 const longImageRequestDispatcher = new Agent({
   headersTimeout: IMAGE_GENERATION_TIMEOUT_MS,
   bodyTimeout: IMAGE_GENERATION_TIMEOUT_MS,
@@ -2693,16 +2694,22 @@ export async function resolveUselgImageResponse(
           attempt,
           addressSource: statusAddressSource,
           targetUrl: providerDiagnosticTarget(provider, statusUrl),
-          timeoutMs: 45_000,
+          timeoutMs: USELG_IMAGE_STATUS_POLL_TIMEOUT_MS,
           method: 'GET',
         })
         : undefined;
       lastStatus = pollDiagnosticScope
         ? (await runImageResponseDiagnosticRequest(
           pollDiagnosticScope,
-          scope => request(statusUrl, undefined, 45_000, undefined, scope),
+          scope => request(
+            statusUrl,
+            undefined,
+            USELG_IMAGE_STATUS_POLL_TIMEOUT_MS,
+            undefined,
+            scope,
+          ),
         )).value
-        : await request(statusUrl, undefined, 45_000);
+        : await request(statusUrl, undefined, USELG_IMAGE_STATUS_POLL_TIMEOUT_MS);
       lastPollError = null;
     } catch (error) {
       const extractStartedAt = performance.now();
