@@ -840,6 +840,15 @@ describe('catalog exposure and upstream discovery safety', () => {
   it('defines MiniMax H3 capabilities without 1080p', () => {
     expect(defaultModelCapabilities('minimax-h3', 'video')).toMatchObject({
       supportedResolutions: ['768p', '2k'],
+      defaultResolution: '768p',
+    });
+    expect(defaultModelCapabilities('seedance-2', 'video')).toMatchObject({
+      supportedResolutions: ['480p', '720p', '1080p'],
+      defaultResolution: '720p',
+    });
+    expect(defaultModelCapabilities('seedance-2-fast', 'video')).toMatchObject({
+      supportedResolutions: ['480p', '720p', '1080p'],
+      defaultResolution: '720p',
     });
   });
 

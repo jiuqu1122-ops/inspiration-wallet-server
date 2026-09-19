@@ -254,6 +254,7 @@ export function defaultModelCapabilities(key: string, modality: AiModality): Pri
   if (key === 'seedance-2' || key === 'seedance-2-fast' || key === 'minimax-h3') {
     return {
       supportedResolutions: key === 'minimax-h3' ? ['768p', '2k'] : ['480p', '720p', '1080p'],
+      defaultResolution: key === 'minimax-h3' ? '768p' : '720p',
       supportedDurations: [4, 5, 10, 15],
       supportedAspectRatios: ['1:1', '3:4', '4:3', '9:16', '16:9'],
       supportsTextPrompt: true,
