@@ -431,7 +431,7 @@ describe('versioned server-side pricing', () => {
     expect(counted.quantity).toBe('3');
   });
 
-  it('prices video duration, resolution, count, and reference surcharges', () => {
+  it('uses one video base billing strategy and then adds reference surcharges', () => {
     const result = calculateSnapshotCharge(snapshot('video', {
       billingType: 'video_resolution_duration',
       credits: '2',
@@ -453,12 +453,26 @@ describe('versioned server-side pricing', () => {
       referenceVideoResolution: '4k',
       inputMode: 'REF',
     }));
-    expect(result.baseCharge).toBe('40.000000');
+    expect(result.baseCharge).toBe('10.000000');
     expect(result.surcharges).toEqual([
       { type: 'extra_reference_images', quantity: '4', credits: '16.000000' },
       { type: 'reference_video_seconds', quantity: '10', credits: '10.000000' },
     ]);
-    expect(result.totalCredits).toBe('66.000000');
+    expect(result.totalCredits).toBe('36.000000');
+  });
+
+  it.each([
+    ['video_flat', { creditsPerVideo: '15', creditsPerSecond: '999' }, { duration: 4, count: 1 }, '15.000000'],
+    ['video_flat', { creditsPerVideo: '15', creditsPerSecond: '999' }, { duration: 15, count: 2 }, '30.000000'],
+    ['video_second', { creditsPerSecond: '15', creditsPerVideo: '999' }, { duration: 4, count: 1 }, '60.000000'],
+    ['video_duration', { creditsByDuration: { '10': '80', '15': '110' } }, { duration: 10, count: 1 }, '80.000000'],
+    ['video_resolution_duration', { creditsByResolution: { '768p': '5', '2k': '9' } }, { duration: 10, count: 1, resolution: '768p' }, '50.000000'],
+  ] as const)('charges %s without adding stale base fields', (billingType, fields, request, expected) => {
+    const result = calculateSnapshotCharge(snapshot('video', {
+      billingType,
+      ...fields,
+    }, request));
+    expect(result.totalCredits).toBe(expected);
   });
 
   it('keeps an in-flight request on its captured version when a new price is published', async () => {
@@ -527,6 +541,7 @@ describe('versioned server-side pricing', () => {
           billingType: 'image_resolution',
           pricing: { pendingPrice: pending, currentVersion: { version: 10 } },
         })),
+        update: vi.fn(async (input: unknown) => input),
       },
       aiPriceVersion: {
         aggregate: vi.fn(async () => ({ _max: { version: 10 } })),
@@ -547,8 +562,67 @@ describe('versioned server-side pricing', () => {
     expect(updateWorkspace).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ currentVersionId: 'price-11' }),
     }));
+    expect(transaction.aiModel.update).toHaveBeenCalledWith({
+      where: { id: 'model-1' },
+      data: { billingType: 'image_resolution' },
+    });
     expect(legacyAiWrite).not.toHaveBeenCalled();
     expect(legacyChatWrite).not.toHaveBeenCalled();
+  });
+
+  it('keeps a pending billing change offline and atomically switches it on publish', async () => {
+    const pending = { billingType: 'video_flat', creditsPerVideo: '15' };
+    const pendingUpsert = vi.fn(async (input: unknown) => input);
+    await setPendingPrice({
+      aiModel: { findUnique: vi.fn(async () => ({ id: 'video-1', modality: 'video', billingType: 'video_second' })) },
+      aiModelPricing: { upsert: pendingUpsert },
+    } as unknown as PrismaClient, 'canonical-video', pending);
+    expect(pendingUpsert).toHaveBeenCalledWith(expect.objectContaining({
+      update: { pendingPrice: pending },
+    }));
+
+    const previousVersion = {
+      id: 'video-price-1',
+      version: 1,
+      pricing: { billingType: 'video_second', creditsPerSecond: '15' },
+    };
+    const modelUpdate = vi.fn(async (input: unknown) => input);
+    const pricingUpdate = vi.fn(async (input: unknown) => input);
+    const transaction = {
+      aiModel: {
+        findUnique: vi.fn(async () => ({
+          id: 'video-1',
+          canonicalModelKey: 'canonical-video',
+          modality: 'video',
+          billingType: 'video_second',
+          capabilities: {},
+          pricing: { pendingPrice: pending, currentVersion: previousVersion },
+        })),
+        update: modelUpdate,
+      },
+      aiPriceVersion: {
+        aggregate: vi.fn(async () => ({ _max: { version: 1 } })),
+        create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({ id: 'video-price-2', ...data })),
+      },
+      aiModelPricing: { update: pricingUpdate },
+    };
+    const published = await publishPendingPrice({
+      $transaction: vi.fn(async (operation: (tx: typeof transaction) => unknown) => operation(transaction)),
+    } as unknown as PrismaClient, 'canonical-video');
+
+    expect(published).toMatchObject({ version: 2, pricing: pending });
+    expect(pricingUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      data: { currentVersionId: 'video-price-2', pendingPrice: Prisma.JsonNull },
+    }));
+    expect(modelUpdate).toHaveBeenCalledWith({
+      where: { id: 'video-1' },
+      data: { billingType: 'video_flat' },
+    });
+    expect(previousVersion).toEqual({
+      id: 'video-price-1',
+      version: 1,
+      pricing: { billingType: 'video_second', creditsPerSecond: '15' },
+    });
   });
 
   it('requires a price for every supported video resolution before publish', () => {
@@ -632,6 +706,61 @@ describe('versioned server-side pricing', () => {
     expect(upsert.mock.calls[0]?.[0]).not.toHaveProperty('update.currentVersionId');
   });
 
+  it('keeps video markup suggestions in the upstream cost billing mode', async () => {
+    const upsert = vi.fn(async (input: unknown) => input);
+    const prisma = {
+      aiModel: {
+        findUnique: vi.fn(async () => ({
+          id: 'flat-video',
+          modality: 'video',
+          routes: [{
+            enabled: true,
+            costProfile: { currency: 'USD', billingType: 'video_flat', amountPerVideo: '3' },
+          }],
+        })),
+      },
+      aiModelPricing: { upsert },
+    } as unknown as PrismaClient;
+
+    await updatePricingPolicy(prisma, 'flat-video', {
+      pricingMode: 'MARKUP',
+      markupMultiplier: '1.32',
+    });
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({
+      update: expect.objectContaining({
+        suggestedPrice: { billingType: 'video_flat', creditsPerVideo: '400' },
+      }),
+    }));
+  });
+
+  it('does not suggest a video price when enabled routes use incompatible cost modes', async () => {
+    const upsert = vi.fn(async (input: unknown) => input);
+    const prisma = {
+      aiModel: {
+        findUnique: vi.fn(async () => ({
+          id: 'mixed-video',
+          modality: 'video',
+          routes: [{
+            enabled: true,
+            costProfile: { currency: 'USD', billingType: 'video_flat', amountPerVideo: '3' },
+          }, {
+            enabled: true,
+            costProfile: { currency: 'USD', billingType: 'video_second', amountPerSecond: '0.06' },
+          }],
+        })),
+      },
+      aiModelPricing: { upsert },
+    } as unknown as PrismaClient;
+
+    await updatePricingPolicy(prisma, 'mixed-video', {
+      pricingMode: 'MARKUP',
+      markupMultiplier: '1.32',
+    });
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({
+      update: expect.objectContaining({ suggestedPrice: Prisma.JsonNull }),
+    }));
+  });
+
   it('rejects malformed pricing instead of stringifying objects into charges', () => {
     expect(() => validatePricingProfile('chat', {
       ...astraPricing,
@@ -647,6 +776,7 @@ describe('catalog exposure and upstream discovery safety', () => {
         findMany: vi.fn(async () => [{
           canonicalModelKey: 'minimax-h3',
           modality: 'video',
+          billingType: 'video_resolution_duration',
           capabilities: { supportedResolutions: ['768p', '2k'] },
           pricing: {
             currentVersion: {
@@ -671,10 +801,40 @@ describe('catalog exposure and upstream discovery safety', () => {
     const projection = await buildClientPricingProjection(prisma);
     expect(projection.videoModels).toEqual([expect.objectContaining({
       model: 'minimax-h3',
+      billingType: 'video_resolution_duration',
+      credits: '0',
       creditsByResolution: { '768p': '10', '2k': '20' },
     })]);
     expect(projection.videoModels[0]?.creditsByResolution).not.toHaveProperty('1080p');
     expect(projection.inspirationAnalysisCredits).toBe('1.250000');
+  });
+
+  it('projects flat video pricing with an explicit billing type and a zero legacy rate', async () => {
+    const prisma = {
+      aiModel: {
+        findMany: vi.fn(async () => [{
+          canonicalModelKey: 'flat-video',
+          modality: 'video',
+          billingType: 'video_flat',
+          capabilities: {},
+          pricing: {
+            currentVersion: {
+              publishedAt: new Date('2026-09-18T00:00:00.000Z'),
+              pricing: { billingType: 'video_flat', creditsPerVideo: '15' },
+            },
+          },
+        }]),
+      },
+      aiUsageModelBinding: { findMany: vi.fn(async () => []) },
+    } as unknown as PrismaClient;
+
+    const projection = await buildClientPricingProjection(prisma);
+    expect(projection.videoModels).toEqual([{
+      model: 'flat-video',
+      billingType: 'video_flat',
+      credits: '0',
+      creditsPerVideo: '15',
+    }]);
   });
 
   it('defines MiniMax H3 capabilities without 1080p', () => {

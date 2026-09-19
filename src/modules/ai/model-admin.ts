@@ -1028,8 +1028,54 @@ function costProfileToSuggestedPrice(
       ? { billingType: 'image_resolution', creditsPerImageByResolution: prices }
       : null;
   }
-  const perSecond = points(costProfile.cnyPerSecond);
-  return perSecond ? { billingType: 'video_second', credits: perSecond, creditsPerSecond: perSecond } : null;
+  const billingType = videoCostBillingType(costProfile);
+  if (billingType === 'video_flat') {
+    const perVideo = points(costProfile.amountPerVideo ?? costProfile.cnyPerRequest);
+    return perVideo ? { billingType: 'video_flat', creditsPerVideo: perVideo } : null;
+  }
+  if (billingType === 'video_second') {
+    const perSecond = points(costProfile.amountPerSecond ?? costProfile.cnyPerSecond);
+    return perSecond ? { billingType: 'video_second', credits: perSecond, creditsPerSecond: perSecond } : null;
+  }
+  return null;
+}
+
+function videoCostBillingType(costProfile: Record<string, unknown>) {
+  if (costProfile.billingType === 'video_flat' || costProfile.billingType === 'video_second') {
+    return costProfile.billingType;
+  }
+  const hasLegacyPerVideo = costProfile.cnyPerRequest !== undefined;
+  const hasLegacyPerSecond = costProfile.cnyPerSecond !== undefined;
+  return hasLegacyPerVideo !== hasLegacyPerSecond
+    ? hasLegacyPerVideo ? 'video_flat' as const : 'video_second' as const
+    : null;
+}
+
+function suggestedPriceForRoutes(
+  modality: AiModality,
+  routes: Array<{ enabled: boolean; costProfile: Prisma.JsonValue | null }>,
+  markupMultiplier: number,
+) {
+  const candidates = routes
+    .filter(route => route.costProfile && typeof route.costProfile === 'object' && !Array.isArray(route.costProfile));
+  const effective = candidates.some(route => route.enabled)
+    ? candidates.filter(route => route.enabled)
+    : candidates;
+  const costProfiles = effective.map(route => route.costProfile as Record<string, unknown>);
+  if (modality === 'video') {
+    const modes = costProfiles.map(videoCostBillingType);
+    if (modes.some(mode => mode === null) || new Set(modes).size > 1) return null;
+  }
+  const suggestions = costProfiles.flatMap(costProfile => {
+    const suggested = costProfileToSuggestedPrice(
+      modality,
+      costProfile,
+      markupMultiplier,
+    );
+    return suggested ? [suggested] : [];
+  });
+  if (modality === 'video' && suggestions.length !== effective.length) return null;
+  return suggestions[0] ?? null;
 }
 
 export async function refreshSuggestedPriceForModel(
@@ -1052,16 +1098,7 @@ export async function refreshSuggestedPriceForModel(
     ...model.routes.filter(route => route.enabled),
     ...model.routes.filter(route => !route.enabled),
   ];
-  let suggestedPrice: CatalogPricingProfile | null = null;
-  for (const route of routes) {
-    if (!route.costProfile || typeof route.costProfile !== 'object' || Array.isArray(route.costProfile)) continue;
-    suggestedPrice = costProfileToSuggestedPrice(
-      model.modality as AiModality,
-      route.costProfile,
-      multiplier,
-    );
-    if (suggestedPrice) break;
-  }
+  const suggestedPrice = suggestedPriceForRoutes(model.modality as AiModality, routes, multiplier);
   await prisma.aiModelPricing.update({
     where: { canonicalModelId },
     data: { suggestedPrice: suggestedPrice === null ? Prisma.JsonNull : toInputJson(suggestedPrice) },
@@ -1081,18 +1118,9 @@ export async function updatePricingPolicy(
   if (!model) throw new Error('Canonical model was not found');
   const multiplier = Number(input.markupMultiplier);
   if (!Number.isFinite(multiplier) || multiplier <= 0 || multiplier > 100) throw new Error('Markup multiplier is invalid');
-  let suggestedPrice: CatalogPricingProfile | null = null;
-  if (input.pricingMode === 'MARKUP') {
-    for (const route of model.routes) {
-      if (!route.costProfile || typeof route.costProfile !== 'object' || Array.isArray(route.costProfile)) continue;
-      suggestedPrice = costProfileToSuggestedPrice(
-        model.modality as AiModality,
-        route.costProfile,
-        multiplier,
-      );
-      if (suggestedPrice) break;
-    }
-  }
+  const suggestedPrice = input.pricingMode === 'MARKUP'
+    ? suggestedPriceForRoutes(model.modality as AiModality, model.routes, multiplier)
+    : null;
   return prisma.aiModelPricing.upsert({
     where: { canonicalModelId: model.id },
     create: {

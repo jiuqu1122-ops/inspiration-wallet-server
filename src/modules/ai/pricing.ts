@@ -8,8 +8,16 @@ export type ImageModelCreditPrice = {
   credits4k: string;
 };
 
+export type VideoBillingType =
+  | 'video_flat'
+  | 'video_second'
+  | 'video_duration'
+  | 'video_resolution_duration';
+
 export type VideoModelCreditPrice = {
   model: string;
+  /** Explicit base billing strategy from the canonical AI Model Center price. */
+  billingType?: VideoBillingType | undefined;
   /** Legacy per-second price. Kept for existing pricing records. */
   credits: string;
   creditsPerSecond?: string | undefined;
@@ -241,6 +249,10 @@ const normalizeStoredVideoModels = (value: Prisma.JsonValue): VideoModelCreditPr
     const record = item as Record<string, unknown>;
     const model = typeof record.model === 'string' ? record.model.trim() : '';
     if (!model || !validCreditString(record.credits)) return [];
+    const billingType = typeof record.billingType === 'string'
+      && ['video_flat', 'video_second', 'video_duration', 'video_resolution_duration'].includes(record.billingType)
+      ? record.billingType as VideoBillingType
+      : undefined;
     const normalizeMap = (candidate: unknown): Record<string, string> | undefined => {
       if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return undefined;
       const entries = Object.entries(candidate as Record<string, unknown>)
@@ -260,6 +272,7 @@ const normalizeStoredVideoModels = (value: Prisma.JsonValue): VideoModelCreditPr
       : undefined;
     return [{
       model,
+      ...(billingType ? { billingType } : {}),
       credits: record.credits,
       ...(validCreditString(record.creditsPerSecond) ? { creditsPerSecond: record.creditsPerSecond } : {}),
       ...(validCreditString(record.creditsPerVideo) ? { creditsPerVideo: record.creditsPerVideo } : {}),
@@ -452,22 +465,48 @@ export function calculateVideoRequestCredits(
   const safeCount = Math.max(1, Math.ceil(Number(count) || 1));
   const durationKey = String(safeDuration);
   const resolutionKey = String(resolution || '720p').trim().toLowerCase() || '720p';
-  const countKey = String(safeCount);
-  const countOverride = price?.creditsByCount?.[countKey];
-
-  const perSecond = BigInt(price?.creditsPerSecond ?? price?.credits ?? fallbackPerSecond);
-  const durationCredits = price?.creditsByDuration?.[durationKey] !== undefined
-    ? BigInt(price.creditsByDuration[durationKey])
-    : perSecond * BigInt(safeDuration);
-  const perVideo = BigInt(price?.creditsPerVideo ?? '0');
-  const resolutionSurchargePerSecond = BigInt(price?.creditsByResolution?.[resolutionKey] ?? '0');
-  const outputCredits = countOverride !== undefined
-    ? BigInt(countOverride)
-    : (
-      durationCredits
-      + perVideo
-      + resolutionSurchargePerSecond * BigInt(safeDuration)
-    ) * BigInt(safeCount);
+  const billingType: VideoBillingType = price?.billingType
+    ?? (price?.creditsPerVideo !== undefined
+      ? 'video_flat'
+      : price?.creditsByResolution !== undefined
+        ? 'video_resolution_duration'
+        : price?.creditsByDuration !== undefined
+          ? 'video_duration'
+          : 'video_second');
+  let outputCredits: bigint;
+  switch (billingType) {
+    case 'video_flat':
+      outputCredits = BigInt(price?.creditsPerVideo ?? price?.credits ?? fallbackPerSecond)
+        * BigInt(safeCount);
+      break;
+    case 'video_duration': {
+      const durationPrice = price?.creditsByDuration?.[durationKey];
+      const fallback = price?.creditsPerSecond
+        ?? (price?.billingType ? undefined : price?.credits)
+        ?? (price?.billingType ? undefined : fallbackPerSecond);
+      if (durationPrice === undefined && fallback === undefined) {
+        throw new Error(`Video pricing is unavailable for duration ${durationKey}`);
+      }
+      outputCredits = durationPrice !== undefined
+        ? BigInt(durationPrice) * BigInt(safeCount)
+        : BigInt(fallback!) * BigInt(safeDuration) * BigInt(safeCount);
+      break;
+    }
+    case 'video_resolution_duration': {
+      const rate = price?.creditsByResolution?.[resolutionKey]
+        ?? (price?.billingType ? undefined : price?.creditsPerSecond ?? price?.credits ?? fallbackPerSecond);
+      if (rate === undefined) throw new Error(`Video pricing is unavailable for resolution ${resolutionKey}`);
+      outputCredits = BigInt(rate)
+        * BigInt(safeDuration)
+        * BigInt(safeCount);
+      break;
+    }
+    case 'video_second':
+      outputCredits = BigInt(price?.creditsPerSecond ?? price?.credits ?? fallbackPerSecond)
+        * BigInt(safeDuration)
+        * BigInt(safeCount);
+      break;
+  }
 
   const imageCount = Math.max(0, Math.floor(Number(references.imageCount) || 0));
   const videoCount = Math.max(0, Math.floor(Number(references.videoCount) || 0));

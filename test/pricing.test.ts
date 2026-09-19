@@ -188,9 +188,10 @@ describe('AI credit pricing', () => {
     });
   });
 
-  it('calculates video credits from duration, resolution, per-video, and count rules', async () => {
+  it('calculates video credits from one explicit base billing strategy', async () => {
     const price = {
       model: 'kling-video',
+      billingType: 'video_resolution_duration' as const,
       credits: '2',
       creditsPerSecond: '3',
       creditsPerVideo: '5',
@@ -198,8 +199,8 @@ describe('AI credit pricing', () => {
       creditsByResolution: { '1080p': '8' },
       creditsByCount: { '3': '200' },
     };
-    expect(calculateVideoRequestCredits(price, '1', 10, '1080p', 2)).toBe(250n);
-    expect(calculateVideoRequestCredits(price, '1', 10, '720p', 3)).toBe(200n);
+    expect(calculateVideoRequestCredits(price, '1', 10, '1080p', 2)).toBe(160n);
+    expect(() => calculateVideoRequestCredits(price, '1', 10, '720p', 3)).toThrow(/unavailable/);
 
     const prisma = prismaWithPricing({
       agentRequestCredits: 8n,
@@ -209,7 +210,7 @@ describe('AI credit pricing', () => {
       imageModelPrices: [],
       videoModelPrices: [price],
     });
-    expect(await configuredVideoRequestCredits(prisma, 'Kling Video', 10, '1080p', 2)).toBe(250n);
+    expect(await configuredVideoRequestCredits(prisma, 'Kling Video', 10, '1080p', 2)).toBe(160n);
   });
 
   it('adds MiniMax H3 reference-image and reference-video material credits', async () => {
@@ -246,7 +247,7 @@ describe('AI credit pricing', () => {
       '2K',
       2,
       { imageCount: 6, videoCount: 1 },
-    )).toBe(418n);
+    )).toBe(298n);
 
     const prisma = prismaWithPricing({
       agentRequestCredits: 8n,
@@ -263,6 +264,6 @@ describe('AI credit pricing', () => {
       '2K',
       1,
       { imageCount: 6, videoCount: 1 },
-    )).toBe(209n);
+    )).toBe(149n);
   });
 });

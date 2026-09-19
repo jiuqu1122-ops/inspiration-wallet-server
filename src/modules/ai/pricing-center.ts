@@ -221,11 +221,11 @@ export function videoPriceToCatalogProfile(price: VideoModelCreditPrice): Catalo
   const pricing = Object.fromEntries(
     Object.entries(price).filter(([key, value]) => key !== 'model' && value !== undefined),
   ) as Prisma.InputJsonObject;
-  const billingType = price.creditsByResolution
+  const billingType = price.billingType ?? (price.creditsByResolution
     ? 'video_resolution_duration'
     : price.creditsByDuration ? 'video_duration'
       : price.creditsPerVideo ? 'video_flat'
-        : 'video_second';
+        : 'video_second');
   return { billingType, ...pricing };
 }
 
@@ -311,16 +311,28 @@ export function catalogProfileToVideoPrice(
   if (profile.billingType === 'video_flat' && !validVideo && !creditPattern.test(scalarText(profile.credits))) return null;
   if (profile.billingType === 'video_duration' && !normalizedMaps.creditsByDuration && !validSecond) return null;
   if (profile.billingType === 'video_resolution_duration' && !normalizedMaps.creditsByResolution) return null;
-  const credits = validSecond
+  const billingType = profile.billingType as NonNullable<VideoModelCreditPrice['billingType']>;
+  const legacyFlatCredits = validVideo ? creditsPerVideo : scalarText(profile.credits);
+  const credits = billingType === 'video_second'
     ? creditsPerSecond
-    : validVideo ? creditsPerVideo : scalarText(profile.credits) || '0';
-  const output: VideoModelCreditPrice = { model, credits };
-  for (const key of ['creditsPerSecond', 'creditsPerVideo', 'creditsPerExtraReferenceImage', 'creditsPerReferenceVideoSecond'] as const) {
+    : billingType === 'video_duration' && validSecond ? creditsPerSecond : '0';
+  const output: VideoModelCreditPrice = { model, billingType, credits };
+  if (billingType === 'video_flat') output.creditsPerVideo = legacyFlatCredits;
+  if (billingType === 'video_second' || (billingType === 'video_duration' && validSecond)) {
+    output.creditsPerSecond = creditsPerSecond;
+  }
+  if (billingType === 'video_duration' && normalizedMaps.creditsByDuration) {
+    output.creditsByDuration = normalizedMaps.creditsByDuration;
+  }
+  if (billingType === 'video_resolution_duration' && normalizedMaps.creditsByResolution) {
+    output.creditsByResolution = normalizedMaps.creditsByResolution;
+  }
+  for (const key of ['creditsPerExtraReferenceImage', 'creditsPerReferenceVideoSecond'] as const) {
     const value = scalarText(profile[key]);
     if (creditPattern.test(value)) output[key] = value;
   }
-  for (const key of ['creditsByDuration', 'creditsByResolution', 'creditsByCount', 'referenceVideoCreditsByResolution'] as const) {
-    if (normalizedMaps[key]) output[key] = normalizedMaps[key];
+  if (normalizedMaps.referenceVideoCreditsByResolution) {
+    output.referenceVideoCreditsByResolution = normalizedMaps.referenceVideoCreditsByResolution;
   }
   if (typeof profile.includedReferenceImages === 'number'
     && Number.isSafeInteger(profile.includedReferenceImages)
@@ -557,26 +569,48 @@ function videoCharge(snapshot: PricingSnapshot, generatedCount?: number): Charge
   const videoCount = Math.max(0, Math.floor(Number(snapshot.request.referenceVideoCount) || 0));
   const byDuration = plainObject(pricing.creditsByDuration) ?? {};
   const byResolution = plainObject(pricing.creditsByResolution) ?? {};
-  const byCount = plainObject(pricing.creditsByCount) ?? {};
-  const byInputMode = plainObject(pricing.creditsByInputMode) ?? {};
   const referenceByResolution = plainObject(pricing.referenceVideoCreditsByResolution) ?? {};
   const referenceResolution = (scalarText(snapshot.request.referenceVideoResolution) || resolution).toLowerCase();
   const inputMode = (scalarText(snapshot.request.inputMode) || 'REF').toUpperCase();
-  const countOverride = count > 0 ? byCount[String(count)] : undefined;
-  const perSecond = pricing.creditsPerSecond ?? pricing.credits ?? '0';
-  const durationBase = byDuration[String(duration)] === undefined
-    ? multiplyCredits(perSecond, BigInt(duration))
-    : creditMicros(byDuration[String(duration)]);
-  const perVideo = creditMicros(pricing.creditsPerVideo
-    ?? (pricing.billingType === 'video_flat' ? pricing.credits : undefined)
-    ?? '0');
-  const inputModeCharge = creditMicros(byInputMode[inputMode.toLowerCase()] ?? byInputMode[inputMode] ?? '0');
-  const resolutionCharge = multiplyCredits(byResolution[resolution] ?? '0', BigInt(duration));
-  const outputBase = countOverride === undefined
-    ? (pricing.billingType === 'video_flat'
-      ? perVideo * BigInt(count)
-      : (durationBase + perVideo + inputModeCharge + resolutionCharge) * BigInt(count))
-    : creditMicros(countOverride);
+  const pricingUnavailable = (message: string): never => {
+    throw new ModelCatalogError('PRICING_NOT_AVAILABLE', message, 503);
+  };
+  let outputBase = 0n;
+  switch (pricing.billingType) {
+    case 'video_flat': {
+      const perVideo = pricing.creditsPerVideo ?? pricing.credits;
+      if (perVideo === undefined) pricingUnavailable(`Per-video pricing is missing for ${snapshot.canonicalModelKey}`);
+      outputBase = multiplyCredits(perVideo, BigInt(count));
+      break;
+    }
+    case 'video_second': {
+      const perSecond = pricing.creditsPerSecond ?? pricing.credits;
+      if (perSecond === undefined) pricingUnavailable(`Per-second pricing is missing for ${snapshot.canonicalModelKey}`);
+      outputBase = multiplyCredits(perSecond, BigInt(duration * count));
+      break;
+    }
+    case 'video_duration': {
+      const durationPrice = byDuration[String(duration)];
+      if (durationPrice !== undefined) {
+        outputBase = multiplyCredits(durationPrice, BigInt(count));
+        break;
+      }
+      const fallbackPerSecond = pricing.creditsPerSecond;
+      if (fallbackPerSecond === undefined) {
+        pricingUnavailable(`Pricing for ${duration} seconds is missing for ${snapshot.canonicalModelKey}`);
+      }
+      outputBase = multiplyCredits(fallbackPerSecond, BigInt(duration * count));
+      break;
+    }
+    case 'video_resolution_duration': {
+      const rate = byResolution[resolution];
+      if (rate === undefined) pricingUnavailable(`Pricing for ${resolution} is missing for ${snapshot.canonicalModelKey}`);
+      outputBase = multiplyCredits(rate, BigInt(duration * count));
+      break;
+    }
+    default:
+      pricingUnavailable(`Video billing type is invalid for ${snapshot.canonicalModelKey}`);
+  }
   const includedImages = Math.max(0, Math.floor(Number(pricing.includedReferenceImages) || 0));
   const extraImages = Math.max(0, imageCount - includedImages);
   const imageSurcharge = multiplyCredits(pricing.creditsPerExtraReferenceImage ?? '0', BigInt(extraImages * count));
@@ -747,7 +781,6 @@ export async function setPendingPrice(
   const model = await prisma.aiModel.findUnique({ where: { canonicalModelKey } });
   if (!model) throw new Error('Canonical model was not found');
   const validated = validatePricingProfile(model.modality as AiModality, pricing);
-  if (validated.billingType !== model.billingType) throw new Error('Pricing billing type does not match the canonical model');
   return prisma.aiModelPricing.upsert({
     where: { canonicalModelId: model.id },
     create: { canonicalModelId: model.id, pendingPrice: toInputJson(validated) },
@@ -790,7 +823,6 @@ async function publishPendingPriceTransaction(
     validatePricingProfile(model.modality as AiModality, model.pricing.pendingPrice),
     model.capabilities,
   );
-  if (pricing.billingType !== model.billingType) throw new Error('Pricing billing type does not match the canonical model');
   const latest = await transaction.aiPriceVersion.aggregate({
     where: { canonicalModelId: model.id },
     _max: { version: true },
@@ -807,6 +839,10 @@ async function publishPendingPriceTransaction(
   await transaction.aiModelPricing.update({
     where: { canonicalModelId: model.id },
     data: { currentVersionId: version.id, pendingPrice: Prisma.JsonNull },
+  });
+  await transaction.aiModel.update({
+    where: { id: model.id },
+    data: { billingType: pricing.billingType },
   });
   return { model: model.canonicalModelKey, version: version.version, pricing: version.pricing };
 }
@@ -825,7 +861,12 @@ export async function buildClientPricingProjection(prisma: PrismaClient) {
   if (!catalogDelegateAvailable(prisma)) return fallback;
   const [models, bindings] = await Promise.all([
     prisma.aiModel.findMany({
-      where: { status: 'PUBLISHED' },
+      where: {
+        enabled: true,
+        visible: true,
+        status: 'PUBLISHED',
+        pricing: { is: { currentVersionId: { not: null } } },
+      },
       include: { pricing: { include: { currentVersion: true } } },
       orderBy: [{ sortOrder: 'asc' }, { canonicalModelKey: 'asc' }],
     }),
@@ -840,6 +881,7 @@ export async function buildClientPricingProjection(prisma: PrismaClient) {
     const raw = model.pricing?.currentVersion?.pricing;
     if (!raw) continue;
     const profile = raw as CatalogPricingProfile;
+    if (profile.billingType !== model.billingType) continue;
     if (model.modality === 'image') {
       const legacy = catalogProfileToImagePrice(model.canonicalModelKey, profile);
       if (legacy) imageModels.push(legacy);
