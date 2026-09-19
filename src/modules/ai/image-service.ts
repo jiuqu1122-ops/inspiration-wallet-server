@@ -73,7 +73,9 @@ import {
   type ImageTaskExecutionConfig,
 } from './image-execution.js';
 import {
+  markImageFetchStarted,
   markImageExtractComplete,
+  markImageRequestPayloadReady,
   markImageResponseBodyComplete,
   markImageResponseHeaders,
   markImageResponseParseComplete,
@@ -1334,10 +1336,27 @@ export async function bigmodelRequest(
     timeoutOverrideMs ?? IMAGE_GENERATION_TIMEOUT_MS,
   );
   try {
-    const response = await fetch(providerRequestUrl(provider, path), {
-      method: body === undefined ? 'GET' : 'POST',
-      headers: bigmodelHeaders(secrets, extraHeaders),
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    const requestUrl = providerRequestUrl(provider, path);
+    const method = body === undefined ? 'GET' : 'POST';
+    const headers = bigmodelHeaders(secrets, extraHeaders);
+    let serializedBody: string | undefined;
+    if (body !== undefined) {
+      const serializeStartedAt = performance.now();
+      serializedBody = JSON.stringify(body);
+      const serializeCompletedAt = performance.now();
+      if (provider.kind === 'USELG' && diagnosticScope?.identity.phase === 'generate') {
+        markImageRequestPayloadReady(
+          diagnosticScope,
+          Buffer.byteLength(serializedBody ?? '', 'utf8'),
+          serializeStartedAt,
+          serializeCompletedAt,
+        );
+      }
+    }
+    const requestInit = {
+      method,
+      headers,
+      ...(body === undefined ? {} : { body: serializedBody }),
       redirect: 'error',
       signal: controller.signal,
       // Node's default Undici dispatcher stops waiting for response headers
@@ -1345,7 +1364,11 @@ export async function bigmodelRequest(
       // that, so keep the transport timeout aligned with our 15-minute job
       // deadline without changing fetch behavior for ordinary API calls.
       dispatcher: longImageRequestDispatcher,
-    } as RequestInit & { dispatcher: Agent });
+    } as RequestInit & { dispatcher: Agent };
+    if (provider.kind === 'USELG' && diagnosticScope?.identity.phase === 'generate') {
+      markImageFetchStarted(diagnosticScope);
+    }
+    const response = await fetch(requestUrl, requestInit);
     if (diagnosticScope) markImageResponseHeaders(diagnosticScope, response);
     const bodyStartedAt = performance.now();
     const text = await response.text();

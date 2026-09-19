@@ -24,6 +24,7 @@ export type ImageResponseDiagnosticScope = {
   readonly startedAt: number;
   readonly enabled: boolean;
   readonly detailed: boolean;
+  fetchStartedAt?: number | undefined;
   stage: 'waiting_headers' | 'reading_body' | 'parsing' | 'complete';
   timeoutTriggered: boolean;
   headersLogged: boolean;
@@ -160,6 +161,10 @@ function elapsedMs(scope: ImageResponseDiagnosticScope) {
   return Number((performance.now() - scope.startedAt).toFixed(3));
 }
 
+function durationMs(startedAt: number, completedAt: number) {
+  return Number((completedAt - startedAt).toFixed(3));
+}
+
 function shouldIncludeProcessSnapshot(scope: ImageResponseDiagnosticScope) {
   return scope.detailed || elapsedMs(scope) >= env.IMAGE_RESPONSE_DIAGNOSTICS_SLOW_MS;
 }
@@ -217,6 +222,7 @@ export function startImageResponseDiagnostic(input: ImageResponseDiagnosticIdent
 }
 
 export function markImageResponseHeaders(scope: ImageResponseDiagnosticScope, response: Response) {
+  const responseHeadersAt = performance.now();
   scope.stage = 'reading_body';
   scope.headersLogged = true;
   if (!scope.enabled) return;
@@ -225,7 +231,32 @@ export function markImageResponseHeaders(scope: ImageResponseDiagnosticScope, re
     contentType: response.headers.get('content-type'),
     contentEncoding: response.headers.get('content-encoding'),
     declaredContentLength: response.headers.get('content-length'),
-    headersWaitMs: elapsedMs(scope),
+    headersWaitMs: durationMs(scope.startedAt, responseHeadersAt),
+    ...(scope.fetchStartedAt === undefined
+      ? {}
+      : { fetchToHeadersMs: durationMs(scope.fetchStartedAt, responseHeadersAt) }),
+  });
+}
+
+export function markImageRequestPayloadReady(
+  scope: ImageResponseDiagnosticScope,
+  requestBodyBytes: number,
+  serializeStartedAt: number,
+  serializeCompletedAt: number,
+) {
+  if (!scope.enabled) return;
+  logInfo('request_payload_ready', scope, {
+    requestBodyBytes,
+    jsonSerializeMs: durationMs(serializeStartedAt, serializeCompletedAt),
+  });
+}
+
+export function markImageFetchStarted(scope: ImageResponseDiagnosticScope) {
+  const fetchStartedAt = performance.now();
+  scope.fetchStartedAt = fetchStartedAt;
+  if (!scope.enabled) return;
+  logInfo('fetch_started', scope, {
+    preFetchMs: durationMs(scope.startedAt, fetchStartedAt),
   });
 }
 

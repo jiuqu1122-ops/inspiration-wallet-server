@@ -2,6 +2,7 @@ import { createServer, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  bigmodelRequest,
   collectImageStrings,
   generatePreparedImageAdapterImages,
   normalizeUselgImageStatusUrl,
@@ -179,6 +180,83 @@ describe('USELG image response diagnostics', () => {
     expect(events[1]?.headersWaitMs as number).toBeGreaterThanOrEqual(40);
     expect(events[2]).toMatchObject({ decodedBodyBytes: 20, wireBodyBytes: null });
     expect(events[3]).toMatchObject({ parseType: 'json', topLevelType: 'object' });
+  });
+
+  it('measures USELG Gemini pre-fetch phases without logging request secrets', async () => {
+    const baseUrl = await localServer((_url, method, response) => {
+      expect(method).toBe('POST');
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end('{"status":"success"}');
+    });
+    const sensitivePrompt = 'private-prompt-do-not-log';
+    const sensitiveBase64 = 'iVBORw0KGgo-private-base64-do-not-log';
+    const sensitiveApiKey = 'private-api-key-do-not-log';
+    const sensitiveAuthorization = 'Bearer private-authorization-do-not-log';
+    const body = {
+      contents: [{
+        role: 'user',
+        parts: [
+          { text: sensitivePrompt },
+          { inlineData: { mimeType: 'image/png', data: sensitiveBase64 } },
+        ],
+      }],
+    };
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const scope = startImageResponseDiagnostic({
+      clientRequestId: 'generate-diagnostic-request',
+      providerId: 'uselg-diagnostic-provider',
+      adapterKey: 'LEGACY',
+      phase: 'generate',
+      attempt: 1,
+      addressSource: 'legacy_default',
+      targetUrl: `${baseUrl}/v1beta/models/gemini-image:generateContent`,
+      timeoutMs: 250,
+      method: 'POST',
+      detailedOverride: true,
+    });
+
+    await expect(runImageResponseDiagnosticRequest(
+      scope,
+      current => bigmodelRequest(
+        { id: 'uselg-diagnostic-provider', baseUrl, kind: 'USELG' } as never,
+        {
+          apiKey: sensitiveApiKey,
+          headers: { authorization: sensitiveAuthorization },
+        },
+        '/v1beta/models/gemini-image:generateContent',
+        body,
+        undefined,
+        250,
+        current,
+      ),
+    )).resolves.toMatchObject({ value: { status: 'success' } });
+
+    const events = info.mock.calls
+      .filter(([prefix]) => prefix === '[image_response_diagnostic]')
+      .map(([, event]) => event as Record<string, unknown>);
+    expect(events.map(event => event.event)).toEqual([
+      'request_started',
+      'request_payload_ready',
+      'fetch_started',
+      'response_headers',
+      'response_body_complete',
+      'response_parse_complete',
+    ]);
+    expect(events[1]).toMatchObject({
+      requestBodyBytes: Buffer.byteLength(JSON.stringify(body), 'utf8'),
+      jsonSerializeMs: expect.any(Number),
+    });
+    expect(events[2]?.preFetchMs).toEqual(expect.any(Number));
+    expect(events[3]).toMatchObject({
+      headersWaitMs: expect.any(Number),
+      fetchToHeadersMs: expect.any(Number),
+    });
+
+    const serializedLogs = JSON.stringify(info.mock.calls);
+    expect(serializedLogs).not.toContain(sensitivePrompt);
+    expect(serializedLogs).not.toContain(sensitiveBase64);
+    expect(serializedLogs).not.toContain(sensitiveAuthorization);
+    expect(serializedLogs).not.toContain(sensitiveApiKey);
   });
 
   it('identifies a timeout while reading a body that never ends', async () => {
