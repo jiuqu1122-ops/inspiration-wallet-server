@@ -56,5 +56,7 @@ export function resolveAgentUsageContext(
 
 export function isFixedCanvasLlmUsageContext(value?: string | null) {
   const context = canonicalAgentUsageContext(value);
-  return context === 'canvas_text_agent' || context === 'workflow';
+  return context === 'canvas_text_agent'
+    || context === 'prompt_optimization'
+    || context === 'workflow';
 }

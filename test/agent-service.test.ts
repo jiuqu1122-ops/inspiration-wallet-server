@@ -31,7 +31,7 @@ import {
 } from '../src/modules/ai/usage-context.js';
 
 describe('Agent usage context billing policy', () => {
-  it.each(['canvas_text_agent', 'workflow'])(
+  it.each(['canvas_text_agent', 'prompt_optimization', 'workflow'])(
     'treats %s as fixed-price canvas LLM usage',
     usageContext => {
       expect(isFixedCanvasLlmUsageContext(usageContext)).toBe(true);

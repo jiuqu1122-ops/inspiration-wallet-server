@@ -26,8 +26,11 @@ import {
 } from '../src/modules/ai/pricing-center.js';
 import { syncUpstreamModels } from '../src/modules/ai/upstream-sync.js';
 import { updateAdminAiRoute, updatePricingPolicy } from '../src/modules/ai/model-admin.js';
-import { listWalletAgentModels } from '../src/modules/ai/service.js';
-import { executeWalletAgentChat } from '../src/modules/ai/service.js';
+import {
+  executeWalletAgentChat,
+  getAgentRequestCredits,
+  listWalletAgentModels,
+} from '../src/modules/ai/service.js';
 import { listWalletImageModels } from '../src/modules/ai/image-service.js';
 import { creditDecimal } from '../src/modules/wallets/credit-amount.js';
 import { ensureAiCatalogSeeded } from '../src/modules/ai/catalog-seed.js';
@@ -287,12 +290,13 @@ describe('canonical model mapping', () => {
 });
 
 describe('versioned server-side pricing', () => {
-  it.each(['canvas_text_agent', 'workflow'])(
-    'charges %s canvas LLM usage at its fixed per-request price',
+  it.each(['canvas_text_agent', 'prompt_optimization'])(
+    'charges %s at the CANVAS_TEXT fixed per-request price',
     usageContext => {
       const fixed = calculateSnapshotCharge(snapshot('chat', astraPricing, {
         usageContext,
-        fallbackCredits: '3',
+        fallbackCredits: '10',
+        fixedUsageCredits: '1.000000',
       }), {
         usage: {
           inputTokens: 500_000n,
@@ -302,7 +306,7 @@ describe('versioned server-side pricing', () => {
         },
       });
       expect(fixed.billingType).toBe('request_fixed');
-      expect(fixed.totalCredits).toBe('3.000000');
+      expect(fixed.totalCredits).toBe('1.000000');
       expect(fixed.details.usage).toEqual({
         inputTokens: '500000',
         normalInputTokens: '500000',
@@ -312,6 +316,22 @@ describe('versioned server-side pricing', () => {
       });
     },
   );
+
+  it('preserves fixed workflow billing', () => {
+    const fixed = calculateSnapshotCharge(snapshot('chat', astraPricing, {
+      usageContext: 'workflow',
+      fallbackCredits: '3',
+    }), {
+      usage: {
+        inputTokens: 500_000n,
+        cachedInputTokens: 0n,
+        cacheWriteTokens: 0n,
+        outputTokens: 500_000n,
+      },
+    });
+    expect(fixed.billingType).toBe('request_fixed');
+    expect(fixed.totalCredits).toBe('3.000000');
+  });
 
   it('keeps ordinary chat on token billing', () => {
     const token = calculateSnapshotCharge(snapshot('chat', astraPricing, {
@@ -337,7 +357,7 @@ describe('versioned server-side pricing', () => {
     expect(estimateSnapshotCredits(token)).toBe('0.000001');
   });
 
-  it.each(['canvas_text_agent', 'workflow'])(
+  it.each(['canvas_text_agent', 'prompt_optimization', 'workflow'])(
     'reserves the fixed price for token-backed %s requests',
     usageContext => {
       const token = snapshot('chat', astraPricing, {
@@ -792,8 +812,12 @@ describe('catalog exposure and upstream discovery safety', () => {
       aiUsageModelBinding: {
         findMany: vi.fn(async () => [{
           key: 'IMAGE_ANALYSIS',
-          fixedCredits: new Prisma.Decimal('1.25'),
+          fixedCredits: new Prisma.Decimal('3'),
           updatedAt: new Date('2026-09-18T01:00:00.000Z'),
+        }, {
+          key: 'CANVAS_TEXT',
+          fixedCredits: new Prisma.Decimal('1'),
+          updatedAt: new Date('2026-09-18T02:00:00.000Z'),
         }]),
       },
     } as unknown as PrismaClient;
@@ -806,7 +830,9 @@ describe('catalog exposure and upstream discovery safety', () => {
       creditsByResolution: { '768p': '10', '2k': '20' },
     })]);
     expect(projection.videoModels[0]?.creditsByResolution).not.toHaveProperty('1080p');
-    expect(projection.inspirationAnalysisCredits).toBe('1.250000');
+    expect(projection.inspirationAnalysisCredits).toBe('3.000000');
+    expect(projection.canvasTextAgentCredits).toBe('1.000000');
+    expect(projection.agentRequestCredits).toBe(String(getAgentRequestCredits()));
   });
 
   it('projects flat video pricing with an explicit billing type and a zero legacy rate', async () => {
@@ -1318,6 +1344,146 @@ describe('catalog exposure and upstream discovery safety', () => {
 });
 
 describe('billing idempotency', () => {
+  it.each(['canvas_text_agent', 'prompt_optimization'])(
+    'reserves and consumes exactly one CANVAS_TEXT credit for %s despite large token usage',
+    async usageContext => {
+      const provider = {
+        id: 'canvas-provider',
+        name: 'canvas-provider',
+        kind: 'NEW_API',
+        status: 'ACTIVE',
+        priority: 10,
+        baseUrl: 'https://1.1.1.1',
+        defaultModel: 'gpt-5.6-sol',
+        allowInsecureHttp: false,
+        encryptedSecrets: encryptProviderSecrets({ apiKey: 'sk-test', headers: {} }),
+        apiKeyLast4: 'test',
+        capabilities: ['LLM'],
+        paramOverrides: null,
+        lastTestStatus: null,
+        lastTestMessage: null,
+        lastTestModelCount: null,
+        lastTestedAt: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      } as AiProviderChannel;
+      const route = {
+        id: 'canvas-route',
+        canonicalModelId: 'canvas-model',
+        channelId: provider.id,
+        provider: 'NEW_API',
+        upstreamModelId: 'gpt-5.6-sol',
+        enabled: true,
+        upstreamAvailable: true,
+        priority: 0,
+        healthStatus: 'HEALTHY',
+        capabilitiesOverride: null,
+        channel: provider,
+      };
+      const model = {
+        id: 'canvas-model',
+        canonicalModelKey: 'canvas-text-model',
+        displayName: 'Canvas Text Model',
+        modality: 'chat',
+        billingType: 'token',
+        capabilities: {},
+        enabled: true,
+        visible: true,
+        status: 'PUBLISHED',
+        routingMode: 'MANAGED',
+        defaultRouteId: route.id,
+        routes: [route],
+      };
+      const binding = {
+        key: 'CANVAS_TEXT',
+        canonicalModelId: model.id,
+        fixedCredits: new Prisma.Decimal('1'),
+        updatedAt: new Date(),
+        canonicalModel: model,
+      };
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+        model: 'gpt-5.6-sol',
+        choices: [{ message: { role: 'assistant', content: 'done' } }],
+        usage: { prompt_tokens: 500_000, completion_tokens: 500_000 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })));
+
+      let requestRow: Record<string, unknown> | null = null;
+      const reserveWallet = vi.fn(async () => ({ count: 1 }));
+      const settleWallet = vi.fn(async () => ({ availableCredits: creditDecimal(99) }));
+      const ledgerCreate = vi.fn(async () => ({}));
+      const transaction = {
+        aiModel: {
+          count: vi.fn(async () => 1),
+          findUnique: vi.fn(async () => null),
+          findMany: vi.fn(async () => []),
+        },
+        aiUsageModelBinding: {
+          findUnique: vi.fn(async () => binding),
+          update: vi.fn(),
+          create: vi.fn(),
+        },
+        aiRequest: {
+          findUnique: vi.fn(async () => null),
+          findFirst: vi.fn(async () => requestRow),
+          create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
+            requestRow = { id: 'canvas-request', ...data, chargedCredits: creditDecimal(0) };
+            return requestRow;
+          }),
+          updateMany: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
+            if (requestRow) Object.assign(requestRow, data);
+            return { count: requestRow ? 1 : 0 };
+          }),
+        },
+        wallet: {
+          updateMany: reserveWallet,
+          findUniqueOrThrow: vi.fn(async () => ({ availableCredits: creditDecimal(99) })),
+          update: settleWallet,
+        },
+        walletLedger: { create: ledgerCreate },
+        aiBillingSettlement: { create: vi.fn(async () => ({})) },
+      };
+      const userMembership = { findFirst: vi.fn(async () => null) };
+      const prisma = {
+        aiModel: transaction.aiModel,
+        aiUsageModelBinding: transaction.aiUsageModelBinding,
+        aiModelPricing: {
+          findUnique: vi.fn(async () => ({
+            currentVersion: { id: 'canvas-price-1', version: 1, pricing: astraPricing },
+          })),
+        },
+        userMembership,
+        $transaction: vi.fn(async (operation: (tx: typeof transaction) => unknown) => operation(transaction)),
+      } as unknown as PrismaClient;
+
+      await expect(executeWalletAgentChat(prisma, {
+        userId: 'user-1',
+        clientRequestId: `${usageContext}-request`,
+        model: 'unmind-agent',
+        usageContext,
+        messages: [{ role: 'user', content: 'hello' }],
+      })).resolves.toMatchObject({ choices: expect.any(Array) });
+
+      const reservation = reserveWallet.mock.calls[0]?.[0] as {
+        data: { availableCredits: { decrement: Prisma.Decimal }; reservedCredits: { increment: Prisma.Decimal } };
+      };
+      expect(reservation.data.availableCredits.decrement.toFixed(6)).toBe('1.000000');
+      expect(reservation.data.reservedCredits.increment.toFixed(6)).toBe('1.000000');
+      const settlement = settleWallet.mock.calls[0]?.[0] as {
+        data: { reservedCredits: { decrement: Prisma.Decimal }; lifetimeConsumed: { increment: Prisma.Decimal } };
+      };
+      expect(settlement.data.reservedCredits.decrement.toFixed(6)).toBe('1.000000');
+      expect(settlement.data.lifetimeConsumed.increment.toFixed(6)).toBe('1.000000');
+      const charge = ledgerCreate.mock.calls
+        .map(([call]) => call as { data: { type: string; amount: Prisma.Decimal } })
+        .find(call => call.data.type === 'CHARGE');
+      expect(charge?.data.amount.toFixed(6)).toBe('1.000000');
+      expect(requestRow).toMatchObject({
+        status: 'SUCCEEDED',
+        chargedCredits: expect.objectContaining({}),
+      });
+    },
+  );
+
   it('rejects a repeated clientRequestId before a second reservation or charge', async () => {
     const provider = {
       id: 'chat-provider',
