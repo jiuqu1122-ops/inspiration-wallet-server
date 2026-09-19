@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { access, readFile, rm } from 'node:fs/promises';
 import sharp from 'sharp';
 import {
+  IMAGE_ADAPTER_SUBMIT_TIMEOUT_MS,
   IMAGE_GENERATION_TIMEOUT_MS,
   buildNewApiImageGenerationBody,
   buildWalletCatalogMetadata,
@@ -18,6 +19,7 @@ import {
   executeWalletImageGeneration,
   filterProviderImageModels,
   generateBigmodelBananaImages,
+  generatePreparedImageAdapterImages,
   generateMikotoBananaImages,
   generateUselgGeminiImages,
   generateNewApiImages,
@@ -77,6 +79,7 @@ import {
 import { createImageResultFromResponse, getImageResult } from '../src/modules/ai/image-result-store.js';
 import { storageService } from '../src/modules/storage/service.js';
 import { encryptProviderSecrets } from '../src/lib/provider-secrets.js';
+import { imageRouteExecutionMode } from '../src/modules/ai/image-execution.js';
 
 describe('Mikoto Seedance model mapping', () => {
   it('does not fall back to another provider when MiniMax is explicitly requested', async () => {
@@ -656,6 +659,373 @@ describe('wallet image provider normalization', () => {
 
   it('allows image generation jobs to run for fifteen minutes', () => {
     expect(IMAGE_GENERATION_TIMEOUT_MS).toBe(15 * 60_000);
+  });
+
+  it('submits an explicit Generic Images task with a short timeout and resolves the sixth USELG poll', async () => {
+    const signedUrl = 'https://provider.example/result.png';
+    const calls: Array<{
+      path: string;
+      body: unknown;
+      timeoutMs: number | undefined;
+      headers: Record<string, string> | undefined;
+    }> = [];
+    let pollCount = 0;
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+
+    const images = await generatePreparedImageAdapterImages(
+      {
+        id: 'uselg-task-provider',
+        name: 'uselg-task-provider',
+        kind: 'USELG',
+        baseUrl: 'https://provider.example',
+      } as never,
+      { apiKey: 'sk-task-secret', headers: {} },
+      {
+        userId: 'user-task',
+        clientRequestId: 'request-task-1',
+        model: 'gemini-3.1-flash-image',
+        prompt: 'do not log this prompt',
+        inputImages: [],
+        aspectRatio: '16:9',
+        resolution: '2k',
+        outputFormat: 'png',
+        count: 1,
+      },
+      {
+        adapterKey: 'GENERIC_OPENAI_IMAGE',
+        execution: 'images-api',
+        submittedModel: 'gemini-3.1-flash-image',
+        endpoint: '/v1/images/generations',
+        method: 'POST',
+        contentType: 'application/json',
+        body: {
+          model: 'gemini-3.1-flash-image',
+          prompt: 'do not log this prompt',
+          async: true,
+        },
+      },
+      {
+        adapterKey: 'GENERIC_OPENAI_IMAGE',
+        adapterConfig: { async: true, generationEndpoint: '/v1/images/generations' },
+        executionMode: 'TASK',
+        executionConfig: {
+          profile: 'USELG_IMAGE_TASK',
+          submitEndpoint: '/v1/images/generations',
+        },
+        requestedCanonicalModel: 'nano-banana-2',
+        resolvedCanonicalModel: 'nano-banana-2',
+        canonicalModelId: 'canonical-nano-banana-2',
+        canonicalModelKey: 'nano-banana-2',
+        routeId: 'route-task-1',
+        channelId: 'uselg-task-provider',
+        upstreamModel: 'gemini-3.1-flash-image',
+      },
+      {
+        wait: async () => { now += 20_000; },
+        request: async (path, body, timeoutMs, headers) => {
+          calls.push({ path, body, timeoutMs, headers });
+          if (body !== undefined) return { task_id: 'imgtask_test', status: 'processing' };
+          pollCount += 1;
+          if (pollCount < 6) return { task_id: 'imgtask_test', status: 'processing' };
+          return {
+            image_task: {
+              task_id: 'imgtask_test',
+              status: 'success',
+              image_requested: 1,
+              image_succeeded: 1,
+              assets: [{ status: 'success', signed_url: signedUrl }],
+            },
+          };
+        },
+      },
+    );
+
+    expect(images).toEqual([signedUrl]);
+    expect(pollCount).toBe(6);
+    expect(calls[0]).toMatchObject({
+      path: '/v1/images/generations',
+      timeoutMs: IMAGE_ADAPTER_SUBMIT_TIMEOUT_MS,
+    });
+    expect(calls[0]?.headers?.['Idempotency-Key']).toBeTruthy();
+    expect(calls[0]?.headers?.['X-Request-Id']).toBe(calls[0]?.headers?.['Idempotency-Key']);
+    expect(calls.slice(1).map(call => call.path)).toEqual(Array(6).fill(
+      '/v1/images/tasks/imgtask_test?view=summary',
+    ));
+    expect(calls.slice(1).every(call => call.timeoutMs === 45_000)).toBe(true);
+    expect(now - 1_800_000_000_000).toBe(120_000);
+    expect(info).toHaveBeenCalledWith('[image_adapter_submit_started]', expect.objectContaining({
+      clientRequestId: 'request-task-1',
+      canonicalModel: 'nano-banana-2',
+      routeId: 'route-task-1',
+      providerId: 'uselg-task-provider',
+      adapterKey: 'GENERIC_OPENAI_IMAGE',
+      executionMode: 'TASK',
+      profile: 'USELG_IMAGE_TASK',
+      endpoint: '/v1/images/generations',
+    }));
+    expect(info).toHaveBeenCalledWith('[image_adapter_poll_state]', expect.objectContaining({
+      taskId: 'imgtask_test',
+      attempt: 6,
+      state: 'success',
+      assetCount: 1,
+      hasSignedUrl: true,
+    }));
+    expect(info).toHaveBeenCalledWith('[image_adapter_resolved]', expect.objectContaining({
+      taskId: 'imgtask_test',
+      totalDurationMs: 120_000,
+      sourceType: 'signed_url',
+    }));
+    const serializedLogs = JSON.stringify(info.mock.calls);
+    expect(serializedLogs).not.toContain('do not log this prompt');
+    expect(serializedLogs).not.toContain('sk-task-secret');
+    expect(serializedLogs).not.toContain(signedUrl);
+  });
+
+  it('treats a missing Route executionMode as INHERIT', () => {
+    expect(imageRouteExecutionMode(undefined)).toBe('INHERIT');
+    expect(imageRouteExecutionMode(null)).toBe('INHERIT');
+    expect(imageRouteExecutionMode('unknown')).toBe('INHERIT');
+  });
+
+  it('keeps Legacy INHERIT on the historical response resolver', async () => {
+    const request = vi.fn(async (path: string, body?: unknown) => body !== undefined
+      ? { task_id: 'legacy-inherit', status_url: '/tasks/legacy-inherit' }
+      : { status: 'completed', data: [{ url: 'https://provider.example/inherit.png' }] });
+    await expect(generatePreparedImageAdapterImages(
+      { id: 'legacy-inherit-provider', kind: 'NEW_API' } as never,
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-legacy', clientRequestId: 'legacy-inherit-request', model: 'legacy-image',
+        prompt: 'legacy', inputImages: [], aspectRatio: '1:1', outputFormat: 'png', count: 1,
+      },
+      {
+        adapterKey: 'LEGACY', execution: 'images-api', submittedModel: 'legacy-image',
+        endpoint: '/v1/images/generations', method: 'POST', contentType: 'application/json', body: {},
+      },
+      {
+        adapterKey: null, adapterConfig: null,
+        requestedCanonicalModel: 'legacy-image', resolvedCanonicalModel: 'legacy-image',
+        canonicalModelId: 'legacy-model', canonicalModelKey: 'legacy-image', routeId: 'legacy-route',
+        channelId: 'legacy-inherit-provider', upstreamModel: 'legacy-image',
+      },
+      { request, wait: async () => {} },
+    )).resolves.toEqual(['https://provider.example/inherit.png']);
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it('runs Legacy DIRECT without task polling', async () => {
+    const request = vi.fn(async () => ({ data: [{ url: 'https://provider.example/direct.png' }] }));
+    await expect(generatePreparedImageAdapterImages(
+      { id: 'legacy-direct-provider', kind: 'NEW_API' } as never,
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-legacy', clientRequestId: 'legacy-direct-request', model: 'legacy-image',
+        prompt: 'legacy', inputImages: [], aspectRatio: '1:1', outputFormat: 'png', count: 1,
+      },
+      {
+        adapterKey: 'LEGACY', execution: 'images-api', submittedModel: 'legacy-image',
+        endpoint: '/v1/images/generations', method: 'POST', contentType: 'application/json', body: {},
+      },
+      {
+        adapterKey: null, adapterConfig: null, executionMode: 'DIRECT', executionConfig: null,
+        requestedCanonicalModel: 'legacy-image', resolvedCanonicalModel: 'legacy-image',
+        canonicalModelId: 'legacy-model', canonicalModelKey: 'legacy-image', routeId: 'legacy-route',
+        channelId: 'legacy-direct-provider', upstreamModel: 'legacy-image',
+      },
+      { request },
+    )).resolves.toEqual(['https://provider.example/direct.png']);
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails Legacy TASK closed before request when no submit contract exists', async () => {
+    const request = vi.fn();
+    await expect(generatePreparedImageAdapterImages(
+      { id: 'legacy-task-invalid-provider', kind: 'USELG' } as never,
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-legacy', clientRequestId: 'legacy-task-invalid', model: 'legacy-image',
+        prompt: 'legacy', inputImages: [], aspectRatio: '1:1', outputFormat: 'png', count: 1,
+      },
+      {
+        adapterKey: 'LEGACY', execution: 'images-api', submittedModel: 'legacy-image',
+        endpoint: '/v1/images/generations', method: 'POST', contentType: 'application/json', body: {},
+      },
+      {
+        adapterKey: null, adapterConfig: null, executionMode: 'TASK', executionConfig: null,
+        requestedCanonicalModel: 'legacy-image', resolvedCanonicalModel: 'legacy-image',
+        canonicalModelId: 'legacy-model', canonicalModelKey: 'legacy-image', routeId: 'legacy-route',
+        channelId: 'legacy-task-invalid-provider', upstreamModel: 'legacy-image',
+      },
+      { request },
+    )).rejects.toMatchObject({ code: 'IMAGE_ADAPTER_CONFIG_INVALID' });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('runs Legacy TASK with the explicit USELG submit contract and async parameter', async () => {
+    const request = vi.fn(async (path: string, body?: unknown) => body !== undefined
+      ? { task_id: 'legacy-task', status: 'queued' }
+      : {
+        image_task: {
+          task_id: 'legacy-task', status: 'success',
+          assets: [{ signed_url: 'https://provider.example/legacy-task.png' }],
+        },
+      });
+    await expect(generatePreparedImageAdapterImages(
+      { id: 'legacy-task-provider', kind: 'USELG' } as never,
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-legacy', clientRequestId: 'legacy-task-request', model: 'legacy-image',
+        prompt: 'legacy', inputImages: [], aspectRatio: '1:1', outputFormat: 'png', count: 1,
+      },
+      {
+        adapterKey: 'LEGACY', execution: 'images-api', submittedModel: 'legacy-image',
+        endpoint: '/v1beta/models/legacy-image:generateContent', method: 'POST', contentType: 'application/json', body: { model: 'legacy-image' },
+      },
+      {
+        adapterKey: null, adapterConfig: null, executionMode: 'TASK',
+        executionConfig: {
+          profile: 'USELG_IMAGE_TASK', submitEndpoint: '/v1/images/generations',
+          asyncParameterName: 'async', asyncParameterValue: true,
+        },
+        requestedCanonicalModel: 'legacy-image', resolvedCanonicalModel: 'legacy-image',
+        canonicalModelId: 'legacy-model', canonicalModelKey: 'legacy-image', routeId: 'legacy-route',
+        channelId: 'legacy-task-provider', upstreamModel: 'legacy-image',
+      },
+      { request, wait: async () => {} },
+    )).resolves.toEqual(['https://provider.example/legacy-task.png']);
+    expect(request.mock.calls[0]?.[0]).toBe('/v1/images/generations');
+    expect(request.mock.calls[0]?.[1]).toMatchObject({ async: true });
+    expect(request.mock.calls.map((call) => call[0]).some((path) => path.includes(':generateContent'))).toBe(false);
+  });
+
+  it('rejects a blocking Gemini generateContent endpoint as a TASK submit contract', async () => {
+    const request = vi.fn();
+    await expect(generatePreparedImageAdapterImages(
+      { id: 'legacy-task-blocking-provider', kind: 'USELG' } as never,
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-legacy', clientRequestId: 'legacy-task-blocking', model: 'legacy-image',
+        prompt: 'legacy', inputImages: [], aspectRatio: '1:1', outputFormat: 'png', count: 1,
+      },
+      {
+        adapterKey: 'LEGACY', execution: 'images-api', submittedModel: 'legacy-image',
+        endpoint: '/v1beta/models/legacy-image:generateContent', method: 'POST', contentType: 'application/json', body: {},
+      },
+      {
+        adapterKey: null, adapterConfig: null, executionMode: 'TASK',
+        executionConfig: {
+          profile: 'USELG_IMAGE_TASK',
+          submitEndpoint: '/v1beta/models/legacy-image:generateContent',
+        },
+        requestedCanonicalModel: 'legacy-image', resolvedCanonicalModel: 'legacy-image',
+        canonicalModelId: 'legacy-model', canonicalModelKey: 'legacy-image', routeId: 'legacy-route',
+        channelId: 'legacy-task-blocking-provider', upstreamModel: 'legacy-image',
+      },
+      { request },
+    )).rejects.toThrow(/not a confirmed fast task submit endpoint/);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('runs Generic TASK with configured paths and resolves a signed URL immediately', async () => {
+    const request = vi.fn(async () => ({
+      job: {
+        id: 'generic-task',
+        state: 'done',
+        outputs: [{ signed: 'https://provider.example/generic-signed.png' }],
+      },
+    }));
+    await expect(generatePreparedImageAdapterImages(
+      { id: 'generic-task-provider', kind: 'NEW_API' } as never,
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-generic', clientRequestId: 'generic-task-request', model: 'generic-image',
+        prompt: 'generic', inputImages: [], aspectRatio: '1:1', outputFormat: 'png', count: 1,
+      },
+      {
+        adapterKey: 'GENERIC_OPENAI_IMAGE', execution: 'images-api', submittedModel: 'generic-image',
+        endpoint: '/adapter-endpoint', method: 'POST', contentType: 'application/json', body: { model: 'generic-image' },
+      },
+      {
+        adapterKey: 'GENERIC_OPENAI_IMAGE', adapterConfig: null, executionMode: 'TASK',
+        executionConfig: {
+          profile: 'GENERIC_TASK', submitEndpoint: '/tasks/submit', statusEndpointTemplate: '/tasks/{taskId}',
+          taskIdPath: 'job.id', statusPath: 'job.state', assetArrayPath: 'job.outputs',
+          signedUrlPath: 'signed', processingStatuses: ['queued'], completedStatuses: ['done'],
+          failedStatuses: ['failed'], pollAfterMsPath: 'poll_after_ms', downloadUrlPath: 'download_url',
+          urlPath: 'url', submitTimeoutMs: 60000,
+        },
+        requestedCanonicalModel: 'generic-image', resolvedCanonicalModel: 'generic-image',
+        canonicalModelId: 'generic-model', canonicalModelKey: 'generic-image', routeId: 'generic-route',
+        channelId: 'generic-task-provider', upstreamModel: 'generic-image',
+      },
+      { request },
+    )).resolves.toEqual(['https://provider.example/generic-signed.png']);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls[0]?.[0]).toBe('/tasks/submit');
+  });
+
+  it('runs Generic DIRECT without converting a task envelope into polling', async () => {
+    const request = vi.fn(async () => ({ task_id: 'must-not-poll' }));
+    await expect(generatePreparedImageAdapterImages(
+      { id: 'generic-direct-provider', kind: 'NEW_API' } as never,
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-generic', clientRequestId: 'generic-direct-request', model: 'generic-image',
+        prompt: 'generic', inputImages: [], aspectRatio: '1:1', outputFormat: 'png', count: 1,
+      },
+      {
+        adapterKey: 'GENERIC_OPENAI_IMAGE', execution: 'images-api', submittedModel: 'generic-image',
+        endpoint: '/v1/images/generations', method: 'POST', contentType: 'application/json', body: { model: 'generic-image' },
+      },
+      {
+        adapterKey: 'GENERIC_OPENAI_IMAGE', adapterConfig: null,
+        executionMode: 'DIRECT', executionConfig: null,
+        requestedCanonicalModel: 'generic-image', resolvedCanonicalModel: 'generic-image',
+        canonicalModelId: 'generic-model', canonicalModelKey: 'generic-image', routeId: 'generic-route',
+        channelId: 'generic-direct-provider', upstreamModel: 'generic-image',
+      },
+      { request },
+    )).rejects.toThrow(/task polling is disabled/);
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps provider-mode Gemini Native on the historical generation timeout and inline response path', async () => {
+    const inline = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nYQAAAAASUVORK5CYII=';
+    const request = vi.fn(async () => ({
+      candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: inline } }] } }],
+    }));
+
+    await expect(generatePreparedImageAdapterImages(
+      { id: 'gemini-native-provider', kind: 'BIGMODEL' } as never,
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-native',
+        clientRequestId: 'request-native',
+        model: 'gemini-3.1-flash-image',
+        prompt: 'inline image',
+        inputImages: [],
+        aspectRatio: '1:1',
+        resolution: '2k',
+        outputFormat: 'png',
+        count: 1,
+      },
+      {
+        adapterKey: 'GEMINI_NATIVE_IMAGE',
+        execution: 'gemini-native',
+        submittedModel: 'gemini-3.1-flash-image',
+        endpoint: '/v1beta/models/gemini-3.1-flash-image:generateContent',
+        method: 'POST',
+        contentType: 'application/json',
+        body: { contents: [] },
+      },
+      undefined,
+      { request },
+    )).resolves.toEqual([`data:image/png;base64,${inline}`]);
+
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls[0]?.[2]).toBe(IMAGE_GENERATION_TIMEOUT_MS);
   });
 
   it('accepts only complete persisted wallet image results', () => {
@@ -2708,6 +3078,46 @@ describe('wallet image provider normalization', () => {
       async () => {},
     )).resolves.toEqual(['https://cdn.example.test/generated.png']);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('summarizes a nested image_task success and returns its signed asset without polling', async () => {
+    const signedUrl = 'https://example.com/image.png';
+    const value = {
+      image_task: {
+        task_id: 'imgtask_test',
+        status: 'success',
+        image_requested: 1,
+        image_succeeded: 1,
+        assets: [{
+          status: 'success',
+          signed_url: signedUrl,
+          download_url: 'https://example.com/download',
+          url: 'https://example.com/raw',
+          width: 5504,
+          height: 3072,
+        }],
+      },
+    };
+
+    expect(summarizeUselgImageStatus(value, [], 1)).toMatchObject({
+      taskId: 'imgtask_test',
+      state: 'success',
+      assets: [{ key: 'signed_url', value: signedUrl }],
+    });
+    const request = vi.fn(async () => {
+      throw new Error('resolver must not poll a completed asset');
+    });
+    await expect(resolveUselgImageResponse(
+      { baseUrl: 'https://api.ai-media.vip', name: 'uselg', kind: 'USELG' } as never,
+      { apiKey: 'sk-uselg', headers: {} },
+      value,
+      [],
+      1,
+      async () => undefined,
+      undefined,
+      request,
+    )).resolves.toEqual([signedUrl]);
+    expect(request).not.toHaveBeenCalled();
   });
 
   it('returns a large inline image immediately even when the USELG task state is processing', async () => {

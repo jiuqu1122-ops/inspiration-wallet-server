@@ -29,7 +29,6 @@ export const genericOpenAiImageAdapter: ImageModelAdapter = {
       method: 'POST',
       contentType: 'application/json',
       body,
-      asyncMode: config.async === true ? 'task' : 'provider',
     };
   },
 };

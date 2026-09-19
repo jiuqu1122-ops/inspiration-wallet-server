@@ -58,7 +58,6 @@ describe('image adapter registry', () => {
         model: 'seedream-5.0-pro',
         prompt: 'A red apple on a white table',
       },
-      asyncMode: 'provider',
     });
     expect(prepared?.body).not.toHaveProperty('quality');
     expect(prepared?.body).not.toHaveProperty('output_resolution');
@@ -92,6 +91,37 @@ describe('image adapter registry', () => {
     expect(prepared?.body).not.toHaveProperty('image_size');
     expect(JSON.stringify(prepared?.body)).not.toContain('1792x1024');
     expect(JSON.stringify(prepared?.body)).not.toContain('2048x1152');
+  });
+
+  it('keeps async payload serialization independent from execution lifecycle', () => {
+    const generic = prepareImageAdapterRequest(
+      getImageModelAdapter('GENERIC_OPENAI_IMAGE'),
+      input({
+        adapterConfig: {
+          async: true,
+          generationEndpoint: '/v1/images/generations',
+        },
+      }),
+    );
+    const grok = prepareImageAdapterRequest(
+      getImageModelAdapter('GROK_IMAGES_API'),
+      input({
+        requestedCanonicalModel: 'grok-image',
+        resolvedCanonicalModel: 'grok-image',
+        canonicalModelKey: 'grok-image',
+        upstreamModel: 'grok-imagine-image-edit',
+        adapterConfig: { async: true },
+      }),
+    );
+
+    expect(generic).toMatchObject({
+      adapterKey: 'GENERIC_OPENAI_IMAGE',
+      body: { async: true },
+    });
+    expect(grok).toMatchObject({
+      adapterKey: 'GROK_IMAGES_API',
+      body: { async: true },
+    });
   });
 
   it('builds Gemini Native generateContent with the exact route SKU and image config', () => {
@@ -130,7 +160,6 @@ describe('image adapter registry', () => {
           imageConfig: { aspectRatio: '16:9', imageSize: '4K' },
         },
       },
-      asyncMode: 'provider',
     });
     expect(prepared?.body).not.toHaveProperty('model');
     expect(prepared?.body).not.toHaveProperty('prompt');
@@ -276,7 +305,6 @@ describe('image adapter registry', () => {
         method: 'POST' as const,
         contentType: 'application/json' as const,
         body: { model: 'another-upstream-sku', prompt: 'test' },
-        asyncMode: 'provider' as const,
       }),
     };
     expect(() => prepareImageAdapterRequest(

@@ -488,6 +488,104 @@ describe('managed canonical route identity', () => {
     });
   });
 
+  it('keeps an ambiguous Generic async submit processing without release or route failover', async () => {
+    const primary = provider('task-primary', 'https://1.1.1.1', 'USELG', ['IMAGE_NANO_BANANA_2']);
+    const fallback = provider('task-fallback', 'https://8.8.8.8', 'USELG', ['IMAGE_NANO_BANANA_2']);
+    const route = (id: string, channel: AiProviderChannel, priority: number) => ({
+      id,
+      canonicalModelId: 'model-task-image',
+      provider: 'USELG',
+      channelId: channel.id,
+      upstreamModelId: 'gemini-3.1-flash-image-preview',
+      adapterKey: 'GENERIC_OPENAI_IMAGE',
+      adapterConfig: {
+        async: true,
+        generationEndpoint: '/v1/images/generations',
+      },
+      executionMode: 'TASK',
+      executionConfig: {
+        profile: 'USELG_IMAGE_TASK',
+        submitEndpoint: '/v1/images/generations',
+      },
+      enabled: true,
+      upstreamAvailable: true,
+      healthStatus: 'HEALTHY',
+      priority,
+      capabilitiesOverride: null,
+      metadata: null,
+      channel,
+    });
+    const model = {
+      id: 'model-task-image',
+      canonicalModelKey: 'task-image',
+      displayName: 'Task Image',
+      modality: 'image',
+      enabled: true,
+      visible: true,
+      status: 'PUBLISHED',
+      routingMode: 'MANAGED',
+      billingType: 'image_resolution',
+      capabilities: {
+        supportedResolutions: ['2k'],
+        supportedAspectRatios: ['1:1'],
+      },
+      defaultRouteId: 'route-task-primary',
+      routes: [
+        route('route-task-primary', primary, 0),
+        route('route-task-fallback', fallback, 10),
+      ],
+    };
+    const { transaction, getRequest } = walletTransaction('image-request-task-ambiguous');
+    const prisma = {
+      userMembership: { findFirst: vi.fn(async () => null) },
+      aiModel: { findUnique: vi.fn(async () => model) },
+      aiModelPricing: {
+        findUnique: vi.fn(async () => ({
+          currentVersion: {
+            id: 'image-price-task',
+            version: 1,
+            publishedAt: new Date(0),
+            pricing: {
+              billingType: 'image_resolution',
+              creditsPerImageByResolution: { '2k': '10' },
+            },
+          },
+        })),
+      },
+      aiProviderChannel: { findMany: vi.fn(async () => []) },
+      $transaction: vi.fn(async (operation: (tx: typeof transaction) => unknown) => operation(transaction)),
+    } as unknown as PrismaClient;
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      error: { message: 'gateway timeout after forwarding the request' },
+    }), {
+      status: 504,
+      headers: { 'content-type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(executeWalletImageGeneration(prisma, {
+      userId: 'user-1',
+      clientRequestId: 'managed-task-ambiguous',
+      model: 'task-image',
+      prompt: 'a red apple',
+      inputImages: [],
+      aspectRatio: '1:1',
+      resolution: '2k',
+      outputFormat: 'png',
+      count: 1,
+    })).rejects.toMatchObject({
+      code: 'AMBIGUOUS_SUBMIT',
+      statusCode: 503,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://1.1.1.1/v1/images/generations');
+    expect(getRequest()).toMatchObject({ status: 'PROCESSING' });
+    expect(transaction.wallet.update).not.toHaveBeenCalled();
+    expect(transaction.walletLedger.create).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps an explicit Grok adapter on the selected route SKU during same-canonical failover', async () => {
     const primary = provider('grok-primary', 'https://1.1.1.1', 'NEW_API', ['IMAGE']);
     const fallback = provider('grok-fallback', 'https://8.8.8.8', 'NEW_API', ['IMAGE']);

@@ -66,6 +66,11 @@ import {
   prepareImageAdapterRequest,
   type PreparedImageAdapterRequest,
 } from './image-adapters/registry.js';
+import {
+  imageRouteExecutionMode,
+  normalizeImageTaskExecutionConfig,
+  type ImageTaskExecutionConfig,
+} from './image-execution.js';
 import { normalizeManagedVideoRequest, ManagedVideoRequestError, type NormalizedVideoRequest } from './video-request.js';
 import { resolveVideoCapabilities, videoAspectRatioAllowed, videoCapabilitiesSupportRequest, videoDurationAllowed } from './video-capabilities.js';
 import { selectManagedVideoRoutes } from './video-routing.js';
@@ -81,6 +86,7 @@ import {
 } from './video-task-service.js';
 
 export const IMAGE_GENERATION_TIMEOUT_MS = 15 * 60_000;
+export { IMAGE_ADAPTER_SUBMIT_TIMEOUT_MS } from './image-execution.js';
 const longImageRequestDispatcher = new Agent({
   headersTimeout: IMAGE_GENERATION_TIMEOUT_MS,
   bodyTimeout: IMAGE_GENERATION_TIMEOUT_MS,
@@ -407,6 +413,10 @@ type UselgImageDiagnosticContext = {
   clientRequestId: string;
   providerId: string;
   model: string;
+  canonicalModel?: string;
+  routeId?: string;
+  adapterKey?: string;
+  adapterExecutionStartedAt?: number;
 };
 
 type UselgImageResolveSourceType =
@@ -414,11 +424,24 @@ type UselgImageResolveSourceType =
   | 'status'
   | 'result_url'
   | 'signed_url'
+  | 'download_url'
+  | 'url'
   | 'asset_content';
+
+type ImageAdapterTaskDiagnosticContext = {
+  clientRequestId: string;
+  canonicalModel: string;
+  routeId: string;
+  providerId: string;
+  adapterKey: string;
+  adapterExecutionStartedAt: number;
+};
 
 type ImageAdapterRouteContext = {
   adapterKey: string | null;
   adapterConfig: unknown;
+  executionMode?: string | null;
+  executionConfig?: unknown;
   requestedCanonicalModel: string;
   resolvedCanonicalModel: string;
   canonicalModelId: string;
@@ -519,6 +542,19 @@ export function providerCanServeImageAlongsideAgent(
 function isRetryableNewApiTaskPollError(error: unknown) {
   return error instanceof UpstreamImageError
     && (error.status === 0 || error.status === 429 || error.status >= 500);
+}
+
+export class AmbiguousImageTaskSubmissionError extends Error {
+  readonly code = 'AMBIGUOUS_SUBMIT';
+
+  constructor(
+    public readonly status: number,
+    message: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = 'AmbiguousImageTaskSubmissionError';
+  }
 }
 
 function isUselgResultNotReadyStatus(status: number) {
@@ -700,6 +736,11 @@ function parseProviderValue(text: string): unknown {
     try { return JSON.parse(text) as unknown; } catch { /* fall through */ }
   }
   return text.trim();
+}
+
+function isAmbiguousImageTaskSubmitError(error: unknown): error is UpstreamImageError {
+  return error instanceof UpstreamImageError
+    && (error.status === 0 || [502, 503, 504].includes(error.status));
 }
 
 async function providerRequest(
@@ -1375,6 +1416,30 @@ export async function generateUselgGeminiImages(
     ),
     (outputIndex) => uselgImageRequestHeaders(input, outputIndex),
     diagnosticContext,
+  );
+}
+
+export async function generateUselgGeminiDirectImages(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  input: ImageInput,
+  preserveUpstreamModel = false,
+) {
+  const model = preserveUpstreamModel ? input.model : resolveUselgImageModel(input.model);
+  return generateGeminiImageConfigImages(
+    provider,
+    secrets,
+    input,
+    model,
+    'uselg Gemini direct',
+    true,
+    undefined,
+    (outputIndex) => uselgImageRequestHeaders(input, outputIndex),
+    {
+      clientRequestId: input.clientRequestId,
+      providerId: provider.id,
+      model,
+    },
   );
 }
 
@@ -2059,7 +2124,7 @@ export function collectUselgTaskAssets(value: unknown, output: UselgTaskAsset[] 
       }
     }
   }
-  for (const key of ['data', 'result', 'task', 'response']) {
+  for (const key of ['data', 'result', 'task', 'image_task', 'response']) {
     const nested = record[key];
     if (typeof nested === 'string'
       && (IMAGE_DATA_URL_PREFIX.test(nested) || looksLikeRawImageBase64(nested))) {
@@ -2078,6 +2143,7 @@ const USELG_TASK_CONTAINER_KEYS = new Set([
   'results',
   'task',
   'tasks',
+  'image_task',
   'response',
 ]);
 
@@ -2090,6 +2156,21 @@ type UselgImageStatusSummary = {
   images: string[];
   assets: UselgTaskAsset[];
 };
+
+function prioritizedUselgAssetImages(assets: UselgTaskAsset[], count: number) {
+  const images: string[] = [];
+  for (const key of ['signed_url', 'download_url', 'url'] as const) {
+    for (const asset of assets) {
+      if (asset.key !== key || !/^https?:\/\//i.test(asset.value) || images.includes(asset.value)) continue;
+      images.push(asset.value);
+      if (images.length >= Math.max(1, count)) return { images, sourceType: key };
+    }
+  }
+  return {
+    images,
+    sourceType: assets[0]?.key ?? 'signed_url',
+  };
+}
 
 function directUselgTaskId(record: Record<string, unknown>) {
   for (const key of ['task_id', 'taskId', 'taskid', 'id']) {
@@ -2236,10 +2317,25 @@ export async function resolveUselgImageResponse(
     milliseconds,
   ) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   diagnosticContext?: UselgImageDiagnosticContext,
+  request: (
+    path: string,
+    body?: unknown,
+    timeoutOverrideMs?: number,
+    onResponseStatus?: (status: number) => void,
+  ) => Promise<unknown> = (path, body, timeoutOverrideMs, onResponseStatus) => providerRequest(
+    provider,
+    secrets,
+    path,
+    body,
+    timeoutOverrideMs,
+    undefined,
+    onResponseStatus,
+  ),
 ) {
   const resolveStartedAt = Date.now();
   const initialSummary = summarizeUselgImageStatus(started, inputImages, count);
   const immediate = initialSummary.images;
+  const initialAssets = prioritizedUselgAssetImages(initialSummary.assets, count);
   const taskId = initialSummary.taskId;
   const initialState = initialSummary.state;
   const initialStatusUrl = initialSummary.statusUrl;
@@ -2254,6 +2350,19 @@ export async function resolveUselgImageResponse(
         sourceType,
       });
     }
+    if (diagnosticContext?.adapterKey) {
+      console.info('[image_adapter_resolved]', {
+        clientRequestId: diagnosticContext.clientRequestId,
+        canonicalModel: diagnosticContext.canonicalModel,
+        routeId: diagnosticContext.routeId,
+        providerId: diagnosticContext.providerId,
+        adapterKey: diagnosticContext.adapterKey,
+        taskId,
+        totalDurationMs: Date.now()
+          - (diagnosticContext.adapterExecutionStartedAt ?? resolveStartedAt),
+        sourceType,
+      });
+    }
     return images;
   };
   if (diagnosticContext) {
@@ -2265,6 +2374,9 @@ export async function resolveUselgImageResponse(
       hasResultUrl: Boolean(initialResultUrl),
       pollAfterMs: initialPollAfterMs,
     });
+  }
+  if (initialAssets.images.length) {
+    return complete(initialAssets.images, initialAssets.sourceType);
   }
   if (immediate.length) return complete(immediate, 'immediate');
   if (!taskId) throw new Error('uselg 没有返回图片数据或 task_id');
@@ -2292,8 +2404,19 @@ export async function resolveUselgImageResponse(
         targetType: 'status',
       });
     }
+    if (diagnosticContext?.adapterKey) {
+      console.info('[image_adapter_poll_started]', {
+        clientRequestId: diagnosticContext.clientRequestId,
+        canonicalModel: diagnosticContext.canonicalModel,
+        routeId: diagnosticContext.routeId,
+        providerId: diagnosticContext.providerId,
+        adapterKey: diagnosticContext.adapterKey,
+        taskId,
+        attempt,
+      });
+    }
     try {
-      lastStatus = await providerRequest(provider, secrets, statusUrl, undefined, 45_000);
+      lastStatus = await request(statusUrl, undefined, 45_000);
       lastPollError = null;
     } catch (error) {
       const errorImages = imagesFromUpstreamError(error, inputImages, count);
@@ -2319,6 +2442,7 @@ export async function resolveUselgImageResponse(
     resultUrl = statusSummary.resultUrl || resultUrl;
     pollAfterMs = statusSummary.pollAfterMs;
     const { images, state, assets } = statusSummary;
+    const prioritizedAssets = prioritizedUselgAssetImages(assets, count);
     if (diagnosticContext) {
       console.info('[uselg_image_poll_complete]', {
         clientRequestId: diagnosticContext.clientRequestId,
@@ -2330,6 +2454,24 @@ export async function resolveUselgImageResponse(
         hasResultUrl: Boolean(resultUrl),
         assetCount: assets.length,
       });
+    }
+    if (diagnosticContext?.adapterKey) {
+      console.info('[image_adapter_poll_state]', {
+        clientRequestId: diagnosticContext.clientRequestId,
+        canonicalModel: diagnosticContext.canonicalModel,
+        routeId: diagnosticContext.routeId,
+        providerId: diagnosticContext.providerId,
+        adapterKey: diagnosticContext.adapterKey,
+        taskId,
+        attempt,
+        state,
+        assetCount: assets.length,
+        hasSignedUrl: assets.some(asset => asset.key === 'signed_url'),
+        durationMs: Date.now() - pollStartedAt,
+      });
+    }
+    if (prioritizedAssets.images.length) {
+      return complete(prioritizedAssets.images, prioritizedAssets.sourceType);
     }
     if (images.length) {
       const sourceType = assets.some(asset => (
@@ -2349,13 +2491,10 @@ export async function resolveUselgImageResponse(
       }
       try {
         let resultResponseStatus = 0;
-        const result = await providerRequest(
-          provider,
-          secrets,
+        const result = await request(
           resultUrl,
           undefined,
           45_000,
-          undefined,
           status => { resultResponseStatus = status; },
         );
         const resultSummary = summarizeUselgImageStatus(result, inputImages, count);
@@ -2465,6 +2604,83 @@ function uniqueImageAdapterImages(value: unknown, inputImages: string[], count: 
     .slice(0, Math.max(1, count));
 }
 
+function imageTaskPathValue(value: unknown, path: string) {
+  let current = value;
+  for (const rawSegment of path.split('.').map(segment => segment.trim()).filter(Boolean)) {
+    const segment = rawSegment.replace(/\[\]$/, '');
+    if (!current || typeof current !== 'object') return undefined;
+    if (Array.isArray(current)) {
+      const index = Number(segment);
+      if (!Number.isInteger(index)) return undefined;
+      current = current[index];
+      continue;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
+function imageTaskPathString(value: unknown, path: string) {
+  const candidate = imageTaskPathValue(value, path);
+  if (typeof candidate === 'number') return String(candidate);
+  return typeof candidate === 'string' ? candidate.trim() : '';
+}
+
+function imageTaskTemplate(template: string | undefined, taskId: string) {
+  if (!template || !taskId) return '';
+  return template.replaceAll('{taskId}', encodeURIComponent(taskId));
+}
+
+function configuredImageTaskEnvelope(
+  value: unknown,
+  config: ImageTaskExecutionConfig,
+  knownTaskId = '',
+) {
+  const taskId = imageTaskPathString(value, config.taskIdPath) || knownTaskId;
+  const rawState = imageTaskPathString(value, config.statusPath).toLowerCase();
+  const state = config.processingStatuses.includes(rawState)
+    ? 'processing'
+    : config.completedStatuses.includes(rawState)
+      ? 'success'
+      : config.failedStatuses.includes(rawState) ? 'failed' : rawState;
+  const rawPollAfter = imageTaskPathValue(value, config.pollAfterMsPath);
+  const pollAfterMs = typeof rawPollAfter === 'number'
+    ? rawPollAfter
+    : typeof rawPollAfter === 'string' ? Number(rawPollAfter) : undefined;
+  const rawAssets = imageTaskPathValue(value, config.assetArrayPath);
+  const assets = Array.isArray(rawAssets)
+    ? rawAssets.flatMap((asset) => {
+      if (!asset || typeof asset !== 'object') return [];
+      const signedUrl = imageTaskPathString(asset, config.signedUrlPath);
+      const downloadUrl = imageTaskPathString(asset, config.downloadUrlPath);
+      const url = imageTaskPathString(asset, config.urlPath);
+      return [{
+        ...(signedUrl ? { signed_url: signedUrl } : {}),
+        ...(downloadUrl ? { download_url: downloadUrl } : {}),
+        ...(url ? { url } : {}),
+      }];
+    })
+    : [];
+  const returnedStatusUrl = nestedStringByKeys(value, new Set(['status_url', 'poll_url']));
+  const returnedResultUrl = nestedStringByKeys(value, new Set(['result_url']));
+  return {
+    ...(value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {}),
+    raw: value,
+    ...(taskId ? { task_id: taskId } : {}),
+    ...(state ? { status: state } : {}),
+    ...(Number.isFinite(pollAfterMs) ? { poll_after_ms: pollAfterMs } : {}),
+    ...(returnedStatusUrl || imageTaskTemplate(config.statusEndpointTemplate, taskId)
+      ? { status_url: returnedStatusUrl || imageTaskTemplate(config.statusEndpointTemplate, taskId) }
+      : {}),
+    ...(returnedResultUrl || imageTaskTemplate(config.resultEndpointTemplate, taskId)
+      ? { result_url: returnedResultUrl || imageTaskTemplate(config.resultEndpointTemplate, taskId) }
+      : {}),
+    ...(assets.length ? { assets } : {}),
+  };
+}
+
 export async function resolveImageAdapterResponse(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
@@ -2485,50 +2701,97 @@ export async function resolveImageAdapterResponse(
     body,
     timeoutOverrideMs,
   ),
+  diagnosticContext?: ImageAdapterTaskDiagnosticContext,
 ) {
   const immediate = uniqueImageAdapterImages(started, inputImages, count);
-  if (immediate.length) return immediate;
   const taskId = getTaskId(started);
-  if (!taskId) throw new UpstreamImageError(502, 'Image adapter response contained neither images nor task_id', started);
-
+  const complete = (images: string[], sourceType: UselgImageResolveSourceType) => {
+    if (diagnosticContext) {
+      console.info('[image_adapter_resolved]', {
+        clientRequestId: diagnosticContext.clientRequestId,
+        canonicalModel: diagnosticContext.canonicalModel,
+        routeId: diagnosticContext.routeId,
+        providerId: diagnosticContext.providerId,
+        adapterKey: diagnosticContext.adapterKey,
+        taskId,
+        totalDurationMs: Date.now() - diagnosticContext.adapterExecutionStartedAt,
+        sourceType,
+      });
+    }
+    return images;
+  };
+  if (immediate.length) return complete(immediate, 'immediate');
   let statusUrl = nestedStringByKeys(started, new Set(['status_url', 'poll_url']));
-  if (!statusUrl) {
+  if (!taskId && !statusUrl) {
     throw new UpstreamImageError(
       502,
-      'Asynchronous image response did not provide status_url',
+      'Image adapter response contained neither images, task_id, nor status_url',
       started,
     );
+  }
+  if (!statusUrl) {
+    throw new UpstreamImageError(502, 'Asynchronous image response did not provide status_url', started);
   }
   let resultUrl = nestedStringByKeys(started, new Set(['result_url']));
   let pollAfterMs = uselgPollAfterMs(started);
   const deadline = Date.now() + IMAGE_GENERATION_TIMEOUT_MS;
   let lastStatus: unknown = started;
+  let attempt = 0;
 
   while (Date.now() < deadline) {
     await wait(pollAfterMs);
+    attempt += 1;
+    const pollStartedAt = Date.now();
+    if (diagnosticContext) {
+      console.info('[image_adapter_poll_started]', {
+        clientRequestId: diagnosticContext.clientRequestId,
+        canonicalModel: diagnosticContext.canonicalModel,
+        routeId: diagnosticContext.routeId,
+        providerId: diagnosticContext.providerId,
+        adapterKey: diagnosticContext.adapterKey,
+        taskId,
+        attempt,
+      });
+    }
     lastStatus = await request(statusUrl, undefined, 45_000);
     statusUrl = nestedStringByKeys(lastStatus, new Set(['status_url', 'poll_url'])) || statusUrl;
     resultUrl = nestedStringByKeys(lastStatus, new Set(['result_url'])) || resultUrl;
     pollAfterMs = uselgPollAfterMs(lastStatus);
 
     const images = uniqueImageAdapterImages(lastStatus, inputImages, count);
-    if (images.length) return images;
+    const state = newApiImageTaskState(lastStatus);
+    const assets = collectUselgTaskAssets(lastStatus);
+    if (diagnosticContext) {
+      console.info('[image_adapter_poll_state]', {
+        clientRequestId: diagnosticContext.clientRequestId,
+        canonicalModel: diagnosticContext.canonicalModel,
+        routeId: diagnosticContext.routeId,
+        providerId: diagnosticContext.providerId,
+        adapterKey: diagnosticContext.adapterKey,
+        taskId,
+        attempt,
+        state,
+        assetCount: assets.length,
+        hasSignedUrl: assets.some(asset => asset.key === 'signed_url'),
+        durationMs: Date.now() - pollStartedAt,
+      });
+    }
+    if (images.length) return complete(images, 'status');
     const failure = getFailure(lastStatus);
     if (failure) throw new UpstreamImageError(502, failure, lastStatus);
-    const state = newApiImageTaskState(lastStatus);
     if (/^(?:failed|failure|error|cancelled|canceled)$/.test(state)) {
-      throw new UpstreamImageError(502, `Image adapter task failed (${state}): ${taskId}`, lastStatus);
+      throw new UpstreamImageError(502, `Image adapter task failed (${state}): ${taskId || 'status_url'}`, lastStatus);
     }
     if (!/^(?:completed|complete|succeeded|success|finished|done)$/.test(state)) continue;
     if (!resultUrl) {
-      throw new UpstreamImageError(502, `Image adapter task completed without an image or result_url: ${taskId}`, lastStatus);
+      throw new UpstreamImageError(502, `Image adapter task completed without an image or result_url: ${taskId || 'status_url'}`, lastStatus);
     }
     const result = await request(resultUrl, undefined, 45_000);
     const resultImages = uniqueImageAdapterImages(result, inputImages, count);
-    if (resultImages.length) return resultImages;
-    throw new UpstreamImageError(502, `Image adapter result_url returned no image: ${taskId}`, result);
+    if (resultImages.length) return complete(resultImages, 'result_url');
+    throw new UpstreamImageError(502, `Image adapter result_url returned no image: ${taskId || 'status_url'}`, result);
   }
-  throw new UpstreamImageError(504, `Image adapter task timed out: ${taskId}`, lastStatus);
+  throw new UpstreamImageError(504, `Image adapter task timed out: ${taskId || 'status_url'}`, lastStatus);
 }
 
 export async function resolveNewApiImageResponse(
@@ -3183,6 +3446,7 @@ export async function generateNewApiImages(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   input: ImageInput,
+  executionMode: 'INHERIT' | 'DIRECT' = 'INHERIT',
 ) {
   if (input.inputImages.some(source => !isSupportedNewApiImageReference(source))) {
     throw new CloudAiError(
@@ -3199,7 +3463,7 @@ export async function generateNewApiImages(
   const stagedImages: StagedNewApiEditImage[] = [];
   let started: unknown;
   let startError: unknown = null;
-  const preferAsync = shouldUseNewApiAsyncImageTask(input);
+  const preferAsync = executionMode === 'INHERIT' && shouldUseNewApiAsyncImageTask(input);
   try {
     if (input.inputImages.length > 0) {
       for (let index = 0; index < input.inputImages.length; index += 1) {
@@ -3270,13 +3534,22 @@ export async function generateNewApiImages(
         : new Error(typeof startError === 'string' ? startError : 'Image generation failed');
     }
   } else try {
-    images = await resolveNewApiImageResponse(
-      provider,
-      secrets,
-      started,
-      input.inputImages,
-      input.count,
-    );
+    images = executionMode === 'DIRECT'
+      ? uniqueImageAdapterImages(started, input.inputImages, input.count)
+      : await resolveNewApiImageResponse(
+        provider,
+        secrets,
+        started,
+        input.inputImages,
+        input.count,
+      );
+    if (!images.length) {
+      throw new UpstreamImageError(
+        502,
+        'DIRECT image response did not contain a final image',
+        started,
+      );
+    }
   } catch (error) {
     images = imagesFromUpstreamError(error, input.inputImages, input.count);
     if (images.length === 0) throw error;
@@ -4528,53 +4801,324 @@ async function prepareRouteImageAdapterRequest(
   });
 }
 
-async function generatePreparedImageAdapterImages(
+async function markImageRequestProcessing(
+  prisma: PrismaClient,
+  userId: string,
+  requestId: string,
+) {
+  await prisma.$transaction(async (transaction) => {
+    await transaction.aiRequest.updateMany({
+      where: {
+        id: requestId,
+        userId,
+        status: { in: ['RESERVED', 'PROCESSING'] },
+      },
+      data: { status: 'PROCESSING' },
+    });
+  });
+}
+
+async function rememberImageTaskIdentity(
+  prisma: PrismaClient,
+  userId: string,
+  requestId: string,
+  identity: {
+    taskId: string;
+    statusUrl: string;
+    profile: ImageTaskExecutionConfig['profile'];
+    clientRequestId: string;
+  },
+) {
+  await prisma.$transaction(async (transaction) => {
+    const current = await transaction.aiRequest.findFirst({
+      where: { id: requestId, userId, status: 'PROCESSING' },
+      select: { result: true },
+    });
+    if (!current) return;
+    const currentResult = current.result && typeof current.result === 'object' && !Array.isArray(current.result)
+      ? current.result as Record<string, unknown>
+      : {};
+    const priorTasks: unknown[] = Array.isArray(currentResult.tasks) ? currentResult.tasks : [];
+    await transaction.aiRequest.updateMany({
+      where: { id: requestId, userId, status: 'PROCESSING' },
+      data: {
+        result: toInputJson({
+          kind: 'image_task_submission',
+          state: 'PROCESSING',
+          tasks: [
+            ...priorTasks,
+            {
+              taskId: identity.taskId,
+              statusUrl: identity.statusUrl,
+              profile: identity.profile,
+              clientRequestId: identity.clientRequestId,
+              submittedAt: new Date().toISOString(),
+            },
+          ],
+        }),
+      },
+    });
+  });
+}
+
+type ImageAdapterRequest = (
+  path: string,
+  body?: unknown,
+  timeoutOverrideMs?: number,
+  extraHeaders?: Record<string, string>,
+  onResponseStatus?: (status: number) => void,
+) => Promise<unknown>;
+
+type PreparedImageAdapterExecutionOptions = {
+  request?: ImageAdapterRequest;
+  wait?: (milliseconds: number) => Promise<unknown>;
+  onTaskSubmitted?: (identity: {
+    taskId: string;
+    statusUrl: string;
+    profile: ImageTaskExecutionConfig['profile'];
+  }) => Promise<void>;
+};
+
+function withImageTaskParameter(
+  body: Record<string, unknown>,
+  name: string | undefined,
+  value: unknown,
+) {
+  if (!name) return { ...body };
+  const output: Record<string, unknown> = { ...body };
+  const segments = name.split('.').filter(Boolean);
+  let cursor = output;
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    const segment = segments[index]!;
+    const current = cursor[segment];
+    const next = current && typeof current === 'object' && !Array.isArray(current)
+      ? { ...current as Record<string, unknown> }
+      : {};
+    cursor[segment] = next;
+    cursor = next;
+  }
+  cursor[segments.at(-1)!] = value;
+  return output;
+}
+
+function directPreparedImageResults(
+  started: unknown,
+  inputImages: string[],
+  count: number,
+) {
+  const summary = summarizeUselgImageStatus(started, inputImages, count);
+  const prioritizedAssets = prioritizedUselgAssetImages(summary.assets, count);
+  const images = prioritizedAssets.images.length
+    ? prioritizedAssets.images
+    : uniqueImageAdapterImages(started, inputImages, count);
+  if (!images.length) {
+    throw new UpstreamImageError(
+      502,
+      'DIRECT image response did not contain a final image; task polling is disabled for this Route',
+      started,
+    );
+  }
+  return images;
+}
+
+export async function generatePreparedImageAdapterImages(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   input: ImageInput,
   prepared: PreparedImageAdapterRequest,
+  route?: ImageAdapterRouteContext,
+  options?: PreparedImageAdapterExecutionOptions,
 ) {
-  const request = prepared.execution === 'gemini-native'
-    ? (path: string, body?: unknown, timeoutOverrideMs?: number) => bigmodelRequest(
+  const executionMode = imageRouteExecutionMode(route?.executionMode);
+  const request: ImageAdapterRequest = options?.request ?? (prepared.execution === 'gemini-native'
+    ? (path, body, timeoutOverrideMs, extraHeaders) => bigmodelRequest(
       provider,
       secrets,
       path,
       body,
-      undefined,
+      extraHeaders,
       timeoutOverrideMs,
     )
-    : (path: string, body?: unknown, timeoutOverrideMs?: number) => providerRequest(
+    : (path, body, timeoutOverrideMs, extraHeaders, onResponseStatus) => providerRequest(
       provider,
       secrets,
       path,
       body,
       timeoutOverrideMs,
+      extraHeaders,
+      onResponseStatus,
+    ));
+
+  // INHERIT deliberately retains the historical adapter behavior: the first
+  // request may wait for the full generation timeout and the old resolver may
+  // consume either a direct response or provider-returned task controls.
+  if (executionMode === 'INHERIT' || executionMode === 'DIRECT') {
+    const images: string[] = [];
+    const requestCount = prepared.execution === 'gemini-native' ? input.count : 1;
+    for (let index = 0; index < requestCount; index += 1) {
+      const started = await request(
+        prepared.endpoint,
+        prepared.body,
+        IMAGE_GENERATION_TIMEOUT_MS,
+      );
+      const expectedCount = prepared.execution === 'gemini-native' ? 1 : input.count;
+      images.push(...(executionMode === 'DIRECT'
+        ? directPreparedImageResults(started, input.inputImages, expectedCount)
+        : await resolveImageAdapterResponse(
+          provider,
+          secrets,
+          started,
+          input.inputImages,
+          expectedCount,
+          options?.wait,
+          (path, body, timeoutOverrideMs) => request(path, body, timeoutOverrideMs),
+        )));
+    }
+    return images;
+  }
+
+  const executionConfig = normalizeImageTaskExecutionConfig(route?.executionConfig);
+  if (executionConfig.profile === 'USELG_IMAGE_TASK' && provider.kind !== 'USELG') {
+    throw new ImageAdapterError(
+      'IMAGE_ADAPTER_CONFIG_INVALID',
+      'USELG_IMAGE_TASK may only be used with a USELG provider channel',
+      executionConfig.submitEndpoint,
     );
-  const images: string[] = [];
-  const requestCount = prepared.execution === 'gemini-native' ? input.count : 1;
-  for (let index = 0; index < requestCount; index += 1) {
-    const started = await request(
-      prepared.endpoint,
-      prepared.body,
-      IMAGE_GENERATION_TIMEOUT_MS,
+  }
+
+  const adapterExecutionStartedAt = Date.now();
+  const diagnosticContext: ImageAdapterTaskDiagnosticContext = {
+    clientRequestId: input.clientRequestId,
+    canonicalModel: route?.canonicalModelKey ?? input.model,
+    routeId: route?.routeId ?? '',
+    providerId: provider.id,
+    adapterKey: prepared.adapterKey,
+    adapterExecutionStartedAt,
+  };
+  console.info('[image_adapter_submit_started]', {
+    clientRequestId: diagnosticContext.clientRequestId,
+    canonicalModel: diagnosticContext.canonicalModel,
+    routeId: diagnosticContext.routeId,
+    providerId: diagnosticContext.providerId,
+    adapterKey: diagnosticContext.adapterKey,
+    executionMode,
+    profile: executionConfig.profile,
+    endpoint: executionConfig.submitEndpoint,
+  });
+
+  const submitStartedAt = Date.now();
+  let started: unknown;
+  const taskBody = { ...prepared.body };
+  delete taskBody.async;
+  const submitBody = withImageTaskParameter(
+    taskBody,
+    executionConfig.asyncParameterName,
+    executionConfig.asyncParameterValue,
+  );
+  try {
+    started = await request(
+      executionConfig.submitEndpoint,
+      submitBody,
+      executionConfig.submitTimeoutMs,
+      uselgIdempotencyHeaders(provider, input),
     );
-    images.push(...await resolveImageAdapterResponse(
+  } catch (error) {
+    if (isAmbiguousImageTaskSubmitError(error)) {
+      throw new AmbiguousImageTaskSubmissionError(
+        error.status,
+        `Image task submission outcome is uncertain: ${error.message}`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+
+  const configuredEnvelope = configuredImageTaskEnvelope(started, executionConfig);
+  const submitSummary = executionConfig.profile === 'USELG_IMAGE_TASK'
+    ? summarizeUselgImageStatus(configuredEnvelope, input.inputImages, input.count)
+    : {
+      taskId: getTaskId(configuredEnvelope),
+      state: newApiImageTaskState(configuredEnvelope),
+      statusUrl: nestedStringByKeys(configuredEnvelope, new Set(['status_url', 'poll_url'])),
+    };
+  const statusUrl = 'statusUrl' in submitSummary ? submitSummary.statusUrl : '';
+  if (!submitSummary.taskId && !statusUrl) {
+    throw new UpstreamImageError(
+      502,
+      'TASK submit response contained neither task_id nor status_url',
+      started,
+    );
+  }
+  console.info('[image_adapter_submit_completed]', {
+    clientRequestId: diagnosticContext.clientRequestId,
+    canonicalModel: diagnosticContext.canonicalModel,
+    routeId: diagnosticContext.routeId,
+    providerId: diagnosticContext.providerId,
+    adapterKey: diagnosticContext.adapterKey,
+    durationMs: Date.now() - submitStartedAt,
+    hasTaskId: Boolean(submitSummary.taskId),
+    taskId: submitSummary.taskId,
+    state: submitSummary.state,
+    hasStatusUrl: Boolean(statusUrl),
+  });
+  await options?.onTaskSubmitted?.({
+    taskId: submitSummary.taskId,
+    statusUrl,
+    profile: executionConfig.profile,
+  });
+
+  if (executionConfig.profile === 'USELG_IMAGE_TASK') {
+    return resolveUselgImageResponse(
       provider,
       secrets,
-      started,
+      configuredEnvelope,
       input.inputImages,
-      prepared.execution === 'gemini-native' ? 1 : input.count,
-      undefined,
-      request,
-    ));
+      input.count,
+      options?.wait,
+      {
+        clientRequestId: diagnosticContext.clientRequestId,
+        providerId: diagnosticContext.providerId,
+        model: prepared.submittedModel,
+        canonicalModel: diagnosticContext.canonicalModel,
+        routeId: diagnosticContext.routeId,
+        adapterKey: diagnosticContext.adapterKey,
+        adapterExecutionStartedAt,
+      },
+      async (path, body, timeoutOverrideMs, onResponseStatus) => configuredImageTaskEnvelope(
+        await request(
+          path,
+          body,
+          timeoutOverrideMs,
+          undefined,
+          onResponseStatus,
+        ),
+        executionConfig,
+        submitSummary.taskId,
+      ),
+    );
   }
-  return images;
+
+  return resolveImageAdapterResponse(
+    provider,
+    secrets,
+    configuredEnvelope,
+    input.inputImages,
+    input.count,
+    options?.wait,
+    async (path, body, timeoutOverrideMs) => configuredImageTaskEnvelope(
+      await request(path, body, timeoutOverrideMs),
+      executionConfig,
+      submitSummary.taskId,
+    ),
+    diagnosticContext,
+  );
 }
 
 async function generateImagesFromProvider(
   provider: AiProviderChannel,
   effectiveInput: ImageInput,
   adapterRoute?: ImageAdapterRouteContext,
+  executionOptions?: Pick<PreparedImageAdapterExecutionOptions, 'onTaskSubmitted'>,
 ) {
   const startedAt = Date.now();
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
@@ -4587,12 +5131,73 @@ async function generateImagesFromProvider(
         : provider.kind === 'USELG' && isUselgGeminiImageModel(input.model)
           ? generateUselgGeminiImages(provider, secrets, input, preserveUpstreamModel)
           : generateNewApiImages(provider, secrets, input);
+  const generateLegacyDirectBatch = async (input: ImageInput, preserveUpstreamModel = false) => {
+    if (provider.kind === 'XAIS') {
+      throw new ImageAdapterError(
+        'IMAGE_ADAPTER_CONFIG_INVALID',
+        'DIRECT execution is not available for the legacy XAIS task protocol',
+      );
+    }
+    if (provider.kind === 'BIGMODEL' && isBigmodelBananaModel(input.model)) {
+      return generateBigmodelBananaImages(provider, secrets, input, preserveUpstreamModel);
+    }
+    if (provider.kind === 'MIKOTO' && isMikotoBananaModel(input.model)) {
+      return generateMikotoBananaImages(provider, secrets, input, preserveUpstreamModel);
+    }
+    if (provider.kind === 'USELG' && isUselgGeminiImageModel(input.model)) {
+      return generateUselgGeminiDirectImages(provider, secrets, input, preserveUpstreamModel);
+    }
+    return generateNewApiImages(provider, secrets, input, 'DIRECT');
+  };
   const generateBatch = async (input: ImageInput) => {
+    const executionMode = imageRouteExecutionMode(adapterRoute?.executionMode);
+    const taskExecutionConfig = executionMode === 'TASK'
+      ? normalizeImageTaskExecutionConfig(adapterRoute?.executionConfig)
+      : null;
     const prepared = adapterRoute
       ? await prepareRouteImageAdapterRequest(provider, input, adapterRoute)
       : null;
-    return prepared
-      ? generatePreparedImageAdapterImages(provider, secrets, input, prepared)
+    if (executionMode === 'TASK') {
+      if (!adapterRoute) {
+        throw new ImageAdapterError(
+          'IMAGE_ADAPTER_CONFIG_INVALID',
+          'TASK execution requires a managed Image Route',
+        );
+      }
+      const legacyBody = buildNewApiImageGenerationBody(input, input.inputImages, false, provider.kind);
+      delete legacyBody.async;
+      const taskPrepared: PreparedImageAdapterRequest = prepared ?? {
+        adapterKey: 'LEGACY',
+        execution: 'images-api',
+        submittedModel: input.model,
+        endpoint: taskExecutionConfig!.submitEndpoint,
+        method: 'POST',
+        contentType: 'application/json',
+        body: legacyBody,
+      };
+      return generatePreparedImageAdapterImages(
+        provider,
+        secrets,
+        input,
+        taskPrepared,
+        adapterRoute,
+        executionOptions,
+      );
+    }
+    if (prepared) {
+      return generatePreparedImageAdapterImages(
+        provider,
+        secrets,
+        input,
+        prepared,
+        adapterRoute,
+      );
+    }
+    return executionMode === 'DIRECT'
+      ? generateLegacyDirectBatch(
+        input,
+        Boolean(adapterRoute?.adapterKey && adapterRoute.adapterKey !== 'LEGACY'),
+      )
       : generateLegacyBatch(
         input,
         Boolean(adapterRoute?.adapterKey && adapterRoute.adapterKey !== 'LEGACY'),
@@ -4861,6 +5466,8 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
           ? {
             adapterKey: activeRoute.adapterKey,
             adapterConfig: activeRoute.adapterConfig,
+            executionMode: activeRoute.executionMode,
+            executionConfig: activeRoute.executionConfig,
             requestedCanonicalModel,
             resolvedCanonicalModel: canonicalModelKey,
             canonicalModelId: catalogResolution.model.id,
@@ -4875,10 +5482,16 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         activeFallbackType = index === 0 ? 'none' : 'same_canonical_route';
         let preparedAdapterRequest: PreparedImageAdapterRequest | null;
         try {
+          const routeExecutionMode = imageRouteExecutionMode(activeAdapterRoute?.executionMode);
+          const taskExecutionConfig = routeExecutionMode === 'TASK'
+            ? normalizeImageTaskExecutionConfig(activeAdapterRoute?.executionConfig)
+            : null;
           preparedAdapterRequest = activeAdapterRoute
             ? await prepareRouteImageAdapterRequest(activeProvider, activeInput, activeAdapterRoute)
             : null;
-          activeEndpoint = preparedAdapterRequest?.endpoint ?? null;
+          activeEndpoint = taskExecutionConfig?.submitEndpoint
+            ?? preparedAdapterRequest?.endpoint
+            ?? null;
         } catch (error) {
           activeEndpoint = error instanceof ImageAdapterError ? error.endpoint ?? null : null;
           throw error;
@@ -4906,7 +5519,26 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
           reservationMs: reservationReadyAt - referencesResolvedAt,
           preflightDurationMs: reservationReadyAt - requestStartedAt,
         });
-        const images = await generateImagesFromProvider(activeProvider, activeInput, activeAdapterRoute);
+        if (imageRouteExecutionMode(activeAdapterRoute?.executionMode) === 'TASK') {
+          await markImageRequestProcessing(
+            prisma,
+            validatedInput.userId,
+            reservation.requestId,
+          );
+        }
+        const images = await generateImagesFromProvider(
+          activeProvider,
+          activeInput,
+          activeAdapterRoute,
+          {
+            onTaskSubmitted: async (identity) => rememberImageTaskIdentity(
+              prisma,
+              validatedInput.userId,
+              reservation.requestId,
+              { ...identity, clientRequestId: activeInput.clientRequestId },
+            ),
+          },
+        );
         const charged = await settleImageCredits(
           prisma,
           activeInput,
@@ -4974,7 +5606,10 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     }
     throw new Error('全部生图渠道请求失败');
   } catch (error) {
-    console.warn('[image_generation_failed]', {
+    console.warn(
+      error instanceof AmbiguousImageTaskSubmissionError
+        ? '[image_generation_uncertain]'
+        : '[image_generation_failed]', {
       clientRequestId: input.clientRequestId,
       reservationRequestId: reservation.requestId,
       requestedModel: input.model,
@@ -4997,7 +5632,26 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       lastProviderName: activeProvider.name,
       totalDurationMs: Date.now() - requestStartedAt,
       error: error instanceof Error ? error.message : String(error),
-    });
+      },
+    );
+    if (error instanceof AmbiguousImageTaskSubmissionError) {
+      console.warn('[image_adapter_submit_ambiguous]', {
+        clientRequestId: input.clientRequestId,
+        canonicalModel: canonicalModelKey,
+        routeId: activeRouteId,
+        providerId: activeProvider.id,
+        adapterKey: activeAdapterKey,
+        status: error.status,
+        requestStatus: 'PROCESSING',
+        creditsReleased: false,
+        routeFailoverAttempted: false,
+      });
+      throw new CloudAiError(
+        error.code,
+        'Image task submission outcome is uncertain; the request remains processing and was not submitted to another route',
+        503,
+      );
+    }
     await releaseImageCredits(prisma, reservationInput, reservation.requestId, reservation.estimated);
     if (error instanceof CloudAiError || error instanceof ModelCatalogError) throw error;
     if (error instanceof ImageResultPersistenceError) {

@@ -19,6 +19,10 @@ import {
   type CatalogPricingProfile,
 } from './pricing-center.js';
 import { validateGenericAsyncVideoConfig } from './video-adapters/generic-async-video.js';
+import {
+  imageRouteExecutionMode,
+  normalizeImageTaskExecutionConfig,
+} from './image-execution.js';
 import { assertVideoCapabilitiesSubset } from './video-capabilities.js';
 import { effectiveDiscoveryModality } from './discovery-modality.js';
 
@@ -335,6 +339,8 @@ export async function updateAdminAiRoute(
     capabilitiesOverride?: Prisma.InputJsonValue | null | undefined;
     adapterKey?: string | null | undefined;
     adapterConfig?: Prisma.InputJsonValue | null | undefined;
+    executionMode?: 'INHERIT' | 'DIRECT' | 'TASK' | undefined;
+    executionConfig?: Prisma.InputJsonValue | null | undefined;
     expectedUpdatedAt?: string | undefined;
   },
   context: AdminMutationContext = { actor: 'admin-api', requestId: randomUUID() },
@@ -355,6 +361,41 @@ export async function updateAdminAiRoute(
       || input.adapterConfig !== undefined && input.adapterConfig !== null)
       && current.canonicalModel?.modality === 'chat') {
       throw new AiModelAdminError('INVALID_REQUEST', 'Media adapters may only be configured on image or video model routes', 400);
+    }
+    const executionChanged = input.executionMode !== undefined
+      || input.executionConfig !== undefined;
+    if (executionChanged && current.canonicalModel?.modality !== 'image') {
+      throw new AiModelAdminError(
+        'INVALID_REQUEST',
+        'Image execution settings may only be configured on image model routes',
+        400,
+      );
+    }
+    const nextExecutionMode = imageRouteExecutionMode(
+      input.executionMode ?? current.executionMode,
+    );
+    const nextExecutionConfig = input.executionConfig !== undefined
+      ? input.executionConfig
+      : current.executionConfig;
+    let normalizedExecutionConfig: Prisma.InputJsonValue | null | undefined;
+    if (executionChanged && nextExecutionMode === 'TASK') {
+      try {
+        normalizedExecutionConfig = toInputJson(
+          normalizeImageTaskExecutionConfig(nextExecutionConfig),
+        );
+      } catch (error) {
+        throw new AiModelAdminError(
+          'INVALID_REQUEST',
+          error instanceof Error ? error.message : 'Image task execution configuration is invalid',
+          400,
+        );
+      }
+    } else if (executionChanged && nextExecutionConfig !== null) {
+      throw new AiModelAdminError(
+        'INVALID_REQUEST',
+        'executionConfig must be null unless executionMode is TASK',
+        400,
+      );
     }
     const costChanged = input.costProfile !== undefined
       && JSON.stringify(current.costProfile) !== JSON.stringify(input.costProfile);
@@ -384,6 +425,12 @@ export async function updateAdminAiRoute(
         : nextAdapterKey === 'GENERIC_ASYNC_VIDEO' || nextAdapterKey === 'AI_MEDIA_VIDEOS_API'
           ? toInputJson(validateGenericAsyncVideoConfig(input.adapterConfig))
           : input.adapterConfig;
+    }
+    if (input.executionMode !== undefined) data.executionMode = input.executionMode;
+    if (input.executionConfig !== undefined) {
+      data.executionConfig = normalizedExecutionConfig === null
+        ? Prisma.DbNull
+        : normalizedExecutionConfig!;
     }
     if (input.costProfile !== undefined) {
       data.costProfile = input.costProfile === null ? Prisma.JsonNull : input.costProfile;

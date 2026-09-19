@@ -75,7 +75,6 @@ export const geminiNativeImageAdapter: ImageModelAdapter = {
           },
         },
       },
-      asyncMode: 'provider',
     };
   },
 };

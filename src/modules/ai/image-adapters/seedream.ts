@@ -39,7 +39,6 @@ export const seedreamImagesApiAdapter: ImageModelAdapter = {
       method: 'POST',
       contentType: 'application/json',
       body,
-      asyncMode: config.async === true ? 'task' : 'provider',
     };
   },
 };

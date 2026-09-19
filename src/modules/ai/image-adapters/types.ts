@@ -48,7 +48,6 @@ export type PreparedImageAdapterRequest = {
   method: 'POST';
   contentType: 'application/json';
   body: Record<string, unknown>;
-  asyncMode: 'provider' | 'task';
 };
 
 export interface ImageModelAdapter {

@@ -47,6 +47,26 @@ const adapterConfigSchema = z.object({
   ).optional(),
   referenceSerializer: z.enum(['json_image', 'json_images']).optional(),
 }).strict();
+const executionModeSchema = z.enum(['INHERIT', 'DIRECT', 'TASK']);
+const imageTaskExecutionConfigSchema = z.object({
+  profile: z.enum(['USELG_IMAGE_TASK', 'GENERIC_TASK']),
+  submitEndpoint: adapterEndpointSchema,
+  statusEndpointTemplate: adapterEndpointSchema.optional(),
+  resultEndpointTemplate: adapterEndpointSchema.optional(),
+  taskIdPath: z.string().trim().min(1).max(160).optional(),
+  statusPath: z.string().trim().min(1).max(160).optional(),
+  pollAfterMsPath: z.string().trim().min(1).max(160).optional(),
+  processingStatuses: z.array(z.string().trim().min(1).max(80)).min(1).max(30).optional(),
+  completedStatuses: z.array(z.string().trim().min(1).max(80)).min(1).max(30).optional(),
+  failedStatuses: z.array(z.string().trim().min(1).max(80)).min(1).max(30).optional(),
+  assetArrayPath: z.string().trim().min(1).max(160).optional(),
+  signedUrlPath: z.string().trim().min(1).max(160).optional(),
+  downloadUrlPath: z.string().trim().min(1).max(160).optional(),
+  urlPath: z.string().trim().min(1).max(160).optional(),
+  submitTimeoutMs: z.number().int().min(45_000).max(90_000).optional(),
+  asyncParameterName: z.string().trim().min(1).max(160).regex(/^[A-Za-z_][A-Za-z0-9_.-]*$/).optional(),
+  asyncParameterValue: z.unknown().optional(),
+}).strict();
 const videoAdapterKeys = [
   'LEGACY_VIDEO',
   'MINIMAX_NATIVE_VIDEO',
@@ -100,6 +120,8 @@ const updateRouteSchema = z.object({
   capabilitiesOverride: jsonObjectSchema.nullable().optional(),
   adapterKey: adapterKeySchema.nullable().optional(),
   adapterConfig: z.union([adapterConfigSchema, jsonObjectSchema]).nullable().optional(),
+  executionMode: executionModeSchema.optional(),
+  executionConfig: imageTaskExecutionConfigSchema.nullable().optional(),
   expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
 }).strict().refine(value => Object.keys(value).length > 0, 'No route changes were supplied');
 
@@ -297,6 +319,10 @@ export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
       ...(body.data.adapterKey !== undefined ? { adapterKey: body.data.adapterKey } : {}),
       ...(body.data.adapterConfig !== undefined ? {
         adapterConfig: body.data.adapterConfig === null ? null : toInputJson(body.data.adapterConfig),
+      } : {}),
+      ...(body.data.executionMode !== undefined ? { executionMode: body.data.executionMode } : {}),
+      ...(body.data.executionConfig !== undefined ? {
+        executionConfig: body.data.executionConfig === null ? null : toInputJson(body.data.executionConfig),
       } : {}),
       ...(body.data.expectedUpdatedAt ? { expectedUpdatedAt: body.data.expectedUpdatedAt } : {}),
     };

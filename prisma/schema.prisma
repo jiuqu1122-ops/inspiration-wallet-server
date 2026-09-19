@@ -94,6 +94,12 @@ enum AdminOperationType {
   USAGE_MODEL_BINDING_UPDATED
 }
 
+enum AiRouteExecutionMode {
+  INHERIT
+  DIRECT
+  TASK
+}
+
 enum AiProviderKind {
   NEW_API
   XAIS
@@ -577,6 +583,8 @@ model AiModelRoute {
   capabilitiesOverride Json?
   adapterKey           String?
   adapterConfig        Json?
+  executionMode        AiRouteExecutionMode @default(INHERIT)
+  executionConfig      Json?
   metadata             Json?
   pricingSyncStatus    String                @default("UNKNOWN")
   costUpdatedAt        DateTime?
