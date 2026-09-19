@@ -219,7 +219,9 @@ export function resolveConfiguredAgentModel(
 export function usageModelBindingKeyForAgentContext(
   usageContext: string | undefined,
 ): AiUsageModelKey | null {
-  return usageContext === 'canvas_text_agent' || usageContext === 'prompt_optimization'
+  return usageContext === 'canvas_text_agent'
+    || usageContext === 'prompt_optimization'
+    || usageContext === 'workflow'
     ? 'CANVAS_TEXT'
     : null;
 }

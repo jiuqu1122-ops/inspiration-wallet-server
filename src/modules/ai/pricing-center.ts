@@ -207,12 +207,18 @@ export function chatPriceToCatalogProfile(price: ChatModelCreditPrice): CatalogP
 }
 
 export function imagePriceToCatalogProfile(price: ImageModelCreditPrice): CatalogPricingProfile {
+  if (price.billingType === 'image_flat' && price.creditsPerRequest !== undefined) {
+    return { billingType: 'image_flat', creditsPerRequest: price.creditsPerRequest };
+  }
+  if (price.billingType === 'image_count' && price.creditsPerImage !== undefined) {
+    return { billingType: 'image_count', creditsPerImage: price.creditsPerImage };
+  }
   return {
     billingType: 'image_resolution',
-    creditsPerImageByResolution: {
+    creditsPerImageByResolution: price.creditsByResolution ?? {
       ...(price.credits1k !== undefined ? { '1k': price.credits1k } : {}),
-      '2k': price.credits2k,
-      '4k': price.credits4k,
+      ...(price.credits2k !== undefined ? { '2k': price.credits2k } : {}),
+      ...(price.credits4k !== undefined ? { '4k': price.credits4k } : {}),
     },
   };
 }
@@ -269,23 +275,45 @@ export function catalogProfileToImagePrice(
   model: string,
   profile: CatalogPricingProfile,
 ): ImageModelCreditPrice | null {
-  const prices = profile.billingType === 'image_resolution'
-    ? plainObject(profile.creditsPerImageByResolution)
-    : profile.billingType === 'image_count'
-      ? { '1k': profile.creditsPerImage, '2k': profile.creditsPerImage, '4k': profile.creditsPerImage }
-      : profile.billingType === 'image_flat'
-        ? { '1k': profile.creditsPerRequest, '2k': profile.creditsPerRequest, '4k': profile.creditsPerRequest }
-        : null;
+  if (profile.billingType === 'image_flat') {
+    const creditsPerRequest = scalarText(profile.creditsPerRequest);
+    if (!creditPattern.test(creditsPerRequest)) return null;
+    return {
+      model,
+      billingType: 'image_flat',
+      creditsPerRequest,
+      credits1k: creditsPerRequest,
+      credits2k: creditsPerRequest,
+      credits4k: creditsPerRequest,
+    };
+  }
+  if (profile.billingType === 'image_count') {
+    const creditsPerImage = scalarText(profile.creditsPerImage);
+    if (!creditPattern.test(creditsPerImage)) return null;
+    return {
+      model,
+      billingType: 'image_count',
+      creditsPerImage,
+      credits1k: creditsPerImage,
+      credits2k: creditsPerImage,
+      credits4k: creditsPerImage,
+    };
+  }
+  if (profile.billingType !== 'image_resolution') return null;
+  const prices = plainObject(profile.creditsPerImageByResolution);
   if (!prices) return null;
-  const credits2k = scalarText(prices['2k']);
-  const credits4k = scalarText(prices['4k']);
-  if (!creditPattern.test(credits2k) || !creditPattern.test(credits4k)) return null;
-  const credits1k = scalarText(prices['1k']);
+  const entries = Object.entries(prices)
+    .map(([resolution, amount]) => [resolution.trim().toLowerCase(), scalarText(amount)] as const);
+  if (entries.length === 0
+    || entries.some(([resolution, amount]) => !resolution || !creditPattern.test(amount))) return null;
+  const creditsByResolution = Object.fromEntries(entries);
   return {
     model,
-    ...(creditPattern.test(credits1k) ? { credits1k } : {}),
-    credits2k,
-    credits4k,
+    billingType: 'image_resolution',
+    creditsByResolution,
+    ...(creditsByResolution['1k'] !== undefined ? { credits1k: creditsByResolution['1k'] } : {}),
+    ...(creditsByResolution['2k'] !== undefined ? { credits2k: creditsByResolution['2k'] } : {}),
+    ...(creditsByResolution['4k'] !== undefined ? { credits4k: creditsByResolution['4k'] } : {}),
   };
 }
 

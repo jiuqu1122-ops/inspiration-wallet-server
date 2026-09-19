@@ -1,11 +1,18 @@
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { env } from '../../config/env.js';
 
+export type ImageBillingType = 'image_flat' | 'image_count' | 'image_resolution';
+
 export type ImageModelCreditPrice = {
   model: string;
+  billingType?: ImageBillingType | undefined;
+  creditsPerRequest?: string | undefined;
+  creditsPerImage?: string | undefined;
+  creditsByResolution?: Record<string, string> | undefined;
+  /** Legacy compatibility fields for clients predating explicit image billing. */
   credits1k?: string | undefined;
-  credits2k: string;
-  credits4k: string;
+  credits2k?: string | undefined;
+  credits4k?: string | undefined;
 };
 
 export type VideoBillingType =
@@ -54,8 +61,14 @@ export type AiPricingConfigValue = {
   updatedAt: string | null;
 };
 
-export type AiPricingConfigInput = Omit<AiPricingConfigValue, 'updatedAt' | 'canvasTextAgentCredits'> & {
+export type AiPricingConfigInput = Omit<AiPricingConfigValue, 'updatedAt' | 'canvasTextAgentCredits' | 'imageModels'> & {
   canvasTextAgentCredits?: string | undefined;
+  imageModels: Array<{
+    model: string;
+    credits1k?: string | undefined;
+    credits2k: string;
+    credits4k: string;
+  }>;
 };
 
 const DEFAULT_AGENT_REQUEST_CREDITS = BigInt(env.AGENT_REQUEST_CREDITS);
@@ -224,19 +237,18 @@ const normalizeStoredImageModels = (value: Prisma.JsonValue): ImageModelCreditPr
     if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
     const record = item as Record<string, unknown>;
     const model = typeof record.model === 'string' ? record.model.trim() : '';
-    if (!model
-      || isRetiredImageModel(model)
-      || !validCreditString(record.credits2k)
-      || !validCreditString(record.credits4k)) return [];
+    const credits2k = validCreditString(record.credits2k) ? record.credits2k : null;
+    const credits4k = validCreditString(record.credits4k) ? record.credits4k : null;
+    if (!model || isRetiredImageModel(model) || !credits2k || !credits4k) return [];
     const canonicalModel = canonicalImagePricingModel(model);
     const credits1k = supportsImageOneK(canonicalModel)
-      ? validCreditString(record.credits1k) ? record.credits1k : record.credits2k
+      ? validCreditString(record.credits1k) ? record.credits1k : credits2k
       : undefined;
     normalized.set(imagePricingModelToken(canonicalModel), {
       model: canonicalModel,
       ...(credits1k ? { credits1k } : {}),
-      credits2k: record.credits2k,
-      credits4k: record.credits4k,
+      credits2k,
+      credits4k,
     });
   });
   return Array.from(normalized.values());
@@ -306,7 +318,7 @@ const mergeKnownImageModels = (
         : token === 'nanobanana2fast'
           ? storedByToken.get('nanobanana2')
           : undefined;
-      return base
+      return base?.credits2k !== undefined && base.credits4k !== undefined
         ? { model: item.model, credits2k: base.credits2k, credits4k: base.credits4k }
         : item;
     });
@@ -438,11 +450,10 @@ export async function configuredImageUnitCredits(
       : fallback;
   }
   const selectedResolution = pricedImageResolution(model, resolution);
-  return BigInt(
-    selectedResolution === '1k'
-      ? exact.credits1k ?? exact.credits2k
-      : selectedResolution === '4k' ? exact.credits4k : exact.credits2k,
-  );
+  const configuredCredits = selectedResolution === '1k'
+    ? exact.credits1k ?? exact.credits2k
+    : selectedResolution === '4k' ? exact.credits4k : exact.credits2k;
+  return BigInt(configuredCredits ?? pricing.imageDefaultCredits);
 }
 
 export async function configuredVideoUnitCredits(prisma: PrismaClient, model: string) {

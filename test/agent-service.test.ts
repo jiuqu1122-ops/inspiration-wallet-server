@@ -58,11 +58,11 @@ describe('Agent usage context billing policy', () => {
 });
 
 describe('Agent provider fallback policy', () => {
-  it('binds only canvas text and prompt optimization to CANVAS_TEXT', () => {
+  it('binds every fixed Canvas LLM context to CANVAS_TEXT', () => {
     expect(usageModelBindingKeyForAgentContext('canvas_text_agent')).toBe('CANVAS_TEXT');
     expect(usageModelBindingKeyForAgentContext('prompt_optimization')).toBe('CANVAS_TEXT');
+    expect(usageModelBindingKeyForAgentContext('workflow')).toBe('CANVAS_TEXT');
     expect(usageModelBindingKeyForAgentContext('chat')).toBeNull();
-    expect(usageModelBindingKeyForAgentContext('workflow')).toBeNull();
   });
 
   it('keeps USELG LLM and Vision capabilities independent', () => {

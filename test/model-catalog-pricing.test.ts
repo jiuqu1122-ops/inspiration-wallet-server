@@ -13,6 +13,7 @@ import {
 } from '../src/modules/ai/model-catalog.js';
 import {
   buildClientPricingProjection,
+  catalogProfileToImagePrice,
   calculateSnapshotCharge,
   capturePricingSnapshot,
   estimateSnapshotCredits,
@@ -290,7 +291,7 @@ describe('canonical model mapping', () => {
 });
 
 describe('versioned server-side pricing', () => {
-  it.each(['canvas_text_agent', 'prompt_optimization'])(
+  it.each(['canvas_text_agent', 'prompt_optimization', 'workflow'])(
     'charges %s at the CANVAS_TEXT fixed per-request price',
     usageContext => {
       const fixed = calculateSnapshotCharge(snapshot('chat', astraPricing, {
@@ -317,10 +318,11 @@ describe('versioned server-side pricing', () => {
     },
   );
 
-  it('preserves fixed workflow billing', () => {
+  it('uses the CANVAS_TEXT fixed price for workflow billing', () => {
     const fixed = calculateSnapshotCharge(snapshot('chat', astraPricing, {
       usageContext: 'workflow',
-      fallbackCredits: '3',
+      fallbackCredits: '10',
+      fixedUsageCredits: '1.000000',
     }), {
       usage: {
         inputTokens: 500_000n,
@@ -330,7 +332,7 @@ describe('versioned server-side pricing', () => {
       },
     });
     expect(fixed.billingType).toBe('request_fixed');
-    expect(fixed.totalCredits).toBe('3.000000');
+    expect(fixed.totalCredits).toBe('1.000000');
   });
 
   it('keeps ordinary chat on token billing', () => {
@@ -449,6 +451,31 @@ describe('versioned server-side pricing', () => {
     expect(flat.quantity).toBe('1');
     expect(counted.totalCredits).toBe('6.750000');
     expect(counted.quantity).toBe('3');
+  });
+
+  it('projects explicit image billing fields while retaining legacy compatibility fields', () => {
+    expect(catalogProfileToImagePrice('flat-image', {
+      billingType: 'image_flat',
+      creditsPerRequest: '7.5',
+    })).toEqual({
+      model: 'flat-image',
+      billingType: 'image_flat',
+      creditsPerRequest: '7.5',
+      credits1k: '7.5',
+      credits2k: '7.5',
+      credits4k: '7.5',
+    });
+    expect(catalogProfileToImagePrice('count-image', {
+      billingType: 'image_count',
+      creditsPerImage: '2.25',
+    })).toEqual({
+      model: 'count-image',
+      billingType: 'image_count',
+      creditsPerImage: '2.25',
+      credits1k: '2.25',
+      credits2k: '2.25',
+      credits4k: '2.25',
+    });
   });
 
   it('uses one video base billing strategy and then adds reference surcharges', () => {
@@ -860,6 +887,37 @@ describe('catalog exposure and upstream discovery safety', () => {
       billingType: 'video_flat',
       credits: '0',
       creditsPerVideo: '15',
+    }]);
+  });
+
+  it('projects a dynamic 2k-only image price without inventing a 4k tier', async () => {
+    const prisma = {
+      aiModel: {
+        findMany: vi.fn(async () => [{
+          canonicalModelKey: 'image-2k-only',
+          modality: 'image',
+          billingType: 'image_resolution',
+          capabilities: { supportedResolutions: ['2k'] },
+          pricing: {
+            currentVersion: {
+              publishedAt: new Date('2026-09-18T00:00:00.000Z'),
+              pricing: {
+                billingType: 'image_resolution',
+                creditsPerImageByResolution: { '2K': '12.5' },
+              },
+            },
+          },
+        }]),
+      },
+      aiUsageModelBinding: { findMany: vi.fn(async () => []) },
+    } as unknown as PrismaClient;
+
+    const projection = await buildClientPricingProjection(prisma);
+    expect(projection.imageModels).toEqual([{
+      model: 'image-2k-only',
+      billingType: 'image_resolution',
+      creditsByResolution: { '2k': '12.5' },
+      credits2k: '12.5',
     }]);
   });
 
@@ -1344,7 +1402,7 @@ describe('catalog exposure and upstream discovery safety', () => {
 });
 
 describe('billing idempotency', () => {
-  it.each(['canvas_text_agent', 'prompt_optimization'])(
+  it.each(['canvas_text_agent', 'prompt_optimization', 'workflow'])(
     'reserves and consumes exactly one CANVAS_TEXT credit for %s despite large token usage',
     async usageContext => {
       const provider = {
