@@ -5,6 +5,7 @@ import { createReadStream } from 'node:fs';
 import { mkdtemp, open, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { Readable } from 'node:stream';
 import sharp from 'sharp';
 import { Agent } from 'undici';
@@ -71,6 +72,16 @@ import {
   normalizeImageTaskExecutionConfig,
   type ImageTaskExecutionConfig,
 } from './image-execution.js';
+import {
+  markImageExtractComplete,
+  markImageResponseBodyComplete,
+  markImageResponseHeaders,
+  markImageResponseParseComplete,
+  runImageResponseDiagnosticRequest,
+  startImageResponseDiagnostic,
+  type ImageResponseDiagnosticScope,
+  type ParsedProviderValue,
+} from './image-response-diagnostics.js';
 import { normalizeManagedVideoRequest, ManagedVideoRequestError, type NormalizedVideoRequest } from './video-request.js';
 import { resolveVideoCapabilities, videoAspectRatioAllowed, videoCapabilitiesSupportRequest, videoDurationAllowed } from './video-capabilities.js';
 import { selectManagedVideoRoutes } from './video-routing.js';
@@ -417,6 +428,8 @@ type UselgImageDiagnosticContext = {
   routeId?: string;
   adapterKey?: string;
   adapterExecutionStartedAt?: number;
+  statusAddressSource?: 'upstream' | 'execution_config';
+  resultAddressSource?: 'upstream' | 'execution_config';
 };
 
 type UselgImageResolveSourceType =
@@ -473,8 +486,9 @@ class UpstreamImageError extends Error {
     public readonly status: number,
     message: string,
     public readonly responseValue?: unknown,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.name = 'UpstreamImageError';
   }
 }
@@ -696,12 +710,25 @@ function providerRequestUrl(provider: Pick<AiProviderChannel, 'baseUrl'>, pathOr
   return target.toString();
 }
 
-function parseProviderValue(text: string): unknown {
+function providerDiagnosticTarget(
+  provider: Pick<AiProviderChannel, 'baseUrl'>,
+  pathOrUrl: string,
+) {
+  try {
+    return providerRequestUrl(provider, pathOrUrl);
+  } catch {
+    // Diagnostics must never change the request result. The real request path
+    // still performs its normal URL validation and reports the original error.
+    return pathOrUrl;
+  }
+}
+
+export function parseProviderResponse(text: string): ParsedProviderValue {
   let firstContentIndex = 0;
   while (firstContentIndex < text.length && /\s/.test(text[firstContentIndex]!)) {
     firstContentIndex += 1;
   }
-  if (firstContentIndex === text.length) return null;
+  if (firstContentIndex === text.length) return { value: null, parseType: 'empty' };
 
   const firstCharacter = text[firstContentIndex]!;
   let jsonParseAttempted = false;
@@ -711,11 +738,16 @@ function parseProviderValue(text: string): unknown {
     try {
       // JSON.parse accepts ordinary surrounding JSON whitespace. Passing the
       // original string avoids copying a large inline image via trim().
-      return JSON.parse(text) as unknown;
+      return { value: JSON.parse(text) as unknown, parseType: 'json' };
     } catch {
       // A leading BOM is JSON whitespace to our detector but not to JSON.parse.
       if (firstContentIndex > 0) {
-        try { return JSON.parse(text.slice(firstContentIndex)) as unknown; } catch { /* fall through */ }
+        try {
+          return {
+            value: JSON.parse(text.slice(firstContentIndex)) as unknown,
+            parseType: 'json',
+          };
+        } catch { /* fall through */ }
       }
     }
   }
@@ -727,15 +759,19 @@ function parseProviderValue(text: string): unknown {
     .map((match) => match[1]?.trim())
     .filter((value): value is string => Boolean(value && value !== '[DONE]'));
   if (eventValues.length) {
-    return eventValues.map((value) => {
+    return { value: eventValues.map((value) => {
       try { return JSON.parse(value) as unknown; } catch { return value; }
-    });
+    }), parseType: 'sse' };
   }
 
   if (!jsonParseAttempted) {
-    try { return JSON.parse(text) as unknown; } catch { /* fall through */ }
+    try { return { value: JSON.parse(text) as unknown, parseType: 'json' }; } catch { /* fall through */ }
   }
-  return text.trim();
+  return { value: text.trim(), parseType: 'text' };
+}
+
+export function parseProviderValue(text: string): unknown {
+  return parseProviderResponse(text).value;
 }
 
 function isAmbiguousImageTaskSubmitError(error: unknown): error is UpstreamImageError {
@@ -743,7 +779,7 @@ function isAmbiguousImageTaskSubmitError(error: unknown): error is UpstreamImage
     && (error.status === 0 || [502, 503, 504].includes(error.status));
 }
 
-async function providerRequest(
+export async function providerRequest(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   path: string,
@@ -751,10 +787,14 @@ async function providerRequest(
   timeoutOverrideMs?: number,
   extraHeaders?: Record<string, string>,
   onResponseStatus?: (status: number) => void,
+  diagnosticScope?: ImageResponseDiagnosticScope,
 ) {
   const controller = new AbortController();
   const timeoutMs = timeoutOverrideMs ?? (/(?:video|workerTask)/i.test(path) ? 10 * 60_000 : 4 * 60_000);
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = setTimeout(() => {
+    if (diagnosticScope) diagnosticScope.timeoutTriggered = true;
+    controller.abort();
+  }, timeoutMs);
   try {
     const response = await fetch(providerRequestUrl(provider, path), {
       method: body === undefined ? 'GET' : 'POST',
@@ -763,19 +803,30 @@ async function providerRequest(
       redirect: 'error',
       signal: controller.signal,
     });
+    if (diagnosticScope) markImageResponseHeaders(diagnosticScope, response);
     onResponseStatus?.(response.status);
+    const bodyStartedAt = performance.now();
     const text = await response.text();
+    if (diagnosticScope) markImageResponseBodyComplete(diagnosticScope, text, bodyStartedAt);
+    const parseStartedAt = performance.now();
+    const parsed = parseProviderResponse(text);
+    if (diagnosticScope) markImageResponseParseComplete(diagnosticScope, parsed, parseStartedAt);
     if (!response.ok) {
       throw new UpstreamImageError(
         response.status,
         upstreamErrorMessage(response.status, text),
-        parseProviderValue(text),
+        parsed.value,
       );
     }
-    return parseProviderValue(text);
+    return parsed.value;
   } catch (error) {
     if (error instanceof UpstreamImageError) throw error;
-    throw new UpstreamImageError(0, error instanceof Error ? error.message : String(error));
+    throw new UpstreamImageError(
+      0,
+      error instanceof Error ? error.message : String(error),
+      undefined,
+      { cause: error },
+    );
   } finally {
     clearTimeout(timeout);
   }
@@ -868,25 +919,31 @@ function appendInlineImage(record: Record<string, unknown>, output: string[]) {
 }
 
 export function collectImageStrings(value: unknown, output: string[] = [], contextKey = ''): string[] {
-  if (!value) return output;
-  if (typeof value === 'string') {
-    appendImageString(value, output, contextKey);
-    return output;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) collectImageStrings(item, output, contextKey);
-    return output;
-  }
-  if (typeof value === 'object') {
-    const record = value as Record<string, unknown>;
-    const hasInlineImage = appendInlineImage(record, output);
-    for (const key of Object.keys(record)) {
-      const normalized = key.toLowerCase();
-      if (hasInlineImage && INLINE_IMAGE_PAYLOAD_KEYS.has(normalized)) {
-        continue;
+  const visited = new Set<object>();
+  const stack: Array<{ nested: unknown; contextKey: string }> = [{ nested: value, contextKey }];
+  while (stack.length) {
+    const current = stack.pop()!;
+    if (!current.nested) continue;
+    if (typeof current.nested === 'string') {
+      appendImageString(current.nested, output, current.contextKey);
+      continue;
+    }
+    if (typeof current.nested !== 'object' || visited.has(current.nested)) continue;
+    visited.add(current.nested);
+    if (Array.isArray(current.nested)) {
+      for (let index = current.nested.length - 1; index >= 0; index -= 1) {
+        stack.push({ nested: current.nested[index], contextKey: current.contextKey });
       }
-      const nested = record[key];
-      collectImageStrings(nested, output, normalized);
+      continue;
+    }
+    const record = current.nested as Record<string, unknown>;
+    const hasInlineImage = appendInlineImage(record, output);
+    const keys = Object.keys(record);
+    for (let index = keys.length - 1; index >= 0; index -= 1) {
+      const key = keys[index]!;
+      const normalized = key.toLowerCase();
+      if (hasInlineImage && INLINE_IMAGE_PAYLOAD_KEYS.has(normalized)) continue;
+      stack.push({ nested: record[key], contextKey: normalized });
     }
   }
   return output;
@@ -1162,17 +1219,21 @@ function bigmodelHeaders(secrets: ProviderSecrets, extraHeaders?: Record<string,
   return headers;
 }
 
-async function bigmodelRequest(
+export async function bigmodelRequest(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   path: string,
   body?: unknown,
   extraHeaders?: Record<string, string>,
   timeoutOverrideMs?: number,
+  diagnosticScope?: ImageResponseDiagnosticScope,
 ) {
   const controller = new AbortController();
   const timeout = setTimeout(
-    () => controller.abort(),
+    () => {
+      if (diagnosticScope) diagnosticScope.timeoutTriggered = true;
+      controller.abort();
+    },
     timeoutOverrideMs ?? IMAGE_GENERATION_TIMEOUT_MS,
   );
   try {
@@ -1188,18 +1249,29 @@ async function bigmodelRequest(
       // deadline without changing fetch behavior for ordinary API calls.
       dispatcher: longImageRequestDispatcher,
     } as RequestInit & { dispatcher: Agent });
+    if (diagnosticScope) markImageResponseHeaders(diagnosticScope, response);
+    const bodyStartedAt = performance.now();
     const text = await response.text();
+    if (diagnosticScope) markImageResponseBodyComplete(diagnosticScope, text, bodyStartedAt);
+    const parseStartedAt = performance.now();
+    const parsed = parseProviderResponse(text);
+    if (diagnosticScope) markImageResponseParseComplete(diagnosticScope, parsed, parseStartedAt);
     if (!response.ok) {
       throw new UpstreamImageError(
         response.status,
         upstreamErrorMessage(response.status, text),
-        parseProviderValue(text),
+        parsed.value,
       );
     }
-    return parseProviderValue(text);
+    return parsed.value;
   } catch (error) {
     if (error instanceof UpstreamImageError) throw error;
-    throw new UpstreamImageError(0, error instanceof Error ? error.message : String(error));
+    throw new UpstreamImageError(
+      0,
+      error instanceof Error ? error.message : String(error),
+      undefined,
+      { cause: error },
+    );
   } finally {
     clearTimeout(timeout);
   }
@@ -1462,6 +1534,21 @@ async function generateGeminiImageConfigImages(
   const images: string[] = [];
   for (let index = 0; index < input.count; index += 1) {
     let value: unknown;
+    const endpoint = `/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+    const diagnosticScope = diagnosticContext
+      ? startImageResponseDiagnostic({
+        clientRequestId: diagnosticContext.clientRequestId,
+        providerId: diagnosticContext.providerId,
+        routeId: diagnosticContext.routeId,
+        adapterKey: diagnosticContext.adapterKey,
+        phase: 'generate',
+        attempt: index + 1,
+        addressSource: diagnosticContext.adapterKey ? 'adapter' : 'legacy_default',
+        targetUrl: providerDiagnosticTarget(provider, endpoint),
+        timeoutMs: IMAGE_GENERATION_TIMEOUT_MS,
+        method: 'POST',
+      })
+      : undefined;
     const generateStartedAt = Date.now();
     if (diagnosticContext) {
       console.info('[uselg_gemini_generate_started]', {
@@ -1472,10 +1559,10 @@ async function generateGeminiImageConfigImages(
       });
     }
     try {
-      value = await bigmodelRequest(
+      const execute = (scope?: ImageResponseDiagnosticScope) => bigmodelRequest(
         provider,
         secrets,
-        `/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        endpoint,
         {
           contents: [{ role: 'user', parts }],
           generationConfig: {
@@ -1487,16 +1574,43 @@ async function generateGeminiImageConfigImages(
           },
         },
         requestHeaders?.(index),
+        IMAGE_GENERATION_TIMEOUT_MS,
+        scope,
       );
+      value = diagnosticScope
+        ? (await runImageResponseDiagnosticRequest(diagnosticScope, execute)).value
+        : await execute();
     } catch (error) {
+      const extractStartedAt = performance.now();
       const recovered = error instanceof UpstreamImageError
         ? selectUniqueImages(error.responseValue, input.inputImages, 1, preferUrlResults)
         : [];
+      if (diagnosticScope) {
+        markImageExtractComplete({
+          scope: diagnosticScope,
+          extractStartedAt,
+          state: 'error_response',
+          images: recovered,
+          assetCount: null,
+          hasResultUrl: false,
+        });
+      }
       if (!recovered.length) throw error;
       images.push(...recovered);
       continue;
     }
+    const extractStartedAt = performance.now();
     const immediate = selectUniqueImages(value, input.inputImages, 1, preferUrlResults);
+    if (diagnosticScope) {
+      markImageExtractComplete({
+        scope: diagnosticScope,
+        extractStartedAt,
+        state: newApiImageTaskState(value),
+        images: immediate,
+        assetCount: null,
+        hasResultUrl: Boolean(nestedStringByKeys(value, new Set(['result_url']))),
+      });
+    }
     if (diagnosticContext) {
       console.info('[uselg_gemini_generate_response]', {
         clientRequestId: diagnosticContext.clientRequestId,
@@ -2220,19 +2334,40 @@ export function summarizeUselgImageStatus(
   value: unknown,
   inputImages: string[],
   count: number,
+  diagnosticScope?: ImageResponseDiagnosticScope,
 ): UselgImageStatusSummary {
+  const extractStartedAt = performance.now();
   let taskId = '';
   let state = '';
   let statusUrl = '';
   let resultUrl = '';
   const imageCandidates: string[] = [];
+  const candidateDiagnostics: Array<{
+    kind: 'url' | 'inline';
+    length: number;
+    fieldPath?: string;
+  }> = [];
   const assets: UselgTaskAsset[] = [];
   const visited = new Set<object>();
 
-  const visit = (nested: unknown, contextKey = '', taskScope = true) => {
+  const rememberCandidates = (before: number, fieldPath: string) => {
+    if (!diagnosticScope?.detailed) return;
+    for (let index = before; index < imageCandidates.length && candidateDiagnostics.length < 12; index += 1) {
+      const candidate = imageCandidates[index]!;
+      candidateDiagnostics.push({
+        kind: /^https?:\/\//i.test(candidate) ? 'url' : 'inline',
+        length: candidate.length,
+        fieldPath,
+      });
+    }
+  };
+
+  const visit = (nested: unknown, contextKey = '', taskScope = true, fieldPath = '') => {
     if (!nested) return;
     if (typeof nested === 'string') {
+      const candidateCount = imageCandidates.length;
       appendImageString(nested, imageCandidates, contextKey);
+      rememberCandidates(candidateCount, fieldPath);
       if (!taskId && taskScope && USELG_TASK_CONTAINER_KEYS.has(contextKey)
         && !IMAGE_DATA_URL_PREFIX.test(nested) && !looksLikeRawImageBase64(nested)) {
         taskId = nested.trim();
@@ -2242,7 +2377,14 @@ export function summarizeUselgImageStatus(
     if (typeof nested !== 'object' || visited.has(nested)) return;
     visited.add(nested);
     if (Array.isArray(nested)) {
-      for (const item of nested) visit(item, contextKey, taskScope);
+      for (let index = 0; index < nested.length; index += 1) {
+        visit(
+          nested[index],
+          contextKey,
+          taskScope,
+          diagnosticScope?.detailed ? `${fieldPath}[${index}]`.slice(0, 240) : '',
+        );
+      }
       return;
     }
 
@@ -2266,7 +2408,8 @@ export function summarizeUselgImageStatus(
       }
     }
 
-    for (const key of Object.keys(record)) {
+    const keys = Object.keys(record);
+    for (const key of keys) {
       const normalizedKey = key.toLowerCase();
       if (!statusUrl && USELG_STATUS_URL_KEYS.has(normalizedKey)) {
         const candidate = record[key];
@@ -2278,20 +2421,24 @@ export function summarizeUselgImageStatus(
       }
     }
 
+    const candidateCount = imageCandidates.length;
     const hasInlineImage = appendInlineImage(record, imageCandidates);
-    for (const key of Object.keys(record)) {
+    rememberCandidates(candidateCount, fieldPath);
+    for (const key of keys) {
       const normalizedKey = key.toLowerCase();
       if (hasInlineImage && INLINE_IMAGE_PAYLOAD_KEYS.has(normalizedKey)) continue;
       visit(
         record[key],
         normalizedKey,
         taskScope && USELG_TASK_CONTAINER_KEYS.has(normalizedKey),
+        diagnosticScope?.detailed ? `${fieldPath}.${key}`.slice(0, 240) : '',
       );
     }
   };
 
-  visit(value);
-  return {
+  visit(value, '', true, diagnosticScope?.detailed ? '$' : '');
+
+  const summary = {
     taskId,
     state,
     statusUrl,
@@ -2305,6 +2452,18 @@ export function summarizeUselgImageStatus(
     ),
     assets,
   };
+  if (diagnosticScope) {
+    markImageExtractComplete({
+      scope: diagnosticScope,
+      extractStartedAt,
+      state,
+      images: summary.images,
+      assetCount: assets.length,
+      hasResultUrl: Boolean(resultUrl),
+      candidates: candidateDiagnostics,
+    });
+  }
+  return summary;
 }
 
 export async function resolveUselgImageResponse(
@@ -2322,7 +2481,8 @@ export async function resolveUselgImageResponse(
     body?: unknown,
     timeoutOverrideMs?: number,
     onResponseStatus?: (status: number) => void,
-  ) => Promise<unknown> = (path, body, timeoutOverrideMs, onResponseStatus) => providerRequest(
+    diagnosticScope?: ImageResponseDiagnosticScope,
+  ) => Promise<unknown> = (path, body, timeoutOverrideMs, onResponseStatus, diagnosticScope) => providerRequest(
     provider,
     secrets,
     path,
@@ -2330,6 +2490,7 @@ export async function resolveUselgImageResponse(
     timeoutOverrideMs,
     undefined,
     onResponseStatus,
+    diagnosticScope,
   ),
 ) {
   const resolveStartedAt = Date.now();
@@ -2383,7 +2544,12 @@ export async function resolveUselgImageResponse(
 
   let statusUrl = initialStatusUrl
     || `/v1/images/tasks/${encodeURIComponent(taskId)}?view=summary`;
+  let statusAddressSource: 'upstream' | 'upstream_updated' | 'execution_config' | 'default' = initialStatusUrl
+    ? diagnosticContext?.statusAddressSource ?? 'upstream'
+    : 'default';
   let resultUrl = initialResultUrl;
+  let resultAddressSource: 'upstream' | 'upstream_updated' | 'execution_config' =
+    diagnosticContext?.resultAddressSource ?? 'upstream';
   let pollAfterMs = initialPollAfterMs;
   let lastStatus: unknown = started;
   let lastPollError: unknown = null;
@@ -2415,11 +2581,43 @@ export async function resolveUselgImageResponse(
         attempt,
       });
     }
+    let pollDiagnosticScope: ImageResponseDiagnosticScope | undefined;
     try {
-      lastStatus = await request(statusUrl, undefined, 45_000);
+      pollDiagnosticScope = diagnosticContext
+        ? startImageResponseDiagnostic({
+          clientRequestId: diagnosticContext.clientRequestId,
+          taskId,
+          providerId: diagnosticContext.providerId,
+          routeId: diagnosticContext.routeId,
+          adapterKey: diagnosticContext.adapterKey,
+          phase: 'status',
+          attempt,
+          addressSource: statusAddressSource,
+          targetUrl: providerDiagnosticTarget(provider, statusUrl),
+          timeoutMs: 45_000,
+          method: 'GET',
+        })
+        : undefined;
+      lastStatus = pollDiagnosticScope
+        ? (await runImageResponseDiagnosticRequest(
+          pollDiagnosticScope,
+          scope => request(statusUrl, undefined, 45_000, undefined, scope),
+        )).value
+        : await request(statusUrl, undefined, 45_000);
       lastPollError = null;
     } catch (error) {
+      const extractStartedAt = performance.now();
       const errorImages = imagesFromUpstreamError(error, inputImages, count);
+      if (pollDiagnosticScope) {
+        markImageExtractComplete({
+          scope: pollDiagnosticScope,
+          extractStartedAt,
+          state: 'error_response',
+          images: errorImages,
+          assetCount: null,
+          hasResultUrl: false,
+        });
+      }
       const retryable = isRetryableNewApiTaskPollError(error);
       if (diagnosticContext) {
         console.warn('[uselg_image_poll_failed]', {
@@ -2437,9 +2635,20 @@ export async function resolveUselgImageResponse(
       continue;
     }
 
-    const statusSummary = summarizeUselgImageStatus(lastStatus, inputImages, count);
-    statusUrl = statusSummary.statusUrl || statusUrl;
-    resultUrl = statusSummary.resultUrl || resultUrl;
+    const statusSummary = summarizeUselgImageStatus(
+      lastStatus,
+      inputImages,
+      count,
+      pollDiagnosticScope,
+    );
+    if (statusSummary.statusUrl && statusSummary.statusUrl !== statusUrl) {
+      statusAddressSource = 'upstream_updated';
+      statusUrl = statusSummary.statusUrl;
+    }
+    if (statusSummary.resultUrl && statusSummary.resultUrl !== resultUrl) {
+      resultAddressSource = 'upstream_updated';
+      resultUrl = statusSummary.resultUrl;
+    }
     pollAfterMs = statusSummary.pollAfterMs;
     const { images, state, assets } = statusSummary;
     const prioritizedAssets = prioritizedUselgAssetImages(assets, count);
@@ -2489,15 +2698,47 @@ export async function resolveUselgImageResponse(
           taskId,
         });
       }
+      let resultDiagnosticScope: ImageResponseDiagnosticScope | undefined;
       try {
         let resultResponseStatus = 0;
-        const result = await request(
-          resultUrl,
-          undefined,
-          45_000,
-          status => { resultResponseStatus = status; },
+        resultDiagnosticScope = diagnosticContext
+          ? startImageResponseDiagnostic({
+            clientRequestId: diagnosticContext.clientRequestId,
+            taskId,
+            providerId: diagnosticContext.providerId,
+            routeId: diagnosticContext.routeId,
+            adapterKey: diagnosticContext.adapterKey,
+            phase: 'result',
+            attempt,
+            addressSource: resultAddressSource,
+            targetUrl: providerDiagnosticTarget(provider, resultUrl),
+            timeoutMs: 45_000,
+            method: 'GET',
+          })
+          : undefined;
+        const result = resultDiagnosticScope
+          ? (await runImageResponseDiagnosticRequest(
+            resultDiagnosticScope,
+            scope => request(
+              resultUrl,
+              undefined,
+              45_000,
+              status => { resultResponseStatus = status; },
+              scope,
+            ),
+          )).value
+          : await request(
+            resultUrl,
+            undefined,
+            45_000,
+            status => { resultResponseStatus = status; },
+          );
+        const resultSummary = summarizeUselgImageStatus(
+          result,
+          inputImages,
+          count,
+          resultDiagnosticScope,
         );
-        const resultSummary = summarizeUselgImageStatus(result, inputImages, count);
         const resultImages = resultSummary.images;
         if (diagnosticContext) {
           console.info('[uselg_image_result_fetch_complete]', {
@@ -2511,7 +2752,18 @@ export async function resolveUselgImageResponse(
         resultProbeNotReady = isUselgResultNotReadyStatus(resultResponseStatus)
           || isUselgPendingTaskState(resultSummary.state);
       } catch (error) {
+        const extractStartedAt = performance.now();
         const resultImages = imagesFromUpstreamError(error, inputImages, count);
+        if (resultDiagnosticScope) {
+          markImageExtractComplete({
+            scope: resultDiagnosticScope,
+            extractStartedAt,
+            state: 'error_response',
+            images: resultImages,
+            assetCount: null,
+            hasResultUrl: true,
+          });
+        }
         if (diagnosticContext) {
           console.warn('[uselg_image_result_fetch_failed]', {
             clientRequestId: diagnosticContext.clientRequestId,
@@ -4867,6 +5119,7 @@ type ImageAdapterRequest = (
   timeoutOverrideMs?: number,
   extraHeaders?: Record<string, string>,
   onResponseStatus?: (status: number) => void,
+  diagnosticScope?: ImageResponseDiagnosticScope,
 ) => Promise<unknown>;
 
 type PreparedImageAdapterExecutionOptions = {
@@ -4931,15 +5184,16 @@ export async function generatePreparedImageAdapterImages(
 ) {
   const executionMode = imageRouteExecutionMode(route?.executionMode);
   const request: ImageAdapterRequest = options?.request ?? (prepared.execution === 'gemini-native'
-    ? (path, body, timeoutOverrideMs, extraHeaders) => bigmodelRequest(
+    ? (path, body, timeoutOverrideMs, extraHeaders, _onResponseStatus, diagnosticScope) => bigmodelRequest(
       provider,
       secrets,
       path,
       body,
       extraHeaders,
       timeoutOverrideMs,
+      diagnosticScope,
     )
-    : (path, body, timeoutOverrideMs, extraHeaders, onResponseStatus) => providerRequest(
+    : (path, body, timeoutOverrideMs, extraHeaders, onResponseStatus, diagnosticScope) => providerRequest(
       provider,
       secrets,
       path,
@@ -4947,6 +5201,7 @@ export async function generatePreparedImageAdapterImages(
       timeoutOverrideMs,
       extraHeaders,
       onResponseStatus,
+      diagnosticScope,
     ));
 
   // INHERIT deliberately retains the historical adapter behavior: the first
@@ -5007,6 +5262,18 @@ export async function generatePreparedImageAdapterImages(
   });
 
   const submitStartedAt = Date.now();
+  const submitDiagnosticScope = startImageResponseDiagnostic({
+    clientRequestId: diagnosticContext.clientRequestId,
+    providerId: diagnosticContext.providerId,
+    routeId: diagnosticContext.routeId,
+    adapterKey: diagnosticContext.adapterKey,
+    phase: 'generate',
+    attempt: 1,
+    addressSource: 'execution_config',
+    targetUrl: providerDiagnosticTarget(provider, executionConfig.submitEndpoint),
+    timeoutMs: executionConfig.submitTimeoutMs,
+    method: 'POST',
+  });
   let started: unknown;
   const taskBody = { ...prepared.body };
   delete taskBody.async;
@@ -5016,12 +5283,17 @@ export async function generatePreparedImageAdapterImages(
     executionConfig.asyncParameterValue,
   );
   try {
-    started = await request(
-      executionConfig.submitEndpoint,
-      submitBody,
-      executionConfig.submitTimeoutMs,
-      uselgIdempotencyHeaders(provider, input),
-    );
+    started = (await runImageResponseDiagnosticRequest(
+      submitDiagnosticScope,
+      scope => request(
+        executionConfig.submitEndpoint,
+        submitBody,
+        executionConfig.submitTimeoutMs,
+        uselgIdempotencyHeaders(provider, input),
+        undefined,
+        scope,
+      ),
+    )).value;
   } catch (error) {
     if (isAmbiguousImageTaskSubmitError(error)) {
       throw new AmbiguousImageTaskSubmissionError(
@@ -5035,7 +5307,12 @@ export async function generatePreparedImageAdapterImages(
 
   const configuredEnvelope = configuredImageTaskEnvelope(started, executionConfig);
   const submitSummary = executionConfig.profile === 'USELG_IMAGE_TASK'
-    ? summarizeUselgImageStatus(configuredEnvelope, input.inputImages, input.count)
+    ? summarizeUselgImageStatus(
+      configuredEnvelope,
+      input.inputImages,
+      input.count,
+      submitDiagnosticScope,
+    )
     : {
       taskId: getTaskId(configuredEnvelope),
       state: newApiImageTaskState(configuredEnvelope),
@@ -5083,14 +5360,23 @@ export async function generatePreparedImageAdapterImages(
         routeId: diagnosticContext.routeId,
         adapterKey: diagnosticContext.adapterKey,
         adapterExecutionStartedAt,
+        statusAddressSource: nestedStringByKeys(
+          started,
+          new Set(['status_url', 'poll_url']),
+        ) ? 'upstream' : 'execution_config',
+        resultAddressSource: nestedStringByKeys(
+          started,
+          new Set(['result_url']),
+        ) ? 'upstream' : 'execution_config',
       },
-      async (path, body, timeoutOverrideMs, onResponseStatus) => configuredImageTaskEnvelope(
+      async (path, body, timeoutOverrideMs, onResponseStatus, diagnosticScope) => configuredImageTaskEnvelope(
         await request(
           path,
           body,
           timeoutOverrideMs,
           undefined,
           onResponseStatus,
+          diagnosticScope,
         ),
         executionConfig,
         submitSummary.taskId,

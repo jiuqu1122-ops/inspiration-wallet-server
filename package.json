@@ -17,6 +17,7 @@
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src --max-warnings=0",
+    "benchmark:image-response": "tsx scripts/benchmark-image-response.mts",
     "credits:grant": "node dist/cli/grant-credits.js",
     "client-assets:upload": "node dist/cli/upload-client-assets.js",
     "prisma:generate": "prisma generate",

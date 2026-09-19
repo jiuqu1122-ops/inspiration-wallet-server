@@ -80,6 +80,8 @@ const envSchema = z
     AI_UPSTREAM_CONNECT_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(30_000),
     AI_UPSTREAM_FIRST_RESPONSE_TIMEOUT_MS: z.coerce.number().int().min(30_000).max(900_000).default(300_000),
     AI_UPSTREAM_IDLE_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(900_000).default(300_000),
+    IMAGE_RESPONSE_DIAGNOSTICS: z.enum(['off', 'basic', 'detailed']).default('basic'),
+    IMAGE_RESPONSE_DIAGNOSTICS_SLOW_MS: z.coerce.number().int().min(100).max(900_000).default(10_000),
     WORKER_HEALTH_FILE: z.string().min(1).default('/tmp/inspiration-worker-health'),
     IMAGE_RESULT_STORE_DIR: z.string().min(1).default(join(tmpdir(), 'inspiration-image-results')),
     IMAGE_RESULT_TTL_MINUTES: z.coerce.number().int().min(30).max(10_080).default(1_440),
