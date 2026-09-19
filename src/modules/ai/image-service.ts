@@ -710,6 +710,35 @@ function providerRequestUrl(provider: Pick<AiProviderChannel, 'baseUrl'>, pathOr
   return target.toString();
 }
 
+export function normalizeUselgImageStatusUrl(
+  provider: Pick<AiProviderChannel, 'baseUrl'>,
+  statusUrl: string,
+  taskId: string,
+) {
+  let target: URL;
+  try {
+    target = new URL(providerRequestUrl(provider, statusUrl));
+  } catch {
+    // Keep the original value so providerRequest performs the existing URL
+    // validation and reports the same error when the poll is attempted.
+    return statusUrl;
+  }
+  const providerOrigin = new URL(provider.baseUrl).origin;
+  const expectedPath = `/v1/images/tasks/${encodeURIComponent(taskId)}`;
+  if (
+    target.origin !== providerOrigin
+    || target.pathname !== expectedPath
+    || target.searchParams.has('view')
+  ) {
+    return statusUrl;
+  }
+
+  target.searchParams.append('view', 'summary');
+  return /^https?:\/\//i.test(statusUrl)
+    ? target.toString()
+    : `${target.pathname}${target.search}${target.hash}`;
+}
+
 function providerDiagnosticTarget(
   provider: Pick<AiProviderChannel, 'baseUrl'>,
   pathOrUrl: string,
@@ -779,6 +808,47 @@ function isAmbiguousImageTaskSubmitError(error: unknown): error is UpstreamImage
     && (error.status === 0 || [502, 503, 504].includes(error.status));
 }
 
+class ProviderResponseTimeoutError extends Error {
+  readonly code = 'IMAGE_PROVIDER_RESPONSE_TIMEOUT';
+
+  constructor(timeoutMs: number) {
+    super(`Provider response exceeded the ${timeoutMs}ms deadline`);
+    this.name = 'ProviderResponseTimeoutError';
+  }
+}
+
+async function readProviderResponseText(
+  response: Response,
+  waitForDeadline: <T>(operation: Promise<T>) => Promise<T>,
+  setActiveReader: (
+    reader: ReadableStreamDefaultReader<Uint8Array> | undefined,
+  ) => void,
+) {
+  if (!response.body) return '';
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  setActiveReader(reader);
+  try {
+    while (true) {
+      const { done, value } = await waitForDeadline(reader.read());
+      if (done) break;
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    return chunks.join('');
+  } finally {
+    setActiveReader(undefined);
+    try {
+      reader.releaseLock();
+    } catch {
+      // A deadline cancellation may still be settling the active read. The
+      // cancellation owns the reader until that operation has completed.
+    }
+  }
+}
+
 export async function providerRequest(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
@@ -791,22 +861,48 @@ export async function providerRequest(
 ) {
   const controller = new AbortController();
   const timeoutMs = timeoutOverrideMs ?? (/(?:video|workerTask)/i.test(path) ? 10 * 60_000 : 4 * 60_000);
+  let activeReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let rejectDeadline: (error: ProviderResponseTimeoutError) => void = () => {};
+  const deadline = new Promise<never>((_resolve, reject) => {
+    rejectDeadline = reject;
+  });
+  const waitForDeadline = <T>(operation: Promise<T>) => Promise.race([operation, deadline]);
   const timeout = setTimeout(() => {
     if (diagnosticScope) diagnosticScope.timeoutTriggered = true;
-    controller.abort();
+    const error = new ProviderResponseTimeoutError(timeoutMs);
+    rejectDeadline(error);
+    controller.abort(error);
+    if (activeReader) {
+      const reader = activeReader;
+      activeReader = undefined;
+      void reader.cancel(error).finally(() => {
+        try {
+          reader.releaseLock();
+        } catch {
+          // The stream implementation may have released the lock on abort.
+        }
+      }).catch(() => {
+        // The controller abort above is the second best-effort cancellation
+        // path. The explicit deadline rejection must not wait on either one.
+      });
+    }
   }, timeoutMs);
   try {
-    const response = await fetch(providerRequestUrl(provider, path), {
+    const response = await waitForDeadline(fetch(providerRequestUrl(provider, path), {
       method: body === undefined ? 'GET' : 'POST',
       headers: upstreamHeaders(secrets, extraHeaders),
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       redirect: 'error',
       signal: controller.signal,
-    });
+    }));
     if (diagnosticScope) markImageResponseHeaders(diagnosticScope, response);
     onResponseStatus?.(response.status);
     const bodyStartedAt = performance.now();
-    const text = await response.text();
+    const text = await readProviderResponseText(
+      response,
+      waitForDeadline,
+      reader => { activeReader = reader; },
+    );
     if (diagnosticScope) markImageResponseBodyComplete(diagnosticScope, text, bodyStartedAt);
     const parseStartedAt = performance.now();
     const parsed = parseProviderResponse(text);
@@ -2542,8 +2638,11 @@ export async function resolveUselgImageResponse(
   if (immediate.length) return complete(immediate, 'immediate');
   if (!taskId) throw new Error('uselg 没有返回图片数据或 task_id');
 
-  let statusUrl = initialStatusUrl
-    || `/v1/images/tasks/${encodeURIComponent(taskId)}?view=summary`;
+  let statusUrl = normalizeUselgImageStatusUrl(
+    provider,
+    initialStatusUrl || `/v1/images/tasks/${encodeURIComponent(taskId)}?view=summary`,
+    taskId,
+  );
   let statusAddressSource: 'upstream' | 'upstream_updated' | 'execution_config' | 'default' = initialStatusUrl
     ? diagnosticContext?.statusAddressSource ?? 'upstream'
     : 'default';
@@ -2643,7 +2742,7 @@ export async function resolveUselgImageResponse(
     );
     if (statusSummary.statusUrl && statusSummary.statusUrl !== statusUrl) {
       statusAddressSource = 'upstream_updated';
-      statusUrl = statusSummary.statusUrl;
+      statusUrl = normalizeUselgImageStatusUrl(provider, statusSummary.statusUrl, taskId);
     }
     if (statusSummary.resultUrl && statusSummary.resultUrl !== resultUrl) {
       resultAddressSource = 'upstream_updated';
