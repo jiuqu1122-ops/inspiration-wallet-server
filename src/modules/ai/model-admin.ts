@@ -1065,6 +1065,10 @@ function costProfileToSuggestedPrice(
     };
   }
   if (modality === 'image') {
+    // Do not invent an exchange rate for USD procurement costs.  Existing
+    // CNY records remain valid; USD records need an explicitly configured
+    // local price before an operator can publish a suggestion.
+    if (costProfile.currency === 'USD') return null;
     const costs = costProfile.cnyPerImageByResolution;
     if (!costs || typeof costs !== 'object' || Array.isArray(costs)) return null;
     const prices = Object.fromEntries(Object.entries(costs).flatMap(([resolution, cost]) => {

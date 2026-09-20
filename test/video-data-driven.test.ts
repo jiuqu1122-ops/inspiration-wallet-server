@@ -254,6 +254,50 @@ describe('data-driven managed video capabilities', () => {
     await expect(genericAsyncVideoAdapter.poll(context, 'task')).resolves.toMatchObject({ state: 'failed', assetState: 'expired' });
   });
 
+  it('preserves a provider poll_after_ms of two minutes and retries a transient status error', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'queued', poll_after_ms: 120_000 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ message: 'gateway' }), { status: 502 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const context = { route: route(), provider };
+    await expect(genericAsyncVideoAdapter.poll(context, 'task')).resolves.toMatchObject({
+      state: 'processing',
+      pollAfterMs: 120_000,
+    });
+    await expect(genericAsyncVideoAdapter.poll(context, 'task')).resolves.toMatchObject({
+      state: 'processing',
+      upstreamStatus: 'temporarily_unavailable',
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds response-body reads instead of waiting forever after headers arrive', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        text: () => new Promise<string>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new Error('body timeout')), { once: true });
+        }),
+      } as unknown as Response));
+      vi.stubGlobal('fetch', fetchMock);
+      const pending = genericAsyncVideoAdapter.submit(
+        { route: route(), provider },
+        normalizeManagedVideoRequest(baseRequest, 'canonical-video', {}),
+        0,
+        videoOutputIdempotencyKey('body-timeout', 0),
+      );
+      const assertion = expect(pending).rejects.toThrow(/outcome is uncertain/);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await assertion;
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('charges video_flat per generated output and duration pricing per second', () => {
     const snapshot = (pricing: PricingSnapshot['pricing'], request: Record<string, unknown>): PricingSnapshot => ({
       schemaVersion: 1,

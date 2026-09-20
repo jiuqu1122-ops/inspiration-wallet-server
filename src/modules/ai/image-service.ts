@@ -4955,6 +4955,24 @@ async function reserveImageCredits(
   return reservation;
 }
 
+function collectTaskIdsFromValue(value: unknown, output = new Set<string>(), depth = 0): string[] {
+  if (depth > 8 || value === null || value === undefined) return Array.from(output);
+  if (Array.isArray(value)) {
+    value.forEach(item => collectTaskIdsFromValue(item, output, depth + 1));
+    return Array.from(output);
+  }
+  if (typeof value !== 'object') return Array.from(output);
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    if (/^(?:task[_-]?id|upstream[_-]?task[_-]?id)$/i.test(key)
+      && (typeof nested === 'string' || typeof nested === 'number')) {
+      const taskId = String(nested).trim();
+      if (taskId) output.add(taskId);
+    }
+    if (nested && typeof nested === 'object') collectTaskIdsFromValue(nested, output, depth + 1);
+  }
+  return Array.from(output);
+}
+
 async function settleImageCredits(
   prisma: PrismaClient,
   input: ImageInput,
@@ -5361,7 +5379,13 @@ export async function generatePreparedImageAdapterImages(
     return images;
   }
 
-  const executionConfig = normalizeImageTaskExecutionConfig(route?.executionConfig);
+  const rawTaskConfig = route?.executionConfig;
+  const taskConfigForNormalization = prepared.adapterKey === 'SEEDREAM_IMAGES_API'
+    && rawTaskConfig && typeof rawTaskConfig === 'object' && !Array.isArray(rawTaskConfig)
+    && typeof (rawTaskConfig as Record<string, unknown>).submitEndpoint !== 'string'
+    ? { ...(rawTaskConfig as Record<string, unknown>), submitEndpoint: prepared.endpoint }
+    : rawTaskConfig;
+  const executionConfig = normalizeImageTaskExecutionConfig(taskConfigForNormalization);
   if (executionConfig.profile === 'USELG_IMAGE_TASK' && provider.kind !== 'USELG') {
     throw new ImageAdapterError(
       'IMAGE_ADAPTER_CONFIG_INVALID',
@@ -5371,6 +5395,13 @@ export async function generatePreparedImageAdapterImages(
   }
 
   const adapterExecutionStartedAt = Date.now();
+  // Images API adapters choose generation vs edit from the actual reference
+  // payload.  A generic TASK submitEndpoint is only a fallback for adapters
+  // without that distinction; it must not overwrite Seedream's prepared edit
+  // endpoint.
+  const taskSubmitEndpoint = prepared.adapterKey === 'SEEDREAM_IMAGES_API'
+    ? prepared.endpoint
+    : executionConfig.submitEndpoint;
   const diagnosticContext: ImageAdapterTaskDiagnosticContext = {
     clientRequestId: input.clientRequestId,
     canonicalModel: route?.canonicalModelKey ?? input.model,
@@ -5387,7 +5418,7 @@ export async function generatePreparedImageAdapterImages(
     adapterKey: diagnosticContext.adapterKey,
     executionMode,
     profile: executionConfig.profile,
-    endpoint: executionConfig.submitEndpoint,
+    endpoint: taskSubmitEndpoint,
   });
 
   const submitStartedAt = Date.now();
@@ -5399,7 +5430,7 @@ export async function generatePreparedImageAdapterImages(
     phase: 'generate',
     attempt: 1,
     addressSource: 'execution_config',
-    targetUrl: providerDiagnosticTarget(provider, executionConfig.submitEndpoint),
+    targetUrl: providerDiagnosticTarget(provider, taskSubmitEndpoint),
     timeoutMs: executionConfig.submitTimeoutMs,
     method: 'POST',
   });
@@ -5415,7 +5446,7 @@ export async function generatePreparedImageAdapterImages(
     started = (await runImageResponseDiagnosticRequest(
       submitDiagnosticScope,
       scope => request(
-        executionConfig.submitEndpoint,
+        taskSubmitEndpoint,
         submitBody,
         executionConfig.submitTimeoutMs,
         uselgIdempotencyHeaders(provider, input),
@@ -6997,6 +7028,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       ));
       for (const task of tasks) {
         let lastError: unknown = new Error('No compatible generic video route is available');
+        let submissionUncertain = false;
         for (const candidate of genericRoutes) {
           const candidateAdapter = getVideoAdapter(candidate.adapterKey);
           if (!candidateAdapter || !candidate.channel) continue;
@@ -7010,11 +7042,57 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
             if (candidate.id !== task.routeId) {
               await prisma.aiVideoTask.update({ where: { id: task.id }, data: { routeId: candidate.id } });
             }
-            await recordVideoTaskSubmission(prisma, task.id, submission);
+            try {
+              await recordVideoTaskSubmission(prisma, task.id, submission);
+            } catch (persistenceError) {
+              // The upstream task already exists. Retry only the local receipt
+              // write; never POST the generation again or fail over to another
+              // channel after a persistence error.
+              try {
+                await recordVideoTaskSubmission(prisma, task.id, submission);
+              } catch (retryPersistenceError) {
+                await prisma.aiVideoTask.update({
+                  where: { id: task.id },
+                  data: {
+                    routeId: candidate.id,
+                    upstreamTaskId: submission.upstreamTaskId,
+                    upstreamPayload: toInputJson(submission.upstreamPayload),
+                    status: 'PERSISTENCE_PENDING',
+                    pollAfterMs: submission.pollAfterMs === undefined
+                      ? null
+                      : clampVideoPollAfterMs(submission.pollAfterMs),
+                    lastError: retryPersistenceError instanceof Error
+                      ? retryPersistenceError.message
+                      : String(retryPersistenceError),
+                  },
+                }).catch(() => undefined);
+                lastError = persistenceError;
+                submissionUncertain = true;
+                break;
+              }
+            }
+            if (submissionUncertain) break;
             lastError = null;
             break;
           } catch (error) {
             lastError = error;
+            const deliveryState = (error as { deliveryState?: string })?.deliveryState;
+            if (deliveryState === 'unknown') {
+              // A timeout/5xx/connection reset does not prove that the route
+              // rejected the task. Leave the reservation and expose a recovery
+              // state instead of switching channels and creating a duplicate.
+              await prisma.aiVideoTask.update({
+                where: { id: task.id },
+                data: {
+                  routeId: candidate.id,
+                  status: 'SUBMISSION_PENDING',
+                  lastError: error instanceof Error ? error.message : String(error),
+                  pollAfterMs: clampVideoPollAfterMs(task.pollAfterMs),
+                },
+              }).catch(() => undefined);
+              submissionUncertain = true;
+              break;
+            }
             console.warn('[managed_video_route_submit_failed]', {
               canonicalModel: canonicalModelKey,
               routeId: candidate.id,
@@ -7023,7 +7101,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
             });
           }
         }
-        if (lastError) await recordVideoTaskFailure(prisma, task.id, lastError);
+        if (lastError && !submissionUncertain) await recordVideoTaskFailure(prisma, task.id, lastError);
       }
       await settleVideoRequestIfTerminal(prisma, reservation.requestId);
       const persistedTasks = await prisma.aiVideoTask.findMany({
@@ -7031,7 +7109,11 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
         orderBy: { outputIndex: 'asc' },
       });
       return {
-        status: persistedTasks.some(task => task.status === 'PROCESSING') ? 'processing' : 'failed',
+        status: persistedTasks.some(task => task.status === 'PROCESSING')
+          ? 'processing'
+          : persistedTasks.some(task => task.status === 'SUBMISSION_PENDING' || task.status === 'PERSISTENCE_PENDING')
+            ? 'pending_confirmation'
+            : 'failed',
         results: persistedTasks.map(publicVideoTask),
         provider: 'managed',
         model: canonicalModelKey,
@@ -7065,6 +7147,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       }
     }
     const results: unknown[] = [];
+    const legacyTaskIds = new Set<string>();
     for (let index = 0; index < upstreamInput.count; index += 1) {
       const path = provider.kind === 'XAIS'
         ? '/xais/workerTaskStart'
@@ -7125,6 +7208,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       }
       if (lastError instanceof Error) throw lastError;
       if (lastError) throw new Error('Mikoto video generation failed');
+      collectTaskIdsFromValue(result).forEach(taskId => legacyTaskIds.add(taskId));
       results.push(await mirrorGeneratedVideoResponse(
         result,
         provider.name,
@@ -7132,6 +7216,16 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
           ? providerVideoResultMirror(provider, secrets)
           : mirrorGeneratedVideoResultToStorage,
       ));
+    }
+    // Keep the upstream identity beside the request before settlement. Legacy
+    // status queries are allowed only when this persisted binding matches the
+    // caller's taskId; an unbound historical row remains manual-verification
+    // only.
+    if (legacyTaskIds.size > 0 && prisma.aiRequest?.update) {
+      await prisma.aiRequest.update({
+        where: { id: reservation.requestId },
+        data: { result: toInputJson({ results, upstreamTaskIds: Array.from(legacyTaskIds) }) },
+      });
     }
     const breakdown = pricingSnapshot ? calculateSnapshotCharge(pricingSnapshot) : undefined;
     await settleVideo(prisma, input.userId, reservation.requestId, reservation.estimated, breakdown, pricingSnapshot);
@@ -7158,7 +7252,19 @@ export async function executeWalletVideoStatus(
     if (managedTask.request.userId !== input.userId) {
       throw new CloudAiError('video_task_not_found', 'Video task was not found', 404);
     }
+    if (input.clientRequestId && input.clientRequestId !== managedTask.request.clientRequestId) {
+      throw new CloudAiError('video_task_not_found', 'Video task was not found', 404);
+    }
+    if (input.providerChannelId && input.providerChannelId !== managedTask.route?.channelId) {
+      throw new CloudAiError('video_task_not_found', 'Video task was not found', 404);
+    }
     if (managedTask.status === 'SUCCEEDED' || managedTask.status === 'FAILED') {
+      return publicVideoTask(managedTask);
+    }
+    // A submit timeout/5xx has no trustworthy upstream task id. Do not turn
+    // that ambiguous receipt into a failure (and therefore a release/refund)
+    // merely because the client retries the status endpoint.
+    if (managedTask.status === 'SUBMISSION_PENDING') {
       return publicVideoTask(managedTask);
     }
     const managedRoute = managedTask.route;
@@ -7175,16 +7281,44 @@ export async function executeWalletVideoStatus(
       return publicVideoTask(await prisma.aiVideoTask.findUniqueOrThrow({ where: { id: managedTask.id } }));
     }
     const context = { route: managedRoute, provider: managedProvider };
-    const status = managedTask.status === 'PERSISTENCE_PENDING'
-      ? {
-        state: 'completed' as const,
-        upstreamStatus: 'completed',
-        upstreamPayload: managedTask.upstreamPayload,
-        videoAvailable: true,
-        ...(managedTask.assetState ? { assetState: managedTask.assetState } : {}),
-        ...(managedTask.pollAfterMs !== null ? { pollAfterMs: managedTask.pollAfterMs } : {}),
+    let status: Awaited<ReturnType<typeof adapter.poll>>;
+    try {
+      status = managedTask.status === 'PERSISTENCE_PENDING'
+        ? {
+          state: 'completed' as const,
+          upstreamStatus: 'completed',
+          upstreamPayload: managedTask.upstreamPayload,
+          videoAvailable: true,
+          ...(managedTask.assetState ? { assetState: managedTask.assetState } : {}),
+          ...(managedTask.pollAfterMs !== null ? { pollAfterMs: managedTask.pollAfterMs } : {}),
+        }
+        : await adapter.poll(context, managedTask.upstreamTaskId);
+    } catch (error) {
+      // A transient status failure must not turn an already-created upstream
+      // task into a terminal failure. Keep the same upstream identity and make
+      // the next recovery attempt visible to the client.
+      const statusCode = Number((error as { status?: unknown })?.status);
+      const retryable = !Number.isFinite(statusCode)
+        || statusCode === 408 || statusCode === 425 || statusCode === 429
+        || statusCode === 500 || statusCode === 502 || statusCode === 503 || statusCode === 504;
+      if (retryable) {
+        const retryAfterMs = Number((error as { retryAfterMs?: unknown })?.retryAfterMs);
+        const nextPollAfterMs = Number.isFinite(retryAfterMs)
+          ? clampVideoPollAfterMs(retryAfterMs)
+          : clampVideoPollAfterMs(managedTask.pollAfterMs);
+        const updated = await prisma.aiVideoTask.update({
+          where: { id: managedTask.id },
+          data: {
+            status: 'PROCESSING',
+            pollAfterMs: nextPollAfterMs,
+            lastPolledAt: new Date(),
+            lastError: error instanceof Error ? error.message : String(error),
+          },
+        });
+        return publicVideoTask(updated);
       }
-      : await adapter.poll(context, managedTask.upstreamTaskId);
+      throw error;
+    }
     await prisma.aiVideoTask.update({
       where: { id: managedTask.id },
       data: {
@@ -7248,8 +7382,14 @@ export async function executeWalletVideoStatus(
     }
     return publicVideoTask(await prisma.aiVideoTask.findUniqueOrThrow({ where: { id: managedTask.id } }));
   }
-  const requestRoute = input.clientRequestId
-    ? (await prisma.aiRequest.findUnique({
+  if (!input.clientRequestId) {
+    // Legacy provider task ids were historically accepted directly from the
+    // client. Without a persisted request binding there is no safe way to know
+    // which user/channel owns the upstream task, so expose recovery as a
+    // verification-needed state instead of probing a guessed provider.
+    throw new CloudAiError('video_task_pending_confirmation', 'This legacy video task needs request verification before it can be queried', 409);
+  }
+  const boundRequest = await prisma.aiRequest.findUnique({
       where: {
         userId_clientRequestId: {
           userId: input.userId,
@@ -7257,8 +7397,15 @@ export async function executeWalletVideoStatus(
         },
       },
       include: { route: { include: { channel: true } } },
-    }))?.route ?? null
-    : null;
+    });
+  if (!boundRequest || boundRequest.capability !== 'VIDEO') {
+    throw new CloudAiError('video_task_not_found', 'Video task was not found', 404);
+  }
+  const requestRoute = boundRequest.route;
+  const boundTaskIds = collectTaskIdsFromValue(boundRequest.result);
+  if (!boundTaskIds.includes(input.taskId)) {
+    throw new CloudAiError('video_task_pending_confirmation', 'The legacy task is not bound to this request; manual verification is required', 409);
+  }
   const provider = requestRoute?.channel
     ?? await selectVideoProvider(prisma, input.provider, input.providerChannelId);
   await assertPublicProviderUrl(provider.baseUrl);

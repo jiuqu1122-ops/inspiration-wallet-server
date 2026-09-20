@@ -31,6 +31,12 @@ export type GenericAsyncVideoConfig = {
   idempotencyHeader: string;
 };
 
+/** A single upstream HTTP exchange must never outlive the task that owns it. */
+export const VIDEO_SUBMIT_REQUEST_TIMEOUT_MS = 60_000;
+export const VIDEO_STATUS_REQUEST_TIMEOUT_MS = 30_000;
+
+export type VideoSubmitDeliveryState = 'not-accepted' | 'unknown';
+
 const objectValue = (value: unknown) => value && typeof value === 'object' && !Array.isArray(value)
   ? value as Record<string, unknown>
   : {};
@@ -134,30 +140,61 @@ async function jsonRequest(
   init: RequestInit,
 ) {
   await assertPublicProviderUrl(context.provider.baseUrl);
-  const response = await fetch(endpoint(context, path), init);
-  const text = await response.text();
-  let payload: unknown = null;
-  try { payload = text ? JSON.parse(text) : null; } catch { payload = { message: text }; }
-  if (!response.ok) {
-    const error = new Error(`Video provider request failed with HTTP ${response.status}`) as Error & {
-      status?: number;
-      retryAfterMs?: number;
-      payload?: unknown;
-    };
-    error.status = response.status;
-    const retryAfter = response.headers.get('retry-after');
-    if (retryAfter) {
-      const seconds = Number(retryAfter);
-      const date = Date.parse(retryAfter);
-      const retryAfterMs = Number.isFinite(seconds)
-        ? Math.max(0, seconds * 1_000)
-        : Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
-      if (retryAfterMs !== undefined) error.retryAfterMs = retryAfterMs;
+  const controller = new AbortController();
+  const timeoutMs = init.method === 'GET'
+    ? VIDEO_STATUS_REQUEST_TIMEOUT_MS
+    : VIDEO_SUBMIT_REQUEST_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const externalSignal = init.signal;
+  const abortExternal = () => controller.abort(externalSignal?.reason);
+  externalSignal?.addEventListener('abort', abortExternal, { once: true });
+  let response: Response;
+  try {
+    // Keep the same deadline for headers and body. A provider that sends headers
+    // and then stalls must not leave an unbounded response.text() behind.
+    response = await fetch(endpoint(context, path), { ...init, signal: controller.signal });
+    const text = await response.text();
+    let payload: unknown = null;
+    try { payload = text ? JSON.parse(text) : null; } catch { payload = { message: text }; }
+    if (!response.ok) {
+      const error = new Error(`Video provider request failed with HTTP ${response.status}`) as Error & {
+        status?: number;
+        retryAfterMs?: number;
+        payload?: unknown;
+        deliveryState?: VideoSubmitDeliveryState;
+      };
+      error.status = response.status;
+      // Only an explicit client/auth/validation rejection proves that no task was
+      // accepted. Gateway errors, throttling and timeouts are intentionally
+      // ambiguous and must not trigger another POST on a different route.
+      error.deliveryState = [400, 401, 403, 404, 405, 409, 415, 422].includes(response.status)
+        ? 'not-accepted'
+        : 'unknown';
+      const retryAfter = response.headers.get('retry-after');
+      if (retryAfter) {
+        const seconds = Number(retryAfter);
+        const date = Date.parse(retryAfter);
+        const retryAfterMs = Number.isFinite(seconds)
+          ? Math.max(0, seconds * 1_000)
+          : Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
+        if (retryAfterMs !== undefined) error.retryAfterMs = retryAfterMs;
+      }
+      error.payload = payload;
+      throw error;
     }
-    error.payload = payload;
-    throw error;
+    return payload;
+  } catch (error) {
+    if (error && typeof error === 'object' && 'status' in error) throw error;
+    const uncertain = new Error(
+      `Video provider ${init.method === 'GET' ? 'status' : 'submission'} request outcome is uncertain`,
+      { cause: error },
+    ) as Error & { deliveryState?: VideoSubmitDeliveryState };
+    uncertain.deliveryState = 'unknown';
+    throw uncertain;
+  } finally {
+    clearTimeout(timer);
+    externalSignal?.removeEventListener('abort', abortExternal);
   }
-  return payload;
 }
 
 export const genericAsyncVideoAdapter: VideoAdapter = {
@@ -213,10 +250,12 @@ export const genericAsyncVideoAdapter: VideoAdapter = {
       );
     } catch (error) {
       const typed = error as Error & { status?: number; retryAfterMs?: number; payload?: unknown };
-      if (typed.status === 429) {
+      if (typed.status === 429 || typed.status === 408 || typed.status === 425
+        || typed.status === 500 || typed.status === 502 || typed.status === 503 || typed.status === 504
+        || (typed as Error & { deliveryState?: VideoSubmitDeliveryState }).deliveryState === 'unknown') {
         return {
           state: 'processing',
-          upstreamStatus: 'rate_limited',
+          upstreamStatus: typed.status === 429 ? 'rate_limited' : 'temporarily_unavailable',
           upstreamPayload: typed.payload ?? null,
           ...(typed.retryAfterMs !== undefined ? { pollAfterMs: typed.retryAfterMs } : {}),
         } satisfies VideoAdapterPollResult;

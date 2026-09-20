@@ -4,8 +4,11 @@
         timeouts {
             read_body 5m
             read_header 15s
-            write 12m
-            idle 15m
+            # The longest synchronous image/video response is bounded by the
+            # application's 15m generation budget. Keep proxy write/header
+            # deadlines aligned and leave a small tail for response flush.
+            write 16m
+            idle 17m
         }
     }
 }
@@ -33,7 +36,7 @@ api.unmind.art {
             dial_timeout 10s
             # Image/video compatibility endpoints remain synchronous. Agent and
             # inspiration analysis now return a task id immediately.
-            response_header_timeout 17m
+            response_header_timeout 16m
         }
     }
 

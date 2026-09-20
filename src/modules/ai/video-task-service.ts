@@ -11,7 +11,10 @@ export const videoOutputIdempotencyKey = (clientRequestId: string, outputIndex: 
 
 export const clampVideoPollAfterMs = (value: unknown, fallback = 2_500) => {
   const number = Number(value);
-  return Number.isFinite(number) ? Math.max(1_000, Math.min(30_000, Math.round(number))) : fallback;
+  // Providers commonly ask for 120s or more.  Keep a safety ceiling for
+  // malformed responses, but never truncate a valid Retry-After/poll_after_ms
+  // to the old 30s client cadence.
+  return Number.isFinite(number) ? Math.max(1_000, Math.min(24 * 60 * 60_000, Math.round(number))) : fallback;
 };
 
 export async function createVideoTasks(
@@ -221,10 +224,13 @@ export function publicVideoTask(task: {
   const status = task.status === 'SUCCEEDED'
     ? 'completed'
     : task.status === 'FAILED' ? 'failed' : 'processing';
+  const confirmationRequired = task.status === 'SUBMISSION_PENDING'
+    || task.status === 'PERSISTENCE_PENDING';
   return {
     taskId: task.id,
     upstreamTaskId: task.upstreamTaskId,
     status,
+    ...(confirmationRequired ? { confirmationRequired: true, recoveryStatus: 'pending_confirmation' } : {}),
     video_available: task.videoAvailable ?? Boolean(task.resultUrl),
     videoAvailable: task.videoAvailable ?? Boolean(task.resultUrl),
     asset_state: task.assetState,
