@@ -709,7 +709,7 @@ describe('managed canonical route identity', () => {
     });
   });
 
-  it('refunds a prepared adapter result when storage persistence fails without regenerating or failing over', async () => {
+  it('keeps a prepared adapter result locally when storage persistence fails without regenerating or failing over', async () => {
     const primary = provider('grok-persistence-primary', 'https://1.1.1.1', 'NEW_API', ['IMAGE']);
     const fallback = provider('grok-persistence-fallback', 'https://8.8.8.8', 'NEW_API', ['IMAGE']);
     const route = (id: string, channel: AiProviderChannel, priority: number) => ({
@@ -789,7 +789,7 @@ describe('managed canonical route identity', () => {
     const info = vi.spyOn(console, 'info').mockImplementation(() => {});
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    await expect(executeWalletImageGeneration(prisma, {
+    const result = await executeWalletImageGeneration(prisma, {
       userId: 'user-1',
       clientRequestId: 'managed-grok-persistence',
       model: 'grok-image',
@@ -799,17 +799,15 @@ describe('managed canonical route identity', () => {
       resolution: '2k',
       outputFormat: 'png',
       count: 1,
-    })).rejects.toMatchObject({
-      code: 'IMAGE_RESULT_PERSISTENCE_FAILED',
-      statusCode: 502,
     });
+    expect(result.images[0]).toMatch(/^https:\/\/api\.example\.test\/v1\/ai\/image-results\/[a-f0-9]{64}\.png$/);
 
     expect(fetchMock.mock.calls.map(([source]) => String(source))).toEqual([
       'https://1.1.1.1/v1/images/generations',
       providerResultUrl,
     ]);
     expect(uploadMedia).toHaveBeenCalledTimes(3);
-    expect(info.mock.calls.some(([event]) => event === '[image_generation_complete]')).toBe(false);
+    expect(info.mock.calls.some(([event]) => event === '[image_generation_complete]')).toBe(true);
     expect(info).toHaveBeenCalledWith('[image_generation_timing]', expect.objectContaining({
       upstreamDurationMs: expect.any(Number),
       mirrorDurationMs: expect.any(Number),
@@ -825,7 +823,7 @@ describe('managed canonical route identity', () => {
       durationMs: expect.any(Number),
       final: true,
     }));
-    expect(getRequest()).toMatchObject({ status: 'FAILED' });
+    expect(getRequest()).toMatchObject({ status: 'SUCCEEDED' });
     expect(transaction.wallet.update).toHaveBeenCalledTimes(1);
   });
 });
