@@ -77,6 +77,7 @@ import {
   xaisAttachmentRegistrationUrls,
 } from '../src/modules/ai/image-service.js';
 import { createImageResultFromResponse, getImageResult } from '../src/modules/ai/image-result-store.js';
+import { imageResultFallbackStore } from '../src/modules/ai/image-result-fallback.js';
 import { storageService } from '../src/modules/storage/service.js';
 import { encryptProviderSecrets } from '../src/lib/provider-secrets.js';
 import { imageRouteExecutionMode } from '../src/modules/ai/image-execution.js';
@@ -2528,7 +2529,7 @@ describe('wallet image provider normalization', () => {
     expect(alphaAt(3, 3)).toBe(255);
   });
 
-  it('returns the original GPT Image 2 result when no transparent background can be produced', async () => {
+  it('keeps the generated GPT Image 2 bytes behind our stable URL when transparency is unavailable', async () => {
     const generated = await sharp({
       create: {
         width: 8,
@@ -2537,15 +2538,15 @@ describe('wallet image provider normalization', () => {
         background: { r: 32, g: 96, b: 160, alpha: 1 },
       },
     }).png().toBuffer();
-    const original = `data:image/png;base64,${generated.toString('base64')}`;
     const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({
       output: [{ result: generated.toString('base64') }],
     }), { status: 200, headers: { 'content-type': 'application/json' } }));
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.stubGlobal('fetch', fetchMock);
 
+    let result: string | undefined;
     try {
-      await expect(generateNewApiImages(
+      [result] = await generateNewApiImages(
         { baseUrl: 'https://provider.example', name: 'Image2 channel' } as Parameters<typeof generateNewApiImages>[0],
         { apiKey: 'test-key', headers: {} },
         {
@@ -2560,12 +2561,19 @@ describe('wallet image provider normalization', () => {
           background: 'transparent',
           count: 1,
         },
-      )).resolves.toEqual([original]);
+      );
     } finally {
       warn.mockRestore();
     }
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result).toMatch(/^https:\/\/api\.example\.test\/v1\/ai\/image-results\/[a-f0-9]{64}\.png$/);
+    expect(result).not.toContain('provider.example');
+    const key = new URL(result!).pathname.split('/').pop()!;
+    const stored = await getImageResult(key);
+    expect(stored).not.toBeNull();
+    expect(await readFile(stored!.path)).toEqual(generated);
+    await rm(stored!.path, { force: true });
   });
 
   it('keeps transparent GPT Image 2 reference requests on the multipart edits endpoint', async () => {
@@ -3012,6 +3020,130 @@ describe('wallet image provider normalization', () => {
     const stored = await getImageResult(key);
     expect(await readFile(stored!.path)).toEqual(outputPng);
     await rm(stored!.path, { force: true });
+  });
+
+  it('accepts a generated image above the 16 MiB reference limit and below 64 MiB', async () => {
+    const outputUrl = 'https://1.1.1.1/generated-20m.png';
+    const outputPng = Buffer.alloc(20 * 1024 * 1024);
+    Buffer.from('89504e470d0a1a0a', 'hex').copy(outputPng);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ url: outputUrl }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(outputPng, {
+        status: 200,
+        headers: {
+          'content-type': 'image/png',
+          'content-length': String(outputPng.byteLength),
+        },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const [result] = await generateNewApiImages(
+      { baseUrl: 'https://provider.example', name: 'NewAPI large result' } as Parameters<typeof generateNewApiImages>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-1', clientRequestId: 'request-large-result', model: 'gemini-3-pro-image',
+        prompt: 'render a large image', inputImages: [], aspectRatio: '16:9', resolution: '4K',
+        outputFormat: 'png', count: 1,
+      },
+    );
+
+    expect(result).not.toBe(outputUrl);
+    const key = new URL(result!).pathname.split('/').pop()!;
+    const stored = await getImageResult(key);
+    expect(stored?.size).toBe(outputPng.byteLength);
+    await rm(stored!.path, { force: true });
+  });
+
+  it('rejects generated images above 64 MiB without returning the upstream URL', async () => {
+    const outputUrl = 'https://1.1.1.1/generated-too-large.png?signature=secret';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ url: outputUrl }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(Buffer.from('89504e470d0a1a0a', 'hex'), {
+        status: 200,
+        headers: {
+          'content-type': 'image/png',
+          'content-length': String(64 * 1024 * 1024 + 1),
+        },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateNewApiImages(
+      { baseUrl: 'https://provider.example', name: 'NewAPI oversized result' } as Parameters<typeof generateNewApiImages>[0],
+      { apiKey: 'test-key', headers: {} },
+      {
+        userId: 'user-1', clientRequestId: 'request-oversized-result', model: 'gemini-3-pro-image',
+        prompt: 'render an oversized image', inputImages: [], aspectRatio: '16:9', resolution: '4K',
+        outputFormat: 'png', count: 1,
+      },
+    )).rejects.toMatchObject({ code: 'IMAGE_DOWNLOAD_TOO_LARGE' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses the server-side fallback after mirroring fails without regenerating', async () => {
+    const outputUrl = 'https://1.1.1.1/generated-fallback.png?signature=UPSTREAM_SECRET';
+    const stableUrl = `https://api.example.test/v1/ai/image-results/${'a'.repeat(64)}.png`;
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ url: outputUrl }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response('', { status: 403 }));
+    const createFallback = vi.spyOn(imageResultFallbackStore, 'createFallback').mockResolvedValue(stableUrl);
+    const getReceipt = vi.spyOn(imageResultFallbackStore, 'getReceipt').mockResolvedValue({
+      version: 1,
+      key: `${'a'.repeat(64)}.png`,
+      source: outputUrl,
+      mime: 'image/png',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    } as never);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      const [result] = await generateNewApiImages(
+        { baseUrl: 'https://provider.example', name: 'NewAPI fallback' } as Parameters<typeof generateNewApiImages>[0],
+        { apiKey: 'test-key', headers: {} },
+        {
+          userId: 'user-1', clientRequestId: 'request-upstream-fallback', model: 'gemini-3-pro-image',
+          prompt: 'render once', inputImages: [], aspectRatio: '16:9', resolution: '2K',
+          outputFormat: 'png', count: 1,
+        },
+      );
+      expect(result).toMatch(/^https:\/\/api\.example\.test\/v1\/ai\/image-results\/[a-f0-9]{64}\.png$/);
+      expect(result).not.toContain('UPSTREAM_SECRET');
+      await expect(mirrorGeneratedImageResults([result!], 'NewAPI fallback')).resolves.toEqual([stableUrl]);
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://provider.example/v1/images/generations');
+    expect(String(fetchMock.mock.calls[1]?.[0])).toBe(outputUrl);
+    expect(createFallback).toHaveBeenCalledOnce();
+    expect(createFallback).toHaveBeenCalledWith(outputUrl);
+    expect(getReceipt).toHaveBeenCalledWith(`${'a'.repeat(64)}.png`);
+  });
+
+  it('keeps the 16 MiB limit for reference images', async () => {
+    const referenceUrl = 'https://1.1.1.1/reference-too-large.png';
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(Buffer.from('89504e470d0a1a0a', 'hex'), {
+      status: 200,
+      headers: {
+        'content-type': 'image/png',
+        'content-length': String(16 * 1024 * 1024 + 1),
+      },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(materializeNewApiReferenceImage(referenceUrl)).rejects.toThrow('reference image is too large');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('polls an async NewAPI image task and downloads binary content when needed', async () => {

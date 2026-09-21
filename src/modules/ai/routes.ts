@@ -16,7 +16,7 @@ import { getClientEngineAsset } from './client-assets.js';
 import { storageService } from '../storage/service.js';
 import { getImageReference } from './reference-store.js';
 import { isVideoResultKey } from './video-result-store.js';
-import { getImageResult, imageResultMimeForKey } from './image-result-store.js';
+import { serveImageResultWithFallback } from './image-result-fallback.js';
 import { agentToolChoiceSchema, createAiTaskSchema } from './task-schema.js';
 import { ensureAiCatalogSeeded } from './catalog-seed.js';
 import { getPublicAiCatalog, ModelCatalogError } from './model-catalog.js';
@@ -319,47 +319,7 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       }
       const rawKey = (request.params as { key?: unknown }).key;
       const key = typeof rawKey === 'string' ? rawKey.trim() : '';
-      const result = await getImageResult(key);
-      const resultMime = result?.mime || imageResultMimeForKey(key);
-      if (!resultMime) {
-        return reply.code(404).send({ error: 'not_found', message: 'Image result not found or expired' });
-      }
-      let objectName = `generated-images/${key}`;
-      try {
-        if (!await storageService.exists(objectName)) {
-          if (!result) {
-            return reply.code(404).send({ error: 'not_found', message: 'Image result not found or expired' });
-          }
-          objectName = await storageService.uploadMedia({
-            namespace: 'generated-images',
-            source: result.path,
-            filename: key,
-            mime: resultMime,
-          });
-        }
-      } catch (error) {
-        request.log.error({ key, errorName: error instanceof Error ? error.name : 'unknown' }, 'temporary OSS image ensure failed');
-        return reply.code(503).send({
-          error: 'oss_upload_failed',
-          message: 'Generated image could not be uploaded to the temporary download bridge',
-        });
-      }
-      try {
-        const url = storageService.getDownloadUrl(objectName);
-        if (query.data.redirect === '0') {
-          return {
-            url,
-            expiresAt: Date.now() + env.STORAGE_SIGNED_URL_EXPIRES_SECONDS * 1_000,
-          };
-        }
-        return reply.redirect(url);
-      } catch (error) {
-        request.log.error({ key, errorName: error instanceof Error ? error.name : 'unknown' }, 'temporary OSS image signing failed');
-        return reply.code(503).send({
-          error: 'oss_signing_failed',
-          message: 'Generated image temporary URL could not be created',
-        });
-      }
+      return serveImageResultWithFallback(key, query.data.redirect, reply);
     },
   );
 

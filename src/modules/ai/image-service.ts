@@ -26,6 +26,7 @@ import {
   isStoredImageResultUrl,
 } from './image-result-store.js';
 import { storageService } from '../storage/service.js';
+import { imageResultFallbackStore, safeImageDeliveryError } from './image-result-fallback.js';
 import { mirrorGeneratedVideoResultToStorage } from './video-result-store.js';
 import { resolveReferenceImageSources } from './reference-upload-service.js';
 import { creditDecimal, serializeCredit } from '../wallets/credit-amount.js';
@@ -3279,9 +3280,10 @@ async function stageNewApiEditImage(
   wait: (milliseconds: number) => Promise<unknown> = (
     milliseconds,
   ) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  maximumBytes = MAX_IMAGE_REFERENCE_BYTES,
 ): Promise<StagedNewApiEditImage> {
   if (/^data:image\//i.test(source)) {
-    const inline = dataUrlImageBytes(source);
+    const inline = dataUrlImageBytes(source, maximumBytes);
     return {
       filename: `reference-${index + 1}.${newApiImageExtension(inline.mime)}`,
       mime: inline.mime,
@@ -3298,7 +3300,7 @@ async function stageNewApiEditImage(
     for (let attempt = 0; attempt < NEW_API_REFERENCE_DOWNLOAD_ATTEMPTS; attempt += 1) {
       if (attempt > 0) await wait(NEW_API_REFERENCE_DOWNLOAD_RETRY_DELAYS_MS[attempt - 1] ?? 1_500);
       try {
-        const staged = await downloadPublicImageReferenceToFile(source, path);
+        const staged = await downloadPublicImageReferenceToFile(source, path, IMAGE_REFERENCE_FETCH_TIMEOUT_MS, maximumBytes);
         const fileSize = (await stat(path)).size;
         if (fileSize !== staged.size) {
           throw new Error(`reference image temporary file size mismatch: expected ${staged.size}, received ${fileSize}`);
@@ -3364,12 +3366,17 @@ async function withImageResultDownloadLogging<T>(
 ) {
   const startedAt = Date.now();
   console.info('[image_result_download_started]', imageResultPersistenceLogFields(context, index, 0));
-  const result = await operation();
-  console.info(
-    '[image_result_download_complete]',
-    imageResultPersistenceLogFields(context, index, Date.now() - startedAt),
-  );
-  return result;
+  try {
+    const result = await operation();
+    console.info('[image_result_download_complete]', imageResultPersistenceLogFields(context, index, Date.now() - startedAt));
+    return result;
+  } catch (error) {
+    console.warn('[image_result_download_failed]', {
+      ...imageResultPersistenceLogFields(context, index, Date.now() - startedAt),
+      ...safeImageDeliveryError(error),
+    });
+    throw error;
+  }
 }
 
 async function stagePublicGeneratedImageResult(source: string, index: number) {
@@ -3384,6 +3391,7 @@ async function stagePublicGeneratedImageResult(source: string, index: number) {
           source,
           path,
           XAIS_RESULT_MIRROR_TIMEOUT_MS,
+          MAX_GENERATED_IMAGE_BYTES,
         );
         const fileSize = (await stat(path)).size;
         if (fileSize !== staged.size) {
@@ -3399,7 +3407,8 @@ async function stagePublicGeneratedImageResult(source: string, index: number) {
       } catch (error) {
         lastError = error;
         await rm(path, { force: true }).catch(() => {});
-        if (attempt >= IMAGE_RESULT_DOWNLOAD_ATTEMPTS - 1) throw error;
+        if ((error as { code?: string })?.code === 'IMAGE_DOWNLOAD_TOO_LARGE'
+          || attempt >= IMAGE_RESULT_DOWNLOAD_ATTEMPTS - 1) throw error;
       }
     }
     throw lastError instanceof Error ? lastError : new Error('generated image download failed');
@@ -3420,7 +3429,14 @@ export async function uploadStoredImageResultToStorage(
   const stored = logResultAcquisition
     ? await withImageResultDownloadLogging(context, index, reopenStoredResult)
     : await reopenStoredResult();
-  if (!key || !stored) throw new Error('generated image mirror could not reopen the stored result');
+  if (!key) throw new Error('generated image mirror received an invalid stable result URL');
+  if (!stored) {
+    // A prior mirror failure may have produced a receipt-only stable URL. It is
+    // already downloadable through our route, so do not turn delivery fallback
+    // into a second generation/failover or a second charge.
+    if (await imageResultFallbackStore.getReceipt(key)) return stableUrl;
+    throw new Error('generated image mirror could not reopen the stored result');
+  }
   const startedAt = Date.now();
   console.info(
     '[image_result_storage_upload_started]',
@@ -3452,9 +3468,16 @@ export async function uploadStoredImageResultToStorage(
         ...imageResultPersistenceLogFields(context, index, Date.now() - startedAt),
         attempt: attempt + 1,
         final: attempt >= IMAGE_RESULT_STORAGE_UPLOAD_ATTEMPTS - 1,
-        errorName: error instanceof Error ? error.name : 'unknown',
+        ...safeImageDeliveryError(error),
       });
     }
+  }
+  if (await reopenStoredResult()) {
+    console.warn('[image_result_local_fallback_ready]', {
+      ...imageResultPersistenceLogFields(context, index, Date.now() - startedAt),
+      ...safeImageDeliveryError(lastError),
+    });
+    return stableUrl;
   }
   throw new ImageResultPersistenceError(lastError);
 }
@@ -3464,17 +3487,44 @@ export async function mirrorPublicGeneratedImageResultToStorage(
   index: number,
   context: ImageResultPersistenceContext = defaultImageResultPersistenceContext(''),
 ) {
-  const staged = await withImageResultDownloadLogging(
-    context,
-    index,
-    () => stagePublicGeneratedImageResult(source, index),
-  );
+  let staged: StagedNewApiEditImage | null = null;
   try {
+    staged = await withImageResultDownloadLogging(
+      context,
+      index,
+      () => stagePublicGeneratedImageResult(source, index),
+    );
     if (!staged.path) throw new Error('generated image mirror did not create a temporary file');
     const stableUrl = await createImageResultFromFile(staged.path, staged.mime);
-    return uploadStoredImageResultToStorage(stableUrl, index, context, false);
+    // Save an encrypted, expiring source receipt beside the persistent local
+    // cache. Returning the stable bridge never exposes the upstream signed URL.
+    try {
+      await imageResultFallbackStore.rememberVerifiedSource(source, staged.mime, stableUrl);
+    } catch (error) {
+      // A verified local copy is still a usable fallback if receipt persistence
+      // or encryption is unavailable. Never discard it just because COS failed.
+      console.warn('[image_result_fallback_receipt_failed]', {
+        ...imageResultPersistenceLogFields(context, index, 0),
+        ...safeImageDeliveryError(error),
+      });
+    }
+    return await uploadStoredImageResultToStorage(stableUrl, index, context, false);
+  } catch (error) {
+    if ((error as { code?: string })?.code === 'IMAGE_DOWNLOAD_TOO_LARGE') throw error;
+    console.warn('[image_result_persistence_fallback_attempt]', {
+      ...imageResultPersistenceLogFields(context, index, 0),
+      ...safeImageDeliveryError(error),
+    });
+    // This performs only a bounded GET of the existing result (never a new
+    // generation). JSON task receipts / 202 / HTML / expired URLs are rejected.
+    // Do not turn an arbitrary URL into a successful, billable image.
+    const fallbackUrl = await imageResultFallbackStore.createFallback(source);
+    console.warn('[image_result_upstream_fallback_ready]', {
+      ...imageResultPersistenceLogFields(context, index, 0),
+    });
+    return fallbackUrl;
   } finally {
-    await staged.cleanup().catch(() => {});
+    await staged?.cleanup().catch(() => {});
   }
 }
 
@@ -3634,7 +3684,7 @@ async function readNewApiResultBytes(source: string, index: number) {
     if (!stored) throw new Error('stored GPT Image 2 result is no longer available');
     return readFile(stored.path);
   }
-  const staged = await stageNewApiEditImage(source, index);
+  const staged = await stageNewApiEditImage(source, index, undefined, MAX_GENERATED_IMAGE_BYTES);
   try {
     if (staged.bytes) return staged.bytes;
     if (staged.path) return await readFile(staged.path);
@@ -3658,7 +3708,11 @@ async function createTransparentGptImage2Result(source: string, index: number) {
     // never discard a paid generation just because its background cannot be
     // converted safely to alpha.
     console.warn('[gpt_image_2_transparency_fallback]', { index, error: message });
-    return source;
+    return createImageResultFromResponse(new Response(new Uint8Array(sourceBytes), {
+      headers: {
+        'content-length': String(sourceBytes.byteLength),
+      },
+    }));
   }
   return createImageResultFromResponse(new Response(new Uint8Array(png), {
     headers: {
@@ -3948,15 +4002,16 @@ export async function generateNewApiImages(
     }
     let staged: StagedNewApiEditImage | null = null;
     try {
-      staged = await stageNewApiEditImage(source, index);
+      staged = await stageNewApiEditImage(source, index, undefined, MAX_GENERATED_IMAGE_BYTES);
       output.push(await createImageResultFromFile(staged.path!, staged.mime));
     } catch (error) {
       console.warn('[newapi_image_result_mirror_failed]', {
         provider: provider.name,
         index,
-        error: error instanceof Error ? error.message : String(error),
+        ...safeImageDeliveryError(error),
       });
-      output.push(source);
+      if ((error as { code?: string })?.code === 'IMAGE_DOWNLOAD_TOO_LARGE') throw error;
+      output.push(await imageResultFallbackStore.createFallback(source));
     } finally {
       if (staged) await staged.cleanup().catch(() => {});
     }
@@ -3983,11 +4038,12 @@ function retryableXaisReferenceDownloadError(error: unknown) {
   return /(?:abort|timed?\s*out|timeout|fetch failed|terminated|socket|connection|incomplete\s*read|ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR|empty image bytes|valid image bytes|content-length mismatch)/i.test(message);
 }
 
-async function writeResponseBodyToFile(response: Response, path: string) {
+async function writeResponseBodyToFile(response: Response, path: string, maximumBytes = MAX_IMAGE_REFERENCE_BYTES) {
   if (!response.body) throw new Error('reference image response has no body');
   const declaredLength = Number(response.headers.get('content-length') || '0');
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_IMAGE_REFERENCE_BYTES) {
-    throw new Error('reference image is too large');
+  if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
+    void response.body.cancel().catch(() => {});
+    throw Object.assign(new Error('image download exceeds the configured byte limit'), { code: 'IMAGE_DOWNLOAD_TOO_LARGE', maximumBytes, declaredLength });
   }
 
   const file = await open(path, 'w');
@@ -4000,9 +4056,9 @@ async function writeResponseBodyToFile(response: Response, path: string) {
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
-      if (total > MAX_IMAGE_REFERENCE_BYTES) {
+      if (total > maximumBytes) {
         await reader.cancel();
-        throw new Error('reference image is too large');
+        throw Object.assign(new Error('image download exceeds the configured byte limit'), { code: 'IMAGE_DOWNLOAD_TOO_LARGE', maximumBytes, downloadedBytes: total });
       }
       if (prefixLength < 512) {
         const prefix = Buffer.from(value.buffer, value.byteOffset, Math.min(value.byteLength, 512 - prefixLength));
@@ -4042,6 +4098,7 @@ async function downloadPublicImageReferenceToFile(
   source: string,
   path: string,
   timeoutMs = IMAGE_REFERENCE_FETCH_TIMEOUT_MS,
+  maximumBytes = MAX_IMAGE_REFERENCE_BYTES,
 ) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -4053,7 +4110,7 @@ async function downloadPublicImageReferenceToFile(
       if (objectKey) {
         return readStorageImageReference(
           objectKey,
-          response => writeResponseBodyToFile(response, path),
+          response => writeResponseBodyToFile(response, path, maximumBytes),
         );
       }
       await assertPublicProviderUrl(currentUrl);
@@ -4070,7 +4127,7 @@ async function downloadPublicImageReferenceToFile(
         continue;
       }
       if (!response.ok) throw new Error(`reference image HTTP ${response.status}`);
-      return await writeResponseBodyToFile(response, path);
+      return await writeResponseBodyToFile(response, path, maximumBytes);
     }
     throw new Error('reference image redirect limit exceeded');
   } finally {
