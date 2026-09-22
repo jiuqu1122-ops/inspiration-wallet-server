@@ -1,3 +1,4 @@
+import { buildFailureDiagnostic } from './failure-diagnostic.js';
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { createHash } from 'node:crypto';
 import { creditDecimal } from '../wallets/credit-amount.js';
@@ -102,6 +103,10 @@ export async function settleVideoRequestIfTerminal(prisma: PrismaClient, request
         where: { id: request.id, status: { in: ['RESERVED', 'PROCESSING'] } },
         data: {
           status: 'FAILED',
+          failureDiagnostic: toInputJson(buildFailureDiagnostic(
+            request.videoTasks.find(task => task.status === 'FAILED')?.lastError,
+            { stage: 'video_task' },
+          )),
           result: toInputJson({
             tasks: request.videoTasks.map(task => ({ id: task.id, status: task.status, error: task.lastError })),
           }),
