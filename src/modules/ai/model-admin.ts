@@ -643,9 +643,6 @@ export async function unmapAdminAiRoute(
       include: { canonicalModel: true, channel: true },
     });
     if (!route?.canonicalModel) throw new AiModelAdminError('NOT_FOUND', 'Mapped route was not found', 404);
-    if (!route.channelId || !route.channel) {
-      throw new AiModelAdminError('INVALID_REQUEST', 'Legacy routes without a channel cannot enter the upstream review queue', 400);
-    }
     if (route.canonicalModelId !== input.currentCanonicalModelId
       || asIso(route.updatedAt) !== asIso(input.expectedUpdatedAt)) {
       throw new AiModelAdminError('CONFLICT', 'Route mapping was modified by another administrator', 409);
@@ -668,44 +665,51 @@ export async function unmapAdminAiRoute(
       route.id,
       context,
     );
-    const discovery = await transaction.aiUpstreamDiscovery.upsert({
-      where: {
-        channelId_upstreamModelId: {
+    // Provider deletion sets channelId to null. The historical route still needs
+    // to be detachable, but cannot be put back in the review queue because an
+    // upstream discovery must belong to an existing channel.
+    const discovery = route.channelId && route.channel
+      ? await transaction.aiUpstreamDiscovery.upsert({
+        where: {
+          channelId_upstreamModelId: {
+            channelId: route.channelId,
+            upstreamModelId: route.upstreamModelId,
+          },
+        },
+        create: {
+          provider: route.provider,
           channelId: route.channelId,
           upstreamModelId: route.upstreamModelId,
+          suggestedModality: route.canonicalModel.modality,
+          availability: route.upstreamAvailable ? 'AVAILABLE' : 'UNAVAILABLE',
+          ...(route.capabilitiesOverride ? { capabilities: route.capabilitiesOverride } : {}),
+          ...(route.costProfile ? { discoveredCost: route.costProfile } : {}),
+          ...(route.metadata ? { metadata: route.metadata } : {}),
+          status: 'UNMAPPED',
+          lastSyncedAt: route.lastSyncedAt ?? new Date(),
         },
-      },
-      create: {
-        provider: route.provider,
-        channelId: route.channelId,
-        upstreamModelId: route.upstreamModelId,
-        suggestedModality: route.canonicalModel.modality,
-        availability: route.upstreamAvailable ? 'AVAILABLE' : 'UNAVAILABLE',
-        ...(route.capabilitiesOverride ? { capabilities: route.capabilitiesOverride } : {}),
-        ...(route.costProfile ? { discoveredCost: route.costProfile } : {}),
-        ...(route.metadata ? { metadata: route.metadata } : {}),
-        status: 'UNMAPPED',
-        lastSyncedAt: route.lastSyncedAt ?? new Date(),
-      },
-      update: {
-        provider: route.provider,
-        suggestedModality: route.canonicalModel.modality,
-        availability: route.upstreamAvailable ? 'AVAILABLE' : 'UNAVAILABLE',
-        ...(route.capabilitiesOverride ? { capabilities: route.capabilitiesOverride } : {}),
-        ...(route.costProfile ? { discoveredCost: route.costProfile } : {}),
-        ...(route.metadata ? { metadata: route.metadata } : {}),
-        status: 'UNMAPPED',
-        suggestedModelId: null,
-        ...(route.lastSyncedAt ? { lastSyncedAt: route.lastSyncedAt } : {}),
-      },
-    });
+        update: {
+          provider: route.provider,
+          suggestedModality: route.canonicalModel.modality,
+          availability: route.upstreamAvailable ? 'AVAILABLE' : 'UNAVAILABLE',
+          ...(route.capabilitiesOverride ? { capabilities: route.capabilitiesOverride } : {}),
+          ...(route.costProfile ? { discoveredCost: route.costProfile } : {}),
+          ...(route.metadata ? { metadata: route.metadata } : {}),
+          status: 'UNMAPPED',
+          suggestedModelId: null,
+          ...(route.lastSyncedAt ? { lastSyncedAt: route.lastSyncedAt } : {}),
+        },
+      })
+      : null;
     await recordAdminOperation(transaction, AdminOperationType.ROUTE_UNMAPPED, context, {
       schemaVersion: 1,
       routeId: route.id,
       provider: route.provider,
       upstreamModelId: route.upstreamModelId,
       before: { canonicalModelId: route.canonicalModelId, canonicalModelKey: route.canonicalModel.canonicalModelKey },
-      after: { canonicalModelId: null, discoveryId: discovery.id, status: 'UNMAPPED' },
+      after: discovery
+        ? { canonicalModelId: null, discoveryId: discovery.id, status: 'UNMAPPED' }
+        : { canonicalModelId: null, discoveryId: null, status: 'CHANNEL_DELETED' },
       preserved: {
         priority: route.priority,
         costProfile: route.costProfile,

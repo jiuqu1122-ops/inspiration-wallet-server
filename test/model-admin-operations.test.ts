@@ -494,6 +494,73 @@ describe('AI Model Center route operations', () => {
     expect(result.route).toMatchObject({ id: route.id, canonicalModelId: null, enabled: false });
   });
 
+  it('unmaps an orphaned route after its channel was deleted', async () => {
+    const route = {
+      id: 'route-deleted-channel',
+      canonicalModelId: 'model-image',
+      canonicalModel: {
+        id: 'model-image',
+        canonicalModelKey: 'image-model',
+        modality: 'image',
+      },
+      channelId: null,
+      channel: null,
+      provider: 'NEW_API',
+      upstreamModelId: 'vendor/image-v1',
+      enabled: true,
+      priority: 4,
+      upstreamAvailable: false,
+      capabilitiesOverride: null,
+      costProfile: null,
+      metadata: null,
+      lastSyncedAt: null,
+      updatedAt,
+    };
+    const routeUpdate = vi.fn(async () => ({ count: 1 }));
+    const auditCreate = vi.fn(async () => ({}));
+    const transaction = {
+      aiModelRoute: {
+        findUnique: vi.fn(async () => route),
+        updateMany: routeUpdate,
+        findFirst: vi.fn(async () => null),
+        findUniqueOrThrow: vi.fn(async () => ({ ...route, canonicalModelId: null, enabled: false })),
+      },
+      aiModel: {
+        findUnique: vi.fn(async ({ where, include }: { where: { id: string }; include?: object }) => (
+          include
+            ? { id: where.id, pricing: null, routes: [] }
+            : { id: where.id, canonicalModelKey: 'image-model', defaultRouteId: route.id }
+        )),
+        update: vi.fn(async () => ({})),
+      },
+      aiModelAlias: { findUnique: vi.fn(async () => null) },
+      adminOperation: { create: auditCreate },
+    };
+
+    const result = await unmapAdminAiRoute(withTransaction(transaction), route.id, {
+      currentCanonicalModelId: route.canonicalModelId,
+      expectedUpdatedAt: updatedAt.toISOString(),
+    }, context);
+
+    expect(routeUpdate).toHaveBeenCalledWith({
+      where: { id: route.id, canonicalModelId: route.canonicalModelId, updatedAt },
+      data: { canonicalModelId: null, enabled: false },
+    });
+    expect(result).toMatchObject({
+      route: { id: route.id, canonicalModelId: null, enabled: false },
+      discovery: null,
+      previousModelId: route.canonicalModelId,
+    });
+    expect(auditCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        type: 'ROUTE_UNMAPPED',
+        result: expect.objectContaining({
+          after: { canonicalModelId: null, discoveryId: null, status: 'CHANNEL_DELETED' },
+        }),
+      }),
+    }));
+  });
+
   it('rejects a stale remap before changing aliases or route ownership', async () => {
     const routeUpdate = vi.fn();
     const aliasUpdate = vi.fn();
