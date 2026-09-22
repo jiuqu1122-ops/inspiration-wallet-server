@@ -1,3 +1,4 @@
+import { buildFailureDiagnostic, type FailureDiagnostic } from './failure-diagnostic.js';
 import { Prisma } from '@prisma/client';
 import type { AiCapability, AiProviderChannel, PrismaClient } from '@prisma/client';
 import { createHash, randomUUID } from 'node:crypto';
@@ -5143,6 +5144,7 @@ async function releaseImageCredits(
   input: ImageInput,
   requestId: string,
   estimated: string,
+  failureDiagnostic?: FailureDiagnostic,
 ) {
   const estimatedCredits = creditDecimal(estimated);
   await prisma.$transaction(async (transaction) => {
@@ -5151,7 +5153,10 @@ async function releaseImageCredits(
     await releaseMembershipQuota(transaction, request.pricingSnapshot);
     const claimed = await transaction.aiRequest.updateMany({
       where: { id: requestId, userId: input.userId, status: { in: ['RESERVED', 'PROCESSING'] } },
-      data: { status: 'FAILED', result: Prisma.DbNull, completedAt: new Date() },
+      data: {
+        status: 'FAILED', result: Prisma.DbNull, completedAt: new Date(),
+        ...(failureDiagnostic ? { failureDiagnostic: toInputJson(failureDiagnostic) } : {}),
+      },
     });
     if (claimed.count !== 1) return;
     const wallet = await transaction.wallet.update({
@@ -6155,7 +6160,8 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         503,
       );
     }
-    await releaseImageCredits(prisma, reservationInput, reservation.requestId, reservation.estimated);
+    await releaseImageCredits(prisma, reservationInput, reservation.requestId, reservation.estimated,
+      buildFailureDiagnostic(error, { stage: 'image_generation', resolution: input.resolution }));
     if (error instanceof CloudAiError || error instanceof ModelCatalogError) throw error;
     if (error instanceof ImageResultPersistenceError) {
       throw new CloudAiError(error.code, error.message, 502);

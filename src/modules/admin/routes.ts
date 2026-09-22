@@ -1,3 +1,4 @@
+import { usageDiagnosticsRoutes } from './usage-diagnostics-routes.js';
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import type { Prisma } from '@prisma/client';
 import { z } from 'zod';
@@ -79,6 +80,7 @@ function invalid(reply: FastifyReply, message: string) {
 
 export const adminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.authenticateAdmin);
+  await app.register(usageDiagnosticsRoutes);
 
   await app.register(providerAdminRoutes, { prefix: '/providers' });
   await app.register(inspirationSpaceAdminRoutes, { prefix: '/inspiration-space' });

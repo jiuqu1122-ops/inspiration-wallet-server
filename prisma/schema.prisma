@@ -455,6 +455,8 @@ model AiRequest {
   estimatedCredits  Decimal              @default(0) @db.Decimal(24, 6)
   chargedCredits    Decimal              @default(0) @db.Decimal(24, 6)
   result            Json?
+  /// Safe failure classification; no response bodies, prompts, secrets or image URLs.
+  failureDiagnostic Json?
   createdAt         DateTime             @default(now())
   completedAt       DateTime?
   user              User                 @relation(fields: [userId], references: [id], onDelete: Restrict)

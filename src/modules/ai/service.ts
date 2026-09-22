@@ -1,3 +1,4 @@
+import { buildFailureDiagnostic, type FailureDiagnostic } from './failure-diagnostic.js';
 import type { AiCapability, AiProviderChannel, Prisma, PrismaClient } from '@prisma/client';
 import { Agent } from 'undici';
 import { env } from '../../config/env.js';
@@ -1376,14 +1377,16 @@ async function settleCredits(
   });
 }
 
-async function releaseCredits(prisma: PrismaClient, userId: string, requestId: string) {
+async function releaseCredits(prisma: PrismaClient, userId: string, requestId: string, failureDiagnostic?: FailureDiagnostic) {
   await prisma.$transaction(async (transaction) => {
     const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
     if (!request || request.userId !== userId || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
     await releaseMembershipQuota(transaction, request.pricingSnapshot);
     const claimed = await transaction.aiRequest.updateMany({
       where: { id: requestId, status: { in: ['RESERVED', 'PROCESSING'] } },
-      data: { status: 'FAILED', completedAt: new Date() },
+      data: { status: 'FAILED', completedAt: new Date(),
+        ...(failureDiagnostic ? { failureDiagnostic: toInputJson(failureDiagnostic) } : {}),
+      },
     });
     if (claimed.count !== 1) return;
     const credits = request.estimatedCredits;
@@ -1720,7 +1723,8 @@ export async function executeWalletAgentChat(
     });
     return result;
   } catch (error) {
-    await releaseCredits(prisma, input.userId, requestId);
+    await releaseCredits(prisma, input.userId, requestId,
+      buildFailureDiagnostic(error, { stage: 'text_request' }));
     throw error;
   }
 }
@@ -1913,7 +1917,8 @@ export async function executeWalletInspirationAnalysis(
     });
     return result.analysis;
   } catch (error) {
-    await releaseCredits(prisma, input.userId, requestId);
+    await releaseCredits(prisma, input.userId, requestId,
+      buildFailureDiagnostic(error, { stage: 'text_request' }));
     throw error;
   }
 }
