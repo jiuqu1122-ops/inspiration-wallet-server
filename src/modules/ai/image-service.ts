@@ -1,3 +1,10 @@
+// MODEL_CATALOG_STABILITY_PATCH_V1
+import { configuredCatalogFallback } from './configured-catalog-fallback.js';
+import {
+  retryImageRead, imageExplicitTaskId, parseImageRetryAfter, withImagePollHint,
+  ImageTaskRecoveryRequiredError, ImageTaskTerminalFailureError,
+  isTransientImageTransferError,
+} from './image-task-retry.js';
 import { buildFailureDiagnostic, type FailureDiagnostic } from './failure-diagnostic.js';
 import { Prisma } from '@prisma/client';
 import type { AiCapability, AiProviderChannel, PrismaClient } from '@prisma/client';
@@ -913,13 +920,13 @@ export async function providerRequest(
     const parsed = parseProviderResponse(text);
     if (diagnosticScope) markImageResponseParseComplete(diagnosticScope, parsed, parseStartedAt);
     if (!response.ok) {
-      throw new UpstreamImageError(
+      throw Object.assign(new UpstreamImageError(
         response.status,
         upstreamErrorMessage(response.status, text),
         parsed.value,
-      );
+      ), { retryAfterMs: parseImageRetryAfter(response.headers.get('retry-after')) });
     }
-    return parsed.value;
+    return withImagePollHint(parsed.value, response.headers.get('retry-after'));
   } catch (error) {
     if (error instanceof UpstreamImageError) throw error;
     throw new UpstreamImageError(
@@ -979,6 +986,7 @@ function rawImageBase64Mime(value: string) {
 }
 
 function appendImageString(value: string, output: string[], contextKey: string) {
+  if (/^(?:error|err|errors|message|msg|detail|fail_reason|failure_reason|error_message|stack|trace|debug|prompt|negative_prompt)$/i.test(contextKey)) return;
   if (IMAGE_DATA_URL_PREFIX.test(value)) {
     output.push(value);
     return;
@@ -999,7 +1007,11 @@ function appendImageString(value: string, output: string[], contextKey: string) 
   if (dataUrls) output.push(...dataUrls);
   output.push(...Array.from(value.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)).map((match) => match[1] ?? ''));
   const urls = value.match(/https?:\/\/[^\s"'<>)}\]]+/gi);
-  if (urls) output.push(...urls.map((url) => url.replace(/[.,;，。；]+$/g, '')));
+  if (urls) {
+    output.push(...urls
+      .map((url) => url.replace(/[.,;，。；]+$/g, ''))
+      .filter((url) => !isUselgTaskControlUrl(url)));
+  }
 }
 
 function appendInlineImage(record: Record<string, unknown>, output: string[]) {
@@ -1254,14 +1266,23 @@ export async function listWalletImageModels(
         error: null,
       };
     } catch (error) {
+      // Discovery health must not erase administrator-configured public SKUs.
+      // These helpers already enforce enabled/published/visible and route
+      // compatibility. Deliberately do not resurrect IDs from old responses.
+      const configured = configuredCatalogFallback(
+        routeModelsForChannel(provider.id, 'image'),
+        modelCapabilitiesForChannel(provider.id, 'image'),
+        provider.defaultModel
+          ? canonicalForUpstream(provider, provider.defaultModel, 'image')
+          : null,
+      );
       return {
         id: provider.id,
         name: provider.name,
         provider: publicWalletImageProviderKind(provider),
-        defaultModel: provider.defaultModel,
-        models: [] as string[],
+        ...configured,
         capabilities: provider.capabilities,
-        modelCapabilities: {},
+        // Keep health error visible; generation still performs route checks.
         error: error instanceof Error ? error.message.slice(0, 800) : '读取模型失败',
       };
     }
@@ -1379,13 +1400,13 @@ export async function bigmodelRequest(
     const parsed = parseProviderResponse(text);
     if (diagnosticScope) markImageResponseParseComplete(diagnosticScope, parsed, parseStartedAt);
     if (!response.ok) {
-      throw new UpstreamImageError(
+      throw Object.assign(new UpstreamImageError(
         response.status,
         upstreamErrorMessage(response.status, text),
         parsed.value,
-      );
+      ), { retryAfterMs: parseImageRetryAfter(response.headers.get('retry-after')) });
     }
-    return parsed.value;
+    return withImagePollHint(parsed.value, response.headers.get('retry-after'));
   } catch (error) {
     if (error instanceof UpstreamImageError) throw error;
     throw new UpstreamImageError(
@@ -1747,9 +1768,9 @@ async function generateGeminiImageConfigImages(
       });
     }
     images.push(...(
-      immediate.length > 0 || !resolvePendingResponse
-        ? immediate
-        : await resolvePendingResponse(value)
+      resolvePendingResponse
+        ? await resolvePendingResponse(value)
+        : immediate
     ));
   }
   const unique = Array.from(new Set(images)).slice(0, input.count);
@@ -2315,21 +2336,22 @@ function nestedStringByKeys(
 }
 
 function uselgPollAfterMs(value: unknown) {
-  if (!value || typeof value !== 'object') return 2_000;
+  if (!value || typeof value !== "object") return 2_000;
   const record = value as Record<string, unknown>;
   const raw = record.poll_after_ms ?? record.pollAfterMs;
-  const parsed = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : NaN;
+  const parsed = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
   return Number.isFinite(parsed) ? Math.max(2_000, Math.min(10_000, Math.round(parsed))) : 2_000;
 }
 
 function isUselgTaskControlUrl(value: string) {
   try {
     const pathname = new URL(value).pathname;
-    return /\/v1\/images\/tasks\/[^/]+\/?$/i.test(pathname);
+    return /\/v1\/images\/tasks\/[^/]+(?:\/result)?\/?$/i.test(pathname);
   } catch {
     return false;
   }
 }
+
 
 function uniqueUselgImages(value: unknown, inputImages: string[], count: number) {
   const inputs = new Set(inputImages.map(normalizeCollectedImageString).filter(Boolean));
@@ -2567,7 +2589,12 @@ export function summarizeUselgImageStatus(
     resultUrl,
     pollAfterMs: uselgPollAfterMs(value),
     images: uniqueUselgImageCandidates(
-      imageCandidates,
+      [...imageCandidates].sort((left, right) => {
+        const rank = (value: string) => assets.some(asset => asset.value === value)
+          ? 2
+          : /^https?:\/\//i.test(value) ? 0 : 1;
+        return rank(left) - rank(right);
+      }),
       inputImages,
       count,
       [statusUrl, resultUrl],
@@ -2734,9 +2761,20 @@ export async function resolveUselgImageResponse(
             scope,
           ),
         )).value
-        : await request(statusUrl, undefined, USELG_IMAGE_STATUS_POLL_TIMEOUT_MS);
+        : await retryImageRead(
+          (timeoutMs) => request(statusUrl, undefined, timeoutMs),
+          {
+            identity: { taskId, statusUrl, resultUrl: resultUrl || "" },
+            stage: "status",
+            deadline,
+            wait,
+            timeoutMs: USELG_IMAGE_STATUS_POLL_TIMEOUT_MS,
+            maxAttempts: 5,
+          },
+        );
       lastPollError = null;
     } catch (error) {
+      if (error instanceof ImageTaskRecoveryRequiredError || error instanceof ImageTaskTerminalFailureError) throw error;
       const extractStartedAt = performance.now();
       const errorImages = imagesFromUpstreamError(error, inputImages, count);
       if (pollDiagnosticScope) {
@@ -3136,13 +3174,33 @@ export async function resolveImageAdapterResponse(
         attempt,
       });
     }
-    lastStatus = await request(statusUrl, undefined, 45_000);
+    lastStatus = await retryImageRead(
+      (timeoutMs) => request(statusUrl, undefined, timeoutMs),
+      {
+        identity: { taskId, statusUrl, resultUrl },
+        stage: "status",
+        deadline,
+        wait,
+        maxAttempts: 5,
+      },
+    );
+    const observedTaskId = imageExplicitTaskId(lastStatus);
+    if (observedTaskId && taskId && observedTaskId !== taskId) {
+      throw new ImageTaskRecoveryRequiredError(
+        { taskId, statusUrl, resultUrl },
+        "status",
+        "task_identity_mismatch",
+      );
+    }
     statusUrl = nestedStringByKeys(lastStatus, new Set(['status_url', 'poll_url'])) || statusUrl;
     resultUrl = nestedStringByKeys(lastStatus, new Set(['result_url'])) || resultUrl;
     pollAfterMs = uselgPollAfterMs(lastStatus);
 
     const images = uniqueImageAdapterImages(lastStatus, inputImages, count);
     const state = newApiImageTaskState(lastStatus);
+    if (/^(?:failed|failure|error|cancelled|canceled)$/.test(state)) {
+      throw new ImageTaskTerminalFailureError(taskId || "status_url", state, lastStatus);
+    }
     const assets = collectUselgTaskAssets(lastStatus);
     if (diagnosticContext) {
       console.info('[image_adapter_poll_state]', {
@@ -3162,16 +3220,27 @@ export async function resolveImageAdapterResponse(
     if (images.length) return complete(images, 'status');
     const failure = getFailure(lastStatus);
     if (failure) throw new UpstreamImageError(502, failure, lastStatus);
-    if (/^(?:failed|failure|error|cancelled|canceled)$/.test(state)) {
-      throw new UpstreamImageError(502, `Image adapter task failed (${state}): ${taskId || 'status_url'}`, lastStatus);
-    }
     if (!/^(?:completed|complete|succeeded|success|finished|done)$/.test(state)) continue;
     if (!resultUrl) {
       throw new UpstreamImageError(502, `Image adapter task completed without an image or result_url: ${taskId || 'status_url'}`, lastStatus);
     }
-    const result = await request(resultUrl, undefined, 45_000);
+    const result = await retryImageRead(
+      (timeoutMs) => request(resultUrl, undefined, timeoutMs),
+      {
+        identity: { taskId, statusUrl, resultUrl },
+        stage: "result",
+        deadline,
+        wait,
+        maxAttempts: 5,
+        allowNotReady: true,
+      },
+    );
     const resultImages = uniqueImageAdapterImages(result, inputImages, count);
     if (resultImages.length) return complete(resultImages, 'result_url');
+    const resultState = newApiImageTaskState(result);
+    if (!resultState || /^(?:pending|processing|dispatching|queued|queue|running|in_progress|waiting|success|succeeded|completed|complete|finished|done)$/.test(resultState)) {
+      continue;
+    }
     throw new UpstreamImageError(502, `Image adapter result_url returned no image: ${taskId || 'status_url'}`, result);
   }
   throw new UpstreamImageError(504, `Image adapter task timed out: ${taskId || 'status_url'}`, lastStatus);
@@ -3408,7 +3477,7 @@ async function stagePublicGeneratedImageResult(source: string, index: number) {
       } catch (error) {
         lastError = error;
         await rm(path, { force: true }).catch(() => {});
-        if ((error as { code?: string })?.code === 'IMAGE_DOWNLOAD_TOO_LARGE'
+        if (!isTransientImageTransferError(error)
           || attempt >= IMAGE_RESULT_DOWNLOAD_ATTEMPTS - 1) throw error;
       }
     }
@@ -3579,21 +3648,31 @@ export async function mirrorGeneratedImageResults(
   mirrorImage: GeneratedImageMirror = mirrorGeneratedImageResultToStorage,
   context: ImageResultPersistenceContext = defaultImageResultPersistenceContext(providerName),
 ) {
-  return Promise.all(images.map(async (source, index) => {
-    const trimmed = source.trim();
-    try {
-      return await mirrorImage(trimmed, index, context);
-    } catch (error) {
+  // Keep output order, wait for all output transfers, never submit new generations.
+  const results = await Promise.allSettled(images.map(async (source, index) => mirrorImage(source.trim(), index, context)));
+  const delivered: string[] = [];
+  let firstError: unknown;
+  results.forEach((result, index) => {
+    if (result.status === 'fulfilled' && result.value.trim()) delivered.push(result.value);
+    else {
+      const reason: unknown = result.status === 'rejected' ? result.reason : new Error('Empty delivered image');
+      firstError ??= reason;
       console.warn('[image_result_mirror_failed]', {
-        provider: providerName,
-        ...imageResultPersistenceLogFields(context, index, 0),
-        errorName: error instanceof Error ? error.name : 'unknown',
+        provider: providerName, ...imageResultPersistenceLogFields(context, index, 0),
+        ...safeImageDeliveryError(reason),
       });
-      throw error instanceof ImageResultPersistenceError
-        ? error
-        : new ImageResultPersistenceError(error);
     }
-  }));
+  });
+  if (delivered.length) {
+    if (delivered.length < images.length) console.warn('[image_result_partial_delivery]', {
+      clientRequestId: context.clientRequestId, requestedCount: images.length, deliveredCount: delivered.length,
+    });
+    // Existing settlement uses delivered count and releases the undelivered share.
+    return delivered;
+  }
+  if (images.length) throw firstError instanceof ImageResultPersistenceError
+    ? firstError : new ImageResultPersistenceError(firstError);
+  return [];
 }
 
 function chromaKeyDistance(red: number, green: number, blue: number) {
@@ -4923,7 +5002,14 @@ async function reserveImageCredits(
     const reusableRequest = existing?.status === 'FAILED'
       ? existing
       : null;
-    if (reusableRequest) existing = null;
+    if (reusableRequest) {
+      const claimedRetry = await transaction.aiRequest.updateMany({
+        where: { id: reusableRequest.id, userId: input.userId, capability: 'IMAGE', status: 'FAILED' },
+        data: { status: 'RESERVED' },
+      });
+      if (claimedRetry.count !== 1) throw new CloudAiError('duplicate_request', '该生图重试已经由另一个请求接管', 409);
+      existing = null;
+    }
     if (existing) throw new CloudAiError('duplicate_request', '该生图请求已经提交过', 409);
     const membershipQuota = pricingSnapshot
       ? await reserveMembershipQuota(transaction, {
@@ -5154,7 +5240,7 @@ async function releaseImageCredits(
     const claimed = await transaction.aiRequest.updateMany({
       where: { id: requestId, userId: input.userId, status: { in: ['RESERVED', 'PROCESSING'] } },
       data: {
-        status: 'FAILED', result: Prisma.DbNull, completedAt: new Date(),
+        status: 'FAILED', completedAt: new Date(),
         ...(failureDiagnostic ? { failureDiagnostic: toInputJson(failureDiagnostic) } : {}),
       },
     });
@@ -5560,11 +5646,16 @@ export async function generatePreparedImageAdapterImages(
     state: submitSummary.state,
     hasStatusUrl: Boolean(statusUrl),
   });
-  await options?.onTaskSubmitted?.({
-    taskId: submitSummary.taskId,
-    statusUrl,
-    profile: executionConfig.profile,
-  });
+  try {
+    await options?.onTaskSubmitted?.({
+      taskId: submitSummary.taskId, statusUrl, profile: executionConfig.profile,
+    });
+  } catch (cause) {
+    throw new ImageTaskRecoveryRequiredError({
+      taskId: submitSummary.taskId, statusUrl,
+      resultUrl: nestedStringByKeys(configuredEnvelope, new Set(['result_url'])),
+    }, 'status', 'receipt_persistence_failed', cause);
+  }
 
   if (executionConfig.profile === 'USELG_IMAGE_TASK') {
     return resolveUselgImageResponse(
@@ -5751,6 +5842,35 @@ async function generateImagesFromProvider(
       resultCount: images.length,
     });
   }
+}
+
+/** Retain the original request/receipt on exhausted reads. No generation or wallet write here.
+ * This is an explicit manual-confirmation hold, not an unattended background job. */
+async function retainImageRetryRecovery(
+  prisma: PrismaClient, userId: string, requestId: string,
+  error: ImageTaskRecoveryRequiredError,
+  providerId: string,
+) {
+  await prisma.$transaction(async transaction => {
+    const row = await transaction.aiRequest.findFirst({
+      where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
+      select: { result: true },
+    });
+    if (!row) return;
+    const previous = row.result && typeof row.result === 'object' && !Array.isArray(row.result)
+      ? row.result as Record<string, unknown> : {};
+    await transaction.aiRequest.updateMany({
+      where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
+      data: {
+        status: 'PROCESSING',
+        result: toInputJson({ ...previous, recovery: {
+          version: 1, state: 'manual_confirmation_required', code: error.code,
+          stage: error.stage, reason: error.reason, providerId,
+          identity: error.identity, observedAt: new Date().toISOString(),
+        } }),
+      },
+    });
+  });
 }
 
 export async function executeWalletImageGeneration(prisma: PrismaClient, input: ImageInput) {
@@ -6094,6 +6214,18 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
           chargedCredits: charged,
         };
       } catch (error) {
+        // No accepted-task failure may trigger another generation POST.
+        if (error instanceof ImageTaskRecoveryRequiredError) throw error;
+        if (error instanceof ImageTaskTerminalFailureError) {
+          throw new UpstreamImageError(502, error.message, undefined);
+        }
+        // A missing HTTP status means the POST outcome is unknown. A returned
+        // 5xx is still the existing channel-failover signal and must not be
+        // turned into a hold before any task was accepted.
+        if (error instanceof UpstreamImageError && error.status === 0) {
+          throw new ImageTaskRecoveryRequiredError({ taskId: '', statusUrl: '', resultUrl: '' },
+            'status', 'submission_outcome_unknown', error);
+        }
         const nextProvider = providers[index + 1];
         const canFailOver = validatedInput.clientPlatform === 'tablet'
           ? isTabletImageProviderFailoverStatus(error instanceof UpstreamImageError ? error.status : -1)
@@ -6114,6 +6246,17 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     }
     throw new Error('全部生图渠道请求失败');
   } catch (error) {
+    if (error instanceof ImageTaskRecoveryRequiredError) {
+      try { await retainImageRetryRecovery(prisma, input.userId, reservation.requestId, error, activeProvider.id); }
+      catch (journalError) {
+        console.error('[image_recovery_journal_failed]', { clientRequestId: input.clientRequestId, ...safeImageDeliveryError(journalError) });
+      }
+      console.warn('[image_task_recovery_required]', {
+        clientRequestId: input.clientRequestId, taskId: error.identity.taskId,
+        stage: error.stage, reason: error.reason, newGenerationSubmitted: false, creditsReleased: false,
+      });
+      throw new CloudAiError(error.code, '图片结果待确认，已停止自动重发。请保留请求 ID 联系管理员恢复原任务。', 503);
+    }
     console.warn(
       error instanceof AmbiguousImageTaskSubmissionError
         ? '[image_generation_uncertain]'
@@ -6221,6 +6364,9 @@ export async function getWalletImageGenerationByRequest(
   );
   return {
     status: request.status.toLowerCase(),
+    ...(request.status === 'PROCESSING' && request.result && typeof request.result === 'object'
+      && !Array.isArray(request.result) && 'recovery' in request.result
+      ? { confirmationRequired: true, recoveryStatus: 'manual_confirmation_required' } : {}),
     completedAt: request.completedAt?.getTime() ?? null,
     ...(result ?? {}),
   };
@@ -7538,3 +7684,6 @@ export async function executeWalletVideoStatus(
     true,
   );
 }
+
+
+
