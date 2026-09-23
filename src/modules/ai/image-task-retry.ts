@@ -59,16 +59,24 @@ export function imagePollDelayMs(value: unknown, fallback = 2_000): number {
   const raw = row?.poll_after_ms ?? row?.pollAfterMs;
   if ((typeof raw !== 'number' && typeof raw !== 'string') || raw === '') return fallback;
   const parsed = Number(raw);
-  // Keep valid long hints intact. The caller compares the hint with its deadline;
-  // it never polls earlier simply because its own budget is shorter.
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? Math.max(250, parsed) : fallback;
+  if (!Number.isSafeInteger(parsed) || parsed < 0) return fallback;
+  return Math.min(10_000, Math.max(1_000, parsed));
+}
+
+/** HTTP Retry-After is a transport/backoff hint, not a task poll interval. */
+export function imageRetryAfterMs(value: unknown): number | undefined {
+  const row = record(value);
+  const raw = row?.retry_after_ms ?? row?.retryAfterMs;
+  if ((typeof raw !== 'number' && typeof raw !== 'string') || raw === '') return undefined;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 export function withImagePollHint(value: unknown, header: string | null): unknown {
   const row = record(value);
   const hint = parseImageRetryAfter(header);
   if (!row || hint === undefined) return value;
-  return { ...row, poll_after_ms: Math.max(imagePollDelayMs(row), hint) };
+  return { ...row, retry_after_ms: hint };
 }
 
 export function isTransientImageReadError(error: unknown, allowNotReady = false): boolean {
@@ -131,7 +139,7 @@ export async function retryImageRead<T>(
 }
 
 export type ImageTaskSnapshot = ImageTaskIdentity & {
-  state: string; pollAfterMs: number; images: string[]; failure?: string;
+  state: string; pollAfterMs: number; images: string[]; failure?: string; retryAfterMs?: number | undefined;
   assets: Array<{ key: 'signed_url' | 'download_url' | 'url'; value: string }>;
 };
 export type ImageTaskPollOptions = {
@@ -149,7 +157,12 @@ export type ImageTaskPollOptions = {
 export async function pollAcceptedImageTask(options: ImageTaskPollOptions): Promise<string[]> {
   const now = options.now ?? Date.now;
   const wait = options.wait ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
-  let snapshot = options.summarize(options.initial);
+  const initialSnapshot = options.summarize(options.initial);
+  const initialRetryAfterMs = imageRetryAfterMs(options.initial) ?? initialSnapshot.retryAfterMs;
+  let snapshot = {
+    ...initialSnapshot,
+    ...(initialRetryAfterMs === undefined ? {} : { retryAfterMs: initialRetryAfterMs }),
+  };
   const identity: ImageTaskIdentity = {
     taskId: snapshot.taskId, statusUrl: snapshot.statusUrl, resultUrl: snapshot.resultUrl,
   };
@@ -168,7 +181,13 @@ export async function pollAcceptedImageTask(options: ImageTaskPollOptions): Prom
     if (options.normalizeStatusUrl && identity.statusUrl) {
       identity.statusUrl = options.normalizeStatusUrl(identity.statusUrl, identity.taskId);
     }
-    snapshot = { ...next, ...identity };
+    const nextRetryAfterMs = next.retryAfterMs;
+    snapshot = {
+      ...next,
+      ...identity,
+      pollAfterMs: imagePollDelayMs({ poll_after_ms: next.pollAfterMs }),
+      ...(nextRetryAfterMs === undefined ? {} : { retryAfterMs: nextRetryAfterMs }),
+    };
     if (terminal(snapshot.state)) throw new ImageTaskTerminalFailureError(identity.taskId, snapshot.state,
       snapshot.failure ? new Error(snapshot.failure) : undefined);
     if (!snapshot.state && snapshot.failure && !snapshot.images.length && !snapshot.assets.length) {
@@ -198,7 +217,7 @@ export async function pollAcceptedImageTask(options: ImageTaskPollOptions): Prom
   if (!identity.statusUrl) throw new ImageTaskRecoveryRequiredError(identity, 'status', 'missing_status_url');
   // One polling session, finite retries, no POST. No phase can extend the deadline.
   for (let poll = 0; poll < 500; poll += 1) {
-    const delayMs = Math.max(250, snapshot.pollAfterMs || 2_000);
+    const delayMs = Math.max(snapshot.pollAfterMs || 2_000, snapshot.retryAfterMs ?? 0);
     if (delayMs >= effectiveDeadline() - now()) break;
     await wait(delayMs);
     const value = await retryImageRead(timeout => options.read(identity.statusUrl, 'status', timeout), {
@@ -208,7 +227,9 @@ export async function pollAcceptedImageTask(options: ImageTaskPollOptions): Prom
       allowNotReady: missingTaskCount++ < 2,
       wait, now, onRetry: options.onRetry,
     });
-    observe(options.summarize(value));
+    const nextStatus = options.summarize(value);
+    observe({ ...nextStatus, ...(imageRetryAfterMs(value) === undefined
+      ? {} : { retryAfterMs: imageRetryAfterMs(value) }) });
     const images = await acquire();
     if (images.length) return images;
     // Never probe result on every queued/processing status; this used to add 45s stalls.
@@ -218,8 +239,10 @@ export async function pollAcceptedImageTask(options: ImageTaskPollOptions): Prom
       allowNotReady: true, wait, now, onRetry: options.onRetry,
     });
     const resultSnapshot = options.summarize(result);
+    const resultRetryAfterMs = imageRetryAfterMs(result) ?? resultSnapshot.retryAfterMs;
     observe({ ...resultSnapshot, state: resultSnapshot.state || snapshot.state,
-      pollAfterMs: Math.max(snapshot.pollAfterMs, resultSnapshot.pollAfterMs) });
+      pollAfterMs: Math.max(snapshot.pollAfterMs, resultSnapshot.pollAfterMs),
+      ...(resultRetryAfterMs === undefined ? {} : { retryAfterMs: resultRetryAfterMs }) });
     const resultImages = await acquire();
     if (resultImages.length) return resultImages;
     // completed without readable assets is delivery-pending, not a generation failure.

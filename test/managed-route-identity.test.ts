@@ -314,7 +314,9 @@ describe('managed canonical route identity', () => {
       outputFormat: 'png',
       count: 1,
     })).resolves.toMatchObject({
-      images: [storedUrl],
+      images: [expect.stringMatching(
+        /^https:\/\/api\.example\.test\/v1\/ai\/image-results\/[a-f0-9]{64}\.png$/,
+      )],
       providerChannelId: routeA2Provider.id,
       model: 'image-model-a',
     });
@@ -441,7 +443,9 @@ describe('managed canonical route identity', () => {
       outputFormat: 'png',
       count: 1,
     })).resolves.toMatchObject({
-      images: [storedUrl],
+      images: [expect.stringMatching(
+        /^https:\/\/api\.example\.test\/v1\/ai\/image-results\/[a-f0-9]{64}\.png$/,
+      )],
       providerChannelId: channel.id,
       model: 'nano-banana-2',
     });
@@ -684,7 +688,9 @@ describe('managed canonical route identity', () => {
       outputFormat: 'png',
       count: 1,
     })).resolves.toMatchObject({
-      images: [storedUrl],
+      images: [expect.stringMatching(
+        /^https:\/\/api\.example\.test\/v1\/ai\/image-results\/[a-f0-9]{64}\.png$/,
+      )],
       providerChannelId: fallback.id,
       model: 'grok-image',
     });
@@ -806,11 +812,20 @@ describe('managed canonical route identity', () => {
       'https://1.1.1.1/v1/images/generations',
       providerResultUrl,
     ]);
-    expect(uploadMedia).toHaveBeenCalledTimes(3);
+    await vi.waitFor(() => expect(warn.mock.calls.some(([event, payload]) => (
+      event === '[image_result_storage_upload_failed]'
+      && payload && typeof payload === 'object'
+      && (payload as { clientRequestId?: unknown }).clientRequestId === 'managed-grok-persistence'
+      && (payload as { final?: unknown }).final === true
+    ))).toBe(true), { timeout: 6_000 });
     expect(info.mock.calls.some(([event]) => event === '[image_generation_complete]')).toBe(true);
     expect(info).toHaveBeenCalledWith('[image_generation_timing]', expect.objectContaining({
       upstreamDurationMs: expect.any(Number),
+      localPersistenceDurationMs: expect.any(Number),
       mirrorDurationMs: expect.any(Number),
+      requestDurationMs: expect.any(Number),
+      storageMirrorScheduled: true,
+      storageMirrorDurationMs: null,
       totalDurationMs: expect.any(Number),
     }));
     expect(warn).toHaveBeenCalledWith('[image_result_storage_upload_failed]', expect.objectContaining({
@@ -825,5 +840,5 @@ describe('managed canonical route identity', () => {
     }));
     expect(getRequest()).toMatchObject({ status: 'SUCCEEDED' });
     expect(transaction.wallet.update).toHaveBeenCalledTimes(1);
-  });
+  }, 10_000);
 });

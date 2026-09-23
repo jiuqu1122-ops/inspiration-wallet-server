@@ -38,6 +38,7 @@ vi.mock('../src/modules/ai/image-result-store.js', () => ({
     size: 5,
   })),
   imageResultMimeForKey: vi.fn((key: string) => key.endsWith('.png') ? 'image/png' : null),
+  isImageResultStorageMirrorPending: vi.fn(() => false),
 }));
 
 vi.mock('../src/modules/storage/service.js', () => ({
@@ -49,7 +50,10 @@ vi.mock('../src/modules/providers/url.js', () => ({
 }));
 
 import { aiRoutes } from '../src/modules/ai/routes.js';
-import { getImageResult } from '../src/modules/ai/image-result-store.js';
+import {
+  getImageResult,
+  isImageResultStorageMirrorPending,
+} from '../src/modules/ai/image-result-store.js';
 import { imageResultFallbackStore } from '../src/modules/ai/image-result-fallback.js';
 
 async function makeApp(prisma: unknown = {}) {
@@ -89,6 +93,7 @@ describe('generated image OSS delivery route', () => {
     bridgeMocks.getObjectStream.mockReset();
     bridgeMocks.headObject.mockReset();
     bridgeMocks.tryResolveObjectKeyFromUrl.mockReset();
+    vi.mocked(isImageResultStorageMirrorPending).mockReset().mockReturnValue(false);
 
     bridgeMocks.exists.mockResolvedValue(true);
     bridgeMocks.uploadMedia.mockImplementation(async (input: { namespace: string; filename: string }) => (
@@ -155,6 +160,16 @@ describe('generated image OSS delivery route', () => {
     expect(response.rawPayload).toEqual(pngBytes);
     expect(bridgeMocks.uploadMedia).not.toHaveBeenCalled();
     expect(bridgeMocks.getDownloadUrl).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('serves the local copy without a COS HEAD while its mirror is pending', async () => {
+    vi.mocked(isImageResultStorageMirrorPending).mockReturnValue(true);
+    const app = await makeApp();
+    const response = await app.inject({ method: 'GET', url: `/v1/ai/image-results/${resultKey}` });
+    expect(response.statusCode).toBe(200);
+    expect(response.rawPayload).toEqual(pngBytes);
+    expect(bridgeMocks.exists).not.toHaveBeenCalled();
     await app.close();
   });
 

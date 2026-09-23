@@ -1,7 +1,8 @@
 // MODEL_CATALOG_STABILITY_PATCH_V1
 import { configuredCatalogFallback } from './configured-catalog-fallback.js';
 import {
-  retryImageRead, imageExplicitTaskId, parseImageRetryAfter, withImagePollHint,
+  retryImageRead, imageExplicitTaskId, imagePollDelayMs, imageRetryAfterMs,
+  parseImageRetryAfter, withImagePollHint,
   ImageTaskRecoveryRequiredError, ImageTaskTerminalFailureError,
   isTransientImageTransferError,
 } from './image-task-retry.js';
@@ -30,8 +31,10 @@ import {
 import {
   createImageResultFromFile,
   createImageResultFromResponse,
+  clearImageResultStorageMirrorPending,
   getImageResult,
   isStoredImageResultUrl,
+  markImageResultStorageMirrorPending,
 } from './image-result-store.js';
 import { storageService } from '../storage/service.js';
 import { imageResultFallbackStore, safeImageDeliveryError } from './image-result-fallback.js';
@@ -492,6 +495,8 @@ export class ImageResultPersistenceError extends Error {
     this.name = 'ImageResultPersistenceError';
   }
 }
+
+const pendingImageStorageMirrors = new Map<string, Promise<void>>();
 
 class UpstreamImageError extends Error {
   constructor(
@@ -2411,6 +2416,7 @@ type UselgImageStatusSummary = {
   statusUrl: string;
   resultUrl: string;
   pollAfterMs: number;
+  retryAfterMs?: number;
   images: string[];
   assets: UselgTaskAsset[];
 };
@@ -2582,12 +2588,14 @@ export function summarizeUselgImageStatus(
 
   visit(value, '', true, diagnosticScope?.detailed ? '$' : '');
 
+  const retryAfterMs = imageRetryAfterMs(value);
   const summary = {
     taskId,
     state,
     statusUrl,
     resultUrl,
     pollAfterMs: uselgPollAfterMs(value),
+    ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
     images: uniqueUselgImageCandidates(
       [...imageCandidates].sort((left, right) => {
         const rank = (value: string) => assets.some(asset => asset.value === value)
@@ -2651,6 +2659,7 @@ export async function resolveUselgImageResponse(
   const initialStatusUrl = initialSummary.statusUrl;
   const initialResultUrl = initialSummary.resultUrl;
   const initialPollAfterMs = initialSummary.pollAfterMs;
+  const initialRetryAfterMs = initialSummary.retryAfterMs;
   const complete = (images: string[], sourceType: UselgImageResolveSourceType) => {
     if (diagnosticContext) {
       console.info('[uselg_image_resolve_complete]', {
@@ -2703,13 +2712,15 @@ export async function resolveUselgImageResponse(
   let resultAddressSource: 'upstream' | 'upstream_updated' | 'execution_config' =
     diagnosticContext?.resultAddressSource ?? 'upstream';
   let pollAfterMs = initialPollAfterMs;
+  let retryAfterMs = initialRetryAfterMs;
   let lastStatus: unknown = started;
   let lastPollError: unknown = null;
   let attempt = 0;
   const deadline = Date.now() + IMAGE_GENERATION_TIMEOUT_MS;
 
   while (Date.now() < deadline) {
-    const currentPollAfterMs = pollAfterMs;
+    const currentPollAfterMs = Math.max(pollAfterMs, retryAfterMs ?? 0);
+    if (currentPollAfterMs >= deadline - Date.now()) break;
     await wait(currentPollAfterMs);
     attempt += 1;
     const pollStartedAt = Date.now();
@@ -2819,6 +2830,7 @@ export async function resolveUselgImageResponse(
       resultUrl = statusSummary.resultUrl;
     }
     pollAfterMs = statusSummary.pollAfterMs;
+    retryAfterMs = statusSummary.retryAfterMs;
     const { images, state, assets } = statusSummary;
     const prioritizedAssets = prioritizedUselgAssetImages(assets, count);
     if (diagnosticContext) {
@@ -3157,13 +3169,16 @@ export async function resolveImageAdapterResponse(
     throw new UpstreamImageError(502, 'Asynchronous image response did not provide status_url', started);
   }
   let resultUrl = nestedStringByKeys(started, new Set(['result_url']));
-  let pollAfterMs = uselgPollAfterMs(started);
+  let pollAfterMs = imagePollDelayMs(started);
+  let retryAfterMs = imageRetryAfterMs(started);
   const deadline = Date.now() + IMAGE_GENERATION_TIMEOUT_MS;
   let lastStatus: unknown = started;
   let attempt = 0;
 
   while (Date.now() < deadline) {
-    await wait(pollAfterMs);
+    const currentPollAfterMs = Math.max(pollAfterMs, retryAfterMs ?? 0);
+    if (currentPollAfterMs >= deadline - Date.now()) break;
+    await wait(currentPollAfterMs);
     attempt += 1;
     const pollStartedAt = Date.now();
     if (diagnosticContext) {
@@ -3197,7 +3212,8 @@ export async function resolveImageAdapterResponse(
     }
     statusUrl = nestedStringByKeys(lastStatus, new Set(['status_url', 'poll_url'])) || statusUrl;
     resultUrl = nestedStringByKeys(lastStatus, new Set(['result_url'])) || resultUrl;
-    pollAfterMs = uselgPollAfterMs(lastStatus);
+    pollAfterMs = imagePollDelayMs(lastStatus);
+    retryAfterMs = imageRetryAfterMs(lastStatus);
 
     const images = uniqueImageAdapterImages(lastStatus, inputImages, count);
     const state = newApiImageTaskState(lastStatus);
@@ -3513,7 +3529,11 @@ export async function uploadStoredImageResultToStorage(
   const startedAt = Date.now();
   console.info(
     '[image_result_storage_upload_started]',
-    imageResultPersistenceLogFields(context, index, 0),
+    {
+      ...imageResultPersistenceLogFields(context, index, 0),
+      attempt: 0,
+      storageMirrorDurationMs: 0,
+    },
   );
   let lastError: unknown = null;
   for (let attempt = 0; attempt < IMAGE_RESULT_STORAGE_UPLOAD_ATTEMPTS; attempt += 1) {
@@ -3533,6 +3553,7 @@ export async function uploadStoredImageResultToStorage(
       console.info('[image_result_storage_upload_complete]', {
         ...imageResultPersistenceLogFields(context, index, Date.now() - startedAt),
         attempt: attempt + 1,
+        storageMirrorDurationMs: Date.now() - startedAt,
       });
       return downloadUrl;
     } catch (error) {
@@ -3540,6 +3561,7 @@ export async function uploadStoredImageResultToStorage(
       console.warn('[image_result_storage_upload_failed]', {
         ...imageResultPersistenceLogFields(context, index, Date.now() - startedAt),
         attempt: attempt + 1,
+        storageMirrorDurationMs: Date.now() - startedAt,
         final: attempt >= IMAGE_RESULT_STORAGE_UPLOAD_ATTEMPTS - 1,
         ...safeImageDeliveryError(error),
       });
@@ -3548,6 +3570,7 @@ export async function uploadStoredImageResultToStorage(
   if (await reopenStoredResult()) {
     console.warn('[image_result_local_fallback_ready]', {
       ...imageResultPersistenceLogFields(context, index, Date.now() - startedAt),
+      storageMirrorDurationMs: Date.now() - startedAt,
       ...safeImageDeliveryError(lastError),
     });
     return stableUrl;
@@ -3555,32 +3578,185 @@ export async function uploadStoredImageResultToStorage(
   throw new ImageResultPersistenceError(lastError);
 }
 
-export async function mirrorPublicGeneratedImageResultToStorage(
+export async function persistGeneratedImageResultLocally(
   source: string,
-  index: number,
+  index = 0,
   context: ImageResultPersistenceContext = defaultImageResultPersistenceContext(''),
 ) {
+  const trimmed = source.trim();
+  if (isStoredImageResultUrl(trimmed)) {
+    const key = new URL(trimmed).pathname.split('/').filter(Boolean).pop();
+    if (key && await getImageResult(key)) return trimmed;
+    // A receipt-only stable URL remains readable through the local fallback
+    // route. It is already a durable API result and must not trigger a new
+    // generation or a second charge.
+    if (key && await imageResultFallbackStore.getReceipt(key)) return trimmed;
+    throw new Error('generated image local result is no longer available');
+  }
+  if (/^data:image\//i.test(trimmed)) {
+    return withImageResultDownloadLogging(context, index, async () => {
+      const inline = dataUrlImageBytes(trimmed, MAX_GENERATED_IMAGE_BYTES);
+      return createImageResultFromResponse(new Response(inline.bytes, {
+        headers: {
+          'content-type': inline.mime,
+          'content-length': String(inline.bytes.byteLength),
+        },
+      }));
+    });
+  }
+
   let staged: StagedNewApiEditImage | null = null;
   try {
     staged = await withImageResultDownloadLogging(
       context,
       index,
-      () => stagePublicGeneratedImageResult(source, index),
+      () => stagePublicGeneratedImageResult(trimmed, index),
     );
-    if (!staged.path) throw new Error('generated image mirror did not create a temporary file');
+    if (!staged.path) throw new Error('generated image local persistence did not create a file');
     const stableUrl = await createImageResultFromFile(staged.path, staged.mime);
-    // Save an encrypted, expiring source receipt beside the persistent local
-    // cache. Returning the stable bridge never exposes the upstream signed URL.
     try {
-      await imageResultFallbackStore.rememberVerifiedSource(source, staged.mime, stableUrl);
+      await imageResultFallbackStore.rememberVerifiedSource(trimmed, staged.mime, stableUrl);
     } catch (error) {
-      // A verified local copy is still a usable fallback if receipt persistence
-      // or encryption is unavailable. Never discard it just because COS failed.
       console.warn('[image_result_fallback_receipt_failed]', {
         ...imageResultPersistenceLogFields(context, index, 0),
         ...safeImageDeliveryError(error),
       });
     }
+    return stableUrl;
+  } finally {
+    await staged?.cleanup().catch(() => {});
+  }
+}
+
+async function persistGeneratedImageResultLocallyWithFallback(
+  source: string,
+  index: number,
+  context: ImageResultPersistenceContext,
+) {
+  try {
+    return await persistGeneratedImageResultLocally(source, index, context);
+  } catch (error) {
+    // Keep the established receipt fallback for a provider URL that cannot be
+    // downloaded locally. This is delivery recovery only; it never re-posts or
+    // changes wallet billing, and it is not eligible for a COS mirror.
+    if ((error as { code?: string })?.code === 'IMAGE_DOWNLOAD_TOO_LARGE'
+      || /^data:image\//i.test(source.trim())
+      || isStoredImageResultUrl(source.trim())) throw error;
+    console.warn('[image_result_persistence_fallback_attempt]', {
+      ...imageResultPersistenceLogFields(context, index, 0),
+      ...safeImageDeliveryError(error),
+    });
+    const fallbackUrl = await imageResultFallbackStore.createFallback(source);
+    console.warn('[image_result_upstream_fallback_ready]', {
+      ...imageResultPersistenceLogFields(context, index, 0),
+    });
+    return fallbackUrl;
+  }
+}
+
+export function scheduleGeneratedImageResultStorageMirror(
+  stableUrl: string,
+  index = 0,
+  context: ImageResultPersistenceContext = defaultImageResultPersistenceContext(''),
+) {
+  if (!isStoredImageResultUrl(stableUrl)) return Promise.resolve();
+  const key = new URL(stableUrl).pathname.split('/').filter(Boolean).pop();
+  if (!key) return Promise.resolve();
+  const existing = pendingImageStorageMirrors.get(key);
+  if (existing) return existing;
+
+  const task = (async () => {
+    const mirrorStartedAt = Date.now();
+    let mirrorPending = false;
+    // Receipt-only fallback results have no validated local bytes to mirror.
+    // Keep them served by the existing upstream receipt path instead of
+    // manufacturing an upload attempt.
+    try {
+      if (!await getImageResult(key)) return;
+      markImageResultStorageMirrorPending(key);
+      mirrorPending = true;
+      console.info('[image_result_storage_upload_scheduled]',
+        {
+          ...imageResultPersistenceLogFields(context, index, 0),
+          attempt: 0,
+          storageMirrorScheduled: true,
+          storageMirrorDurationMs: 0,
+        });
+      const mirroredUrl = await uploadStoredImageResultToStorage(stableUrl, index, context, false);
+      if (mirroredUrl === stableUrl) {
+        console.warn('[image_result_storage_upload_failed]', {
+          ...imageResultPersistenceLogFields(context, index, Date.now() - mirrorStartedAt),
+          attempt: IMAGE_RESULT_STORAGE_UPLOAD_ATTEMPTS,
+          storageMirrorDurationMs: Date.now() - mirrorStartedAt,
+          final: true,
+          background: true,
+        });
+      }
+    } catch (error) {
+      console.warn('[image_result_storage_upload_failed]', {
+        ...imageResultPersistenceLogFields(context, index, Date.now() - mirrorStartedAt),
+        attempt: IMAGE_RESULT_STORAGE_UPLOAD_ATTEMPTS,
+        storageMirrorDurationMs: Date.now() - mirrorStartedAt,
+        final: true,
+        background: true,
+        ...safeImageDeliveryError(error),
+      });
+    } finally {
+      if (mirrorPending) clearImageResultStorageMirrorPending(key);
+      pendingImageStorageMirrors.delete(key);
+    }
+  })();
+  pendingImageStorageMirrors.set(key, task);
+  return task;
+}
+
+export async function persistGeneratedImageResultsAndScheduleMirrors(
+  images: string[],
+  providerName: string,
+  context: ImageResultPersistenceContext = defaultImageResultPersistenceContext(providerName),
+  persistImage: (
+    source: string,
+    index: number,
+    context: ImageResultPersistenceContext,
+  ) => Promise<string> = persistGeneratedImageResultLocallyWithFallback,
+) {
+  const results = await Promise.allSettled(images.map((source, index) => persistImage(source.trim(), index, context)));
+  const delivered: string[] = [];
+  let firstError: unknown;
+  results.forEach((result, index) => {
+    if (result.status === 'fulfilled' && result.value.trim()) {
+      delivered.push(result.value);
+      void scheduleGeneratedImageResultStorageMirror(result.value, index, context);
+      return;
+    }
+    const reason: unknown = result.status === 'rejected' ? result.reason : new Error('Empty local image result');
+    firstError ??= reason;
+    console.warn('[image_result_local_persistence_failed]', {
+      provider: providerName,
+      ...imageResultPersistenceLogFields(context, index, 0),
+      ...safeImageDeliveryError(reason),
+    });
+  });
+  if (delivered.length) {
+    if (delivered.length < images.length) console.warn('[image_result_partial_delivery]', {
+      clientRequestId: context.clientRequestId,
+      requestedCount: images.length,
+      deliveredCount: delivered.length,
+    });
+    return delivered;
+  }
+  if (images.length) throw firstError instanceof ImageResultPersistenceError
+    ? firstError : new ImageResultPersistenceError(firstError);
+  return [];
+}
+
+export async function mirrorPublicGeneratedImageResultToStorage(
+  source: string,
+  index: number,
+  context: ImageResultPersistenceContext = defaultImageResultPersistenceContext(''),
+) {
+  try {
+    const stableUrl = await persistGeneratedImageResultLocally(source, index, context);
     return await uploadStoredImageResultToStorage(stableUrl, index, context, false);
   } catch (error) {
     if ((error as { code?: string })?.code === 'IMAGE_DOWNLOAD_TOO_LARGE') throw error;
@@ -3588,16 +3764,11 @@ export async function mirrorPublicGeneratedImageResultToStorage(
       ...imageResultPersistenceLogFields(context, index, 0),
       ...safeImageDeliveryError(error),
     });
-    // This performs only a bounded GET of the existing result (never a new
-    // generation). JSON task receipts / 202 / HTML / expired URLs are rejected.
-    // Do not turn an arbitrary URL into a successful, billable image.
     const fallbackUrl = await imageResultFallbackStore.createFallback(source);
     console.warn('[image_result_upstream_fallback_ready]', {
       ...imageResultPersistenceLogFields(context, index, 0),
     });
     return fallbackUrl;
-  } finally {
-    await staged?.cleanup().catch(() => {});
   }
 }
 
@@ -3606,15 +3777,7 @@ export async function mirrorInlineGeneratedImageResultToStorage(
   index = 0,
   context: ImageResultPersistenceContext = defaultImageResultPersistenceContext(''),
 ) {
-  const stableUrl = await withImageResultDownloadLogging(context, index, async () => {
-    const inline = dataUrlImageBytes(source, MAX_GENERATED_IMAGE_BYTES);
-    return createImageResultFromResponse(new Response(inline.bytes, {
-      headers: {
-        'content-type': inline.mime,
-        'content-length': String(inline.bytes.byteLength),
-      },
-    }));
-  });
+  const stableUrl = await persistGeneratedImageResultLocally(source, index, context);
   return uploadStoredImageResultToStorage(stableUrl, index, context, false);
 }
 
@@ -5819,17 +5982,19 @@ async function generateImagesFromProvider(
     adapterKey: adapterRoute?.adapterKey?.trim() || 'LEGACY',
   };
   let images: string[] = [];
+  let storageMirrorScheduled = false;
+  const localPersistenceStartedAt = Date.now();
   try {
-    images = await mirrorGeneratedImageResults(
+    images = await persistGeneratedImageResultsAndScheduleMirrors(
       boundedProviderImages,
       provider.name,
-      mirrorGeneratedImageResultToStorage,
       persistenceContext,
     );
     if (!images.length) throw new Error('渠道没有返回图片数据');
+    storageMirrorScheduled = true;
     return images;
   } finally {
-    const mirrorCompletedAt = Date.now();
+    const localPersistenceCompletedAt = Date.now();
     console.info('[image_generation_timing]', {
       clientRequestId: effectiveInput.clientRequestId,
       canonicalModel: persistenceContext.canonicalModel,
@@ -5840,8 +6005,16 @@ async function generateImagesFromProvider(
       model: effectiveInput.model,
       resolution: effectiveInput.resolution ?? '',
       upstreamDurationMs: upstreamCompletedAt - startedAt,
-      mirrorDurationMs: mirrorCompletedAt - upstreamCompletedAt,
-      totalDurationMs: mirrorCompletedAt - startedAt,
+      localPersistenceDurationMs: localPersistenceCompletedAt - localPersistenceStartedAt,
+      // Keep the legacy field for existing dashboards while making the
+      // foreground/local boundary explicit.
+      mirrorDurationMs: localPersistenceCompletedAt - upstreamCompletedAt,
+      requestDurationMs: localPersistenceCompletedAt - startedAt,
+      totalDurationMs: localPersistenceCompletedAt - startedAt,
+      storageMirrorScheduled,
+      // The mirror is deliberately detached from this request. Its actual
+      // duration is emitted by the background upload completion/failure log.
+      storageMirrorDurationMs: null,
       resultCount: images.length,
     });
   }

@@ -8,6 +8,7 @@ const MAX_SINGLE_IMAGE_BYTES = 64 * 1024 * 1024;
 const PRUNE_INTERVAL_MS = 60_000;
 let lastPrunedAt = 0;
 let pendingPrune: Promise<void> | null = null;
+const pendingStorageMirrorKeys = new Set<string>();
 
 function extensionForMime(mime: string) {
   if (mime === 'image/png') return 'png';
@@ -53,6 +54,18 @@ function imageResultUrl(key: string) {
 export function isStoredImageResultUrl(value: string) {
   const prefix = `${env.APP_BASE_URL.replace(/\/+$/, '')}/v1/ai/image-results/`;
   return value.startsWith(prefix) && RESULT_KEY_PATTERN.test(value.slice(prefix.length));
+}
+
+export function markImageResultStorageMirrorPending(key: string) {
+  if (RESULT_KEY_PATTERN.test(key)) pendingStorageMirrorKeys.add(key);
+}
+
+export function clearImageResultStorageMirrorPending(key: string) {
+  pendingStorageMirrorKeys.delete(key);
+}
+
+export function isImageResultStorageMirrorPending(key: string) {
+  return pendingStorageMirrorKeys.has(key);
 }
 
 async function pruneImageResults(force = false) {

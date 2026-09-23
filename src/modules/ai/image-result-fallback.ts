@@ -3,7 +3,11 @@ import type { FastifyReply } from 'fastify';
 import { env } from '../../config/env.js';
 import { assertPublicProviderUrl } from '../providers/url.js';
 import { storageService } from '../storage/service.js';
-import { getImageResult, imageResultMimeForKey } from './image-result-store.js';
+import {
+  getImageResult,
+  imageResultMimeForKey,
+  isImageResultStorageMirrorPending,
+} from './image-result-store.js';
 import {
   createImageResultFallbackStore,
   ImageDeliveryError,
@@ -66,16 +70,18 @@ export async function serveImageResultWithFallback(
   const objectName = `generated-images/${key}`;
   // Do not require a successful COS write simply to read an already generated
   // image. A read must not start another generation or repeatedly upload it.
-  try {
-    if (await boundedStorageLookup(storageService.exists(objectName))) {
-      const url = storageService.getDownloadUrl(objectName);
-      if (redirect === '0') return reply.header('Cache-Control', 'private, no-store').send({
-        url, expiresAt: Date.now() + env.STORAGE_SIGNED_URL_EXPIRES_SECONDS * 1_000,
-      });
-      return reply.header('Cache-Control', 'private, no-store').redirect(url);
+  if (!isImageResultStorageMirrorPending(key)) {
+    try {
+      if (await boundedStorageLookup(storageService.exists(objectName))) {
+        const url = storageService.getDownloadUrl(objectName);
+        if (redirect === '0') return reply.header('Cache-Control', 'private, no-store').send({
+          url, expiresAt: Date.now() + env.STORAGE_SIGNED_URL_EXPIRES_SECONDS * 1_000,
+        });
+        return reply.header('Cache-Control', 'private, no-store').redirect(url);
+      }
+    } catch (error) {
+      console.warn('[image_result_storage_read_fallback]', { key, ...safeImageDeliveryError(error) });
     }
-  } catch (error) {
-    console.warn('[image_result_storage_read_fallback]', { key, ...safeImageDeliveryError(error) });
   }
 
   try {

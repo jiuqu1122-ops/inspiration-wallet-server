@@ -432,10 +432,13 @@ describe('wallet image provider normalization', () => {
       $transaction: vi.fn(async (callback: (tx: typeof transaction) => unknown) => callback(transaction)),
     };
     const resultUrl = 'https://9.9.9.9/fallback.png';
-    const storedUrl = 'https://storage.example/generated-images/fallback.png?signature=redacted';
+    const stableResultUrl = expect.stringMatching(
+      /^https:\/\/api\.example\.test\/v1\/ai\/image-results\/[a-f0-9]{64}\.png$/,
+    );
+    const cosUrl = 'https://storage.example/generated-images/fallback.png?signature=redacted';
     const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
     vi.spyOn(storageService, 'uploadMedia').mockResolvedValue('generated-images/fallback.png');
-    vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(storedUrl);
+    vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(cosUrl);
     const fetchMock = vi.fn(async (source: RequestInfo | URL) => {
       if (String(source) === resultUrl) {
         return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } });
@@ -468,7 +471,7 @@ describe('wallet image provider normalization', () => {
       outputFormat: 'png',
       count: 1,
     })).resolves.toMatchObject({
-      images: [storedUrl],
+      images: [stableResultUrl],
       providerChannelId: fallback.id,
       providerChannelName: fallback.name,
     });
@@ -528,11 +531,11 @@ describe('wallet image provider normalization', () => {
       $transaction: vi.fn(async (callback: (tx: typeof transaction) => unknown) => callback(transaction)),
     };
     const resultUrl = 'https://9.9.9.9/fallback-after-task-failure.png';
-    const storedUrl = 'https://storage.example/generated-images/fallback-after-task-failure.png?signature=redacted';
+    const cosUrl = 'https://storage.example/generated-images/fallback-after-task-failure.png?signature=redacted';
     const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
     vi.spyOn(storageService, 'uploadMedia')
       .mockResolvedValue('generated-images/fallback-after-task-failure.png');
-    vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(storedUrl);
+    vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(cosUrl);
     const fetchMock = vi.fn(async (source: RequestInfo | URL) => {
       const url = String(source);
       if (url === resultUrl) {
@@ -581,7 +584,9 @@ describe('wallet image provider normalization', () => {
       outputFormat: 'png',
       count: 1,
     })).resolves.toMatchObject({
-      images: [storedUrl],
+      images: [expect.stringMatching(
+        /^https:\/\/api\.example\.test\/v1\/ai\/image-results\/[a-f0-9]{64}\.png$/,
+      )],
       providerChannelId: fallback.id,
       providerChannelName: fallback.name,
     });
@@ -1846,7 +1851,7 @@ describe('wallet image provider normalization', () => {
       wait,
     )).resolves.toEqual(['data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB']);
 
-    expect(wait).toHaveBeenCalledWith(2_000);
+    expect(wait).toHaveBeenCalledWith(1_000);
     expect(fetchMock.mock.calls.map(([source]) => String(source))).toEqual([
       'https://provider.example/v1/custom-status/seedream-task-123',
       'https://provider.example/v1/custom-results/seedream-task-123',

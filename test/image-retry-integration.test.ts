@@ -8,6 +8,7 @@ import {
 } from '../src/modules/ai/image-service.js';
 import {
   ImageTaskRecoveryRequiredError, ImageTaskTerminalFailureError,
+  imagePollDelayMs, retryImageRead, withImagePollHint,
 } from '../src/modules/ai/image-task-retry.js';
 
 const provider = { id: 'fixture-provider', kind: 'USELG', baseUrl: 'https://provider.example', name: 'fixture' } as never;
@@ -25,6 +26,59 @@ const done = () => ({ task_id: 'fixture-task', status: 'success', data: [{ url: 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('image retry integration with image-service entry points', () => {
+  it('clamps normal task poll hints without changing USELG result safety', () => {
+    expect(imagePollDelayMs({ poll_after_ms: 200 })).toBe(1_000);
+    expect(imagePollDelayMs({ poll_after_ms: 2_000 })).toBe(2_000);
+    expect(imagePollDelayMs({ poll_after_ms: 8_000 })).toBe(8_000);
+    expect(imagePollDelayMs({ poll_after_ms: 10_000 })).toBe(10_000);
+    expect(imagePollDelayMs({ poll_after_ms: 60_000 })).toBe(10_000);
+    expect(imagePollDelayMs({ poll_after_ms: Number.NaN })).toBe(2_000);
+    expect(imagePollDelayMs({ poll_after_ms: '' })).toBe(2_000);
+    expect(withImagePollHint({ poll_after_ms: 2_000 }, '30')).toEqual({
+      poll_after_ms: 2_000,
+      retry_after_ms: 30_000,
+    });
+  });
+
+  it('keeps Retry-After separate and preserves its 30-second delay', async () => {
+    const waits: number[] = [];
+    let attempts = 0;
+    const result = await retryImageRead(
+      async () => {
+        attempts += 1;
+        if (attempts === 1) throw Object.assign(transient(429), { retryAfterMs: 30_000 });
+        return 'ok';
+      },
+      {
+        identity: { taskId: 'retry-after-task', statusUrl: '/status', resultUrl: '/result' },
+        stage: 'status',
+        deadline: Date.now() + 60_000,
+        wait: async ms => { waits.push(ms); },
+        random: () => 0,
+      },
+    );
+    expect(result).toBe('ok');
+    expect(waits).toEqual([30_000]);
+  });
+
+  it('does not extend the recovery deadline for an oversized Retry-After hint', async () => {
+    const waits: number[] = [];
+    await expect(retryImageRead(
+      async () => { throw Object.assign(transient(429), { retryAfterMs: 30_000 }); },
+      {
+        identity: { taskId: 'deadline-task', statusUrl: '/status', resultUrl: '/result' },
+        stage: 'status',
+        deadline: Date.now() + 5_000,
+        wait: async ms => { waits.push(ms); },
+        random: () => 0,
+      },
+    )).rejects.toMatchObject({
+      code: 'IMAGE_TASK_RECOVERY_REQUIRED',
+      reason: 'retry_hint_exceeds_budget',
+    });
+    expect(waits).toEqual([]);
+  });
+
   it('does not treat task controls as an immediate generated image', () => {
     expect(uniqueImages(receipt, [], 1)).toEqual([]);
     expect(collectImageStrings({ ...receipt, error: { message: 'see https://docs.example/error' },
