@@ -2858,6 +2858,70 @@ export async function resolveUselgImageResponse(
       return complete(images, sourceType);
     }
 
+    const failure = getFailure(lastStatus);
+    if (failure) throw new UpstreamImageError(502, failure, lastStatus);
+    if (/^(?:failed|failure|error|cancelled|canceled|uncertain|client_disconnected)$/.test(state)) {
+      throw new UpstreamImageError(
+        502,
+        `uselg 图片任务失败（${state}）：${taskId}`,
+        lastStatus,
+      );
+    }
+    if (!/^(?:completed|complete|succeeded|success|finished|done)$/.test(state)) continue;
+
+    const resolvedAssets: string[] = [];
+    let resolvedAssetSourceType: UselgImageResolveSourceType = 'signed_url';
+    for (const asset of assets) {
+      if (asset.key === 'signed_url' && /^https?:\/\//i.test(asset.value)) {
+        resolvedAssets.push(asset.value);
+      } else {
+        const assetFetchStartedAt = Date.now();
+        if (diagnosticContext) {
+          console.info('[uselg_image_asset_fetch_started]', {
+            clientRequestId: diagnosticContext.clientRequestId,
+            taskId,
+            assetType: asset.key,
+          });
+        }
+        try {
+          const content = await providerImageContentRequest(provider, secrets, asset.value);
+          const assetImages = uniqueUselgImages(content, inputImages, count);
+          if (diagnosticContext) {
+            console.info('[uselg_image_asset_fetch_complete]', {
+              clientRequestId: diagnosticContext.clientRequestId,
+              taskId,
+              assetType: asset.key,
+              durationMs: Date.now() - assetFetchStartedAt,
+              hasImage: assetImages.length > 0,
+            });
+          }
+          if (assetImages.length) resolvedAssetSourceType = 'asset_content';
+          resolvedAssets.push(...assetImages);
+        } catch (error) {
+          if (diagnosticContext) {
+            console.warn('[uselg_image_asset_fetch_failed]', {
+              clientRequestId: diagnosticContext.clientRequestId,
+              taskId,
+              assetType: asset.key,
+              durationMs: Date.now() - assetFetchStartedAt,
+              hasImage: imagesFromUpstreamError(error, inputImages, count).length > 0,
+              errorName: error instanceof Error ? error.name : 'unknown',
+            });
+          }
+          throw error;
+        }
+      }
+      if (resolvedAssets.length >= count) break;
+    }
+    if (resolvedAssets.length) {
+      return complete(
+        Array.from(new Set(resolvedAssets)).slice(0, count),
+        resolvedAssetSourceType,
+      );
+    }
+
+    // result_url may be present while the task is still queued or processing.
+    // Probe it only after status reports success and provides no usable image.
     let resultProbeNotReady = false;
     if (resultUrl) {
       const resultFetchStartedAt = Date.now();
@@ -2946,67 +3010,6 @@ export async function resolveUselgImageResponse(
       }
     }
 
-    const failure = getFailure(lastStatus);
-    if (failure) throw new UpstreamImageError(502, failure, lastStatus);
-    if (/^(?:failed|failure|error|cancelled|canceled|uncertain|client_disconnected)$/.test(state)) {
-      throw new UpstreamImageError(
-        502,
-        `uselg 图片任务失败（${state}）：${taskId}`,
-        lastStatus,
-      );
-    }
-    if (!/^(?:completed|complete|succeeded|success|finished|done)$/.test(state)) continue;
-
-    const resolvedAssets: string[] = [];
-    let resolvedAssetSourceType: UselgImageResolveSourceType = 'signed_url';
-    for (const asset of assets) {
-      if (asset.key === 'signed_url' && /^https?:\/\//i.test(asset.value)) {
-        resolvedAssets.push(asset.value);
-      } else {
-        const assetFetchStartedAt = Date.now();
-        if (diagnosticContext) {
-          console.info('[uselg_image_asset_fetch_started]', {
-            clientRequestId: diagnosticContext.clientRequestId,
-            taskId,
-            assetType: asset.key,
-          });
-        }
-        try {
-          const content = await providerImageContentRequest(provider, secrets, asset.value);
-          const assetImages = uniqueUselgImages(content, inputImages, count);
-          if (diagnosticContext) {
-            console.info('[uselg_image_asset_fetch_complete]', {
-              clientRequestId: diagnosticContext.clientRequestId,
-              taskId,
-              assetType: asset.key,
-              durationMs: Date.now() - assetFetchStartedAt,
-              hasImage: assetImages.length > 0,
-            });
-          }
-          if (assetImages.length) resolvedAssetSourceType = 'asset_content';
-          resolvedAssets.push(...assetImages);
-        } catch (error) {
-          if (diagnosticContext) {
-            console.warn('[uselg_image_asset_fetch_failed]', {
-              clientRequestId: diagnosticContext.clientRequestId,
-              taskId,
-              assetType: asset.key,
-              durationMs: Date.now() - assetFetchStartedAt,
-              hasImage: imagesFromUpstreamError(error, inputImages, count).length > 0,
-              errorName: error instanceof Error ? error.name : 'unknown',
-            });
-          }
-          throw error;
-        }
-      }
-      if (resolvedAssets.length >= count) break;
-    }
-    if (resolvedAssets.length) {
-      return complete(
-        Array.from(new Set(resolvedAssets)).slice(0, count),
-        resolvedAssetSourceType,
-      );
-    }
     if (resultProbeNotReady) continue;
     throw new Error(`uselg 图片任务已成功但没有返回可下载资产：${taskId}`);
   }

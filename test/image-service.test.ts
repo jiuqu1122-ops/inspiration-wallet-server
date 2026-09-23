@@ -1698,14 +1698,28 @@ describe('wallet image provider normalization', () => {
     expect(serializedLogs).not.toContain('sk-uselg');
   });
 
-  it('probes a USELG result_url while the task is still dispatching', async () => {
+  it('does not probe a USELG result_url until the task is completed', async () => {
     const statusUrl = '/v1/images/tasks/gemini-dispatching?view=summary';
     const resultUrl = 'https://api.ai-media.vip/v1/images/tasks/gemini-dispatching/result';
     const outputUrl = 'https://cdn.example.test/generated-dispatching.png';
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({
         task_id: 'gemini-dispatching',
-        status: 'dispatching',
+        status: 'processing',
+        status_url: statusUrl,
+        result_url: resultUrl,
+        poll_after_ms: 2_000,
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        task_id: 'gemini-dispatching',
+        status: 'processing',
+        status_url: statusUrl,
+        result_url: resultUrl,
+        poll_after_ms: 2_000,
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        task_id: 'gemini-dispatching',
+        status: 'completed',
         status_url: statusUrl,
         result_url: resultUrl,
         poll_after_ms: 2_000,
@@ -1723,6 +1737,7 @@ describe('wallet image provider normalization', () => {
         task_id: 'gemini-dispatching',
         status: 'queued',
         status_url: statusUrl,
+        result_url: resultUrl,
         poll_after_ms: 2_000,
       },
       [],
@@ -1730,23 +1745,32 @@ describe('wallet image provider normalization', () => {
       wait,
     )).resolves.toEqual([outputUrl]);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(fetchMock.mock.calls.map(([source]) => String(source))).toEqual([
+      `https://api.ai-media.vip${statusUrl}`,
+      `https://api.ai-media.vip${statusUrl}`,
       `https://api.ai-media.vip${statusUrl}`,
       resultUrl,
     ]);
-    expect(wait).toHaveBeenCalledTimes(1);
+    expect(wait).toHaveBeenCalledTimes(3);
     expect(wait).toHaveBeenCalledWith(2_000);
   });
 
-  it('keeps polling the same USELG task when result_url returns 202 pending', async () => {
+  it('keeps polling the same USELG task when a completed result_url returns 202 pending', async () => {
     const statusUrl = '/v1/images/tasks/gemini-result-pending?view=summary';
     const resultUrl = '/v1/images/tasks/gemini-result-pending/result';
     const outputUrl = 'https://cdn.example.test/generated-after-pending.png';
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({
         task_id: 'gemini-result-pending',
-        status: 'dispatching',
+        status: 'processing',
+        status_url: statusUrl,
+        result_url: resultUrl,
+        poll_after_ms: 2_000,
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        task_id: 'gemini-result-pending',
+        status: 'completed',
         status_url: statusUrl,
         result_url: resultUrl,
         poll_after_ms: 2_000,
@@ -1757,7 +1781,7 @@ describe('wallet image provider normalization', () => {
       }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
         task_id: 'gemini-result-pending',
-        status: 'dispatching',
+        status: 'completed',
         status_url: statusUrl,
         result_url: resultUrl,
         poll_after_ms: 2_000,
@@ -1782,14 +1806,15 @@ describe('wallet image provider normalization', () => {
       wait,
     )).resolves.toEqual([outputUrl]);
 
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
     expect(fetchMock.mock.calls.map(([source]) => String(source))).toEqual([
+      'https://api.ai-media.vip/v1/images/tasks/gemini-result-pending?view=summary',
       'https://api.ai-media.vip/v1/images/tasks/gemini-result-pending?view=summary',
       'https://api.ai-media.vip/v1/images/tasks/gemini-result-pending/result',
       'https://api.ai-media.vip/v1/images/tasks/gemini-result-pending?view=summary',
       'https://api.ai-media.vip/v1/images/tasks/gemini-result-pending/result',
     ]);
-    expect(wait).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenCalledTimes(3);
     expect(wait).toHaveBeenCalledWith(2_000);
   });
 
@@ -3188,6 +3213,7 @@ describe('wallet image provider normalization', () => {
       return new Response(JSON.stringify({
         task_id: 'imgtask-123',
         status: 'success',
+        result_url: '/v1/images/tasks/imgtask-123/result',
         assets: [{ signed_url: 'https://cdn.example.test/generated.png' }],
       }), {
         status: 200,
