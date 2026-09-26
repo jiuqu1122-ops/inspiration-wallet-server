@@ -4710,6 +4710,36 @@ const isFailureTaskState = (state: string) => (
   || /(?:^|_)(?:failed|failure|error|cancelled|canceled|rejected|aborted|expired|timeout|timed_out)(?:_|$)/.test(state)
 );
 
+const VIDEO_SUCCESS_STATES = new Set([
+  'success',
+  'succeeded',
+  'complete',
+  'completed',
+  'done',
+  'finished',
+]);
+
+function videoTaskState(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+  const record = value as Record<string, unknown>;
+  return normalizeTaskState(
+    record.status
+      ?? record.state
+      ?? record.task_status
+      ?? record.taskStatus
+      ?? record.phase,
+  );
+}
+
+function isVideoSuccessState(value: unknown) {
+  return VIDEO_SUCCESS_STATES.has(videoTaskState(value));
+}
+
+/** True only when the task-scoped payload is terminal and contains media. */
+export function isMiniMaxVideoTaskReadyForSettlement(value: unknown) {
+  return isVideoSuccessState(value) && collectGeneratedVideoStrings(value).length > 0;
+}
+
 const VIDEO_TASK_ID_KEYS = [
   'task_id',
   'taskId',
@@ -7051,6 +7081,7 @@ async function reserveVideo(
   input: VideoInput,
   pricingSnapshot?: PricingSnapshot,
   canonicalModelKey?: string,
+  options: { reuseFailed?: boolean } = {},
 ) {
   const estimated = pricingSnapshot
     ? estimateSnapshotCredits(pricingSnapshot)
@@ -7068,7 +7099,7 @@ async function reserveVideo(
   const estimatedCredits = creditDecimal(estimated);
   return prisma.$transaction(async (transaction) => {
     let existing = await transaction.aiRequest.findUnique({ where: { userId_clientRequestId: { userId: input.userId, clientRequestId: input.clientRequestId } } });
-    const reusableRequest = existing?.status === 'FAILED'
+    const reusableRequest = options.reuseFailed !== false && existing?.status === 'FAILED'
       ? existing
       : null;
     if (reusableRequest) existing = null;
@@ -7121,6 +7152,7 @@ async function settleVideo(
   charged: string,
   breakdown?: ReturnType<typeof calculateSnapshotCharge>,
   pricingSnapshot?: PricingSnapshot,
+  result?: unknown,
 ) {
   const chargedCredits = creditDecimal(charged);
   await prisma.$transaction(async (transaction) => {
@@ -7134,6 +7166,7 @@ async function settleVideo(
         status: 'SUCCEEDED',
         chargedCredits,
         ...(breakdown ? { chargeBreakdown: toInputJson(breakdown) } : {}),
+        ...(result !== undefined ? { result: toInputJson(result) } : {}),
         completedAt: new Date(),
       },
     });
@@ -7392,7 +7425,15 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       ...(input.resolution ? { referenceVideoResolution: input.resolution } : {}),
     }, input.userId)
     : undefined;
-  const reservation = await reserveVideo(prisma, upstreamInput, pricingSnapshot, canonicalModelKey);
+  const legacyMiniMaxAsync = provider.kind === 'MINIMAX' && isMiniMaxH3VideoModel(upstreamInput.model);
+  const reservation = await reserveVideo(
+    prisma,
+    upstreamInput,
+    pricingSnapshot,
+    canonicalModelKey,
+    { reuseFailed: !legacyMiniMaxAsync },
+  );
+  let acceptedLegacyTask = false;
   try {
     console.info('[video_generation_upstream_dispatch]', {
       requestedCanonicalModel,
@@ -7593,14 +7634,44 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       }
       if (lastError instanceof Error) throw lastError;
       if (lastError) throw new Error('Mikoto video generation failed');
-      collectTaskIdsFromValue(result).forEach(taskId => legacyTaskIds.add(taskId));
-      results.push(await mirrorGeneratedVideoResponse(
-        result,
-        provider.name,
-        provider.kind === 'MIKOTO'
-          ? providerVideoResultMirror(provider, secrets)
-          : mirrorGeneratedVideoResultToStorage,
-      ));
+      const submittedTaskIds = collectTaskIdsFromValue(result);
+      if (legacyMiniMaxAsync) {
+        // MiniMax H3 acknowledges an asynchronous job here. A task id is a
+        // receipt, not a deliverable video, so keep the wallet request in
+        // PROCESSING until the status endpoint proves completion and a media
+        // URL can be mirrored.
+        if (submittedTaskIds.length === 0) {
+          throw new CloudAiError(
+            'video_task_pending_confirmation',
+            'MiniMax accepted the request without returning a task ID; recovery is required before retrying',
+            409,
+          );
+        }
+        acceptedLegacyTask = true;
+        submittedTaskIds.forEach(taskId => legacyTaskIds.add(taskId));
+        results.push({ task_id: submittedTaskIds[0], status: 'processing' });
+        await prisma.aiRequest.update({
+          where: { id: reservation.requestId },
+          data: {
+            status: 'PROCESSING',
+            result: toInputJson({
+              results,
+              upstreamTaskIds: Array.from(legacyTaskIds),
+              providerChannelId: provider.id,
+              providerKind: provider.kind,
+            }),
+          },
+        });
+      } else {
+        submittedTaskIds.forEach(taskId => legacyTaskIds.add(taskId));
+        results.push(await mirrorGeneratedVideoResponse(
+          result,
+          provider.name,
+          provider.kind === 'MIKOTO'
+            ? providerVideoResultMirror(provider, secrets)
+            : mirrorGeneratedVideoResultToStorage,
+        ));
+      }
     }
     // Keep the upstream identity beside the request before settlement. Legacy
     // status queries are allowed only when this persisted binding matches the
@@ -7609,14 +7680,32 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
     if (legacyTaskIds.size > 0 && prisma.aiRequest?.update) {
       await prisma.aiRequest.update({
         where: { id: reservation.requestId },
-        data: { result: toInputJson({ results, upstreamTaskIds: Array.from(legacyTaskIds) }) },
+        data: { result: toInputJson({
+          results,
+          upstreamTaskIds: Array.from(legacyTaskIds),
+          ...(legacyMiniMaxAsync ? { providerChannelId: provider.id, providerKind: provider.kind } : {}),
+        }) },
       });
+    }
+    if (legacyMiniMaxAsync) {
+      return {
+        status: 'processing',
+        results,
+        provider: provider.kind,
+        model: canonicalModelKey,
+        charged_credits: '0.000000',
+        chargedCredits: '0.000000',
+      };
     }
     const breakdown = pricingSnapshot ? calculateSnapshotCharge(pricingSnapshot) : undefined;
     await settleVideo(prisma, input.userId, reservation.requestId, reservation.estimated, breakdown, pricingSnapshot);
     return { results, provider: provider.kind, model: canonicalModelKey, chargedCredits: serializeCredit(creditDecimal(reservation.estimated)) };
   } catch (error) {
-    await releaseVideo(prisma, input.userId, reservation.requestId, reservation.estimated);
+    // Once MiniMax has returned a task id the upstream job exists. Never
+    // release and allow a client retry to submit a second paid generation.
+    if (!acceptedLegacyTask) {
+      await releaseVideo(prisma, input.userId, reservation.requestId, reservation.estimated);
+    }
     if (error instanceof CloudAiError) throw error;
     throw new CloudAiError('video_generation_failed', error instanceof Error ? error.message : '视频生成失败', 502);
   }
@@ -7786,13 +7875,28 @@ export async function executeWalletVideoStatus(
   if (!boundRequest || boundRequest.capability !== 'VIDEO') {
     throw new CloudAiError('video_task_not_found', 'Video task was not found', 404);
   }
+  if (boundRequest.status === 'SUCCEEDED') {
+    return boundRequest.result ?? { status: 'succeeded', results: [] };
+  }
+  if (boundRequest.status === 'FAILED' || boundRequest.status === 'REFUNDED') {
+    throw new CloudAiError('video_generation_failed', 'The video generation failed', 502);
+  }
   const requestRoute = boundRequest.route;
+  const boundResult = boundRequest.result && typeof boundRequest.result === 'object' && !Array.isArray(boundRequest.result)
+    ? boundRequest.result as Record<string, unknown>
+    : null;
   const boundTaskIds = collectTaskIdsFromValue(boundRequest.result);
   if (!boundTaskIds.includes(input.taskId)) {
     throw new CloudAiError('video_task_pending_confirmation', 'The legacy task is not bound to this request; manual verification is required', 409);
   }
   const provider = requestRoute?.channel
-    ?? await selectVideoProvider(prisma, input.provider, input.providerChannelId);
+    ?? await selectVideoProvider(
+      prisma,
+      input.provider,
+      typeof boundResult?.providerChannelId === 'string'
+        ? boundResult.providerChannelId
+        : input.providerChannelId,
+    );
   await assertPublicProviderUrl(provider.baseUrl);
   if (requestRoute?.channel && (input.provider || input.providerChannelId)) {
     console.info('[legacy_wallet_route_hint_ignored]', {
@@ -7834,6 +7938,64 @@ export async function executeWalletVideoStatus(
       await refundVideoRequest(prisma, input.userId, input.clientRequestId);
     }
     throw new CloudAiError('video_generation_failed', failure, 502);
+  }
+  if (provider.kind === 'MINIMAX') {
+    // Only the task-scoped terminal state is authoritative. In particular,
+    // an outer `success: true` or a historical completed row must not settle
+    // this request while the requested H3 task is still running.
+    if (!isMiniMaxVideoTaskReadyForSettlement(waited)) {
+      return {
+        status: 'processing',
+        results: [{ task_id: input.taskId, status: videoTaskState(waited) || 'processing' }],
+        upstream: waited,
+      };
+    }
+    const sources = Array.from(new Set(collectGeneratedVideoStrings(waited)));
+    if (sources.length === 0) {
+      return {
+        status: 'processing',
+        results: [{ task_id: input.taskId, status: 'processing' }],
+        upstream: waited,
+      };
+    }
+    try {
+      const mirrored = await Promise.all(sources.map(source => mirrorGeneratedVideoResultToStorage(
+        source,
+        undefined,
+        `${provider.id}:${input.taskId}`,
+      )));
+      const completedResult = {
+        status: 'succeeded',
+        results: mirrored,
+        walletVideoResults: mirrored,
+        upstreamTaskIds: [input.taskId],
+        providerChannelId: provider.id,
+        upstream: waited,
+      };
+      await prisma.aiRequest.update({
+        where: { id: boundRequest.id },
+        data: { result: toInputJson(completedResult), status: 'PROCESSING' },
+      });
+      await settleVideo(
+        prisma,
+        input.userId,
+        boundRequest.id,
+        boundRequest.estimatedCredits.toString(),
+        undefined,
+        undefined,
+        completedResult,
+      );
+      return completedResult;
+    } catch (error) {
+      // The provider task is complete, but persistence is not. Keep the
+      // reservation and retry mirroring on the next status poll.
+      return {
+        status: 'processing',
+        results: [{ task_id: input.taskId, status: 'completed', asset_state: 'saving' }],
+        upstream: waited,
+        error: error instanceof Error ? error.message : 'video result persistence is pending',
+      };
+    }
   }
   if (provider.kind !== 'XAIS') {
     const cacheScope = `${provider.id}:${input.taskId}`;

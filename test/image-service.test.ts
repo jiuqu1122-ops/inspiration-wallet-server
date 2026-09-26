@@ -30,6 +30,7 @@ import {
   isNewApiGeminiImageDecodeError,
   isNewApiParamOverrideCopyError,
   isImageProviderFailoverStatus,
+  isMiniMaxVideoTaskReadyForSettlement,
   isTabletImageProviderFailoverStatus,
   isPublicNewApiImageReference,
   isRetryableXaisPollError,
@@ -324,6 +325,30 @@ describe('Mikoto Seedance model mapping', () => {
     ]);
     expect(selectVideoTaskPayload({ tasks: [{ task_id: 'old-task' }] }, 'current-task'))
       .toBeUndefined();
+  });
+
+  it('does not settle an outer success while the current task is processing', () => {
+    expect(isMiniMaxVideoTaskReadyForSettlement({
+      success: true,
+      tasks: [{
+        task_id: 'current-task',
+        status: 'processing',
+        video_url: 'https://media.example/current.mp4',
+      }],
+    })).toBe(false);
+  });
+
+  it('settles only the current terminal task with a deliverable video', () => {
+    expect(isMiniMaxVideoTaskReadyForSettlement(selectVideoTaskPayload({
+      tasks: [
+        { task_id: 'old-task', status: 'succeeded', video_url: 'https://media.example/old.mp4' },
+        { task_id: 'current-task', status: 'succeeded', video_url: 'https://media.example/current.mp4' },
+      ],
+    }, 'current-task'))).toBe(true);
+    expect(isMiniMaxVideoTaskReadyForSettlement({
+      task_id: 'current-task',
+      status: 'succeeded',
+    })).toBe(false);
   });
 });
 
