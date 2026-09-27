@@ -4773,6 +4773,77 @@ export function getDeliverableVideoSources(value: unknown) {
   return (stable.length > 0 ? stable : sources).filter(isVideoMediaUrl);
 }
 
+const MINIMAX_H3_VIDEO_URL_KEYS = /^(?:video_url|videoUrl|download_url|downloadUrl|file_url|fileUrl|content_url|contentUrl|url)$/i;
+const MINIMAX_H3_VIDEO_CONTAINER_KEYS = /^(?:content|result|results|output|outputs|video|videos|download|downloads|file|files)$/i;
+const MINIMAX_H3_FILE_ID_KEYS = /^(?:file_id|fileId)$/i;
+
+/**
+ * MiniMax H3's successful query response commonly returns either
+ * `content.url`/`download_url` without a `.mp4` suffix or only a `file_id`.
+ * Keep this extractor scoped to the H3 response shape; accepting arbitrary
+ * extensionless URLs in the generic extractor would mistake task/API URLs for
+ * media (and would also re-ingest reference videos).
+ */
+export function collectMiniMaxH3VideoSources(
+  value: unknown,
+  output: string[] = [],
+  trusted = false,
+  depth = 0,
+): string[] {
+  if (!value || depth > 10) return output;
+  if (typeof value === 'string') {
+    const source = value.trim();
+    if (trusted && (/^data:video\//i.test(source) || /^https?:\/\//i.test(source))) {
+      output.push(source);
+    }
+    return output;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectMiniMaxH3VideoSources(item, output, trusted, depth + 1);
+    return output;
+  }
+  if (typeof value !== 'object') return output;
+  const record = value as Record<string, unknown>;
+  const role = typeof record.role === 'string' ? record.role.trim().toLowerCase() : '';
+  const isReferenceMedia = /^(?:reference_|first_frame|last_frame)/.test(role);
+  for (const [key, nested] of Object.entries(record)) {
+    if (isReferenceMedia && /^(?:image_url|video_url|audio_url)$/i.test(key)) continue;
+    if (VIDEO_REFERENCE_KEYS.test(key) && !/^video_url$/i.test(key)) continue;
+    const keyTrusted = trusted
+      || MINIMAX_H3_VIDEO_URL_KEYS.test(key)
+      || MINIMAX_H3_VIDEO_CONTAINER_KEYS.test(key);
+    collectMiniMaxH3VideoSources(nested, output, keyTrusted, depth + 1);
+  }
+  return Array.from(new Set(output));
+}
+
+export function collectMiniMaxH3FileIds(
+  value: unknown,
+  output: string[] = [],
+  depth = 0,
+): string[] {
+  if (!value || depth > 10) return output;
+  if (Array.isArray(value)) {
+    for (const item of value) collectMiniMaxH3FileIds(item, output, depth + 1);
+    return Array.from(new Set(output));
+  }
+  if (typeof value !== 'object') return output;
+  const record = value as Record<string, unknown>;
+  const role = typeof record.role === 'string' ? record.role.trim().toLowerCase() : '';
+  const isReferenceMedia = /^(?:reference_|first_frame|last_frame)/.test(role);
+  for (const [key, nested] of Object.entries(record)) {
+    if (isReferenceMedia && /^(?:image|video|audio)_?file_?id$/i.test(key)) continue;
+    if (MINIMAX_H3_FILE_ID_KEYS.test(key)
+      && (typeof nested === 'string' || typeof nested === 'number')) {
+      const fileId = String(nested).trim();
+      if (fileId) output.push(fileId);
+      continue;
+    }
+    collectMiniMaxH3FileIds(nested, output, depth + 1);
+  }
+  return Array.from(new Set(output));
+}
+
 /** A task receipt, status message, or ordinary API URL is not deliverable media. */
 export function hasDeliverableVideoResult(value: unknown) {
   return getDeliverableVideoSources(value).length > 0;
@@ -6924,20 +6995,37 @@ export async function mirrorGeneratedVideoResponse(
   return { walletVideoResults: mirrored, upstream: value };
 }
 
+/**
+ * Provider result URLs on the provider origin can require the same bearer
+ * token that was used for the status request.  Never forward that token to a
+ * different origin (signed CDN URLs must remain unauthenticated).
+ */
+export function providerVideoResultRequestHeaders(
+  provider: Pick<AiProviderChannel, 'baseUrl'>,
+  source: string,
+  secrets: ProviderSecrets,
+) {
+  if (!/^https?:\/\//i.test(source)) return undefined;
+  try {
+    const sourceOrigin = new URL(source).origin;
+    const providerOrigin = new URL(provider.baseUrl).origin;
+    return sourceOrigin === providerOrigin ? upstreamHeaders(secrets) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function providerVideoResultMirror(
   provider: Pick<AiProviderChannel, 'baseUrl'>,
   secrets: ProviderSecrets,
   cacheScope?: string,
 ) {
-  const providerOrigin = new URL(provider.baseUrl).origin;
   return (source: string) => {
-    if (!/^https?:\/\//i.test(source)) {
-      return mirrorGeneratedVideoResultToStorage(source, undefined, cacheScope);
-    }
-    const sourceOrigin = new URL(source).origin;
-    return sourceOrigin === providerOrigin
-      ? mirrorGeneratedVideoResultToStorage(source, upstreamHeaders(secrets), cacheScope)
-      : mirrorGeneratedVideoResultToStorage(source, undefined, cacheScope);
+    return mirrorGeneratedVideoResultToStorage(
+      source,
+      providerVideoResultRequestHeaders(provider, source, secrets),
+      cacheScope,
+    );
   };
 }
 
@@ -7898,9 +7986,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
         results.push(await mirrorGeneratedVideoResponse(
           result,
           provider.name,
-          provider.kind === 'MIKOTO'
-            ? providerVideoResultMirror(provider, secrets)
-            : mirrorGeneratedVideoResultToStorage,
+          providerVideoResultMirror(provider, secrets),
         ));
       }
     }
@@ -8247,7 +8333,41 @@ export async function executeWalletVideoStatus(
       deliveryPayload = { result: waited, attachments: resolved };
     }
   }
-  const sources = getDeliverableVideoSources(deliveryPayload);
+  let sources = getDeliverableVideoSources(deliveryPayload);
+  let usedMiniMaxFileRetrieval = false;
+  let miniMaxFileRetrievalError = '';
+  if (provider.kind === 'MINIMAX' && isVideoSuccessState(waited)) {
+    // H3 CDN URLs are often extensionless, so the generic media filter cannot
+    // recognize them. Prefer explicit H3 output fields before resolving a
+    // file_id through the provider's file API.
+    const h3Sources = collectMiniMaxH3VideoSources(deliveryPayload);
+    if (h3Sources.length > 0) {
+      sources = h3Sources;
+    } else {
+      const fileIds = collectMiniMaxH3FileIds(deliveryPayload);
+      for (const fileId of fileIds) {
+        const retrievePaths = [
+          `/api/minimax/v2/files/retrieve?file_id=${encodeURIComponent(fileId)}`,
+          `/api/minimax/v1/files/retrieve?file_id=${encodeURIComponent(fileId)}`,
+          `/v1/files/retrieve?file_id=${encodeURIComponent(fileId)}`,
+        ];
+        for (const retrievePath of retrievePaths) {
+          try {
+            const filePayload = await providerRequest(provider, secrets, retrievePath);
+            const retrievedSources = collectMiniMaxH3VideoSources(filePayload);
+            if (retrievedSources.length > 0) {
+              sources = retrievedSources;
+              usedMiniMaxFileRetrieval = true;
+              break;
+            }
+          } catch (error) {
+            miniMaxFileRetrievalError = error instanceof Error ? error.message : String(error);
+          }
+        }
+        if (sources.length > 0) break;
+      }
+    }
+  }
   const success = isVideoSuccessState(waited) && sources.length > 0;
   const durationMs = Date.now() - statusStartedAt;
   console.info('[video_status_poll]', {
@@ -8260,6 +8380,12 @@ export async function executeWalletVideoStatus(
     hasDeliverableResult: success,
     alreadySettled,
     resultCount: sources.length,
+    usedMiniMaxFileRetrieval,
+    ...(miniMaxFileRetrievalError ? { miniMaxFileRetrievalError: miniMaxFileRetrievalError.replace(/https?:\/\/[^\s]+/gi, '[URL]') } : {}),
+    upstreamState: videoTaskState(waited) || null,
+    upstreamKeys: waited && typeof waited === 'object' && !Array.isArray(waited)
+      ? Object.keys(waited).slice(0, 32)
+      : [],
     durationMs,
   });
   if (!success) {
@@ -8270,11 +8396,12 @@ export async function executeWalletVideoStatus(
   }
 
   try {
-    const mirrored = await Promise.all(sources.map(source => mirrorGeneratedVideoResultToStorage(
-      source,
-      undefined,
+    const mirrorVideo = providerVideoResultMirror(
+      provider,
+      secrets,
       `${provider.id}:${upstreamTaskId}`,
-    )));
+    );
+    const mirrored = await Promise.all(sources.map(source => mirrorVideo(source)));
     const envelope = videoStatusEnvelope(input.taskId, 'succeeded', {
       upstream: waited,
       sources: mirrored,
@@ -8386,9 +8513,26 @@ export async function executeWalletVideoStatus(
       durationMs,
     });
     return envelope;
-  } catch {
+  } catch (error) {
     // The provider task is complete, but persistence is not. Keep the request
     // recoverable and retry only mirroring on the next status poll.
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.warn('[video_status_persistence_pending]', {
+      clientRequestId: input.clientRequestId ?? null,
+      requestId: boundRequest.id,
+      taskId: input.taskId,
+      providerId: provider.id,
+      providerKind: provider.kind,
+      routeId: requestRoute?.id ?? null,
+      requestStatus: boundRequest.status,
+      hasDeliverableResult: true,
+      alreadySettled,
+      resultCount: sources.length,
+      usedMiniMaxFileRetrieval,
+      durationMs,
+      // Do not write signed URLs or bearer tokens to production logs.
+      error: errorMessage.replace(/https?:\/\/[^\s]+/gi, '[URL]'),
+    });
     return videoStatusEnvelope(input.taskId, 'processing', {
       upstream: waited,
       upstreamTaskIds: [upstreamTaskId],

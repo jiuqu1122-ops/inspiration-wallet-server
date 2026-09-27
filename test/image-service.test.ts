@@ -13,6 +13,8 @@ import {
   collectImageStrings,
   collectUselgTaskAssets,
   collectGeneratedVideoStrings,
+  collectMiniMaxH3FileIds,
+  collectMiniMaxH3VideoSources,
   classifyLegacyVideoSubmitResponse,
   getDeliverableVideoSources,
   hasDeliverableVideoResult,
@@ -48,6 +50,7 @@ import {
   providerSupportsImageModel,
   boundProviderImageResults,
   providerCanServeImageAlongsideAgent,
+  providerVideoResultRequestHeaders,
   providerSupportsVideoModel,
   resolveBigmodelImageModel,
   resolveImageModel,
@@ -356,6 +359,39 @@ describe('Mikoto Seedance model mapping', () => {
 });
 
 describe('legacy video result protocol', () => {
+  it('extracts extensionless MiniMax H3 output URLs and file IDs without reference media', () => {
+    const payload = {
+      task_id: 'h3-task',
+      status: 'Success',
+      file_id: 'h3-file',
+      content: { url: 'https://video-product.cdn.minimax.io/inference_output/rollout/abc' },
+      inputs: {
+        reference_video: { url: 'https://media.example/reference.mp4' },
+      },
+    };
+    expect(collectMiniMaxH3VideoSources(payload)).toEqual([
+      'https://video-product.cdn.minimax.io/inference_output/rollout/abc',
+    ]);
+    expect(collectMiniMaxH3FileIds(payload)).toEqual(['h3-file']);
+  });
+
+  it('authenticates same-origin provider result downloads without leaking auth to CDNs', () => {
+    const provider = { baseUrl: 'https://provider.example/v1' };
+    const secrets = { apiKey: 'sk-video', headers: { 'x-provider': 'wallet' } };
+    const protectedHeaders = providerVideoResultRequestHeaders(
+      provider,
+      'https://provider.example/v1/videos/task-1/content',
+      secrets,
+    );
+    expect(new Headers(protectedHeaders).get('authorization')).toBe('Bearer sk-video');
+    expect(new Headers(protectedHeaders).get('x-provider')).toBe('wallet');
+    expect(providerVideoResultRequestHeaders(
+      provider,
+      'https://cdn.example/output.mp4?signature=redacted',
+      secrets,
+    )).toBeUndefined();
+  });
+
   it('distinguishes an async receipt from a deliverable result for every legacy provider', () => {
     expect(classifyLegacyVideoSubmitResponse({ task_id: 'mikoto-1', status: 'processing' })).toEqual({
       kind: 'async-task-receipt',
