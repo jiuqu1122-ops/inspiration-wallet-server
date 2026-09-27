@@ -5077,10 +5077,11 @@ function videoStatusEnvelope(
   return envelope;
 }
 
-function mergeLegacyVideoStatusResult(
+export function mergeLegacyVideoStatusResult(
   previous: unknown,
   taskId: string,
   statusEnvelope: Record<string, unknown>,
+  excludedTaskIds: string[] = [],
 ) {
   const previousRecord = previous && typeof previous === 'object' && !Array.isArray(previous)
     ? previous as Record<string, unknown>
@@ -5101,10 +5102,21 @@ function mergeLegacyVideoStatusResult(
   };
   const replaced = previousResults.map(item => hasVideoTaskBinding(item, taskId) ? currentTaskResult : item);
   if (!replaced.some(item => hasVideoTaskBinding(item, taskId))) replaced.push(currentTaskResult);
+  // `videoStatusEnvelope` uses the caller's task id as its public `task_id`.
+  // Newer clients may use their slot/clientRequestId there while the provider
+  // task id lives in `upstreamTaskIds`. Do not persist that synthetic id as an
+  // upstream task binding, otherwise the next poll can query the wrong task
+  // and the request can never satisfy the final-delivery check.
+  const excluded = new Set(excludedTaskIds.map(value => String(value || '').trim()).filter(Boolean));
   const allTaskIds = Array.from(new Set([
     ...collectTaskIdsFromValue(previous),
-    ...collectTaskIdsFromValue(statusEnvelope),
-  ]));
+    ...(Array.isArray(statusEnvelope.upstreamTaskIds)
+      ? statusEnvelope.upstreamTaskIds
+        .filter((value): value is string | number => typeof value === 'string' || typeof value === 'number')
+        .map(value => String(value).trim())
+      : []),
+    taskId,
+  ])).filter(value => !excluded.has(value));
   const allSources = replaced.flatMap(item => getDeliverableVideoSources(item));
   return {
     ...previousRecord,
@@ -8200,9 +8212,14 @@ export async function executeWalletVideoStatus(
     ? boundRequest.result as Record<string, unknown>
     : null;
   const boundTaskIds = collectTaskIdsFromValue(boundRequest.result);
+  const requestClientTaskId = String(input.clientRequestId || '').trim();
+  // A newer client can send its slot/clientRequestId as `taskId`. That value
+  // is not an upstream provider task and must never win task resolution after
+  // an earlier status response persisted it beside the real task id.
+  const upstreamBoundTaskIds = boundTaskIds.filter(taskId => taskId !== requestClientTaskId);
   const alreadySettled = boundRequest.status === 'SUCCEEDED';
-  const persistedTaskId = input.clientRequestId === input.taskId && boundTaskIds.length === 1
-    ? (boundTaskIds[0] || input.taskId)
+  const persistedTaskId = input.clientRequestId === input.taskId && upstreamBoundTaskIds.length === 1
+    ? (upstreamBoundTaskIds[0] || input.taskId)
     : input.taskId;
   const storedSources = getTaskScopedVideoResultSources(boundRequest.result, persistedTaskId);
   const requestScopedStoredSources = alreadySettled && storedSources.length === 0
@@ -8224,16 +8241,16 @@ export async function executeWalletVideoStatus(
     return videoStatusEnvelope(input.taskId, 'succeeded', {
       sources: requestScopedStoredSources,
       upstream: boundResult?.upstream,
-      upstreamTaskIds: boundTaskIds,
+      upstreamTaskIds: upstreamBoundTaskIds,
     });
   }
   // Newer clients persist the slot clientRequestId as output.taskId while the
   // server stores the real upstream task id in result.upstreamTaskIds. Allow
   // that historical shape to recover without submitting a second generation.
-  const upstreamTaskId = boundTaskIds.includes(input.taskId)
+  const upstreamTaskId = input.taskId !== requestClientTaskId && upstreamBoundTaskIds.includes(input.taskId)
     ? input.taskId
-    : input.clientRequestId === input.taskId && boundTaskIds.length === 1
-      ? boundTaskIds[0]
+    : input.clientRequestId === input.taskId && upstreamBoundTaskIds.length === 1
+      ? upstreamBoundTaskIds[0]
       : '';
   if (!upstreamTaskId) {
     throw new CloudAiError('video_task_pending_confirmation', 'The legacy task is not bound to this request; manual verification is required', 409);
@@ -8408,7 +8425,7 @@ export async function executeWalletVideoStatus(
       upstreamTaskIds: [upstreamTaskId],
     });
     const repairedResult = {
-      ...mergeLegacyVideoStatusResult(boundRequest.result, upstreamTaskId, envelope),
+      ...mergeLegacyVideoStatusResult(boundRequest.result, upstreamTaskId, envelope, [requestClientTaskId]),
       ...(typeof boundResult?.providerChannelId === 'string'
         ? { providerChannelId: boundResult.providerChannelId }
         : { providerChannelId: provider.id }),
@@ -8418,9 +8435,9 @@ export async function executeWalletVideoStatus(
     };
     const repairedSources = getTaskScopedVideoResultSources(repairedResult, upstreamTaskId);
     const taskIds = Array.from(new Set([
-      ...boundTaskIds,
-      ...collectTaskIdsFromValue(repairedResult),
-    ]));
+      ...upstreamBoundTaskIds,
+      ...collectTaskIdsFromValue(repairedResult).filter(taskId => taskId !== requestClientTaskId),
+    ])).filter(taskId => taskId !== requestClientTaskId);
     const repairedEntries: unknown[] = Array.isArray(repairedResult.results)
       ? repairedResult.results
       : [];

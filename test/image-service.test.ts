@@ -42,6 +42,7 @@ import {
   materializeNewApiReferenceImage,
   mirrorGeneratedImageResults,
   mirrorGeneratedVideoResponse,
+  mergeLegacyVideoStatusResult,
   minimaxVideoBody,
   mirrorXaisImageResults,
   newApiImageRequestParams,
@@ -359,6 +360,35 @@ describe('Mikoto Seedance model mapping', () => {
 });
 
 describe('legacy video result protocol', () => {
+  it('does not persist a slot clientRequestId as an upstream task binding', () => {
+    const merged = mergeLegacyVideoStatusResult(
+      {
+        results: [{ task_id: 'h3-task', status: 'processing' }],
+        upstreamTaskIds: ['h3-task'],
+      },
+      'h3-task',
+      {
+        task_id: 'slot-request-id',
+        taskId: 'slot-request-id',
+        status: 'succeeded',
+        upstreamTaskIds: ['slot-request-id', 'h3-task'],
+        video_url: 'https://api.unmind.art/v1/ai/video-results/h3.mp4',
+        walletVideoResults: ['https://api.unmind.art/v1/ai/video-results/h3.mp4'],
+      },
+      ['slot-request-id'],
+    );
+
+    expect(merged.upstreamTaskIds).toEqual(['h3-task']);
+    expect(merged.results).toEqual([{
+      task_id: 'h3-task',
+      taskId: 'h3-task',
+      status: 'succeeded',
+      video_url: 'https://api.unmind.art/v1/ai/video-results/h3.mp4',
+      videoUrl: undefined,
+      walletVideoResults: ['https://api.unmind.art/v1/ai/video-results/h3.mp4'],
+    }]);
+  });
+
   it('extracts extensionless MiniMax H3 output URLs and file IDs without reference media', () => {
     const payload = {
       task_id: 'h3-task',
