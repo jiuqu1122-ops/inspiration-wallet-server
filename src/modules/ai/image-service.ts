@@ -5614,7 +5614,12 @@ function collectTaskIdsFromValue(value: unknown, output = new Set<string>(), dep
     const isVideoTaskIdKey = VIDEO_TASK_ID_KEYS.some(candidate => (
       candidate.toLowerCase().replace(/[\s-]+/g, '_') === normalizedKey
     ));
-    if ((isVideoTaskIdKey || /^(?:task[_-]?ids|upstream[_-]?task[_-]?ids)$/i.test(key))
+    // Metaso's H3 list response uses `items[].id` together with a direct
+    // status field instead of `task_id`. Treat that shape as a task binding,
+    // but do not collect arbitrary file/request ids that lack task state.
+    const isGenericVideoTaskId = normalizedKey === 'id'
+      && hasDirectVideoTaskState(value as Record<string, unknown>);
+    if ((isVideoTaskIdKey || isGenericVideoTaskId || /^(?:task[_-]?ids|upstream[_-]?task[_-]?ids)$/i.test(key))
       && (typeof nested === 'string' || typeof nested === 'number')) {
       const taskId = String(nested).trim();
       if (taskId) output.add(taskId);

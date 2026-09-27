@@ -299,6 +299,32 @@ describe('Mikoto Seedance model mapping', () => {
     expect(collectGeneratedVideoStrings(selected)).toEqual([]);
   });
 
+  it('scopes the Metaso H3 items response by item id before reading content.url', () => {
+    const selected = selectVideoTaskPayload({
+      items: [
+        {
+          id: 'old-task',
+          status: 'failed',
+          content: { url: 'https://media.example/old.mp4' },
+        },
+        {
+          id: 'current-task',
+          status: 'succeeded',
+          content: { url: 'https://video-product.cdn.minimax.io/inference_output/current' },
+        },
+      ],
+    }, 'current-task');
+
+    expect(selected).toEqual({
+      id: 'current-task',
+      status: 'succeeded',
+      content: { url: 'https://video-product.cdn.minimax.io/inference_output/current' },
+    });
+    expect(collectMiniMaxH3VideoSources(selected)).toEqual([
+      'https://video-product.cdn.minimax.io/inference_output/current',
+    ]);
+  });
+
   it('keeps polling safely while a newly accepted H3 task is not listed yet', () => {
     const scoped = scopeMiniMaxVideoStatusPayload({
       tasks: [{
