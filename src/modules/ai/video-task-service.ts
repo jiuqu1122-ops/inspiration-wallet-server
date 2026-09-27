@@ -224,16 +224,20 @@ export function publicVideoTask(task: {
   videoAvailable: boolean | null;
   pollAfterMs: number | null;
   resultUrl: string | null;
+  upstreamPayload?: unknown;
   lastError: string | null;
 }) {
   const status = task.status === 'SUCCEEDED'
-    ? 'completed'
+    ? 'succeeded'
     : task.status === 'FAILED' ? 'failed' : 'processing';
   const confirmationRequired = task.status === 'SUBMISSION_PENDING'
     || task.status === 'PERSISTENCE_PENDING';
+  const upstreamTaskIds = task.upstreamTaskId ? [task.upstreamTaskId] : [];
   return {
+    task_id: task.id,
     taskId: task.id,
     upstreamTaskId: task.upstreamTaskId,
+    upstreamTaskIds,
     status,
     ...(confirmationRequired ? { confirmationRequired: true, recoveryStatus: 'pending_confirmation' } : {}),
     video_available: task.videoAvailable ?? Boolean(task.resultUrl),
@@ -242,6 +246,7 @@ export function publicVideoTask(task: {
     assetState: task.assetState,
     poll_after_ms: task.pollAfterMs,
     pollAfterMs: task.pollAfterMs,
+    ...(task.upstreamPayload ? { upstream: task.upstreamPayload } : {}),
     ...(task.resultUrl ? { video_url: task.resultUrl, videoUrl: task.resultUrl, walletVideoResults: [task.resultUrl] } : {}),
     ...(task.lastError ? { error: task.lastError } : {}),
   };

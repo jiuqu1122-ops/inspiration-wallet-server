@@ -4719,25 +4719,86 @@ const VIDEO_SUCCESS_STATES = new Set([
   'finished',
 ]);
 
-function videoTaskState(value: unknown) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+const VIDEO_PENDING_STATES = new Set([
+  'queued', 'pending', 'accepted', 'submitted', 'processing', 'running',
+  'in_progress', 'preparing', 'waiting',
+]);
+
+function videoTaskState(value: unknown, depth = 0): string {
+  if (!value || typeof value !== 'object' || depth > 8) return '';
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const state = videoTaskState(item, depth + 1);
+      if (state) return state;
+    }
+    return '';
+  }
   const record = value as Record<string, unknown>;
-  return normalizeTaskState(
+  const direct = normalizeTaskState(
     record.status
       ?? record.state
       ?? record.task_status
       ?? record.taskStatus
       ?? record.phase,
   );
+  if (direct) return direct;
+  for (const key of ['data', 'result', 'results', 'task', 'tasks', 'response', 'payload', 'upstream']) {
+    const state = videoTaskState(record[key], depth + 1);
+    if (state) return state;
+  }
+  return '';
 }
 
 function isVideoSuccessState(value: unknown) {
   return VIDEO_SUCCESS_STATES.has(videoTaskState(value));
 }
 
+function isStoredVideoResultUrl(value: string) {
+  return /\/v1\/ai\/video-results\//i.test(value);
+}
+
+function isVideoMediaUrl(value: string) {
+  if (/^data:video\//i.test(value)) return true;
+  try {
+    const pathname = new URL(value).pathname;
+    return isStoredVideoResultUrl(value) || /\.(?:avi|m4v|mov|mp4|webm)$/i.test(pathname);
+  } catch {
+    return false;
+  }
+}
+
+export function getDeliverableVideoSources(value: unknown) {
+  const sources = Array.from(new Set(collectGeneratedVideoStrings(value)));
+  const stable = sources.filter(isStoredVideoResultUrl);
+  return (stable.length > 0 ? stable : sources).filter(isVideoMediaUrl);
+}
+
+/** A task receipt, status message, or ordinary API URL is not deliverable media. */
+export function hasDeliverableVideoResult(value: unknown) {
+  return getDeliverableVideoSources(value).length > 0;
+}
+
+export type LegacyVideoSubmitResponseKind = 'deliverable' | 'async-task-receipt' | 'invalid';
+
+export function classifyLegacyVideoSubmitResponse(value: unknown): {
+  kind: LegacyVideoSubmitResponseKind;
+  taskIds: string[];
+  sources: string[];
+} {
+  const taskIds = collectTaskIdsFromValue(value);
+  const sources = getDeliverableVideoSources(value);
+  const state = videoTaskState(value);
+  const explicitSuccess = isVideoSuccessState(value);
+  if (sources.length > 0 && (taskIds.length === 0 || explicitSuccess || !VIDEO_PENDING_STATES.has(state))) {
+    return { kind: 'deliverable', taskIds, sources };
+  }
+  if (taskIds.length > 0) return { kind: 'async-task-receipt', taskIds, sources: [] };
+  return { kind: 'invalid', taskIds, sources: [] };
+}
+
 /** True only when the task-scoped payload is terminal and contains media. */
 export function isMiniMaxVideoTaskReadyForSettlement(value: unknown) {
-  return isVideoSuccessState(value) && collectGeneratedVideoStrings(value).length > 0;
+  return isVideoSuccessState(value) && hasDeliverableVideoResult(value);
 }
 
 const VIDEO_TASK_ID_KEYS = [
@@ -4857,6 +4918,169 @@ export function scopeMiniMaxVideoStatusPayload(value: unknown, taskId: string): 
     task_id: expectedTaskId,
     status: 'processing',
   };
+}
+
+function hasVideoTaskBinding(value: unknown, expectedTaskId: string) {
+  return collectTaskIdsFromValue(value).includes(expectedTaskId);
+}
+
+function findVideoTaskEnvelope(value: unknown, expectedTaskId: string, depth = 0): unknown {
+  if (!value || typeof value !== 'object' || depth > 10) return undefined;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findVideoTaskEnvelope(item, expectedTaskId, depth + 1);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (hasVideoTaskBinding(record, expectedTaskId)) return record;
+  for (const nested of Object.values(record)) {
+    const found = findVideoTaskEnvelope(nested, expectedTaskId, depth + 1);
+    if (found === undefined) continue;
+    if (record.walletVideoResults || record.video_url || record.videoUrl) return record;
+    return found;
+  }
+  return undefined;
+}
+
+function directVideoEnvelopeSources(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  const record = value as Record<string, unknown>;
+  const directValues: unknown[] = [];
+  for (const key of ['walletVideoResults', 'video_url', 'videoUrl', 'video', 'videos']) {
+    if (record[key] !== undefined) directValues.push(record[key]);
+  }
+  if (Array.isArray(record.results) && record.results.every(item => typeof item === 'string')) {
+    directValues.push(record.results);
+  }
+  return getDeliverableVideoSources(directValues);
+}
+
+function getTaskScopedVideoResultSources(value: unknown, taskId: string) {
+  const envelope = findVideoTaskEnvelope(value, taskId);
+  if (!envelope) return [];
+  const direct = directVideoEnvelopeSources(envelope);
+  if (direct.length > 0) return direct;
+  if (Array.isArray((envelope as Record<string, unknown>).results)) {
+    const currentResult = ((envelope as Record<string, unknown>).results as unknown[])
+      .find(item => hasVideoTaskBinding(item, taskId));
+    if (currentResult) return getDeliverableVideoSources(currentResult);
+  }
+  return [];
+}
+
+function videoStatusEnvelope(
+  taskId: string,
+  status: 'processing' | 'succeeded' | 'failed',
+  options: {
+    upstream?: unknown;
+    sources?: string[];
+    upstreamTaskIds?: string[];
+    pollAfterMs?: unknown;
+    error?: string;
+  } = {},
+) {
+  const sources = Array.from(new Set((options.sources || []).filter(isVideoMediaUrl)));
+  const upstreamTaskIds = Array.from(new Set([taskId, ...(options.upstreamTaskIds || [])].filter(Boolean)));
+  const envelope = {
+    task_id: taskId,
+    taskId,
+    status,
+    video_available: status === 'succeeded' && sources.length > 0,
+    videoAvailable: status === 'succeeded' && sources.length > 0,
+    ...(status === 'processing' ? {
+      poll_after_ms: clampVideoPollAfterMs(options.pollAfterMs),
+      pollAfterMs: clampVideoPollAfterMs(options.pollAfterMs),
+    } : {}),
+    ...(status === 'succeeded' && sources.length > 0 ? {
+      results: sources,
+      video_url: sources[0],
+      videoUrl: sources[0],
+      walletVideoResults: sources,
+    } : {}),
+    upstreamTaskIds,
+    ...(options.upstream !== undefined ? { upstream: options.upstream } : {}),
+    ...(options.error ? { error: options.error } : {}),
+  };
+  return envelope;
+}
+
+function mergeLegacyVideoStatusResult(
+  previous: unknown,
+  taskId: string,
+  statusEnvelope: Record<string, unknown>,
+) {
+  const previousRecord = previous && typeof previous === 'object' && !Array.isArray(previous)
+    ? previous as Record<string, unknown>
+    : {};
+  const previousResults: unknown[] = Array.isArray(previousRecord.results)
+    ? previousRecord.results as unknown[]
+    : [];
+  const currentTaskResult = {
+    task_id: taskId,
+    taskId,
+    status: statusEnvelope.status,
+    ...(typeof statusEnvelope.video_url === 'string' ? {
+      video_url: statusEnvelope.video_url,
+      videoUrl: statusEnvelope.videoUrl,
+      walletVideoResults: statusEnvelope.walletVideoResults,
+    } : {}),
+    ...(statusEnvelope.upstream !== undefined ? { upstream: statusEnvelope.upstream } : {}),
+  };
+  const replaced = previousResults.map(item => hasVideoTaskBinding(item, taskId) ? currentTaskResult : item);
+  if (!replaced.some(item => hasVideoTaskBinding(item, taskId))) replaced.push(currentTaskResult);
+  const allTaskIds = Array.from(new Set([
+    ...collectTaskIdsFromValue(previous),
+    ...collectTaskIdsFromValue(statusEnvelope),
+  ]));
+  const allSources = replaced.flatMap(item => getDeliverableVideoSources(item));
+  return {
+    ...previousRecord,
+    task_id: taskId,
+    taskId,
+    status: statusEnvelope.status,
+    results: replaced,
+    upstreamTaskIds: allTaskIds.length > 0 ? allTaskIds : [taskId],
+    ...(statusEnvelope.status === 'succeeded' && allSources.length > 0 ? {
+      walletVideoResults: Array.from(new Set(allSources)),
+      video_url: allSources[0],
+      videoUrl: allSources[0],
+    } : {
+      walletVideoResults: undefined,
+      video_url: undefined,
+      videoUrl: undefined,
+    }),
+    ...(statusEnvelope.upstream !== undefined ? { upstream: statusEnvelope.upstream } : {}),
+  };
+}
+
+function getVideoTerminalFailure(value: unknown) {
+  const state = videoTaskState(value);
+  if (isFailureTaskState(state)) {
+    const failure = getFailure(value) || state;
+    if (/(?:timeout|timed out|temporarily unavailable|too many requests|rate limit|HTTP\s*(?:408|425|429|500|502|503|504)|gateway|network|dns|connection|暂时|超时|限流)/i.test(failure)) {
+      return '';
+    }
+    return failure;
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    if (record.success === false || record.ok === false) {
+      return getFailure(value) || 'upstream request failed';
+    }
+  }
+  return '';
+}
+
+function isTransientVideoStatusError(error: unknown) {
+  const status = Number((error as { status?: unknown })?.status);
+  if (!Number.isFinite(status) || status === 0) return true;
+  if ([408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string' ? error : '';
+  return /(?:timeout|timed out|aborted|ECONNRESET|ECONNREFUSED|ENOTFOUND|fetch failed|network)/i.test(message);
 }
 
 function getFailure(value: unknown, depth = 0): string {
@@ -5303,10 +5527,22 @@ function collectTaskIdsFromValue(value: unknown, output = new Set<string>(), dep
   }
   if (typeof value !== 'object') return Array.from(output);
   for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-    if (/^(?:task[_-]?id|upstream[_-]?task[_-]?id)$/i.test(key)
+    const normalizedKey = key.trim().toLowerCase().replace(/[\s-]+/g, '_');
+    const isVideoTaskIdKey = VIDEO_TASK_ID_KEYS.some(candidate => (
+      candidate.toLowerCase().replace(/[\s-]+/g, '_') === normalizedKey
+    ));
+    if ((isVideoTaskIdKey || /^(?:task[_-]?ids|upstream[_-]?task[_-]?ids)$/i.test(key))
       && (typeof nested === 'string' || typeof nested === 'number')) {
       const taskId = String(nested).trim();
       if (taskId) output.add(taskId);
+    }
+    if (/^(?:task[_-]?ids|upstream[_-]?task[_-]?ids)$/i.test(key) && Array.isArray(nested)) {
+      nested.forEach(candidate => {
+        if (typeof candidate === 'string' || typeof candidate === 'number') {
+          const taskId = String(candidate).trim();
+          if (taskId) output.add(taskId);
+        }
+      });
     }
     if (nested && typeof nested === 'object') collectTaskIdsFromValue(nested, output, depth + 1);
   }
@@ -7113,6 +7349,7 @@ async function reserveVideo(
     const request = reusableRequest
       ? await transaction.aiRequest.update({ where: { id: reusableRequest.id }, data: {
         status: 'RESERVED',
+        ...(pricingSnapshot?.routeId ? { routeId: pricingSnapshot.routeId } : {}),
         logicalModel: canonicalModelKey ?? input.model,
         ...(pricingSnapshot ? {
           canonicalModelId: pricingSnapshot.canonicalModelId,
@@ -7131,6 +7368,7 @@ async function reserveVideo(
         clientRequestId: input.clientRequestId,
         capability: 'VIDEO',
         logicalModel: canonicalModelKey ?? input.model,
+        ...(pricingSnapshot?.routeId ? { routeId: pricingSnapshot.routeId } : {}),
         ...(pricingSnapshot ? {
           canonicalModelId: pricingSnapshot.canonicalModelId,
           routeId: pricingSnapshot.routeId,
@@ -7425,14 +7663,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       ...(input.resolution ? { referenceVideoResolution: input.resolution } : {}),
     }, input.userId)
     : undefined;
-  const legacyMiniMaxAsync = provider.kind === 'MINIMAX' && isMiniMaxH3VideoModel(upstreamInput.model);
-  const reservation = await reserveVideo(
-    prisma,
-    upstreamInput,
-    pricingSnapshot,
-    canonicalModelKey,
-    { reuseFailed: !legacyMiniMaxAsync },
-  );
+  const reservation = await reserveVideo(prisma, upstreamInput, pricingSnapshot, canonicalModelKey);
   let acceptedLegacyTask = false;
   try {
     console.info('[video_generation_upstream_dispatch]', {
@@ -7634,19 +7865,19 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       }
       if (lastError instanceof Error) throw lastError;
       if (lastError) throw new Error('Mikoto video generation failed');
-      const submittedTaskIds = collectTaskIdsFromValue(result);
-      if (legacyMiniMaxAsync) {
-        // MiniMax H3 acknowledges an asynchronous job here. A task id is a
-        // receipt, not a deliverable video, so keep the wallet request in
-        // PROCESSING until the status endpoint proves completion and a media
-        // URL can be mirrored.
-        if (submittedTaskIds.length === 0) {
-          throw new CloudAiError(
-            'video_task_pending_confirmation',
-            'MiniMax accepted the request without returning a task ID; recovery is required before retrying',
-            409,
-          );
-        }
+      const classification = classifyLegacyVideoSubmitResponse(result);
+      if (classification.kind === 'invalid') {
+        throw new CloudAiError(
+          'video_task_pending_confirmation',
+          '视频渠道没有返回可交付视频或任务 ID；需要恢复确认后才能重试',
+          409,
+        );
+      }
+      if (classification.kind === 'async-task-receipt') {
+        // A task id is a receipt, not a deliverable video. Keep every legacy
+        // provider in PROCESSING until the task-scoped status proves success
+        // and the result has been mirrored to a stable wallet URL.
+        const submittedTaskIds = classification.taskIds;
         acceptedLegacyTask = true;
         submittedTaskIds.forEach(taskId => legacyTaskIds.add(taskId));
         results.push({ task_id: submittedTaskIds[0], status: 'processing' });
@@ -7663,7 +7894,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
           },
         });
       } else {
-        submittedTaskIds.forEach(taskId => legacyTaskIds.add(taskId));
+        classification.taskIds.forEach(taskId => legacyTaskIds.add(taskId));
         results.push(await mirrorGeneratedVideoResponse(
           result,
           provider.name,
@@ -7683,11 +7914,11 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
         data: { result: toInputJson({
           results,
           upstreamTaskIds: Array.from(legacyTaskIds),
-          ...(legacyMiniMaxAsync ? { providerChannelId: provider.id, providerKind: provider.kind } : {}),
+          ...(acceptedLegacyTask ? { providerChannelId: provider.id, providerKind: provider.kind } : {}),
         }) },
       });
     }
-    if (legacyMiniMaxAsync) {
+    if (acceptedLegacyTask) {
       return {
         status: 'processing',
         results,
@@ -7701,8 +7932,8 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
     await settleVideo(prisma, input.userId, reservation.requestId, reservation.estimated, breakdown, pricingSnapshot);
     return { results, provider: provider.kind, model: canonicalModelKey, chargedCredits: serializeCredit(creditDecimal(reservation.estimated)) };
   } catch (error) {
-    // Once MiniMax has returned a task id the upstream job exists. Never
-    // release and allow a client retry to submit a second paid generation.
+    // Once any legacy provider has returned a task id the upstream job exists.
+    // Never release and allow a client retry to submit a second generation.
     if (!acceptedLegacyTask) {
       await releaseVideo(prisma, input.userId, reservation.requestId, reservation.estimated);
     }
@@ -7875,9 +8106,6 @@ export async function executeWalletVideoStatus(
   if (!boundRequest || boundRequest.capability !== 'VIDEO') {
     throw new CloudAiError('video_task_not_found', 'Video task was not found', 404);
   }
-  if (boundRequest.status === 'SUCCEEDED') {
-    return boundRequest.result ?? { status: 'succeeded', results: [] };
-  }
   if (boundRequest.status === 'FAILED' || boundRequest.status === 'REFUNDED') {
     throw new CloudAiError('video_generation_failed', 'The video generation failed', 502);
   }
@@ -7886,7 +8114,42 @@ export async function executeWalletVideoStatus(
     ? boundRequest.result as Record<string, unknown>
     : null;
   const boundTaskIds = collectTaskIdsFromValue(boundRequest.result);
-  if (!boundTaskIds.includes(input.taskId)) {
+  const alreadySettled = boundRequest.status === 'SUCCEEDED';
+  const persistedTaskId = input.clientRequestId === input.taskId && boundTaskIds.length === 1
+    ? (boundTaskIds[0] || input.taskId)
+    : input.taskId;
+  const storedSources = getTaskScopedVideoResultSources(boundRequest.result, persistedTaskId);
+  const requestScopedStoredSources = alreadySettled && storedSources.length === 0
+    ? getDeliverableVideoSources(boundRequest.result)
+    : storedSources;
+  if (alreadySettled && requestScopedStoredSources.length > 0) {
+    console.info('[video_status_final_envelope]', {
+      clientRequestId: input.clientRequestId ?? null,
+      requestId: boundRequest.id,
+      taskId: input.taskId,
+      providerId: boundResult?.providerChannelId ?? null,
+      routeId: boundRequest.routeId ?? null,
+      requestStatus: boundRequest.status,
+      hasDeliverableResult: true,
+      alreadySettled: true,
+      resultCount: requestScopedStoredSources.length,
+      durationMs: 0,
+    });
+    return videoStatusEnvelope(input.taskId, 'succeeded', {
+      sources: requestScopedStoredSources,
+      upstream: boundResult?.upstream,
+      upstreamTaskIds: boundTaskIds,
+    });
+  }
+  // Newer clients persist the slot clientRequestId as output.taskId while the
+  // server stores the real upstream task id in result.upstreamTaskIds. Allow
+  // that historical shape to recover without submitting a second generation.
+  const upstreamTaskId = boundTaskIds.includes(input.taskId)
+    ? input.taskId
+    : input.clientRequestId === input.taskId && boundTaskIds.length === 1
+      ? boundTaskIds[0]
+      : '';
+  if (!upstreamTaskId) {
     throw new CloudAiError('video_task_pending_confirmation', 'The legacy task is not bound to this request; manual verification is required', 409);
   }
   const provider = requestRoute?.channel
@@ -7911,116 +8174,227 @@ export async function executeWalletVideoStatus(
     });
   }
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+  const statusStartedAt = Date.now();
   const path = provider.kind === 'XAIS'
-    ? `/xais/workerTaskWait?json=1&id=${encodeURIComponent(input.taskId)}`
+    ? `/xais/workerTaskWait?json=1&id=${encodeURIComponent(upstreamTaskId)}`
     : provider.kind === 'MIKOTO'
-      ? `/v1/videos/${encodeURIComponent(input.taskId)}`
+      ? `/v1/videos/${encodeURIComponent(upstreamTaskId)}`
       : provider.kind === 'MINIMAX'
-        ? `/api/minimax/v2/query/video_generation?task_id=${encodeURIComponent(input.taskId)}`
-      : `/v1/video/generations/${encodeURIComponent(input.taskId)}`;
-  const upstreamStatus = await providerRequest(provider, secrets, path);
-  const selectedMiniMaxStatus = provider.kind === 'MINIMAX'
-    ? selectVideoTaskPayload(upstreamStatus, input.taskId)
-    : undefined;
-  if (provider.kind === 'MINIMAX' && selectedMiniMaxStatus === undefined) {
-    console.warn('[minimax_video_status_task_mismatch]', {
-      provider: provider.name,
-      expectedTaskId: input.taskId,
-      receivedTaskId: getTaskId(upstreamStatus) || undefined,
+        ? `/api/minimax/v2/query/video_generation?task_id=${encodeURIComponent(upstreamTaskId)}`
+      : `/v1/video/generations/${encodeURIComponent(upstreamTaskId)}`;
+  let upstreamStatus: unknown;
+  try {
+    upstreamStatus = await providerRequest(provider, secrets, path);
+  } catch (error) {
+    const durationMs = Date.now() - statusStartedAt;
+    if (isTransientVideoStatusError(error)) {
+      const envelope = videoStatusEnvelope(input.taskId, 'processing', {
+        upstreamTaskIds: [upstreamTaskId],
+        error: '视频状态暂时无法确认，请稍后重试',
+      });
+      console.info('[video_status_poll]', {
+        clientRequestId: input.clientRequestId ?? null,
+        requestId: boundRequest.id,
+        taskId: input.taskId,
+        providerId: provider.id,
+        routeId: requestRoute?.id ?? null,
+        requestStatus: boundRequest.status,
+        hasDeliverableResult: false,
+        alreadySettled,
+        resultCount: 0,
+        durationMs,
+      });
+      return envelope;
+    }
+    throw new CloudAiError('video_status_unavailable', '视频状态暂时无法确认', 502);
+  }
+  const waited = findVideoTaskEnvelope(upstreamStatus, upstreamTaskId)
+    ?? (collectTaskIdsFromValue(upstreamStatus).length > 0
+      ? { task_id: upstreamTaskId, status: 'processing' }
+      : upstreamStatus);
+  const terminalFailure = getVideoTerminalFailure(waited);
+  if (terminalFailure) {
+    if (input.clientRequestId) await refundVideoRequest(prisma, input.userId, input.clientRequestId);
+    const envelope = videoStatusEnvelope(input.taskId, 'failed', {
+      upstream: waited,
+      upstreamTaskIds: [upstreamTaskId],
+      error: terminalFailure,
+    });
+    console.info('[video_status_poll]', {
+      clientRequestId: input.clientRequestId ?? null,
+      requestId: boundRequest.id,
+      taskId: input.taskId,
+      providerId: provider.id,
+      routeId: requestRoute?.id ?? null,
+      requestStatus: boundRequest.status,
+      hasDeliverableResult: false,
+      alreadySettled,
+      resultCount: 0,
+      durationMs: Date.now() - statusStartedAt,
+    });
+    return envelope;
+  }
+
+  let deliveryPayload = waited;
+  if (provider.kind === 'XAIS') {
+    const attachments = collectAttachmentIds(waited)
+      .filter((value) => !/^(?:pending|processing|queued|completed|success|succeeded|failed|failure|error|cancelled|canceled)$/i.test(value));
+    if (attachments.length > 0) {
+      const resolved: unknown[] = [];
+      for (const attachment of Array.from(new Set(attachments))) {
+        resolved.push(await providerRequest(provider, secrets, `/xais/attUrls?att=${encodeURIComponent(attachment)}`));
+      }
+      deliveryPayload = { result: waited, attachments: resolved };
+    }
+  }
+  const sources = getDeliverableVideoSources(deliveryPayload);
+  const success = isVideoSuccessState(waited) && sources.length > 0;
+  const durationMs = Date.now() - statusStartedAt;
+  console.info('[video_status_poll]', {
+    clientRequestId: input.clientRequestId ?? null,
+    requestId: boundRequest.id,
+    taskId: input.taskId,
+    providerId: provider.id,
+    routeId: requestRoute?.id ?? null,
+    requestStatus: boundRequest.status,
+    hasDeliverableResult: success,
+    alreadySettled,
+    resultCount: sources.length,
+    durationMs,
+  });
+  if (!success) {
+    return videoStatusEnvelope(input.taskId, 'processing', {
+      upstream: waited,
+      upstreamTaskIds: [upstreamTaskId],
     });
   }
-  const waited = provider.kind === 'MINIMAX'
-    ? scopeMiniMaxVideoStatusPayload(upstreamStatus, input.taskId)
-    : upstreamStatus;
-  const failure = getFailure(waited);
-  if (failure) {
-    if (input.clientRequestId) {
-      await refundVideoRequest(prisma, input.userId, input.clientRequestId);
-    }
-    throw new CloudAiError('video_generation_failed', failure, 502);
-  }
-  if (provider.kind === 'MINIMAX') {
-    // Only the task-scoped terminal state is authoritative. In particular,
-    // an outer `success: true` or a historical completed row must not settle
-    // this request while the requested H3 task is still running.
-    if (!isMiniMaxVideoTaskReadyForSettlement(waited)) {
-      return {
-        status: 'processing',
-        results: [{ task_id: input.taskId, status: videoTaskState(waited) || 'processing' }],
-        upstream: waited,
-      };
-    }
-    const sources = Array.from(new Set(collectGeneratedVideoStrings(waited)));
-    if (sources.length === 0) {
-      return {
-        status: 'processing',
-        results: [{ task_id: input.taskId, status: 'processing' }],
-        upstream: waited,
-      };
-    }
-    try {
-      const mirrored = await Promise.all(sources.map(source => mirrorGeneratedVideoResultToStorage(
-        source,
-        undefined,
-        `${provider.id}:${input.taskId}`,
-      )));
-      const completedResult = {
-        status: 'succeeded',
-        results: mirrored,
-        walletVideoResults: mirrored,
-        upstreamTaskIds: [input.taskId],
-        providerChannelId: provider.id,
-        upstream: waited,
-      };
+
+  try {
+    const mirrored = await Promise.all(sources.map(source => mirrorGeneratedVideoResultToStorage(
+      source,
+      undefined,
+      `${provider.id}:${upstreamTaskId}`,
+    )));
+    const envelope = videoStatusEnvelope(input.taskId, 'succeeded', {
+      upstream: waited,
+      sources: mirrored,
+      upstreamTaskIds: [upstreamTaskId],
+    });
+    const repairedResult = {
+      ...mergeLegacyVideoStatusResult(boundRequest.result, upstreamTaskId, envelope),
+      ...(typeof boundResult?.providerChannelId === 'string'
+        ? { providerChannelId: boundResult.providerChannelId }
+        : { providerChannelId: provider.id }),
+      ...(typeof boundResult?.providerKind === 'string'
+        ? { providerKind: boundResult.providerKind }
+        : { providerKind: provider.kind }),
+    };
+    const repairedSources = getTaskScopedVideoResultSources(repairedResult, upstreamTaskId);
+    const taskIds = Array.from(new Set([
+      ...boundTaskIds,
+      ...collectTaskIdsFromValue(repairedResult),
+    ]));
+    const repairedEntries: unknown[] = Array.isArray(repairedResult.results)
+      ? repairedResult.results
+      : [];
+    const allTasksDelivered = taskIds.length === 0
+      || taskIds.every(taskId => {
+        const entry = repairedEntries.find(item => hasVideoTaskBinding(item, taskId));
+        return entry !== undefined && getDeliverableVideoSources(entry).length > 0;
+      });
+    if (alreadySettled) {
       await prisma.aiRequest.update({
         where: { id: boundRequest.id },
-        data: { result: toInputJson(completedResult), status: 'PROCESSING' },
+        data: { result: toInputJson(repairedResult) },
       });
-      await settleVideo(
-        prisma,
-        input.userId,
-        boundRequest.id,
-        boundRequest.estimatedCredits.toString(),
-        undefined,
-        undefined,
-        completedResult,
-      );
-      return completedResult;
-    } catch (error) {
-      // The provider task is complete, but persistence is not. Keep the
-      // reservation and retry mirroring on the next status poll.
-      return {
-        status: 'processing',
-        results: [{ task_id: input.taskId, status: 'completed', asset_state: 'saving' }],
-        upstream: waited,
-        error: error instanceof Error ? error.message : 'video result persistence is pending',
-      };
+      console.info('[video_status_historical_success_recovery]', {
+        clientRequestId: input.clientRequestId ?? null,
+        requestId: boundRequest.id,
+        taskId: input.taskId,
+        providerId: provider.id,
+        routeId: requestRoute?.id ?? null,
+        requestStatus: boundRequest.status,
+        hasDeliverableResult: repairedSources.length > 0,
+        alreadySettled: true,
+        resultCount: repairedSources.length,
+        durationMs,
+      });
+      console.info('[video_status_result_repaired]', {
+        clientRequestId: input.clientRequestId ?? null,
+        requestId: boundRequest.id,
+        taskId: input.taskId,
+        providerId: provider.id,
+        routeId: requestRoute?.id ?? null,
+        requestStatus: boundRequest.status,
+        hasDeliverableResult: repairedSources.length > 0,
+        alreadySettled: true,
+        resultCount: repairedSources.length,
+        durationMs,
+      });
+      console.info('[video_status_settlement_skipped_already_settled]', {
+        clientRequestId: input.clientRequestId ?? null,
+        requestId: boundRequest.id,
+        taskId: input.taskId,
+        providerId: provider.id,
+        routeId: requestRoute?.id ?? null,
+        requestStatus: boundRequest.status,
+        hasDeliverableResult: true,
+        alreadySettled: true,
+        resultCount: repairedSources.length,
+        durationMs,
+      });
+      return envelope;
     }
+    if (!allTasksDelivered) {
+      await prisma.aiRequest.update({
+        where: { id: boundRequest.id },
+        data: { status: 'PROCESSING', result: toInputJson(repairedResult) },
+      });
+      return envelope;
+    }
+    await settleVideo(
+      prisma,
+      input.userId,
+      boundRequest.id,
+      boundRequest.estimatedCredits.toString(),
+      undefined,
+      undefined,
+      repairedResult,
+    );
+    console.info('[video_status_deliverable_found]', {
+      clientRequestId: input.clientRequestId ?? null,
+      requestId: boundRequest.id,
+      taskId: input.taskId,
+      providerId: provider.id,
+      routeId: requestRoute?.id ?? null,
+      requestStatus: boundRequest.status,
+      hasDeliverableResult: true,
+      alreadySettled: false,
+      resultCount: mirrored.length,
+      durationMs,
+    });
+    console.info('[video_status_final_envelope]', {
+      clientRequestId: input.clientRequestId ?? null,
+      requestId: boundRequest.id,
+      taskId: input.taskId,
+      providerId: provider.id,
+      routeId: requestRoute?.id ?? null,
+      requestStatus: 'SUCCEEDED',
+      hasDeliverableResult: true,
+      alreadySettled: false,
+      resultCount: mirrored.length,
+      durationMs,
+    });
+    return envelope;
+  } catch {
+    // The provider task is complete, but persistence is not. Keep the request
+    // recoverable and retry only mirroring on the next status poll.
+    return videoStatusEnvelope(input.taskId, 'processing', {
+      upstream: waited,
+      upstreamTaskIds: [upstreamTaskId],
+      error: '视频结果持久化仍在重试',
+    });
   }
-  if (provider.kind !== 'XAIS') {
-    const cacheScope = `${provider.id}:${input.taskId}`;
-    const mirrorVideo = provider.kind === 'MIKOTO'
-      ? providerVideoResultMirror(provider, secrets, cacheScope)
-      : (source: string) => mirrorGeneratedVideoResultToStorage(
-        source,
-        undefined,
-        cacheScope,
-      );
-    return mirrorGeneratedVideoResponse(waited, provider.name, mirrorVideo);
-  }
-  const attachments = collectAttachmentIds(waited)
-    .filter((value) => !/^(?:pending|processing|queued|completed|success|succeeded|failed|failure|error|cancelled|canceled)$/i.test(value));
-  if (!attachments.length) return mirrorGeneratedVideoResponse(waited, provider.name);
-  const resolved: unknown[] = [];
-  for (const attachment of Array.from(new Set(attachments))) {
-    resolved.push(await providerRequest(provider, secrets, `/xais/attUrls?att=${encodeURIComponent(attachment)}`));
-  }
-  return mirrorGeneratedVideoResponse(
-    { result: waited, attachments: resolved },
-    provider.name,
-    mirrorGeneratedVideoResultToStorage,
-    true,
-  );
 }
 
 

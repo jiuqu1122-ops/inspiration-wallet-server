@@ -11,6 +11,7 @@ import {
   sanitizeTaskError,
   serializeAiTask,
 } from '../src/modules/ai/task-service.js';
+import { publicVideoTask } from '../src/modules/ai/video-task-service.js';
 
 const makeTask = (overrides: Partial<AiTask> = {}): AiTask => ({
   id: 'task-1',
@@ -64,6 +65,27 @@ function taskPrisma(initial?: AiTask) {
 }
 
 describe('PostgreSQL-backed AI tasks', () => {
+  it('returns a root video envelope while preserving the upstream payload', () => {
+    expect(publicVideoTask({
+      id: 'client-request-1',
+      upstreamTaskId: 'upstream-1',
+      status: 'SUCCEEDED',
+      assetState: 'ready',
+      videoAvailable: true,
+      pollAfterMs: null,
+      resultUrl: 'https://api.unmind.art/v1/ai/video-results/stable.mp4',
+      upstreamPayload: { status: 'completed' },
+      lastError: null,
+    })).toMatchObject({
+      task_id: 'client-request-1',
+      taskId: 'client-request-1',
+      upstreamTaskIds: ['upstream-1'],
+      status: 'succeeded',
+      walletVideoResults: ['https://api.unmind.art/v1/ai/video-results/stable.mp4'],
+      upstream: { status: 'completed' },
+    });
+  });
+
   it('creates once and returns the same task for a duplicate requestId', async () => {
     const fake = taskPrisma();
     const input = {

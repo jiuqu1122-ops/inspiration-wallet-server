@@ -13,6 +13,9 @@ import {
   collectImageStrings,
   collectUselgTaskAssets,
   collectGeneratedVideoStrings,
+  classifyLegacyVideoSubmitResponse,
+  getDeliverableVideoSources,
+  hasDeliverableVideoResult,
   collectProviderModelIds,
   confirmXaisReferenceAttachment,
   convertGptImage2ChromaKeyToTransparentPng,
@@ -349,6 +352,41 @@ describe('Mikoto Seedance model mapping', () => {
       task_id: 'current-task',
       status: 'succeeded',
     })).toBe(false);
+  });
+});
+
+describe('legacy video result protocol', () => {
+  it('distinguishes an async receipt from a deliverable result for every legacy provider', () => {
+    expect(classifyLegacyVideoSubmitResponse({ task_id: 'mikoto-1', status: 'processing' })).toEqual({
+      kind: 'async-task-receipt',
+      taskIds: ['mikoto-1'],
+      sources: [],
+    });
+    expect(classifyLegacyVideoSubmitResponse({
+      task_id: 'mikoto-1',
+      status: 'succeeded',
+      video_url: 'https://media.example/mikoto-1.mp4',
+    })).toEqual({
+      kind: 'deliverable',
+      taskIds: ['mikoto-1'],
+      sources: ['https://media.example/mikoto-1.mp4'],
+    });
+  });
+
+  it('does not count task endpoints, text, or API receipts as media', () => {
+    expect(getDeliverableVideoSources({
+      task_id: 'task-1',
+      status: 'succeeded',
+      video_url: 'https://api.unmind.art/v1/ai/videos/task-1',
+    })).toEqual([]);
+    expect(hasDeliverableVideoResult({ task_id: 'task-1', status: 'processing' })).toBe(false);
+  });
+
+  it('prefers stable mirrored URLs over upstream signed URLs', () => {
+    expect(getDeliverableVideoSources({
+      walletVideoResults: ['https://api.unmind.art/v1/ai/video-results/stable.mp4'],
+      upstream: { video_url: 'https://provider.example/signed.mp4?token=secret' },
+    })).toEqual(['https://api.unmind.art/v1/ai/video-results/stable.mp4']);
   });
 });
 
