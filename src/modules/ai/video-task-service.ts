@@ -147,13 +147,33 @@ export async function settleVideoRequestIfTerminal(prisma: PrismaClient, request
       throw new Error('Final video charge exceeds the reserved estimate');
     }
     const releasedCredits = request.estimatedCredits.sub(chargedCredits);
+    const resultUrls = succeeded.map(task => task.resultUrl!);
+    const primaryResultUrl = resultUrls[0] || null;
     const result = {
-      results: succeeded.map(task => task.resultUrl!),
+      results: resultUrls,
+      ...(primaryResultUrl ? {
+        // Keep the stable wallet URL under the field names used by both the
+        // current canvas client and older video clients.
+        video_url: primaryResultUrl,
+        videoUrl: primaryResultUrl,
+        result_url: primaryResultUrl,
+        resultUrl: primaryResultUrl,
+        cos_url: primaryResultUrl,
+        cosUrl: primaryResultUrl,
+      } : {}),
       tasks: request.videoTasks.map(task => ({
         id: task.id,
         outputIndex: task.outputIndex,
         status: task.status,
         resultUrl: task.resultUrl,
+        ...(task.resultUrl ? {
+          video_url: task.resultUrl,
+          videoUrl: task.resultUrl,
+          result_url: task.resultUrl,
+          resultUrl: task.resultUrl,
+          cos_url: task.resultUrl,
+          cosUrl: task.resultUrl,
+        } : {}),
         error: task.lastError,
       })),
     };
@@ -247,7 +267,15 @@ export function publicVideoTask(task: {
     poll_after_ms: task.pollAfterMs,
     pollAfterMs: task.pollAfterMs,
     ...(task.upstreamPayload ? { upstream: task.upstreamPayload } : {}),
-    ...(task.resultUrl ? { video_url: task.resultUrl, videoUrl: task.resultUrl, walletVideoResults: [task.resultUrl] } : {}),
+    ...(task.resultUrl ? {
+      video_url: task.resultUrl,
+      videoUrl: task.resultUrl,
+      result_url: task.resultUrl,
+      resultUrl: task.resultUrl,
+      cos_url: task.resultUrl,
+      cosUrl: task.resultUrl,
+      walletVideoResults: [task.resultUrl],
+    } : {}),
     ...(task.lastError ? { error: task.lastError } : {}),
   };
 }

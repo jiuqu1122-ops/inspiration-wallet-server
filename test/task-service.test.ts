@@ -82,6 +82,9 @@ describe('PostgreSQL-backed AI tasks', () => {
       upstreamTaskIds: ['upstream-1'],
       status: 'succeeded',
       walletVideoResults: ['https://api.unmind.art/v1/ai/video-results/stable.mp4'],
+      video_url: 'https://api.unmind.art/v1/ai/video-results/stable.mp4',
+      result_url: 'https://api.unmind.art/v1/ai/video-results/stable.mp4',
+      cos_url: 'https://api.unmind.art/v1/ai/video-results/stable.mp4',
       upstream: { status: 'completed' },
     });
   });

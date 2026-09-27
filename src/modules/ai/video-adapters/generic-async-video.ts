@@ -140,6 +140,7 @@ async function jsonRequest(
   init: RequestInit,
 ) {
   await assertPublicProviderUrl(context.provider.baseUrl);
+  const requestUrl = endpoint(context, path);
   const controller = new AbortController();
   const timeoutMs = init.method === 'GET'
     ? VIDEO_STATUS_REQUEST_TIMEOUT_MS
@@ -152,7 +153,14 @@ async function jsonRequest(
   try {
     // Keep the same deadline for headers and body. A provider that sends headers
     // and then stalls must not leave an unbounded response.text() behind.
-    response = await fetch(endpoint(context, path), { ...init, signal: controller.signal });
+    response = await fetch(requestUrl, { ...init, signal: controller.signal });
+    console.info('[video_upstream_http]', {
+      providerId: context.provider.id,
+      routeId: context.route.id,
+      method: init.method || 'GET',
+      url: requestUrl,
+      status: response.status,
+    });
     const text = await response.text();
     let payload: unknown = null;
     try { payload = text ? JSON.parse(text) : null; } catch { payload = { message: text }; }
@@ -225,6 +233,14 @@ export const genericAsyncVideoAdapter: VideoAdapter = {
     if (request.inputImages.length > 0 && config.referenceImagesParameter) body[config.referenceImagesParameter] = request.inputImages;
     if (request.inputVideos.length > 0 && config.referenceVideosParameter) body[config.referenceVideosParameter] = request.inputVideos;
     if (request.inputAudios.length > 0 && config.referenceAudiosParameter) body[config.referenceAudiosParameter] = request.inputAudios;
+    const submitUrl = endpoint(context, config.submitEndpoint);
+    console.info('[video_upstream_submit]', {
+      providerId: context.provider.id,
+      routeId: context.route.id,
+      url: submitUrl,
+      model: context.route.upstreamModelId,
+      outputIndex: _outputIndex,
+    });
     const payload = await jsonRequest(context, config.submitEndpoint, {
       method: 'POST',
       headers: requestHeaders(context, { [config.idempotencyHeader]: idempotencyKey }),
@@ -232,6 +248,13 @@ export const genericAsyncVideoAdapter: VideoAdapter = {
     });
     const upstreamTaskId = scalarText(pathValue(payload, config.taskIdPath));
     if (!upstreamTaskId) throw new Error(`Video provider response is missing ${config.taskIdPath}`);
+    console.info('[video_upstream_task_created]', {
+      providerId: context.provider.id,
+      routeId: context.route.id,
+      url: submitUrl,
+      upstreamTaskId,
+      taskIdPath: config.taskIdPath,
+    });
     const pollAfter = Number(pathValue(payload, config.pollAfterMsPath));
     return {
       upstreamTaskId,
@@ -241,11 +264,20 @@ export const genericAsyncVideoAdapter: VideoAdapter = {
   },
   async poll(context, upstreamTaskId) {
     const config = normalizeGenericAsyncVideoConfig(context.route.adapterConfig);
+    const statusPath = config.statusEndpointTemplate.replaceAll('{taskId}', encodeURIComponent(upstreamTaskId));
+    const statusUrl = endpoint(context, statusPath);
+    console.info('[video_upstream_status_url]', {
+      providerId: context.provider.id,
+      routeId: context.route.id,
+      upstreamTaskId,
+      statusUrl,
+      template: config.statusEndpointTemplate,
+    });
     let payload: unknown;
     try {
       payload = await jsonRequest(
         context,
-        config.statusEndpointTemplate.replaceAll('{taskId}', encodeURIComponent(upstreamTaskId)),
+        statusPath,
         { method: 'GET', headers: requestHeaders(context) },
       );
     } catch (error) {
@@ -275,6 +307,16 @@ export const genericAsyncVideoAdapter: VideoAdapter = {
       ...(assetState ? { assetState } : {}),
       ...(Number.isFinite(pollAfterValue) && pollAfterValue >= 0 ? { pollAfterMs: pollAfterValue } : {}),
     };
+    console.info('[video_upstream_status_result]', {
+      providerId: context.provider.id,
+      routeId: context.route.id,
+      upstreamTaskId,
+      statusUrl,
+      upstreamStatus: status || 'unknown',
+      videoAvailable: videoAvailable ?? null,
+      assetState: assetState ?? null,
+      pollAfterMs: Number.isFinite(pollAfterValue) && pollAfterValue >= 0 ? pollAfterValue : null,
+    });
     if (assetState === 'expired') return { state: 'failed', error: 'Video asset expired', ...common };
     if (config.failedStatuses.includes(status)) return { state: 'failed', error: `Video task failed: ${status}`, ...common };
     if (config.completedStatuses.includes(status)) {
@@ -286,8 +328,16 @@ export const genericAsyncVideoAdapter: VideoAdapter = {
   },
   async fetchContent(context, upstreamTaskId) {
     const config = normalizeGenericAsyncVideoConfig(context.route.adapterConfig);
+    const contentUrl = endpoint(context, config.contentEndpointTemplate, upstreamTaskId);
+    console.info('[video_upstream_content_url]', {
+      providerId: context.provider.id,
+      routeId: context.route.id,
+      upstreamTaskId,
+      contentUrl,
+      template: config.contentEndpointTemplate,
+    });
     return {
-      source: endpoint(context, config.contentEndpointTemplate, upstreamTaskId),
+      source: contentUrl,
       requestHeaders: requestHeaders(context),
     };
   },

@@ -628,10 +628,27 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       });
       if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', message: '视频任务 ID 无效' });
       try {
-        return await executeWalletVideoStatus(app.prisma, {
+        const result = await executeWalletVideoStatus(app.prisma, {
           userId: request.user.sub,
           ...parsed.data,
         });
+        const response = result && typeof result === 'object' && !Array.isArray(result)
+          ? result as Record<string, unknown>
+          : {};
+        console.info('[video_client_query_final]', {
+          requestedTaskId: parsed.data.taskId,
+          clientRequestId: parsed.data.clientRequestId ?? null,
+          status: response.status ?? null,
+          task_id: response.task_id ?? null,
+          upstreamTaskId: response.upstreamTaskId ?? null,
+          upstreamTaskIds: Array.isArray(response.upstreamTaskIds) ? response.upstreamTaskIds : [],
+          responseFields: Object.keys(response),
+          video_url: response.video_url ?? null,
+          result_url: response.result_url ?? null,
+          cos_url: response.cos_url ?? null,
+          walletVideoResults: Array.isArray(response.walletVideoResults) ? response.walletVideoResults : [],
+        });
+        return result;
       } catch (error) {
         return knownError(reply, error);
       }

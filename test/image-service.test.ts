@@ -414,9 +414,24 @@ describe('legacy video result protocol', () => {
       taskId: 'h3-task',
       status: 'succeeded',
       video_url: 'https://api.unmind.art/v1/ai/video-results/h3.mp4',
-      videoUrl: undefined,
+      videoUrl: 'https://api.unmind.art/v1/ai/video-results/h3.mp4',
+      result_url: 'https://api.unmind.art/v1/ai/video-results/h3.mp4',
+      resultUrl: 'https://api.unmind.art/v1/ai/video-results/h3.mp4',
+      cos_url: 'https://api.unmind.art/v1/ai/video-results/h3.mp4',
+      cosUrl: 'https://api.unmind.art/v1/ai/video-results/h3.mp4',
       walletVideoResults: ['https://api.unmind.art/v1/ai/video-results/h3.mp4'],
     }]);
+    expect(merged).toMatchObject({
+      video_url: 'https://api.unmind.art/v1/ai/video-results/h3.mp4',
+      result_url: 'https://api.unmind.art/v1/ai/video-results/h3.mp4',
+      cos_url: 'https://api.unmind.art/v1/ai/video-results/h3.mp4',
+    });
+  });
+
+  it('recognizes generic result_url and cos_url aliases as deliverable video sources', () => {
+    const source = 'https://api.unmind.art/v1/ai/video-results/h3.mp4';
+    expect(getDeliverableVideoSources({ result_url: source })).toEqual([source]);
+    expect(getDeliverableVideoSources({ cos_url: source })).toEqual([source]);
   });
 
   it('extracts extensionless MiniMax H3 output URLs and file IDs without reference media', () => {

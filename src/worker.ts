@@ -17,6 +17,7 @@ import {
   heartbeatAiTask,
   markStaleAiTaskFailed,
 } from './modules/ai/task-service.js';
+import { recoverStaleAiRequests } from './modules/ai/request-recovery.js';
 
 const prisma = new PrismaClient();
 const workerId = `${hostname()}:${process.pid}`;
@@ -62,6 +63,24 @@ async function recoverStaleTasks() {
     await releaseRequestCreditsForClientRequest(prisma, task.userId, task.requestId);
   }
   if (recovered > 0) log('stale_tasks_failed', { count: recovered });
+}
+
+async function recoverStaleRequests() {
+  try {
+    const staleBefore = new Date(Date.now() - env.AI_REQUEST_STALE_AFTER_MS);
+    const result = await recoverStaleAiRequests(prisma, staleBefore);
+    if (result.recovered > 0) {
+      log('stale_ai_requests_recovered', {
+        scanned: result.scanned,
+        recovered: result.recovered,
+        staleBefore: staleBefore.toISOString(),
+      });
+    }
+  } catch (error) {
+    log('stale_ai_request_recovery_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 async function executeTask(task: AiTask) {
@@ -173,15 +192,29 @@ async function updateHealthFile() {
 async function main() {
   await prisma.$connect();
   await recoverStaleTasks();
+  await recoverStaleRequests();
   let lastCleanupAt = 0;
   let lastRecoveryAt = Date.now();
-  log('worker_started', { concurrency: env.AI_WORKER_CONCURRENCY });
+  let lastRequestRecoveryAt = Date.now();
+  const requestRecoveryIntervalMs = Math.max(
+    30_000,
+    Math.min(5 * 60_000, Math.floor(env.AI_REQUEST_STALE_AFTER_MS / 4)),
+  );
+  log('worker_started', {
+    concurrency: env.AI_WORKER_CONCURRENCY,
+    aiRequestStaleAfterMs: env.AI_REQUEST_STALE_AFTER_MS,
+    aiRequestRecoveryIntervalMs: requestRecoveryIntervalMs,
+  });
 
   while (!shuttingDown) {
     await updateHealthFile();
     if (Date.now() - lastRecoveryAt > env.AI_TASK_STALE_AFTER_MS / 2) {
       await recoverStaleTasks();
       lastRecoveryAt = Date.now();
+    }
+    if (Date.now() - lastRequestRecoveryAt > requestRecoveryIntervalMs) {
+      await recoverStaleRequests();
+      lastRequestRecoveryAt = Date.now();
     }
     if (Date.now() - lastCleanupAt > 60 * 60_000) {
       const retentionMs = env.AI_TASK_RETENTION_DAYS * 24 * 60 * 60_000;

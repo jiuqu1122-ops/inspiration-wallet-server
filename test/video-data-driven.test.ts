@@ -239,6 +239,34 @@ describe('data-driven managed video capabilities', () => {
     expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://8.8.8.8/v1/videos');
   });
 
+  it('replaces {taskId} independently in the configured status and content URLs', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe('https://8.8.8.8/api/seedance/status/upstream-task%2F123');
+      return new Response(JSON.stringify({ status: 'processing' }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const context = {
+      route: route({
+        adapterConfig: {
+          statusEndpointTemplate: '/api/seedance/status/{taskId}',
+          contentEndpointTemplate: '/api/seedance/content/{taskId}',
+        },
+      }),
+      provider,
+    };
+
+    await expect(genericAsyncVideoAdapter.poll(context, 'upstream-task/123'))
+      .resolves.toMatchObject({ state: 'processing', upstreamStatus: 'processing' });
+    await expect(genericAsyncVideoAdapter.fetchContent(context, 'upstream-task/123', {
+      state: 'completed',
+      upstreamStatus: 'completed',
+      upstreamPayload: {},
+    })).resolves.toMatchObject({
+      source: 'https://8.8.8.8/api/seedance/content/upstream-task%2F123',
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps queued/completed-not-available/saving tasks pending and expires terminally', async () => {
     const payloads = [
       { status: 'queued', poll_after_ms: 4_000 },
@@ -407,6 +435,12 @@ describe('data-driven managed video capabilities', () => {
     expect(transaction.aiRequest.updateMany).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ chargedCredits: creditDecimal('3') }),
     }));
+    const persistedResult = transaction.aiRequest.updateMany.mock.calls[0]?.[0]?.data?.result as Record<string, unknown>;
+    expect(persistedResult).toMatchObject({
+      video_url: 'https://cdn.example/1.mp4',
+      result_url: 'https://cdn.example/1.mp4',
+      cos_url: 'https://cdn.example/1.mp4',
+    });
     expect(transaction.wallet.update).toHaveBeenCalledWith(expect.objectContaining({
       data: {
         reservedCredits: { decrement: creditDecimal('6') },

@@ -12,9 +12,10 @@ const KNOWN_MESSAGES: Record<string, string> = {
   PROVIDER_SERVER_ERROR: '上游服务返回错误',
   PROVIDER_HTTP_ERROR: '上游 HTTP 请求失败',
   REQUEST_CANCELLED: '请求已取消',
+  REQUEST_STALE: '任务长时间未完成，已自动释放预留积分',
   GENERATION_FAILED: '请求执行失败，未记录可安全展示的详细原因',
 };
-const SAFE_STAGES = new Set(['image_generation', 'text_request', 'video_task', 'result_persistence']);
+const SAFE_STAGES = new Set(['image_generation', 'text_request', 'video_task', 'result_persistence', 'request_recovery']);
 const SAFE_CAUSE_CODES = new Set([
   'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'ECONNREFUSED', 'ENOSPC', 'EACCES', 'ENOENT',
   'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',

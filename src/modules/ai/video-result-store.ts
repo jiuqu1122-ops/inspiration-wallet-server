@@ -133,6 +133,13 @@ async function stagePublicVideo(source: string, requestHeaders?: HeadersInit) {
         redirect: 'manual',
         signal: controller.signal,
       });
+      console.info('[video_content_response]', {
+        contentUrl: current.toString(),
+        status: response.status,
+        contentType: response.headers.get('content-type') || null,
+        contentLength: response.headers.get('content-length') || null,
+        redirectCount,
+      });
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
         if (!location || redirectCount >= 3) throw new Error('generated video redirect is invalid');
@@ -143,6 +150,12 @@ async function stagePublicVideo(source: string, requestHeaders?: HeadersInit) {
       const staged = await writeVideoResponseToFile(response, path);
       const fileSize = (await stat(path)).size;
       if (fileSize !== staged.size) throw new Error('generated video temporary file size mismatch');
+      console.info('[video_content_downloaded]', {
+        contentUrl: current.toString(),
+        bytes: staged.size,
+        mime: staged.mime,
+        extension: staged.extension,
+      });
       return {
         path,
         ...staged,
@@ -204,11 +217,26 @@ async function performGeneratedVideoResultMirror(source: string, requestHeaders?
       source: staged.path,
       mime: staged.mime,
     });
-    if (!await storageService.exists(objectName)) {
+    const exists = await storageService.exists(objectName);
+    console.info('[video_cos_upload]', {
+      storageProvider: storageService.providerName,
+      objectKey: objectName,
+      bytes: staged.size,
+      mime: staged.mime,
+      exists,
+    });
+    if (!exists) {
       throw new Error('generated video mirror object is missing after upload');
     }
+    const resultUrl = videoResultUrl(key);
+    console.info('[video_cos_result]', {
+      storageProvider: storageService.providerName,
+      objectKey: objectName,
+      resultUrl,
+      bytes: staged.size,
+    });
     storageService.getDownloadUrl(objectName);
-    return videoResultUrl(key);
+    return resultUrl;
   } finally {
     await staged.cleanup().catch(() => {});
   }

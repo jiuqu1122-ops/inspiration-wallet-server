@@ -5011,7 +5011,13 @@ export function findVideoTaskEnvelope(value: unknown, expectedTaskId: string, de
   for (const nested of Object.values(record)) {
     const found = findVideoTaskEnvelope(nested, expectedTaskId, depth + 1);
     if (found === undefined) continue;
-    if (record.walletVideoResults || record.video_url || record.videoUrl) return record;
+    if (record.walletVideoResults
+      || record.video_url
+      || record.videoUrl
+      || record.result_url
+      || record.resultUrl
+      || record.cos_url
+      || record.cosUrl) return record;
     return found;
   }
   if (hasVideoTaskBinding(record, expectedTaskId)) return record;
@@ -5022,7 +5028,17 @@ function directVideoEnvelopeSources(value: unknown) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
   const record = value as Record<string, unknown>;
   const directValues: unknown[] = [];
-  for (const key of ['walletVideoResults', 'video_url', 'videoUrl', 'video', 'videos']) {
+  for (const key of [
+    'walletVideoResults',
+    'video_url',
+    'videoUrl',
+    'result_url',
+    'resultUrl',
+    'cos_url',
+    'cosUrl',
+    'video',
+    'videos',
+  ]) {
     if (record[key] !== undefined) directValues.push(record[key]);
   }
   if (Array.isArray(record.results) && record.results.every(item => typeof item === 'string')) {
@@ -5071,6 +5087,10 @@ function videoStatusEnvelope(
       results: sources,
       video_url: sources[0],
       videoUrl: sources[0],
+      result_url: sources[0],
+      resultUrl: sources[0],
+      cos_url: sources[0],
+      cosUrl: sources[0],
       walletVideoResults: sources,
     } : {}),
     upstreamTaskIds,
@@ -5092,14 +5112,28 @@ export function mergeLegacyVideoStatusResult(
   const previousResults: unknown[] = Array.isArray(previousRecord.results)
     ? previousRecord.results as unknown[]
     : [];
+  const statusSource = [
+    statusEnvelope.video_url,
+    statusEnvelope.videoUrl,
+    statusEnvelope.result_url,
+    statusEnvelope.resultUrl,
+    statusEnvelope.cos_url,
+    statusEnvelope.cosUrl,
+  ].find((value): value is string => typeof value === 'string' && value.trim().length > 0);
   const currentTaskResult = {
     task_id: taskId,
     taskId,
     status: statusEnvelope.status,
-    ...(typeof statusEnvelope.video_url === 'string' ? {
-      video_url: statusEnvelope.video_url,
-      videoUrl: statusEnvelope.videoUrl,
-      walletVideoResults: statusEnvelope.walletVideoResults,
+    ...(statusSource ? {
+      video_url: statusSource,
+      videoUrl: statusSource,
+      result_url: statusSource,
+      resultUrl: statusSource,
+      cos_url: statusSource,
+      cosUrl: statusSource,
+      walletVideoResults: Array.isArray(statusEnvelope.walletVideoResults)
+        ? statusEnvelope.walletVideoResults
+        : [statusSource],
     } : {}),
     ...(statusEnvelope.upstream !== undefined ? { upstream: statusEnvelope.upstream } : {}),
   };
@@ -5132,10 +5166,18 @@ export function mergeLegacyVideoStatusResult(
       walletVideoResults: Array.from(new Set(allSources)),
       video_url: allSources[0],
       videoUrl: allSources[0],
+      result_url: allSources[0],
+      resultUrl: allSources[0],
+      cos_url: allSources[0],
+      cosUrl: allSources[0],
     } : {
       walletVideoResults: undefined,
       video_url: undefined,
       videoUrl: undefined,
+      result_url: undefined,
+      resultUrl: undefined,
+      cos_url: undefined,
+      cosUrl: undefined,
     }),
     ...(statusEnvelope.upstream !== undefined ? { upstream: statusEnvelope.upstream } : {}),
   };
@@ -6936,7 +6978,7 @@ const isMiniMaxH3VideoModel = (model: string) => (
   model.trim().toLowerCase().replace(/[\s_.-]+/g, '') === 'minimaxh3'
 );
 
-const VIDEO_RESULT_KEYS = /^(?:result|results|output|outputs|video|videos|video_url|videoUrl|url|urls|uri|uris|href|download|downloads|file|files)$/i;
+const VIDEO_RESULT_KEYS = /^(?:result|results|output|outputs|video|videos|video_url|videoUrl|result_url|resultUrl|cos_url|cosUrl|url|urls|uri|uris|href|download|downloads|file|files)$/i;
 const VIDEO_REFERENCE_KEYS = /^(?:image|images|input|inputs|reference|references|referenceImages|referenceVideos|referenceAudios|audio|audios)$/i;
 
 function hasImageResultExtension(value: string) {
@@ -8069,6 +8111,18 @@ export async function executeWalletVideoStatus(
     if (input.providerChannelId && input.providerChannelId !== managedTask.route?.channelId) {
       throw new CloudAiError('video_task_not_found', 'Video task was not found', 404);
     }
+    // A stale-request recovery can win the race with a late upstream poll.
+    // Never expose that late task as succeeded after its reservation was
+    // released and its parent request was marked failed.
+    if (managedTask.request.status === 'FAILED' || managedTask.request.status === 'REFUNDED') {
+      return publicVideoTask({
+        ...managedTask,
+        status: 'FAILED',
+        resultUrl: null,
+        videoAvailable: false,
+        lastError: managedTask.lastError || '视频请求已超时，预留积分已释放',
+      });
+    }
     if (managedTask.status === 'SUCCEEDED' || managedTask.status === 'FAILED') {
       return publicVideoTask(managedTask);
     }
@@ -8130,7 +8184,7 @@ export async function executeWalletVideoStatus(
       }
       throw error;
     }
-    await prisma.aiVideoTask.update({
+    const polledTask = await prisma.aiVideoTask.update({
       where: { id: managedTask.id },
       data: {
         status: status.state === 'failed' ? 'FAILED' : status.state === 'completed' ? 'PERSISTENCE_PENDING' : 'PROCESSING',
@@ -8143,6 +8197,16 @@ export async function executeWalletVideoStatus(
         ...(status.state === 'failed' ? { completedAt: new Date() } : {}),
       },
     });
+    console.info('[video_db_poll_persisted]', {
+      taskId: polledTask.id,
+      upstreamTaskId: polledTask.upstreamTaskId,
+      status: polledTask.status,
+      assetState: polledTask.assetState,
+      videoAvailable: polledTask.videoAvailable,
+      pollAfterMs: polledTask.pollAfterMs,
+      resultObjectKey: polledTask.resultObjectKey,
+      resultUrl: polledTask.resultUrl,
+    });
     if (status.state === 'failed') {
       await settleVideoRequestIfTerminal(prisma, managedTask.requestId);
       return publicVideoTask(await prisma.aiVideoTask.findUniqueOrThrow({ where: { id: managedTask.id } }));
@@ -8150,6 +8214,13 @@ export async function executeWalletVideoStatus(
     if (status.state === 'completed') {
       try {
         const content = await adapter.fetchContent(context, managedTask.upstreamTaskId, status);
+        console.info('[video_content_fetch_start]', {
+          taskId: managedTask.id,
+          upstreamTaskId: managedTask.upstreamTaskId,
+          providerId: managedProvider.id,
+          routeId: managedRoute.id,
+          contentUrl: content.source,
+        });
         const resultUrl = await mirrorGeneratedVideoResultToStorage(
           content.source,
           content.requestHeaders,
@@ -8163,7 +8234,7 @@ export async function executeWalletVideoStatus(
         } catch {
           resultObjectKey = null;
         }
-        await prisma.aiVideoTask.update({
+        const completedTask = await prisma.aiVideoTask.update({
           where: { id: managedTask.id },
           data: {
             status: 'SUCCEEDED',
@@ -8175,11 +8246,40 @@ export async function executeWalletVideoStatus(
             completedAt: new Date(),
           },
         });
+        console.info('[video_db_result_persisted]', {
+          taskId: completedTask.id,
+          upstreamTaskId: completedTask.upstreamTaskId,
+          status: completedTask.status,
+          assetState: completedTask.assetState,
+          videoAvailable: completedTask.videoAvailable,
+          resultObjectKey: completedTask.resultObjectKey,
+          resultUrl: completedTask.resultUrl,
+          video_url: completedTask.resultUrl,
+          result_url: completedTask.resultUrl,
+          cos_url: completedTask.resultUrl,
+        });
         await settleVideoRequestIfTerminal(prisma, managedTask.requestId);
+        const settledRequest = await prisma.aiRequest.findUnique({
+          where: { id: managedTask.requestId },
+          select: { id: true, status: true, result: true, completedAt: true },
+        });
+        const settledResult = settledRequest?.result && typeof settledRequest.result === 'object' && !Array.isArray(settledRequest.result)
+          ? settledRequest.result as Record<string, unknown>
+          : null;
+        console.info('[video_db_request_final]', {
+          requestId: managedTask.requestId,
+          status: settledRequest?.status ?? null,
+          completedAt: settledRequest?.completedAt?.toISOString() ?? null,
+          resultFields: settledResult ? Object.keys(settledResult) : [],
+          results: Array.isArray(settledResult?.results) ? settledResult.results : [],
+          video_url: settledResult?.video_url ?? null,
+          result_url: settledResult?.result_url ?? null,
+          cos_url: settledResult?.cos_url ?? null,
+        });
       } catch (error) {
         // The upstream generation already exists. Keep the task retryable and
         // retry persistence only; never submit a second generation.
-        await prisma.aiVideoTask.update({
+        const pendingTask = await prisma.aiVideoTask.update({
           where: { id: managedTask.id },
           data: {
             status: 'PERSISTENCE_PENDING',
@@ -8188,6 +8288,16 @@ export async function executeWalletVideoStatus(
             lastError: error instanceof Error ? error.message : String(error),
             pollAfterMs: clampVideoPollAfterMs(managedTask.pollAfterMs),
           },
+        });
+        console.warn('[video_db_persistence_pending]', {
+          taskId: pendingTask.id,
+          upstreamTaskId: pendingTask.upstreamTaskId,
+          status: pendingTask.status,
+          assetState: pendingTask.assetState,
+          videoAvailable: pendingTask.videoAvailable,
+          resultObjectKey: pendingTask.resultObjectKey,
+          resultUrl: pendingTask.resultUrl,
+          error: pendingTask.lastError,
         });
       }
     }
@@ -8459,6 +8569,23 @@ export async function executeWalletVideoStatus(
         where: { id: boundRequest.id },
         data: { result: toInputJson(repairedResult) },
       });
+      const repairedRequest = await prisma.aiRequest.findUnique({
+        where: { id: boundRequest.id },
+        select: { id: true, status: true, result: true, completedAt: true },
+      });
+      const repairedDbResult = repairedRequest?.result && typeof repairedRequest.result === 'object' && !Array.isArray(repairedRequest.result)
+        ? repairedRequest.result as Record<string, unknown>
+        : null;
+      console.info('[video_db_request_final]', {
+        requestId: boundRequest.id,
+        status: repairedRequest?.status ?? null,
+        completedAt: repairedRequest?.completedAt?.toISOString() ?? null,
+        resultFields: repairedDbResult ? Object.keys(repairedDbResult) : [],
+        results: Array.isArray(repairedDbResult?.results) ? repairedDbResult.results : [],
+        video_url: repairedDbResult?.video_url ?? null,
+        result_url: repairedDbResult?.result_url ?? null,
+        cos_url: repairedDbResult?.cos_url ?? null,
+      });
       console.info('[video_status_historical_success_recovery]', {
         clientRequestId: input.clientRequestId ?? null,
         requestId: boundRequest.id,
@@ -8502,6 +8629,15 @@ export async function executeWalletVideoStatus(
         where: { id: boundRequest.id },
         data: { status: 'PROCESSING', result: toInputJson(repairedResult) },
       });
+      console.info('[video_db_request_partial]', {
+        requestId: boundRequest.id,
+        status: 'PROCESSING',
+        resultFields: Object.keys(repairedResult),
+        results: Array.isArray(repairedResult.results) ? repairedResult.results : [],
+        video_url: repairedResult.video_url ?? null,
+        result_url: repairedResult.result_url ?? null,
+        cos_url: repairedResult.cos_url ?? null,
+      });
       return envelope;
     }
     await settleVideo(
@@ -8513,6 +8649,23 @@ export async function executeWalletVideoStatus(
       undefined,
       repairedResult,
     );
+    const settledRequest = await prisma.aiRequest.findUnique({
+      where: { id: boundRequest.id },
+      select: { id: true, status: true, result: true, completedAt: true },
+    });
+    const settledDbResult = settledRequest?.result && typeof settledRequest.result === 'object' && !Array.isArray(settledRequest.result)
+      ? settledRequest.result as Record<string, unknown>
+      : null;
+    console.info('[video_db_request_final]', {
+      requestId: boundRequest.id,
+      status: settledRequest?.status ?? null,
+      completedAt: settledRequest?.completedAt?.toISOString() ?? null,
+      resultFields: settledDbResult ? Object.keys(settledDbResult) : [],
+      results: Array.isArray(settledDbResult?.results) ? settledDbResult.results : [],
+      video_url: settledDbResult?.video_url ?? null,
+      result_url: settledDbResult?.result_url ?? null,
+      cos_url: settledDbResult?.cos_url ?? null,
+    });
     console.info('[video_status_deliverable_found]', {
       clientRequestId: input.clientRequestId ?? null,
       requestId: boundRequest.id,

@@ -77,6 +77,9 @@ const envSchema = z
     AI_TASK_STALE_AFTER_MS: z.coerce.number().int().min(30_000).max(3_600_000).default(120_000),
     AI_TASK_MAX_RUNTIME_MS: z.coerce.number().int().min(60_000).max(3_600_000).default(15 * 60_000),
     AI_TASK_RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(14),
+    // API-backed image/video requests have no worker heartbeat. A stale
+    // reservation is released by the worker after this safety window.
+    AI_REQUEST_STALE_AFTER_MS: z.coerce.number().int().min(15 * 60_000).max(7 * 24 * 60 * 60_000).default(60 * 60_000),
     AI_UPSTREAM_CONNECT_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(30_000),
     AI_UPSTREAM_FIRST_RESPONSE_TIMEOUT_MS: z.coerce.number().int().min(30_000).max(900_000).default(300_000),
     AI_UPSTREAM_IDLE_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(900_000).default(300_000),
