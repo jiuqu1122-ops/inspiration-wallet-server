@@ -23,6 +23,7 @@ import {
   convertGptImage2ChromaKeyToTransparentPng,
   executeWalletImageGeneration,
   filterProviderImageModels,
+  findVideoTaskEnvelope,
   generateBigmodelBananaImages,
   generatePreparedImageAdapterImages,
   generateMikotoBananaImages,
@@ -300,7 +301,7 @@ describe('Mikoto Seedance model mapping', () => {
   });
 
   it('scopes the Metaso H3 items response by item id before reading content.url', () => {
-    const selected = selectVideoTaskPayload({
+    const response = {
       items: [
         {
           id: 'old-task',
@@ -313,7 +314,9 @@ describe('Mikoto Seedance model mapping', () => {
           content: { url: 'https://video-product.cdn.minimax.io/inference_output/current' },
         },
       ],
-    }, 'current-task');
+    };
+    const selected = selectVideoTaskPayload(response, 'current-task');
+    const envelope = findVideoTaskEnvelope(response, 'current-task');
 
     expect(selected).toEqual({
       id: 'current-task',
@@ -323,6 +326,7 @@ describe('Mikoto Seedance model mapping', () => {
     expect(collectMiniMaxH3VideoSources(selected)).toEqual([
       'https://video-product.cdn.minimax.io/inference_output/current',
     ]);
+    expect(envelope).toEqual(selected);
   });
 
   it('keeps polling safely while a newly accepted H3 task is not listed yet', () => {

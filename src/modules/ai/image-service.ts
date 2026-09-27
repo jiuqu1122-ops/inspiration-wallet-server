@@ -4995,7 +4995,7 @@ function hasVideoTaskBinding(value: unknown, expectedTaskId: string) {
   return collectTaskIdsFromValue(value).includes(expectedTaskId);
 }
 
-function findVideoTaskEnvelope(value: unknown, expectedTaskId: string, depth = 0): unknown {
+export function findVideoTaskEnvelope(value: unknown, expectedTaskId: string, depth = 0): unknown {
   if (!value || typeof value !== 'object' || depth > 10) return undefined;
   if (Array.isArray(value)) {
     for (const item of value) {
@@ -5005,13 +5005,16 @@ function findVideoTaskEnvelope(value: unknown, expectedTaskId: string, depth = 0
     return undefined;
   }
   const record = value as Record<string, unknown>;
-  if (hasVideoTaskBinding(record, expectedTaskId)) return record;
+  // A Metaso list response can contain several `items[].id` rows. Search for
+  // the narrow matching task before treating the outer list wrapper as bound;
+  // otherwise an old failed row can mask the current successful row.
   for (const nested of Object.values(record)) {
     const found = findVideoTaskEnvelope(nested, expectedTaskId, depth + 1);
     if (found === undefined) continue;
     if (record.walletVideoResults || record.video_url || record.videoUrl) return record;
     return found;
   }
+  if (hasVideoTaskBinding(record, expectedTaskId)) return record;
   return undefined;
 }
 
