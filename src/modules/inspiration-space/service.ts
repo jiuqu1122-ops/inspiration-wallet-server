@@ -7,7 +7,7 @@ import {
   uploadInspirationPreview,
 } from './asset-store.js';
 
-export const INSPIRATION_SHARE_KINDS = ['NODE_PRESET', 'WORKFLOW', 'PROMPT'] as const;
+export const INSPIRATION_SHARE_KINDS = ['NODE_PRESET', 'WORKFLOW', 'PROMPT', 'AGENT'] as const;
 export const INSPIRATION_SHARE_STATUSES = ['PENDING', 'PUBLISHED', 'REJECTED'] as const;
 export type InspirationShareKind = typeof INSPIRATION_SHARE_KINDS[number];
 export type InspirationShareStatus = typeof INSPIRATION_SHARE_STATUSES[number];
@@ -27,6 +27,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function classifyCandidate(value: unknown, result: Set<InspirationShareKind>) {
   if (!isRecord(value)) return;
+  if (
+    value.type === 'inspiration-drawer-agent-share'
+    && value.version === 1
+    && typeof value.markdown === 'string'
+    && value.markdown.trim().length > 0
+  ) {
+    result.add('AGENT');
+    return;
+  }
   if (
     value.type === 'inspiration-drawer-prompt-share'
     && typeof value.prompt === 'string'
@@ -51,6 +60,16 @@ function promptFromPayload(value: unknown) {
   ) {
     return value.prompt.trim() || null;
   }
+  return null;
+}
+
+function agentMarkdownFromPayload(value: unknown) {
+  if (
+    isRecord(value)
+    && value.type === 'inspiration-drawer-agent-share'
+    && value.version === 1
+    && typeof value.markdown === 'string'
+  ) return value.markdown.trim() || null;
   return null;
 }
 
@@ -122,19 +141,29 @@ export function validateInspirationSubmission(input: {
       throw new Error('Prompt shares must include exactly one generated preview image');
     }
   }
+  if (input.kind === 'AGENT') {
+    const markdown = agentMarkdownFromPayload(input.payload);
+    if (!markdown || markdown.length > 40_000 || Buffer.byteLength(markdown, 'utf8') > 160_000) {
+      throw new Error('Agent Markdown must contain content and stay within 40,000 characters');
+    }
+    if (markdown.replace(/^\uFEFF?---[\s\S]*?---\s*/m, '').trim().length === 0) {
+      throw new Error('Agent Markdown must include skill instructions');
+    }
+  }
   return input.previews.map((preview) => ({
     ...preview,
     ...imageMimeAndBytes(preview.dataUrl),
   }));
 }
 
-function safeJsonFilename(value: string) {
+function safeShareFilename(value: string, kind: InspirationShareKind) {
+  const extension = kind === 'AGENT' ? '.md' : '.json';
   const stem = value
-    .replace(/\.json$/i, '')
+    .replace(/\.(?:json|md)$/i, '')
     .replace(/[<>:"/\\|?*\p{Cc}]/gu, '-')
     .trim()
     .slice(0, 120) || 'inspiration-share';
-  return `${stem}.json`;
+  return `${stem}${extension}`;
 }
 
 function previewApiUrl(previewId: string) {
@@ -240,7 +269,7 @@ export async function createInspirationShare(
         description: input.description ?? null,
         authorName: input.authorName,
         tags: input.tags,
-        fileName: safeJsonFilename(input.fileName),
+        fileName: safeShareFilename(input.fileName, input.kind),
         jsonPayload: input.payload as Prisma.InputJsonValue,
         previews: { create: uploaded },
       },
@@ -303,7 +332,7 @@ export async function getInspirationShareDownload(prisma: PrismaClient, shareId:
   return prisma.$transaction(async (transaction) => {
     const share = await transaction.inspirationShare.findFirst({
       where: { id: shareId, status: 'PUBLISHED' },
-      select: { id: true, fileName: true, jsonPayload: true },
+      select: { id: true, kind: true, fileName: true, jsonPayload: true },
     });
     if (!share) return null;
     await transaction.inspirationShare.update({
@@ -336,6 +365,7 @@ export async function listAdminInspirationShares(
     items: shares.map((share) => ({
       ...serializeShare(share),
       prompt: share.kind === 'PROMPT' ? promptFromPayload(share.jsonPayload) : null,
+      agentMarkdown: share.kind === 'AGENT' ? agentMarkdownFromPayload(share.jsonPayload) : null,
     })),
   };
 }

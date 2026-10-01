@@ -123,6 +123,7 @@ enum InspirationShareKind {
   NODE_PRESET
   WORKFLOW
   PROMPT
+  AGENT
 }
 
 enum InspirationShareStatus {

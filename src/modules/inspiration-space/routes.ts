@@ -22,14 +22,17 @@ const submissionSchema = z.object({
   description: z.string().trim().max(1_000).nullable().optional(),
   authorName: z.string().trim().min(2).max(32),
   tags: z.array(z.string().trim().min(1).max(20)).max(8).default([]),
-  fileName: z.string().trim().min(1).max(160).regex(/\.json$/i),
+  fileName: z.string().trim().min(1).max(160).regex(/\.(?:json|md)$/i),
   payload: z.unknown(),
   previews: z.array(z.object({
     dataUrl: z.string().max(1_300_000),
     width: z.number().int().min(1).max(8_192),
     height: z.number().int().min(1).max(8_192),
   }).strict()).max(6).default([]),
-}).strict();
+}).strict().refine((value) => value.kind === 'AGENT' ? /\.md$/i.test(value.fileName) : /\.json$/i.test(value.fileName), {
+  message: 'File extension does not match the inspiration share type',
+  path: ['fileName'],
+});
 
 function invalid(reply: FastifyReply, message: string) {
   return reply.code(400).send({ error: 'invalid_request', message });
@@ -68,7 +71,7 @@ export const inspirationSpaceRoutes: FastifyPluginAsync = async (app) => {
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : '投稿处理失败';
-        if (/JSON|image|Preview|preset|workflow|prompt|预览|图片|提示词/i.test(message)) {
+        if (/JSON|image|Preview|preset|workflow|prompt|agent|Markdown|预览|图片|提示词/i.test(message)) {
           return invalid(reply, message);
         }
         request.log.error({ requestId: request.id }, 'Inspiration space submission failed');
@@ -93,8 +96,20 @@ export const inspirationSpaceRoutes: FastifyPluginAsync = async (app) => {
   app.get('/:shareId/download', async (request, reply) => {
     const parsed = z.object({ shareId: idSchema }).safeParse(request.params);
     if (!parsed.success) return invalid(reply, '分享 ID 无效');
+    const query = z.object({ format: z.enum(['markdown']).optional() }).safeParse(request.query);
+    if (!query.success) return invalid(reply, '下载格式无效');
     const share = await getInspirationShareDownload(app.prisma, parsed.data.shareId);
     if (!share) return reply.code(404).send({ error: 'not_found', message: '分享不存在' });
+    if (query.data.format === 'markdown') {
+      const payload = share.jsonPayload as { type?: unknown; markdown?: unknown } | null;
+      if (share.kind !== 'AGENT' || payload?.type !== 'inspiration-drawer-agent-share' || typeof payload.markdown !== 'string') {
+        return invalid(reply, '这个分享不是 Markdown 智能体');
+      }
+      return reply
+        .header('content-type', 'text/markdown; charset=utf-8')
+        .header('content-disposition', `attachment; filename*=UTF-8''${attachmentName(share.fileName)}`)
+        .send(payload.markdown);
+    }
     return reply
       .header('content-type', 'application/json; charset=utf-8')
       .header('content-disposition', `attachment; filename*=UTF-8''${attachmentName(share.fileName)}`)

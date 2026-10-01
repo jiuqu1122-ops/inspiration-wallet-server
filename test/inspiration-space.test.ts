@@ -32,6 +32,17 @@ describe('inspiration space payload validation', () => {
       .toEqual(['NODE_PRESET']);
   });
 
+  it('accepts a Markdown agent without a preview and rejects empty instructions', () => {
+    const payload = { type: 'inspiration-drawer-agent-share', version: 1, markdown: '---\nname: designer\n---\n# Designer\nCreate canvas images.' };
+    expect(classifyInspirationPayload(payload)).toEqual(['AGENT']);
+    expect(() => validateInspirationSubmission({ kind: 'AGENT', payload, previews: [] })).not.toThrow();
+    expect(() => validateInspirationSubmission({
+      kind: 'AGENT',
+      payload: { ...payload, markdown: '---\nname: empty\n---\n' },
+      previews: [],
+    })).toThrow(/instructions/i);
+  });
+
   it('recognizes exported preset and workflow containers', () => {
     expect(classifyInspirationPayload({
       presets: [{ label: '节点预设', prompt: '测试' }],
