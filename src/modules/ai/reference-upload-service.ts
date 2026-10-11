@@ -12,6 +12,9 @@ import {
 
 export const REFERENCE_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
 export const REFERENCE_UPLOAD_TTL_SECONDS = 5 * 60;
+// The PUT signature expires quickly; uploaded references must survive upload
+// queues and long-running generations, just like legacy reference uploads.
+const REFERENCE_IMAGE_TTL_SECONDS = Math.max(60 * 60, env.STORAGE_SIGNED_URL_EXPIRES_SECONDS);
 const REFERENCE_IMAGE_FILENAME_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?:-\d+)?\.(?:png|jpe?g|webp|gif)$/i;
 
 export const referenceUploadInputSchema = z.object({
@@ -87,7 +90,7 @@ export async function issueReferenceUploadTicket(
       contentType: input.mime,
       sizeBytes: input.sizeBytes,
       status: 'ISSUED',
-      expiresAt,
+      expiresAt: new Date(Date.now() + REFERENCE_IMAGE_TTL_SECONDS * 1_000),
     },
   });
   return {
@@ -119,10 +122,7 @@ export async function recordLegacyReferenceUpload(
       contentType,
       sizeBytes,
       status: 'UPLOADED',
-      expiresAt: new Date(Date.now() + Math.max(
-        REFERENCE_UPLOAD_TTL_SECONDS,
-        env.STORAGE_SIGNED_URL_EXPIRES_SECONDS,
-      ) * 1_000),
+      expiresAt: new Date(Date.now() + REFERENCE_IMAGE_TTL_SECONDS * 1_000),
       uploadedAt: new Date(),
     },
   });

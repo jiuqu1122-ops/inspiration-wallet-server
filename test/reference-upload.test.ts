@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Readable } from 'node:stream';
 
 const storageMocks = vi.hoisted(() => ({
@@ -52,6 +52,8 @@ function fakePrisma() {
 }
 
 describe('reference image direct upload ownership', () => {
+  afterEach(() => vi.useRealTimers());
+
   beforeEach(() => {
     storageMocks.createUploadUrl.mockClear();
     storageMocks.headObject.mockClear();
@@ -95,6 +97,43 @@ describe('reference image direct upload ownership', () => {
       where: { id: 'upload-1' },
       data: expect.objectContaining({ status: 'UPLOADED' }),
     }));
+  });
+
+  it('keeps uploaded references usable after the PUT signature expires, but enforces ownership expiry', async () => {
+    vi.useFakeTimers();
+    const issuedAt = new Date('2026-10-11T12:00:00Z');
+    vi.setSystemTime(issuedAt);
+    const prisma = fakePrisma();
+    const ticket = await issueReferenceUploadTicket(prisma as never, 'user-1', {
+      filename: 'reference.png', mime: 'image/png', sizeBytes: 4,
+    });
+    const record = prisma.referenceUpload.create.mock.calls[0][0].data;
+    const ownershipExpiry = record.expiresAt as Date;
+    expect(new Date(ticket.expiresAt).getTime() - issuedAt.getTime()).toBe(5 * 60_000);
+    expect(ownershipExpiry.getTime() - issuedAt.getTime()).toBeGreaterThanOrEqual(60 * 60_000);
+    expect(storageMocks.createUploadUrl).toHaveBeenCalledWith(ticket.objectKey, {
+      expiresSeconds: 300, contentType: 'image/png',
+    });
+    prisma.referenceUpload.findFirst.mockImplementation(async ({ where }) => {
+      const now = (where.expiresAt as { gt: Date }).gt;
+      if (ownershipExpiry <= now || (where.userId && where.userId !== record.userId)) return null;
+      return { id: 'upload-1', ...record } as never;
+    });
+
+    // The model may fetch references well after uploads and queueing finish.
+    vi.setSystemTime(issuedAt.getTime() + 25 * 60_000);
+    await expect(resolveReferenceImageSources(prisma as never, 'user-1', [ticket.objectKey]))
+      .resolves.toEqual([`https://storage.example/${ticket.objectKey}?signed=1`]);
+    await expect(getReferenceImageContent(prisma as never, ticket.objectKey.slice('reference-images/'.length)))
+      .resolves.toMatchObject({ objectKey: ticket.objectKey, contentLength: 4 });
+    await expect(resolveReferenceImageSources(prisma as never, 'other-user', [ticket.objectKey]))
+      .rejects.toMatchObject({ code: 'invalid_reference_image' });
+
+    vi.setSystemTime(ownershipExpiry.getTime() + 1);
+    await expect(resolveReferenceImageSources(prisma as never, 'user-1', [ticket.objectKey]))
+      .rejects.toMatchObject({ code: 'invalid_reference_image' });
+    await expect(getReferenceImageContent(prisma as never, ticket.objectKey.slice('reference-images/'.length)))
+      .rejects.toMatchObject({ code: 'reference_image_not_found' });
   });
 
   it('rejects a direct key that is not owned by the current user', async () => {
