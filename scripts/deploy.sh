@@ -41,7 +41,9 @@ else
 fi
 
 source_revision="$(git rev-parse HEAD 2>/dev/null)" || fail 'Cannot resolve the Git revision for the prebuilt image.'
-deployment_image="${BACKEND_IMAGE:-${BACKEND_IMAGE_REPOSITORY}:sha-${source_revision}}"
+# Always derive the immutable image from this checkout. A stale inherited
+# BACKEND_IMAGE must not deploy a different revision than the pulled source.
+deployment_image="${BACKEND_IMAGE_REPOSITORY}:sha-${source_revision}"
 export BACKEND_IMAGE="$deployment_image"
 
 log 'Validating Docker Compose configuration...'

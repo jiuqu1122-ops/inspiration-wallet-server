@@ -6,8 +6,20 @@ import {
 } from './images-api-config.js';
 import {
   assertAdapterModelFamily,
+  type ImageAdapterConfig,
   type ImageModelAdapter,
 } from './types.js';
+
+export function usesSeedreamReferences(adapterKey: string, upstreamModel: string) {
+  return adapterKey === 'SEEDREAM_IMAGES_API'
+    || (adapterKey === 'GENERIC_OPENAI_IMAGE' && /^seedream(?:[-_.\s]|$)/i.test(upstreamModel.trim()));
+}
+
+export function seedreamReferenceTransport(config: ImageAdapterConfig) {
+  // The channel's published contract confirms public URLs but does not confirm
+  // Data URLs. Inline bytes are used only when the route explicitly opts in.
+  return config.referenceTransport ?? 'public_https';
+}
 
 export const seedreamImagesApiAdapter: ImageModelAdapter = {
   key: 'SEEDREAM_IMAGES_API',

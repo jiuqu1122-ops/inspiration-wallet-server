@@ -15,6 +15,8 @@ import { env } from '../../config/env.js';
 import { getClientEngineAsset } from './client-assets.js';
 import { storageService } from '../storage/service.js';
 import { getImageReference } from './reference-store.js';
+import { getProviderReference } from './provider-reference-store.js';
+import { createReadStream } from 'node:fs';
 import { isVideoResultKey } from './video-result-store.js';
 import { serveImageResultWithFallback } from './image-result-fallback.js';
 import { agentToolChoiceSchema, createAiTaskSchema } from './task-schema.js';
@@ -320,6 +322,23 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       const rawKey = (request.params as { key?: unknown }).key;
       const key = typeof rawKey === 'string' ? rawKey.trim() : '';
       return serveImageResultWithFallback(key, query.data.redirect, reply);
+    },
+  );
+
+  app.get(
+    '/provider-references/:key',
+    { config: { rateLimit: { max: 600, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const rawKey = (request.params as { key?: unknown }).key;
+      const reference = typeof rawKey === 'string' ? await getProviderReference(rawKey) : null;
+      if (!reference) return reply.code(404).send({ error: 'not_found', message: 'Reference image not found or expired' });
+      return reply
+        .header('content-type', reference.mime)
+        .header('content-length', String(reference.size))
+        .header('cache-control', 'no-store')
+        .header('cross-origin-resource-policy', 'cross-origin')
+        .header('x-content-type-options', 'nosniff')
+        .send(createReadStream(reference.path));
     },
   );
 

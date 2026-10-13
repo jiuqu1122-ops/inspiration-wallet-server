@@ -18,7 +18,8 @@ export type ImageAdapterConfig = {
   generationEndpoint?: string;
   editEndpoint?: string;
   exactDimensions?: Record<string, Record<string, string>>;
-  referenceSerializer?: 'json_image' | 'json_images';
+  referenceSerializer?: 'json_image' | 'json_images' | 'object_image_url';
+  referenceTransport?: 'data_url' | 'public_https';
 };
 
 export type ImageAdapterInput = {
@@ -48,6 +49,7 @@ export type PreparedImageAdapterRequest = {
   method: 'POST';
   contentType: 'application/json';
   body: Record<string, unknown>;
+  preparedReferences?: string[];
 };
 
 export interface ImageModelAdapter {
@@ -85,6 +87,7 @@ export function imageAdapterConfig(value: unknown): ImageAdapterConfig {
     'editEndpoint',
     'exactDimensions',
     'referenceSerializer',
+    'referenceTransport',
   ]);
   const unknown = Object.keys(source).find(key => !allowed.has(key));
   if (unknown) {
@@ -146,9 +149,15 @@ export function imageAdapterConfig(value: unknown): ImageAdapterConfig {
     config.exactDimensions = exactDimensions;
   }
   if (source.referenceSerializer !== undefined) {
-    if (source.referenceSerializer === 'json_image' || source.referenceSerializer === 'json_images') {
+    if (source.referenceSerializer === 'json_image' || source.referenceSerializer === 'json_images'
+      || source.referenceSerializer === 'object_image_url') {
       config.referenceSerializer = source.referenceSerializer;
     } else throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'Invalid referenceSerializer');
+  }
+  if (source.referenceTransport !== undefined) {
+    if (source.referenceTransport === 'data_url' || source.referenceTransport === 'public_https') {
+      config.referenceTransport = source.referenceTransport;
+    } else throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'Invalid referenceTransport');
   }
   return config;
 }

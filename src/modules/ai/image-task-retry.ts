@@ -211,6 +211,21 @@ export async function pollAcceptedImageTask(options: ImageTaskPollOptions): Prom
   };
   const immediate = await acquire();
   if (immediate.length) return immediate;
+  const readCompletedResult = async (): Promise<string[]> => {
+    if (!completed(snapshot.state) || !identity.resultUrl) return [];
+    const result = await retryImageRead(timeout => options.read(identity.resultUrl, 'result', timeout), {
+      identity, stage: 'result', deadline: effectiveDeadline(), timeoutMs: 45_000,
+      allowNotReady: true, wait, now, onRetry: options.onRetry,
+    });
+    const resultSnapshot = options.summarize(result);
+    const resultRetryAfterMs = imageRetryAfterMs(result) ?? resultSnapshot.retryAfterMs;
+    observe({ ...resultSnapshot, state: resultSnapshot.state || snapshot.state,
+      pollAfterMs: Math.max(snapshot.pollAfterMs, resultSnapshot.pollAfterMs),
+      ...(resultRetryAfterMs === undefined ? {} : { retryAfterMs: resultRetryAfterMs }) });
+    return acquire();
+  };
+  const initialResult = await readCompletedResult();
+  if (initialResult.length) return initialResult;
   if (!identity.taskId && !identity.statusUrl) {
     throw new ImageTaskRecoveryRequiredError(identity, 'status', 'missing_task_receipt');
   }
@@ -233,17 +248,7 @@ export async function pollAcceptedImageTask(options: ImageTaskPollOptions): Prom
     const images = await acquire();
     if (images.length) return images;
     // Never probe result on every queued/processing status; this used to add 45s stalls.
-    if (!completed(snapshot.state) || !identity.resultUrl) continue;
-    const result = await retryImageRead(timeout => options.read(identity.resultUrl, 'result', timeout), {
-      identity, stage: 'result', deadline: effectiveDeadline(), timeoutMs: 45_000,
-      allowNotReady: true, wait, now, onRetry: options.onRetry,
-    });
-    const resultSnapshot = options.summarize(result);
-    const resultRetryAfterMs = imageRetryAfterMs(result) ?? resultSnapshot.retryAfterMs;
-    observe({ ...resultSnapshot, state: resultSnapshot.state || snapshot.state,
-      pollAfterMs: Math.max(snapshot.pollAfterMs, resultSnapshot.pollAfterMs),
-      ...(resultRetryAfterMs === undefined ? {} : { retryAfterMs: resultRetryAfterMs }) });
-    const resultImages = await acquire();
+    const resultImages = await readCompletedResult();
     if (resultImages.length) return resultImages;
     // completed without readable assets is delivery-pending, not a generation failure.
   }
@@ -296,13 +301,19 @@ export function imageExplicitTaskId(value: unknown): string {
     for (const key of ['task_id', 'taskId', 'taskid']) {
       const id = idText(row[key]); if (id) return id;
     }
-    if (taskContainer || typeof row.status === 'string' || typeof row.state === 'string'
-      || typeof row.status_url === 'string' || typeof row.poll_url === 'string') {
-      const id = idText(row.id); if (id) return id;
-    }
     for (const key of ['data', 'result', 'results', 'task', 'tasks', 'image_task', 'response', 'raw']) {
-      const id = walk(row[key], depth + 1, ['task', 'tasks', 'image_task'].includes(key));
+      const id = walk(row[key], depth + 1, ['task', 'tasks', 'image_task', 'response'].includes(key));
       if (id) return id;
+    }
+    // A wrapper's request id and a final image's asset id are not task ids.
+    // Prefer an explicit nested task receipt; consider `id` only on task-like
+    // objects that are not themselves a final image descriptor.
+    const mediaDescriptor = ['url', 'signed_url', 'download_url', 'b64_json', 'inlineData', 'inline_data']
+      .some(key => key in row) && !Array.isArray(row.assets) && !row.status_url && !row.poll_url;
+    if (!mediaDescriptor && (taskContainer || depth === 0 || Array.isArray(row.assets)
+      || typeof row.status === 'string' || typeof row.state === 'string'
+      || typeof row.status_url === 'string' || typeof row.poll_url === 'string')) {
+      const id = idText(row.id); if (id) return id;
     }
     return '';
   };

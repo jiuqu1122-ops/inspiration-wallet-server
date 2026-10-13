@@ -93,7 +93,10 @@ function executionString(
   return value.trim();
 }
 
-export function normalizeImageTaskExecutionConfig(value: unknown): ImageTaskExecutionConfig {
+export function normalizeImageTaskExecutionConfig(
+  value: unknown,
+  defaults: Partial<Pick<ImageTaskExecutionConfig, 'submitEndpoint' | 'statusEndpointTemplate' | 'asyncParameterName'>> = {},
+): ImageTaskExecutionConfig {
   const source = executionConfigRecord(value);
   const profile = source.profile;
   if (profile !== 'USELG_IMAGE_TASK' && profile !== 'GENERIC_TASK') {
@@ -105,7 +108,7 @@ export function normalizeImageTaskExecutionConfig(value: unknown): ImageTaskExec
   const preset = profile === 'USELG_IMAGE_TASK'
     ? USELG_IMAGE_TASK_PROFILE
     : GENERIC_IMAGE_TASK_PROFILE;
-  const submitEndpoint = executionString(source, 'submitEndpoint');
+  const submitEndpoint = executionString(source, 'submitEndpoint', defaults.submitEndpoint);
   if (!submitEndpoint?.startsWith('/') || submitEndpoint.startsWith('//')) {
     throw new ImageAdapterError(
       'IMAGE_ADAPTER_CONFIG_INVALID',
@@ -129,7 +132,7 @@ export function normalizeImageTaskExecutionConfig(value: unknown): ImageTaskExec
       'Image task submitTimeoutMs must be an integer between 45000 and 90000',
     );
   }
-  const asyncParameterName = executionString(source, 'asyncParameterName');
+  const asyncParameterName = executionString(source, 'asyncParameterName', defaults.asyncParameterName);
   if (asyncParameterName && !/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(asyncParameterName)) {
     throw new ImageAdapterError(
       'IMAGE_ADAPTER_CONFIG_INVALID',
@@ -149,7 +152,7 @@ export function normalizeImageTaskExecutionConfig(value: unknown): ImageTaskExec
   const statusEndpointTemplate = executionString(
     source,
     'statusEndpointTemplate',
-    presetStatusEndpoint,
+    presetStatusEndpoint ?? defaults.statusEndpointTemplate,
   );
   const resultEndpointTemplate = executionString(source, 'resultEndpointTemplate');
 

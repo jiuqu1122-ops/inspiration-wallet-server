@@ -65,6 +65,10 @@ export function serializeConfiguredReferences(
     body.images = references;
     return;
   }
+  if (config.referenceSerializer === 'object_image_url') {
+    body.images = references.map(image_url => ({ image_url }));
+    return;
+  }
   throw new ImageAdapterError(
     'PROVIDER_REFERENCE_EDIT_UNSUPPORTED',
     'The selected image route has no confirmed reference image serializer',

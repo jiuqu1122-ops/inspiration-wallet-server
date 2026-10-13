@@ -76,6 +76,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       PROVIDER_SECRETS_ENCRYPTION_KEY: ${PROVIDER_SECRETS_ENCRYPTION_KEY:-}
       WORKER_HEALTH_FILE: /tmp/inspiration-worker-health
+      IMAGE_RESULT_STORE_DIR: /var/lib/inspiration/image-results
       STORAGE_PROVIDER: ${STORAGE_PROVIDER:-tencent-cos}
       STORAGE_SIGNED_URL_EXPIRES_SECONDS: ${STORAGE_SIGNED_URL_EXPIRES_SECONDS:-3600}
       OSS_REGION: ${OSS_REGION:-}
@@ -86,6 +87,8 @@ services:
       COS_BUCKET: ${COS_BUCKET:-}
       COS_SECRET_ID: ${COS_SECRET_ID:-}
       COS_SECRET_KEY: ${COS_SECRET_KEY:-}
+    volumes:
+      - image_result_data:/var/lib/inspiration/image-results
     depends_on:
       postgres:
         condition: service_healthy
