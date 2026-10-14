@@ -902,6 +902,7 @@ export async function buildClientPricingProjection(prisma: PrismaClient) {
     videoDefaultCredits: String(env.VIDEO_REQUEST_CREDITS),
     imageModels: [] as ImageModelCreditPrice[],
     videoModels: [] as VideoModelCreditPrice[],
+    musicModels: [] as Array<{ model: string; billingType: 'music_flat'; creditsPerRequest: string }>,
     updatedAt: null as string | null,
   };
   if (!catalogDelegateAvailable(prisma)) return fallback;
@@ -923,12 +924,16 @@ export async function buildClientPricingProjection(prisma: PrismaClient) {
   ]);
   const imageModels: ImageModelCreditPrice[] = [];
   const videoModels: VideoModelCreditPrice[] = [];
+  const musicModels: typeof fallback.musicModels = [];
   for (const model of models) {
     const raw = model.pricing?.currentVersion?.pricing;
     if (!raw) continue;
     const profile = raw as CatalogPricingProfile;
     if (profile.billingType !== model.billingType) continue;
-    if (model.modality === 'image') {
+    if (model.modality === 'audio' && profile.billingType === 'music_flat') {
+      const creditsPerRequest = scalarText(profile.creditsPerRequest);
+      if (creditPattern.test(creditsPerRequest)) musicModels.push({ model: model.canonicalModelKey, billingType: 'music_flat', creditsPerRequest });
+    } else if (model.modality === 'image') {
       const legacy = catalogProfileToImagePrice(model.canonicalModelKey, profile);
       if (legacy) imageModels.push(legacy);
     } else if (model.modality === 'video') {
@@ -963,6 +968,7 @@ export async function buildClientPricingProjection(prisma: PrismaClient) {
       ?? fallback.canvasTextAgentCredits,
     imageModels,
     videoModels,
+    musicModels,
     updatedAt: updatedAt?.toISOString() ?? null,
   };
 }

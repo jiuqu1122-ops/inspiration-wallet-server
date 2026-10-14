@@ -94,6 +94,7 @@ describe('music model admin HTTP contract', () => {
     expect(desktop.json()).toMatchObject({ provider: 'NEW_API', models: [], channels: [], videoChannels: [], catalog: [{ id: 'configured-music', modality: 'audio', enabled: true, visible: true, isDefault: true, capabilities: { outputAssetType: 'audio', billingMode: 'per_request' } }] });
     expect(desktop.body).not.toContain('private-channel-secret');
     expect(desktop.body).not.toContain('provider-audio');
+    expect(desktop.json().pricing.musicModels).toEqual([{ model: 'configured-music', billingType: 'music_flat', creditsPerRequest: '17' }]);
     model.visible = false;
     const hidden = await app.inject({ method: 'GET', url: '/v1/ai/images/models' });
     expect(hidden.statusCode, hidden.body).toBe(200);
