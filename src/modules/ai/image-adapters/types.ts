@@ -34,6 +34,8 @@ export type ImageAdapterInput = {
   negativePrompt?: string;
   references: string[];
   resolution?: string;
+  quality?: string;
+  capabilities?: unknown;
   aspectRatio: string;
   count: number;
   outputFormat: 'jpg' | 'jpeg' | 'png' | 'webp';

@@ -1046,6 +1046,10 @@ function costProfileToSuggestedPrice(
       ? roundSuggestedPoints(cny * 100 * markupMultiplier)
       : null;
   };
+  if (modality === 'audio') {
+    const creditsPerRequest = points(costProfile.cnyPerRequest);
+    return creditsPerRequest ? { billingType: 'music_flat', creditsPerRequest } : null;
+  }
   if (modality === 'chat') {
     const convertTier = (value: unknown) => {
       if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -1079,8 +1083,18 @@ function costProfileToSuggestedPrice(
       const suggested = points(cost);
       return suggested ? [[resolution.toLowerCase(), suggested]] : [];
     }));
+    const qualityCosts = costProfile.cnyPerImageByResolutionQuality;
+    const qualityPrices: Record<string, Record<string, string>> = {};
+    if (qualityCosts && typeof qualityCosts === 'object' && !Array.isArray(qualityCosts)) {
+      for (const [resolution, row] of Object.entries(qualityCosts as Record<string, unknown>)) {
+        if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+        const entries = Object.entries(row).map(([quality, cost]) => [quality, points(cost)] as const);
+        if (entries.some(([, price]) => price === null)) return null;
+        qualityPrices[resolution.toLowerCase()] = Object.fromEntries(entries) as Record<string, string>;
+      }
+    }
     return prices['2k'] && prices['4k']
-      ? { billingType: 'image_resolution', creditsPerImageByResolution: prices }
+      ? { billingType: 'image_resolution', creditsPerImageByResolution: prices, ...(Object.keys(qualityPrices).length ? { creditsPerImageByResolutionQuality: qualityPrices } : {}) }
       : null;
   }
   const billingType = videoCostBillingType(costProfile);

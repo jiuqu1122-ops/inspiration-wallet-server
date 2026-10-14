@@ -1,3 +1,4 @@
+import { imageQualityFields } from '../image-capabilities.js';
 import { genericOpenAiImageAdapter } from './generic-openai-image.js';
 import { geminiNativeImageAdapter } from './gemini-native.js';
 import { gptImageAdapter } from './gpt-image.js';
@@ -54,6 +55,10 @@ export function prepareImageAdapterRequest(
     );
   }
   const prepared = adapter.buildRequest(input);
+  if (input.capabilities !== undefined) {
+    delete prepared.body.quality;
+    Object.assign(prepared.body, imageQualityFields(input.capabilities, input.quality));
+  }
   assertPreparedImageIdentity(input, prepared);
   return prepared;
 }

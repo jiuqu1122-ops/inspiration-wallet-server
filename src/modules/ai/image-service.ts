@@ -102,6 +102,7 @@ import {
   type ParsedProviderValue,
 } from './image-response-diagnostics.js';
 import { normalizeManagedVideoRequest, ManagedVideoRequestError, type NormalizedVideoRequest } from './video-request.js';
+import { imageQualityFields, imageResultLimit, resolveImageOutputCapabilities } from './image-capabilities.js';
 import { resolveVideoCapabilities, videoAspectRatioAllowed, videoCapabilitiesSupportRequest, videoDurationAllowed } from './video-capabilities.js';
 import { selectManagedVideoRoutes } from './video-routing.js';
 import { getVideoAdapter } from './video-adapters/registry.js';
@@ -147,6 +148,7 @@ const imageReferenceCache = new Map<string, { dataUrl: string; expiresAt: number
 const pendingImageReferenceFetches = new Map<string, Promise<string>>();
 
 export type WalletImageGenerationResult = {
+  imageAssets?: Array<{ assetType: 'image'; url: string }>;
   images: string[];
   provider: string;
   providerChannelId: string;
@@ -423,6 +425,8 @@ export function filterProviderImageModels(
 }
 
 export type ImageInput = {
+  quality?: string | undefined;
+  imageCapabilities?: unknown;
   userId: string;
   clientRequestId: string;
   clientPlatform?: 'tablet' | undefined;
@@ -2110,6 +2114,7 @@ export function buildNewApiImageGenerationBody(
     input.outputFormat,
     input.background,
   );
+  if (input.imageCapabilities !== undefined) { delete (imageParams as Record<string, unknown>).quality; Object.assign(imageParams, imageQualityFields(input.imageCapabilities, input.quality)); }
   return {
     model: input.model,
     prompt: promptWithConstraints(input, providerKind),
@@ -5939,6 +5944,8 @@ export async function prepareRouteImageAdapterRequest(
     outputFormat: input.outputFormat,
     ...(input.background ? { background: input.background } : {}),
     adapterConfig: route.adapterConfig,
+    capabilities: input.imageCapabilities,
+    ...(input.quality ? { quality: input.quality } : {}),
   };
   // Validate the existing route contract before downloading or creating any
   // temporary references. A missing serializer must never be guessed.
@@ -6111,6 +6118,7 @@ export async function generatePreparedImageAdapterImages(
   route?: ImageAdapterRouteContext,
   options?: PreparedImageAdapterExecutionOptions,
 ) {
+  const resultLimit = imageResultLimit(input.imageCapabilities, input.count);
   const executionMode = imageRouteExecutionMode(route?.executionMode);
   const request: ImageAdapterRequest = options?.request ?? (prepared.execution === 'gemini-native'
     ? (path, body, timeoutOverrideMs, extraHeaders, _onResponseStatus, diagnosticScope) => bigmodelRequest(
@@ -6145,7 +6153,7 @@ export async function generatePreparedImageAdapterImages(
         prepared.body,
         IMAGE_GENERATION_TIMEOUT_MS,
       );
-      const expectedCount = prepared.execution === 'gemini-native' ? 1 : input.count;
+      const expectedCount = prepared.execution === 'gemini-native' ? 1 : resultLimit;
       images.push(...(executionMode === 'DIRECT'
         ? directPreparedImageResults(started, input.inputImages, expectedCount)
         : await resolveImageAdapterResponse(
@@ -6262,7 +6270,7 @@ export async function generatePreparedImageAdapterImages(
     ? summarizeUselgImageStatus(
       configuredEnvelope,
       input.inputImages,
-      input.count,
+      resultLimit,
       submitDiagnosticScope,
     )
     : {
@@ -6315,7 +6323,7 @@ export async function generatePreparedImageAdapterImages(
       secrets,
       configuredEnvelope,
       input.inputImages,
-      input.count,
+      resultLimit,
       options?.wait,
       {
         clientRequestId: diagnosticContext.clientRequestId,
@@ -6354,7 +6362,7 @@ export async function generatePreparedImageAdapterImages(
     secrets,
     configuredEnvelope,
     input.inputImages,
-    input.count,
+    resultLimit,
     options?.wait,
     async (path, body, timeoutOverrideMs) => configuredImageTaskEnvelope(
       await request(path, body, timeoutOverrideMs),
@@ -6466,7 +6474,7 @@ async function generateImagesFromProvider(
     providerImages.push(...await generateBatch(input));
   }
   const upstreamCompletedAt = Date.now();
-  const boundedProviderImages = boundProviderImageResults(providerImages, effectiveInput.count);
+  const boundedProviderImages = boundProviderImageResults(providerImages, imageResultLimit(effectiveInput.imageCapabilities, effectiveInput.count));
   const persistenceContext: ImageResultPersistenceContext = {
     clientRequestId: effectiveInput.clientRequestId,
     canonicalModel: adapterRoute?.canonicalModelKey ?? effectiveInput.model,
@@ -6580,6 +6588,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     });
     return {
       images: existingResult.images,
+      ...(existingResult.imageAssets ? { imageAssets: existingResult.imageAssets } : {}),
       provider: existingResult.provider,
       providerChannelId: existingResult.providerChannelId,
       providerChannelName: existingResult.providerChannelName,
@@ -6611,9 +6620,13 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
   }
   const validatedInput: ImageInput = {
     ...input,
+    imageCapabilities: catalogResolution?.model.capabilities,
+    quality: resolveImageOutputCapabilities(catalogResolution?.model.capabilities).supportedQualities.length ? input.quality : undefined,
     referenceSourceTypes: input.inputImages.map(referenceSourceType),
     inputImages: await resolveReferenceImageSources(prisma, input.userId, input.inputImages),
   };
+  try { imageQualityFields(validatedInput.imageCapabilities, validatedInput.quality); }
+  catch { throw new CloudAiError('invalid_request', 'Unsupported image quality', 400); }
   const referencesResolvedAt = Date.now();
   if (catalogResolution
     && !catalogModelSupportsImageRequest(
@@ -6695,7 +6708,9 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
   const pricingSnapshot = catalogResolution
     ? await capturePricingSnapshot(prisma, catalogResolution.model, primaryRoute?.id ?? null, {
       resolution: reservationInput.resolution ?? '2k',
-      count: validatedInput.count,
+      count: imageResultLimit(validatedInput.imageCapabilities, validatedInput.count),
+      ...(validatedInput.quality ? { quality: validatedInput.quality } : {}),
+      ...(resolveImageOutputCapabilities(validatedInput.imageCapabilities).billingMode ? { billingMode: resolveImageOutputCapabilities(validatedInput.imageCapabilities).billingMode } : {}),
     }, input.userId)
     : undefined;
   await assertPublicProviderUrl(primaryProvider.baseUrl);
@@ -6846,6 +6861,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
           images.length,
           {
             images,
+            imageAssets: images.map(url => ({ assetType: 'image', url })),
             provider: publicWalletImageProviderKind(activeProvider),
             providerChannelId: activeProvider.id,
             providerChannelName: activeProvider.name,
@@ -6878,6 +6894,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         });
         return {
           images,
+          imageAssets: images.map(url => ({ assetType: 'image' as const, url })),
           provider: publicWalletImageProviderKind(activeProvider),
           providerChannelId: activeProvider.id,
           providerChannelName: activeProvider.name,

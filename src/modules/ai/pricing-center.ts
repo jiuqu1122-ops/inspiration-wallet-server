@@ -280,6 +280,7 @@ export function catalogProfileToImagePrice(
     if (!creditPattern.test(creditsPerRequest)) return null;
     return {
       model,
+      creditsByResolutionQuality: profile.creditsPerImageByResolutionQuality as Record<string, Record<string, string>> | undefined,
       billingType: 'image_flat',
       creditsPerRequest,
       credits1k: creditsPerRequest,
@@ -292,6 +293,7 @@ export function catalogProfileToImagePrice(
     if (!creditPattern.test(creditsPerImage)) return null;
     return {
       model,
+      creditsByResolutionQuality: profile.creditsPerImageByResolutionQuality as Record<string, Record<string, string>> | undefined,
       billingType: 'image_count',
       creditsPerImage,
       credits1k: creditsPerImage,
@@ -310,6 +312,7 @@ export function catalogProfileToImagePrice(
   return {
     model,
     billingType: 'image_resolution',
+    creditsByResolutionQuality: profile.creditsPerImageByResolutionQuality as Record<string, Record<string, string>> | undefined,
     creditsByResolution,
     ...(creditsByResolution['1k'] !== undefined ? { credits1k: creditsByResolution['1k'] } : {}),
     ...(creditsByResolution['2k'] !== undefined ? { credits2k: creditsByResolution['2k'] } : {}),
@@ -373,12 +376,22 @@ export function catalogProfileToVideoPrice(
 export function validatePricingProfile(modality: AiModality, profile: unknown): CatalogPricingProfile {
   const pricing = plainObject(profile);
   if (!pricing || typeof pricing.billingType !== 'string') throw new Error('Pricing profile is invalid');
-  if (modality === 'chat') {
+  if (modality === 'audio') {
+    if (pricing.billingType !== 'music_flat' || !creditPattern.test(scalarText(pricing.creditsPerRequest))) throw new Error('Music requires a flat request price');
+  } else if (modality === 'chat') {
     if (!catalogProfileToChatPrice('validation', pricing as CatalogPricingProfile)) throw new Error('Chat pricing profile is invalid');
   } else if (modality === 'image') {
     if (!catalogProfileToImagePrice('validation', pricing as CatalogPricingProfile)) throw new Error('Image pricing profile is invalid');
   } else if (!catalogProfileToVideoPrice('validation', pricing as CatalogPricingProfile)) {
     throw new Error('Video pricing profile is invalid');
+  }
+  if (pricing.creditsPerImageByResolutionQuality !== undefined) {
+    const matrix = plainObject(pricing.creditsPerImageByResolutionQuality);
+    if (!matrix) throw new Error('Quality pricing must be an object');
+    for (const [resolution, row] of Object.entries(matrix)) {
+      const qualities = plainObject(row);
+      if (resolution !== resolution.toLowerCase() || !qualities || Object.values(qualities).some(amount => !creditPattern.test(scalarText(amount)))) throw new Error('Invalid quality pricing');
+    }
   }
   return pricing as CatalogPricingProfile;
 }
@@ -556,12 +569,12 @@ function imageCharge(snapshot: PricingSnapshot, generatedCount?: number): Charge
   const count = generatedCount === undefined
     ? requestedCount
     : Math.max(0, Math.min(requestedCount, Math.floor(generatedCount)));
-  const isFlat = snapshot.pricing.billingType === 'image_flat';
-  const unit = isFlat
+  const quality = scalarText(snapshot.request.quality);
+  const qualityPrices = plainObject(plainObject(snapshot.pricing.creditsPerImageByResolutionQuality)?.[resolution]);
+  const isFlat = snapshot.request.billingMode === 'per_request' || (snapshot.request.billingMode !== 'per_image' && snapshot.pricing.billingType === 'image_flat');
+  const unit = (quality ? qualityPrices?.[quality] : undefined) ?? (snapshot.pricing.billingType === 'image_flat'
     ? snapshot.pricing.creditsPerRequest
-    : snapshot.pricing.billingType === 'image_count'
-      ? snapshot.pricing.creditsPerImage
-      : prices[resolution] ?? prices['2k'];
+    : snapshot.pricing.billingType === 'image_count' ? snapshot.pricing.creditsPerImage : prices[resolution] ?? prices['2k']);
   const total = isFlat ? creditMicros(unit) : multiplyCredits(unit, BigInt(count));
   return {
     schemaVersion: 1,
@@ -576,6 +589,7 @@ function imageCharge(snapshot: PricingSnapshot, generatedCount?: number): Charge
     totalCredits: microsToCredit(total),
     details: {
       resolution,
+      quality,
       requestedCount,
       generatedCount: count,
       ...(isFlat
@@ -768,6 +782,10 @@ export function calculateSnapshotCharge(
   snapshot: PricingSnapshot,
   options: { usage?: ChatTokenUsage | null; generatedCount?: number } = {},
 ) {
+  if (snapshot.modality === 'audio') {
+    const total = microsToCredit(creditMicros(snapshot.pricing.creditsPerRequest));
+    return { schemaVersion: 1 as const, model: snapshot.canonicalModelKey, modality: 'audio' as const, route: snapshot.routeId, priceVersion: snapshot.priceVersion, billingType: 'music_flat', quantity: '1', baseCharge: total, surcharges: [], totalCredits: total, details: {} };
+  }
   if (snapshot.modality === 'chat') return chatCharge(snapshot, options.usage);
   if (snapshot.modality === 'image') return imageCharge(snapshot, options.generatedCount);
   return videoCharge(snapshot, options.generatedCount);

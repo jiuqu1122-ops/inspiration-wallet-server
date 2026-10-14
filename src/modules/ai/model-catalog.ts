@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Prisma, PrismaClient } from '@prisma/client';
 
-export type AiModality = 'chat' | 'image' | 'video';
+export type AiModality = 'chat' | 'image' | 'video' | 'audio';
 
 const ROUTE_UNAVAILABLE_HEALTH = new Set(['UNAVAILABLE', 'UNHEALTHY', 'DOWN', 'FAILED', 'DISABLED']);
 
@@ -113,6 +113,7 @@ const CHAT_ALIAS_MAP: Record<string, string> = {
 };
 
 export const EXPLICIT_LEGACY_ALIASES: Record<AiModality, Record<string, string>> = {
+  audio: {},
   chat: CHAT_ALIAS_MAP,
   image: IMAGE_ALIAS_MAP,
   video: VIDEO_ALIAS_MAP,
@@ -230,6 +231,7 @@ export function withGptImage2DimensionCapabilities(
 }
 
 export function defaultModelCapabilities(key: string, modality: AiModality): Prisma.InputJsonValue {
+  if (modality === 'audio') return { outputAssetType: 'audio', billingMode: 'per_request' };
   if (modality === 'chat') {
     return key === 'gpt-5.6-luna'
       ? { billing: 'request' }
@@ -292,6 +294,15 @@ export function normalizeModelCapabilities(value: Prisma.InputJsonValue): Prisma
     }
     normalized[key] = Array.from(new Set(values));
   };
+  if (source.supportedQualities !== undefined) {
+    if (!Array.isArray(source.supportedQualities) || source.supportedQualities.some(item => typeof item !== 'string' || !/^[a-zA-Z0-9_-]{1,32}$/.test(item))) throw new Error('supportedQualities must contain quality names');
+    normalized.supportedQualities = [...new Set(source.supportedQualities)];
+    normalized.qualityParameter = source.qualityParameter ?? 'quality';
+  }
+  if (source.qualityParameter !== undefined && (typeof source.qualityParameter !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(source.qualityParameter) || ['model', 'prompt', 'n', 'size', 'images', 'image', '__proto__', 'constructor', 'prototype'].includes(source.qualityParameter))) throw new Error('Invalid qualityParameter');
+  if (source.outputMode !== undefined && source.outputMode !== 'single_asset' && source.outputMode !== 'multiple_assets') throw new Error('Invalid outputMode');
+  if (source.billingMode !== undefined && source.billingMode !== 'per_request' && source.billingMode !== 'per_image') throw new Error('Invalid billingMode');
+  if (source.maxOutputImages !== undefined && (!Number.isSafeInteger(source.maxOutputImages) || Number(source.maxOutputImages) < 1 || Number(source.maxOutputImages) > 16)) throw new Error('Invalid maxOutputImages');
   normalizeStrings('supportedResolutions', /^[a-z0-9][a-z0-9._+-]{0,31}$/);
   normalizeStrings('supportedAspectRatios', /^[1-9]\d{0,4}:[1-9]\d{0,4}$/);
   if (source.supportedDurations !== undefined) {
@@ -497,6 +508,11 @@ export function normalizePublicModelCapabilities(value: unknown) {
     return undefined;
   };
   return Object.fromEntries(Object.entries({
+    supportedQualities: stringArray('supportedQualities'),
+    qualityParameter: typeof source.qualityParameter === 'string' ? source.qualityParameter : Array.isArray(source.supportedQualities) ? 'quality' : undefined,
+    outputMode: typeof source.outputMode === 'string' ? source.outputMode : undefined,
+    maxOutputImages: numberValue('maxOutputImages'),
+    billingMode: typeof source.billingMode === 'string' ? source.billingMode : undefined,
     resolutions: stringArray('resolutions', 'supportedResolutions'),
     aspectRatios: stringArray('aspectRatios', 'supportedAspectRatios'),
     aspectRatiosByResolution: stringArrayMap(
@@ -528,6 +544,7 @@ export function normalizePublicModelCapabilities(value: unknown) {
     supportsFirstLastFrame: booleanValue('supportsFirstLastFrame'),
     supportedInputModes: stringArray('supportedInputModes'),
     supportedOutputFormats: stringArray('supportedOutputFormats'),
+    supportsImageEdit: booleanValue('supportsImageEdit'),
     supportsTransparentBackground: booleanValue('supportsTransparentBackground'),
     supportsVision: booleanValue('supportsVision'),
     maxOutputs: numberValue('maxOutputs'),

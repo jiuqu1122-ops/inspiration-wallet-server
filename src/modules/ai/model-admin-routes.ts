@@ -31,7 +31,7 @@ import {
 } from './usage-model-binding.js';
 import { IMAGE_ADAPTER_KEYS } from './image-adapters/registry.js';
 
-const modalitySchema = z.enum(['chat', 'image', 'video']);
+const modalitySchema = z.enum(['chat', 'image', 'video', 'audio']);
 const jsonObjectSchema = z.record(z.string(), z.unknown());
 const adapterEndpointSchema = z.string().trim().min(1).max(240).regex(/^\/(?!\/)/);
 const adapterConfigSchema = z.object({

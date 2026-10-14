@@ -9,6 +9,7 @@ export type ImageModelCreditPrice = {
   creditsPerRequest?: string | undefined;
   creditsPerImage?: string | undefined;
   creditsByResolution?: Record<string, string> | undefined;
+  creditsByResolutionQuality?: Record<string, Record<string, string>> | undefined;
   /** Legacy compatibility fields for clients predating explicit image billing. */
   credits1k?: string | undefined;
   credits2k?: string | undefined;

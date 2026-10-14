@@ -16,6 +16,7 @@ export type StorageMediaNamespace =
   | 'reference-images'
   | 'generated-images'
   | 'generated-videos'
+  | 'generated-audios'
   | 'client-assets';
 
 const SAFE_FILENAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$/;
@@ -116,7 +117,7 @@ export class ObjectStorageService {
       ...(input.metadata ? { metadata: input.metadata } : {}),
       timeoutMs: input.namespace === 'generated-videos' || input.namespace === 'client-assets'
         ? 10 * 60_000
-        : input.namespace === 'generated-images'
+        : input.namespace === 'generated-images' || input.namespace === 'generated-audios'
           ? 4 * 60_000
           : 30_000,
     }).then(() => objectKey);

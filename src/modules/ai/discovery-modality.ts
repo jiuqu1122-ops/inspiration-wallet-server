@@ -6,7 +6,7 @@ type DiscoveryModalityFields = {
 };
 
 export function storedAiModality(value: unknown): AiModality | null {
-  return value === 'chat' || value === 'image' || value === 'video' ? value : null;
+  return value === 'chat' || value === 'image' || value === 'video' || value === 'audio' ? value : null;
 }
 
 export function effectiveDiscoveryModality(discovery: DiscoveryModalityFields): AiModality | null {

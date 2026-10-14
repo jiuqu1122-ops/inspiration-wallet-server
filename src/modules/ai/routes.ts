@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { z } from 'zod';
+import { executeWalletMusicGeneration, getWalletMusicGenerationByRequest } from './music-service.js';
 import { CloudAiError, listWalletAgentModels } from './service.js';
 import {
   executeWalletImageGeneration,
@@ -18,6 +19,7 @@ import { getImageReference } from './reference-store.js';
 import { getProviderReference } from './provider-reference-store.js';
 import { createReadStream } from 'node:fs';
 import { isVideoResultKey } from './video-result-store.js';
+import { isAudioResultKey } from './audio-result-store.js';
 import { serveImageResultWithFallback } from './image-result-fallback.js';
 import { agentToolChoiceSchema, createAiTaskSchema } from './task-schema.js';
 import { ensureAiCatalogSeeded } from './catalog-seed.js';
@@ -99,6 +101,7 @@ const imageSchema = z.object({
   inputImages: z.array(z.string().min(1).max(12_000_000)).max(9).default([]),
   aspectRatio: imageAspectRatioSchema.default('1:1'),
   resolution: optionalString(20),
+  quality: optionalString(32),
   outputFormat: z.enum(['jpg', 'jpeg', 'png', 'webp']).default('jpg'),
   background: z.enum(['transparent']).nullish()
     .transform((value) => value ?? undefined),
@@ -342,6 +345,24 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
+  app.get('/audio-results/:key', { config: { rateLimit: { max: 240, timeWindow: '1 minute' } } }, async (request, reply) => {
+    const query = z.object({ redirect: z.enum(['0', '1']).optional(), download: z.enum(['0', '1']).optional() }).strict().safeParse(request.query);
+    if (!query.success) return reply.code(400).send({ error: 'invalid_request' });
+    const key = (request.params as { key: string }).key;
+    if (!isAudioResultKey(key)) return reply.code(404).send({ error: 'not_found' });
+    try {
+      const objectKey = `generated-audios/${key}`;
+      if (!await storageService.exists(objectKey)) return reply.code(404).send({ error: 'not_found' });
+      const url = storageService.getDownloadUrl(objectKey, query.data.download === '1' ? { download: true, filename: `music.${key.split('.').pop()}` } : undefined);
+      reply.header('cache-control', 'no-store').header('cross-origin-resource-policy', 'cross-origin');
+      if (query.data.redirect === '0') return { url, expiresAt: Date.now() + env.STORAGE_SIGNED_URL_EXPIRES_SECONDS * 1_000 };
+      // COS serves byte ranges directly. The stable API address signs anew on every visit.
+      return reply.redirect(url);
+    } catch {
+      return reply.code(503).send({ error: 'audio_storage_unavailable', message: 'Audio result is temporarily unavailable' });
+    }
+  });
+
   app.get(
     '/video-results/:key',
     { config: { rateLimit: { max: 240, timeWindow: '1 minute' } } },
@@ -574,6 +595,18 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       return reply.code(202).send({ taskId: task.id, status: publicTaskStatus(task.status) });
     },
   );
+
+  app.post('/music/generations', { preHandler: app.authenticateAccessToken, config: { rateLimit: { max: 12, timeWindow: '1 minute' } } }, async (request, reply) => {
+    const parsed = z.object({ clientRequestId: z.string().trim().min(1).max(128), model: z.string().trim().min(1).max(160), prompt: z.string().trim().min(1).max(32000) }).safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request' });
+    try { return await executeWalletMusicGeneration(app.prisma, { userId: request.user.sub, ...parsed.data }); } catch (error) { return knownError(reply, error); }
+  });
+
+  app.get('/music/generations/by-request/:requestId', { preHandler: app.authenticateAccessToken, config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (request, reply) => {
+    const parsed = z.object({ requestId: z.string().trim().min(1).max(128) }).safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request' });
+    try { return await getWalletMusicGenerationByRequest(app.prisma, request.user.sub, parsed.data.requestId); } catch (error) { return knownError(reply, error); }
+  });
 
   app.post(
     '/images/generations',

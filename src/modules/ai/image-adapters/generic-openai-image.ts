@@ -11,7 +11,8 @@ export const genericOpenAiImageAdapter: ImageModelAdapter = {
   execution: 'images-api',
   buildRequest(input) {
     const { config, body: configuredFields } = configuredImagesApiFields(input);
-    const endpoint = input.references.length > 0
+    const nativeEdit = (input.capabilities as { supportsImageEdit?: boolean } | undefined)?.supportsImageEdit !== false;
+    const endpoint = input.references.length > 0 && nativeEdit
       ? editEndpoint(config)
       : generationEndpoint(config);
     const body = {
