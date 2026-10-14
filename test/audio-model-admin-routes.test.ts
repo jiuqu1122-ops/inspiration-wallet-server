@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import type { PrismaClient } from '@prisma/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { aiModelAdminRoutes } from '../src/modules/ai/model-admin-routes.js';
+import { aiRoutes } from '../src/modules/ai/routes.js';
 import { getPublicAiCatalog, resolveCatalogModel } from '../src/modules/ai/model-catalog.js';
 import { calculateSnapshotCharge, type PricingSnapshot } from '../src/modules/ai/pricing-center.js';
 
@@ -18,10 +19,13 @@ describe('music model admin HTTP contract', () => {
 
   beforeEach(async () => {
     model = null; route = null; pricing = null; version = null;
-    discovery = { id: 'music-discovery', status: 'UNMAPPED', provider: 'USELG', channelId: 'channel', upstreamModelId: 'provider-audio', suggestedModality: 'image', modalityOverride: 'audio', availability: 'AVAILABLE', channel: { id: 'channel', priority: 1, status: 'ACTIVE' } };
+    discovery = { id: 'music-discovery', status: 'UNMAPPED', provider: 'USELG', channelId: 'channel', upstreamModelId: 'provider-audio', suggestedModality: 'image', modalityOverride: 'audio', availability: 'AVAILABLE', channel: { id: 'channel', kind: 'USELG', priority: 1, status: 'ACTIVE', encryptedSecrets: 'private-channel-secret' } };
     const fullModel = () => model ? { ...model, pricing: pricing ? { ...pricing, currentVersion: version } : null, routes: route ? [{ ...route, channel: discovery.channel }] : [], aliases: [] } : null;
     const fullRoute = () => route ? { ...route, canonicalModel: model, channel: discovery.channel } : null;
     const tx: any = {
+      aiProviderChannel: { findMany: vi.fn(async () => []) },
+      aiUsageModelBinding: { findMany: vi.fn(async () => []) },
+      aiPricingConfig: { findUnique: vi.fn(async () => null) },
       aiUpstreamDiscovery: {
         findUnique: vi.fn(async () => discovery),
         updateMany: vi.fn(async ({ where, data }) => { if (discovery.status !== where.status) return { count: 0 }; Object.assign(discovery, data); return { count: 1 }; }),
@@ -35,6 +39,7 @@ describe('music model admin HTTP contract', () => {
         updateMany: vi.fn(async ({ data }) => { Object.assign(model, data); return { count: 1 }; }),
       },
       aiModelRoute: {
+        findMany: vi.fn(async () => route?.enabled && route.upstreamAvailable ? [fullRoute()] : []),
         upsert: vi.fn(async ({ create }) => { route = { id: 'music-route', updatedAt: new Date(), ...create }; return route; }),
         findUnique: vi.fn(async () => fullRoute()),
         findUniqueOrThrow: vi.fn(async () => fullRoute()),
@@ -54,7 +59,9 @@ describe('music model admin HTTP contract', () => {
     prisma = { ...tx, $transaction: async (callback: (client: any) => unknown) => callback(tx) } as PrismaClient;
     app = Fastify();
     app.decorate('prisma', prisma);
+    app.decorate('authenticateAccessToken', async () => {});
     await app.register(aiModelAdminRoutes, { prefix: '/v1/admin/ai-models' });
+    await app.register(aiRoutes, { prefix: '/v1/ai' });
   });
   afterEach(() => app.close());
 
@@ -80,6 +87,29 @@ describe('music model admin HTTP contract', () => {
     expect(await resolveCatalogModel(prisma, 'configured-music', 'audio')).toMatchObject({ model: { billingType: 'music_flat' }, route: { id: 'music-route', enabled: true } });
     const catalog = await getPublicAiCatalog(prisma);
     expect(catalog.models).toEqual([expect.objectContaining({ id: 'configured-music', modality: 'audio', billingType: 'music_flat', pricing: { billingType: 'music_flat', creditsPerRequest: '17' } })]);
+    // This compatibility endpoint is the actual desktop transport, including
+    // installations with no image or video provider at all.
+    const desktop = await app.inject({ method: 'GET', url: '/v1/ai/images/models' });
+    expect(desktop.statusCode, desktop.body).toBe(200);
+    expect(desktop.json()).toMatchObject({ provider: 'NEW_API', models: [], channels: [], videoChannels: [], catalog: [{ id: 'configured-music', modality: 'audio', enabled: true, visible: true, isDefault: true, capabilities: { outputAssetType: 'audio', billingMode: 'per_request' } }] });
+    expect(desktop.body).not.toContain('private-channel-secret');
+    expect(desktop.body).not.toContain('provider-audio');
+    model.visible = false;
+    const hidden = await app.inject({ method: 'GET', url: '/v1/ai/images/models' });
+    expect(hidden.statusCode, hidden.body).toBe(200);
+    expect(hidden.json().catalog).toEqual([]);
+    model.visible = true;
+    for (const patch of [{ enabled: false }, { upstreamAvailable: false }, { healthStatus: 'UNHEALTHY' }]) {
+      const savedRoute = { ...route };
+      Object.assign(route, patch);
+      const unavailable = await app.inject({ method: 'GET', url: '/v1/ai/images/models' });
+      expect(unavailable.statusCode, unavailable.body).toBe(503);
+      Object.assign(route, savedRoute);
+    }
+    discovery.channel.status = 'DISABLED';
+    const inactive = await app.inject({ method: 'GET', url: '/v1/ai/images/models' });
+    expect(inactive.statusCode, inactive.body).toBe(503);
+    discovery.channel.status = 'ACTIVE';
     const snapshot: PricingSnapshot = { schemaVersion: 1, canonicalModelId: model.id, canonicalModelKey: model.canonicalModelKey, modality: 'audio', routeId: route.id, priceVersionId: version.id, priceVersion: 1, billingType: 'music_flat', pricing: version.pricing, request: {}, capturedAt: '' };
     expect(calculateSnapshotCharge(snapshot, { generatedCount: 4 })).toMatchObject({ totalCredits: '17.000000', quantity: '1' });
   });

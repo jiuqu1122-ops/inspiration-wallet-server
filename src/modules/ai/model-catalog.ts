@@ -513,6 +513,7 @@ export function normalizePublicModelCapabilities(value: unknown) {
     outputMode: typeof source.outputMode === 'string' ? source.outputMode : undefined,
     maxOutputImages: numberValue('maxOutputImages'),
     billingMode: typeof source.billingMode === 'string' ? source.billingMode : undefined,
+    outputAssetType: ['image', 'video', 'audio'].includes(String(source.outputAssetType)) ? source.outputAssetType : undefined,
     resolutions: stringArray('resolutions', 'supportedResolutions'),
     aspectRatios: stringArray('aspectRatios', 'supportedAspectRatios'),
     aspectRatiosByResolution: stringArrayMap(

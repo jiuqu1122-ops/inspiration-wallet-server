@@ -59,6 +59,7 @@ import {
   ModelCatalogError,
   normalizePublicModelCapabilities,
   resolveCatalogModel,
+  routeCanReceiveTraffic,
   withGptImage2DimensionCapabilities,
 } from './model-catalog.js';
 import {
@@ -1120,6 +1121,7 @@ export function buildWalletCatalogMetadata(
   const defaultVideoModel = publicModels.find(model => (
     model.modality === 'video' && videoChannels.some(channel => channel.models.includes(model.id))
   ))?.id ?? publicModels.find(model => model.modality === 'video')?.id ?? null;
+  const defaultAudioModel = publicModels.find(model => model.modality === 'audio')?.id ?? null;
   const catalog = publicModels.map(model => ({
     id: model.id,
     displayName: model.displayName,
@@ -1128,7 +1130,7 @@ export function buildWalletCatalogMetadata(
     capabilities: model.capabilities,
     enabled: true,
     visible: true,
-    isDefault: model.id === (model.modality === 'image' ? defaultImageModel : defaultVideoModel),
+    isDefault: model.id === (model.modality === 'image' ? defaultImageModel : model.modality === 'audio' ? defaultAudioModel : defaultVideoModel),
   }));
   return {
     defaultImageModel,
@@ -1150,6 +1152,9 @@ export async function listWalletImageModels(
     catalogDelegateAvailable(prisma) ? prisma.aiModelRoute.findMany({
       where: { enabled: true, upstreamAvailable: true },
       select: {
+        enabled: true,
+        upstreamAvailable: true,
+        healthStatus: true,
         channelId: true,
         channel: true,
         upstreamModelId: true,
@@ -1189,11 +1194,14 @@ export async function listWalletImageModels(
   const videoProviders = Array.from(new Map(
     [...managedVideoProviders, ...legacyVideoProviders].map(provider => [provider.id, provider]),
   ).values());
-  if (!providers.length) {
+  const audioRoutes = routes.filter(route => route.canonicalModel?.modality === 'audio'
+    && route.channel?.status === 'ACTIVE'
+    && routeCanReceiveTraffic(route));
+  if (!providers.length && !videoProviders.length && !audioRoutes.length) {
     throw new CloudAiError('provider_unavailable', '当前没有可用的生图渠道', 503);
   }
   const publicModels = (publicCatalog?.models ?? []).filter(model => (
-    model.modality === 'image' || model.modality === 'video'
+    model.modality === 'image' || model.modality === 'video' || model.modality === 'audio'
   ));
   const publicKeys = new Set(publicModels.map(model => `${model.modality}:${model.id}`));
   const aliasMap = new Map(publicModels.flatMap(model => model.aliases.map(alias => ([
@@ -1307,7 +1315,7 @@ export async function listWalletImageModels(
   }));
   const firstAvailable = channels.find((channel) => !channel.error && channel.models.length > 0)
     ?? channels.find(channel => !channel.error)
-    ?? channels[0]!;
+    ?? channels[0];
   const videoChannels = videoProviders.map((provider) => ({
     id: provider.id,
     name: provider.name,
@@ -1326,6 +1334,7 @@ export async function listWalletImageModels(
   const availableModelIds = new Set([
     ...channels.flatMap(channel => channel.models),
     ...videoChannels.flatMap(channel => channel.models),
+    ...audioRoutes.map(route => route.canonicalModel!.canonicalModelKey),
   ]);
   const catalogMetadata = buildWalletCatalogMetadata(
     publicModels.filter(model => availableModelIds.has(model.id)),
@@ -1333,8 +1342,8 @@ export async function listWalletImageModels(
     videoChannels,
   );
   return {
-    provider: firstAvailable.provider,
-    defaultModel: firstAvailable.defaultModel ?? catalogMetadata.defaultImageModel,
+    provider: firstAvailable?.provider ?? videoProviders[0]?.kind ?? publicWalletImageProviderKind(audioRoutes[0]!.channel!),
+    defaultModel: firstAvailable?.defaultModel ?? catalogMetadata.defaultImageModel,
     defaultImageModel: catalogMetadata.defaultImageModel,
     defaultVideoModel: catalogMetadata.defaultVideoModel,
     models: Array.from(new Set(channels.flatMap((channel) => channel.models))),

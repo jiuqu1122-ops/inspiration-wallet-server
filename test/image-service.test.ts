@@ -548,6 +548,11 @@ describe('wallet image provider normalization', () => {
       modality: 'video',
       aliases: ['seedance2'],
       capabilities: { resolutions: ['1080p'], durations: [5, 10] },
+    }, {
+      id: 'configured-music', displayName: 'Music', modality: 'audio', aliases: ['music-route'],
+      capabilities: { outputAssetType: 'audio', billingMode: 'per_request' },
+    }, {
+      id: 'other-music', displayName: 'Other music', modality: 'audio', aliases: [], capabilities: {},
     }], [{ models: ['gpt-image-medium'] }], [{ models: ['seedance-2'] }]);
 
     expect(metadata).toMatchObject({
@@ -559,6 +564,9 @@ describe('wallet image provider normalization', () => {
     });
     expect(metadata.catalog).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'gpt-image-medium', displayName: 'GPT Image 2.5', isDefault: true }),
+      expect.objectContaining({ id: 'seedance-2', isDefault: true }),
+      expect.objectContaining({ id: 'configured-music', modality: 'audio', isDefault: true }),
+      expect.objectContaining({ id: 'other-music', modality: 'audio', isDefault: false }),
     ]));
   });
 
