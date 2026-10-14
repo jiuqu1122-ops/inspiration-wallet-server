@@ -1,5 +1,6 @@
 import type { AiCapability, Prisma, PrismaClient } from '@prisma/client';
 import { buildFailureDiagnostic, readFailureDiagnostic } from '../ai/failure-diagnostic.js';
+import { imageRecoveryDiagnostic } from '../ai/image-recovery-diagnostic.js';
 import {
   createUsageTimingCollector, decodeUsageCursor, encodeUsageCursor,
   timingModality, usageDiagnosticsRange, usageDurationMs,
@@ -124,7 +125,9 @@ export async function listAdminUsageErrors(prisma: PrismaClient, input: UsageErr
     createdAt: createdWindow(range),
     ...(capabilities ? { capability: { in: capabilities } } : {}),
     AND: [
-      { OR: [{ status: { in: ['FAILED', 'REFUNDED'] } }, { videoTasks: { some: { status: 'FAILED' } } }] },
+      { OR: [{ status: { in: ['FAILED', 'REFUNDED'] } }, { videoTasks: { some: { status: 'FAILED' } } },
+        { status: 'PROCESSING', capability: 'IMAGE', result: { path: ['recovery', 'state'], equals: 'manual_confirmation_required' } },
+      ] },
       ...(query ? [{ OR: [
         { id: { contains: query, mode: 'insensitive' as const } },
         { clientRequestId: { contains: query, mode: 'insensitive' as const } },
@@ -157,10 +160,19 @@ export async function listAdminUsageErrors(prisma: PrismaClient, input: UsageErr
     }),
   ]);
   const page = rows.slice(0, input.limit);
+  const recoveryIds = page.filter(row => row.status === 'PROCESSING' && row.capability === 'IMAGE').map(row => row.id);
+  // Load journals only for held requests; failed/successful rows can carry
+  // large result payloads and do not need them for this metadata page.
+  const recoveryRows = recoveryIds.length ? await prisma.aiRequest.findMany({
+    where: { id: { in: recoveryIds }, status: 'PROCESSING', capability: 'IMAGE' },
+    select: { id: true, result: true }, take: input.limit,
+  }) : [];
+  const recoveries = new Map(recoveryRows.map(row => [row.id, imageRecoveryDiagnostic(row.result, snapshot)]));
   return {
     total, snapshotAt: snapshot.toISOString(), days: input.days,
     nextCursor: rows.length > input.limit && page.length ? encodeUsageCursor(page[page.length - 1]!) : null,
     items: page.map(row => {
+      const pendingRecovery = recoveries.get(row.id);
       const taskWithError = row.videoTasks.find(task => Boolean(task.lastError));
       const outputDiagnostic = taskWithError
         ? buildFailureDiagnostic(taskWithError.lastError, { stage: 'video_task' }, taskWithError.completedAt ?? snapshot)
@@ -169,7 +181,7 @@ export async function listAdminUsageErrors(prisma: PrismaClient, input: UsageErr
       // success, use the current failed output, not stale request metadata.
       const diagnostic = ['FAILED', 'REFUNDED'].includes(row.status)
         ? readFailureDiagnostic(row.failureDiagnostic) ?? outputDiagnostic
-        : outputDiagnostic;
+        : pendingRecovery?.diagnostic ?? outputDiagnostic;
       return {
         id: row.id, clientRequestId: row.clientRequestId, status: row.status,
         kind: timingModality(row.capability) ?? 'other',
@@ -182,6 +194,7 @@ export async function listAdminUsageErrors(prisma: PrismaClient, input: UsageErr
         durationMs: timingModality(row.capability) === 'video' ? null : usageDurationMs(row.createdAt, row.completedAt, snapshot),
         failedOutputCount: row.videoTasks.length,
         diagnostic,
+        ...(pendingRecovery ? { recovery: pendingRecovery.recovery } : {}),
       };
     }),
   };

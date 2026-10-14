@@ -272,7 +272,12 @@ export function withoutImageControlFields(value: unknown): unknown {
     const out: Record<string, unknown> = {}; seen.set(item, out);
     const row = item as Record<string, unknown>;
     const taskEnvelope = ['task_id', 'taskId', 'status_url', 'poll_url', 'result_url'].some(key => key in row);
+    // OpenAI descriptors may contain both bytes and a URL for the SAME image.
+    // Keep one representation so four outputs do not become eight candidates.
+    const hasImageBytes = typeof row.b64_json === 'string' && row.b64_json.length >= 4
+      && /^(?:data:image\/[^;]+;base64,)?[a-zA-Z0-9+/=\s]+$/.test(row.b64_json);
     for (const [key, child] of Object.entries(item)) {
+      if (hasImageBytes && key === 'url') continue;
       if (taskEnvelope && /^(?:message|msg|detail)$/i.test(key)) continue;
       if (/^(?:status_url|statusUrl|poll_url|pollUrl|result_url|resultUrl|error|err|errors|fail_reason|failure_reason|error_message|errorMessage|request|input|input_images|reference_images|referenceImages|prompt|negative_prompt|metadata|debug|trace|stack)$/i.test(key)) continue;
       out[key] = walk(child, depth + 1);

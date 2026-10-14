@@ -7,6 +7,7 @@ import {
   executeWalletVideoGeneration,
   executeWalletVideoStatus,
   getWalletImageGenerationByRequest,
+  recoverWalletImageGeneration,
   listWalletImageModels,
 } from './image-service.js';
 import { mkdir, readdir, stat, unlink, writeFile } from 'node:fs/promises';
@@ -652,6 +653,16 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       return result;
     },
   );
+
+  app.post('/images/generations/by-request/:clientRequestId/recover', {
+    preHandler: app.authenticateAccessToken,
+    config: { rateLimit: { max: 4, timeWindow: '1 minute' } },
+  }, async (request, reply) => {
+    const parsed = imageGenerationRequestParamsSchema.safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', message: '生图请求 ID 无效' });
+    try { return await recoverWalletImageGeneration(app.prisma, request.user.sub, parsed.data.clientRequestId); }
+    catch (error) { return knownError(reply, error); }
+  });
 
   app.post(
     '/videos',

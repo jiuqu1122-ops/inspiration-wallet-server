@@ -46,4 +46,25 @@ describe('capability configuration through request and billing', () => {
     expect(request).toHaveBeenCalledTimes(1);
     expect(boundProviderImageResults(images, imageResultLimit(capabilities, 1))).toEqual(urls);
   });
+  it('binds a final OpenAI image payload to the accepted GET even when it has an internal task_id', async () => {
+    const prepared = prepareImageAdapterRequest(getImageModelAdapter('GENERIC_OPENAI_IMAGE'), input)!;
+    const data = Array.from({ length: 4 }, (_, index) => ({
+      b64_json: Buffer.from(`fixture-image-${index}`).toString('base64'), output_format: 'png',
+      url: `https://cdn.example.com/result-${index}.png`,
+    }));
+    const request = vi.fn(async (_path: string, body?: unknown) => body === undefined
+      ? { created: 1791998040, task_id: '677c22c20a86413ea819a04d8cdebbe3', data }
+      : { task_id: 'imgtask-accepted', status: 'processing', status_url: '/v1/images/tasks/imgtask-accepted' });
+    const images = await generatePreparedImageAdapterImages({ id: 'channel', kind: 'NEW_API', baseUrl: 'https://example.com' } as never,
+      { apiKey: 'test', headers: {} },
+      { userId: 'user', clientRequestId: 'request-id', model: input.upstreamModel, prompt: input.prompt, inputImages: [], aspectRatio: '1:1', outputFormat: 'png', count: 1, imageCapabilities: capabilities },
+      prepared, { ...input, upstreamModel: input.upstreamModel, adapterKey: 'GENERIC_OPENAI_IMAGE', adapterConfig: {}, executionMode: 'TASK',
+        executionConfig: { profile: 'GENERIC_TASK', submitEndpoint: '/v1/images/generations', statusEndpointTemplate: '/v1/images/tasks/{taskId}' } } as never,
+      { request, wait: async () => {} });
+    expect(request).toHaveBeenCalledTimes(2);
+    expect((request.mock.calls[0]![1] as Record<string, unknown>).n ?? 1).toBe(1);
+    expect(request.mock.calls[1]![0]).toBe('/v1/images/tasks/imgtask-accepted');
+    expect(request.mock.calls[1]![1]).toBeUndefined();
+    expect(images).toEqual(data.map(image => `data:image/png;base64,${image.b64_json}`));
+  });
 });

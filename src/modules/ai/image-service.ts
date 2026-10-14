@@ -1,7 +1,8 @@
 // MODEL_CATALOG_STABILITY_PATCH_V1
 import { configuredCatalogFallback } from './configured-catalog-fallback.js';
+import { imageRecoveryDiagnostic } from './image-recovery-diagnostic.js';
 import {
-  retryImageRead, imageExplicitTaskId, imagePollDelayMs, imageRetryAfterMs,
+  retryImageRead, imageExplicitTaskId, imagePollDelayMs, imageRetryAfterMs, withoutImageControlFields,
   parseImageRetryAfter, withImagePollHint,
   ImageTaskRecoveryRequiredError, ImageTaskTerminalFailureError,
   isTransientImageTransferError,
@@ -3106,9 +3107,14 @@ function configuredImageTaskEnvelope(
   config: ImageTaskExecutionConfig,
   knownTaskId = '',
 ) {
-  const taskId = imageTaskPathString(value, config.taskIdPath) || imageExplicitTaskId(value) || knownTaskId;
   const rawState = (imageTaskPathString(value, config.statusPath) || newApiImageTaskState(value)).toLowerCase();
-  const state = config.processingStatuses.includes(rawState)
+  const finalImageResponse = Boolean(knownTaskId && !rawState && isFinalImageTaskResponse(value));
+  // Some task gateways return an OpenAI image response on the final GET. Its
+  // task_id belongs to the internal renderer, while the accepted receipt ID
+  // still identifies this GET. Do not build a new polling URL from that ID.
+  const taskId = finalImageResponse ? knownTaskId
+    : imageTaskPathString(value, config.taskIdPath) || imageExplicitTaskId(value) || knownTaskId;
+  const state = finalImageResponse ? 'success' : config.processingStatuses.includes(rawState)
     ? 'processing'
     : config.completedStatuses.includes(rawState)
       ? 'success'
@@ -3134,11 +3140,12 @@ function configuredImageTaskEnvelope(
     : [];
   const returnedStatusUrl = nestedStringByKeys(value, new Set(['status_url', 'poll_url']));
   const returnedResultUrl = nestedStringByKeys(value, new Set(['result_url']));
+  const envelopeValue = finalImageResponse ? withoutImageControlFields(value) : value;
   return {
-    ...(value && typeof value === 'object' && !Array.isArray(value)
-      ? value as Record<string, unknown>
+    ...(envelopeValue && typeof envelopeValue === 'object' && !Array.isArray(envelopeValue)
+      ? envelopeValue as Record<string, unknown>
       : {}),
-    raw: value,
+    raw: envelopeValue,
     ...(taskId ? { task_id: taskId } : {}),
     ...(state ? { status: state } : {}),
     ...(Number.isFinite(pollAfterMs) ? { poll_after_ms: pollAfterMs } : {}),
@@ -3150,6 +3157,18 @@ function configuredImageTaskEnvelope(
       : {}),
     ...(assets.length ? { assets } : {}),
   };
+}
+
+function isFinalImageTaskResponse(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  if (row.status_url || row.poll_url || row.result_url || row.error || row.errors) return false;
+  return Array.isArray(row.data) && row.data.length > 0 && row.data.every(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const image = item as Record<string, unknown>;
+    return (typeof image.b64_json === 'string' && image.b64_json.length > 0)
+      || (typeof image.url === 'string' && /^(?:https?:\/\/|data:image\/)/i.test(image.url));
+  });
 }
 
 function imageTaskDiagnosticUrl(provider: AiProviderChannel, value: string) {
@@ -6024,6 +6043,10 @@ async function rememberImageTaskIdentity(
     statusUrl: string;
     profile: ImageTaskExecutionConfig['profile'];
     clientRequestId: string;
+    providerId?: string;
+    routeId?: string | null;
+    submittedModel?: string;
+    executionConfig?: unknown;
   },
 ) {
   await prisma.$transaction(async (transaction) => {
@@ -6049,6 +6072,10 @@ async function rememberImageTaskIdentity(
               statusUrl: identity.statusUrl,
               profile: identity.profile,
               clientRequestId: identity.clientRequestId,
+              providerId: identity.providerId,
+              routeId: identity.routeId,
+              submittedModel: identity.submittedModel,
+              executionConfig: identity.executionConfig,
               submittedAt: new Date().toISOString(),
             },
           ],
@@ -6858,7 +6885,9 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
               prisma,
               validatedInput.userId,
               reservation.requestId,
-              { ...identity, clientRequestId: activeInput.clientRequestId },
+              { ...identity, clientRequestId: activeInput.clientRequestId, providerId: activeProvider.id,
+                routeId: activeRoute?.id ?? null, submittedModel: activeInput.model,
+                executionConfig: activeAdapterRoute?.executionConfig },
             ),
           },
         );
@@ -7067,6 +7096,105 @@ export async function getWalletImageGenerationByRequest(
     completedAt: request.completedAt?.getTime() ?? null,
     ...(result ?? {}),
   };
+}
+
+const imageRecoverySessions = new Map<string, Promise<Awaited<ReturnType<typeof getWalletImageGenerationByRequest>>>>();
+
+/** Resume the accepted receipt by GET only. Never dispatch or reserve a new job. */
+export async function recoverWalletImageGeneration(prisma: PrismaClient, userId: string, clientRequestId: string) {
+  const key = `${userId}:${clientRequestId}`;
+  const active = imageRecoverySessions.get(key);
+  if (active) return active;
+  const session = resumeWalletImageGeneration(prisma, userId, clientRequestId);
+  imageRecoverySessions.set(key, session);
+  try { return await session; }
+  finally { if (imageRecoverySessions.get(key) === session) imageRecoverySessions.delete(key); }
+}
+
+async function resumeWalletImageGeneration(prisma: PrismaClient, userId: string, clientRequestId: string) {
+  const request = await prisma.aiRequest.findUnique({
+    where: { userId_clientRequestId: { userId, clientRequestId } },
+    include: { route: { include: { channel: true } } },
+  });
+  if (!request || request.userId !== userId || request.capability !== 'IMAGE') {
+    throw new CloudAiError('image_request_not_found', '没有找到对应的生图任务', 404);
+  }
+  if (request.status === 'SUCCEEDED') return getWalletImageGenerationByRequest(prisma, userId, clientRequestId);
+  if (request.status !== 'PROCESSING' || !imageRecoveryDiagnostic(request.result)) {
+    throw new CloudAiError('image_recovery_unavailable', '该请求没有待恢复的图片任务', 409);
+  }
+  const journal = request.result as Record<string, unknown>;
+  const recovery = journal.recovery as Record<string, unknown>;
+  const identity = recovery.identity as { taskId?: string; statusUrl?: string; resultUrl?: string } | undefined;
+  const tasks = Array.isArray(journal.tasks) ? journal.tasks as Array<Record<string, unknown>> : [];
+  const receipt = tasks.find(task => task.taskId === identity?.taskId);
+  const snapshot = request.pricingSnapshot as PricingSnapshot | null;
+  // Historical requests without a receipt or captured tariff require manual
+  // handling. Never guess a task, switch channels, or use today's price.
+  if (!identity?.taskId || !identity.statusUrl || tasks.length !== 1 || !receipt
+    || !snapshot || snapshot.schemaVersion !== 1 || snapshot.modality !== 'image'
+    || !snapshot.request || !snapshot.pricing) {
+    throw new CloudAiError('IMAGE_TASK_RECOVERY_REQUIRED', '原任务回执或原始价格不完整，需要管理员核对；不会重新生成', 409);
+  }
+  const routeId = typeof receipt.routeId === 'string' ? receipt.routeId : request.routeId;
+  const route = routeId === request.routeId ? request.route
+    : routeId ? await prisma.aiModelRoute.findUnique({ where: { id: routeId }, include: { channel: true } }) : null;
+  const provider = route?.channel;
+  if (!route || !provider || provider.id !== recovery.providerId
+    || route.canonicalModelId !== request.canonicalModelId) {
+    throw new CloudAiError('IMAGE_TASK_RECOVERY_REQUIRED', '原任务渠道或模型映射已变化，需要管理员核对；不会重新生成', 409);
+  }
+  const config = normalizeImageTaskExecutionConfig(receipt.executionConfig ?? route.executionConfig);
+  const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+  const resultLimit = Math.max(1, Math.min(16, Math.floor(Number(snapshot.request.count) || 1)));
+  const submittedModel = typeof receipt.submittedModel === 'string' ? receipt.submittedModel : route.upstreamModelId;
+  const input: ImageInput = {
+    userId, clientRequestId, model: snapshot.canonicalModelKey, prompt: '', inputImages: [],
+    aspectRatio: '1:1', resolution: typeof snapshot.request.resolution === 'string' ? snapshot.request.resolution : undefined,
+    outputFormat: 'png', count: resultLimit,
+  };
+  try {
+    await assertPublicProviderUrl(provider.baseUrl);
+    const initial = { task_id: identity.taskId, status: 'processing', status_url: identity.statusUrl,
+      ...(identity.resultUrl ? { result_url: identity.resultUrl } : {}) };
+    const sources = await resolveImageAdapterResponse(provider, secrets, initial, [], resultLimit, undefined,
+      async (path, body, timeoutMs) => {
+        if (body !== undefined) throw new Error('Image recovery only permits GET');
+        return configuredImageTaskEnvelope(await providerRequest(provider, secrets, path, undefined, timeoutMs), config, identity.taskId);
+      }, {
+        clientRequestId, canonicalModel: snapshot.canonicalModelKey, routeId: route.id, providerId: provider.id,
+        adapterKey: route.adapterKey || 'LEGACY', configuredModel: submittedModel,
+        submittedModel, profile: config.profile,
+        adapterExecutionStartedAt: Date.now(),
+      }, async (path, timeoutMs) => configuredImageTaskEnvelope(
+        await imageTaskResultContent(provider, secrets, path, timeoutMs), config, identity.taskId));
+    const images = await persistGeneratedImageResultsAndScheduleMirrors(sources, provider.name, {
+      clientRequestId, canonicalModel: snapshot.canonicalModelKey, routeId: route.id,
+      providerId: provider.id, adapterKey: route.adapterKey || 'LEGACY',
+    });
+    if (!images.length) throw new ImageTaskRecoveryRequiredError(initialIdentity(initial), 'result', 'result_not_ready');
+    await settleImageCredits(prisma, input, request.id, '0', images.length, {
+      images, imageAssets: images.map(url => ({ assetType: 'image', url })),
+      provider: publicWalletImageProviderKind(provider), providerChannelId: provider.id,
+      providerChannelName: provider.name, model: snapshot.canonicalModelKey,
+    }, snapshot, route.id);
+    console.info('[image_task_recovered]', { clientRequestId, taskId: identity.taskId, resultCount: images.length, newGenerationSubmitted: false });
+    return getWalletImageGenerationByRequest(prisma, userId, clientRequestId);
+  } catch (error) {
+    if (error instanceof ImageTaskTerminalFailureError) {
+      await releaseImageCredits(prisma, input, request.id, serializeCredit(request.estimatedCredits),
+        buildFailureDiagnostic(error, { stage: 'request_recovery', resolution: input.resolution }));
+      return getWalletImageGenerationByRequest(prisma, userId, clientRequestId);
+    }
+    const pending = error instanceof ImageTaskRecoveryRequiredError ? error
+      : new ImageTaskRecoveryRequiredError({ taskId: identity.taskId, statusUrl: identity.statusUrl, resultUrl: identity.resultUrl || '' }, 'result', 'read_not_retryable', error);
+    await retainImageRetryRecovery(prisma, userId, request.id, pending, provider.id);
+    throw new CloudAiError('IMAGE_TASK_RECOVERY_REQUIRED', '原任务结果仍待确认，已保留预扣积分；不会重新生成', 503);
+  }
+}
+
+function initialIdentity(value: { task_id: string; status_url: string; result_url?: string }) {
+  return { taskId: value.task_id, statusUrl: value.status_url, resultUrl: value.result_url || '' };
 }
 
 export type VideoInput = {

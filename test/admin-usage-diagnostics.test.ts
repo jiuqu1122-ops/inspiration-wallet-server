@@ -143,6 +143,25 @@ test('partial video failures remain visible without relabelling the request fail
   assert.equal(result.items[0]?.durationMs, null); assert.equal(result.items[0]?.diagnostic?.code, 'PROVIDER_SERVER_ERROR');
   assert.ok(!JSON.stringify(result).includes('secret prompt'));
 });
+
+test('held image requests remain processing and expose only safe recovery metadata', async () => {
+  const queries: unknown[] = [];
+  const row = { ...errorRow(), status: 'PROCESSING', completedAt: null };
+  const result = { recovery: { version: 1, state: 'manual_confirmation_required', stage: 'status',
+    reason: 'task_identity_mismatch', observedAt: now.toISOString(), providerId: 'channel',
+    identity: { taskId: 'imgtask-accepted', statusUrl: 'https://private.example?api_key=secret' } } };
+  const db = { aiRequest: {
+    count: async (q: unknown) => { queries.push(q); return 1; },
+    findMany: async (q: any) => q.select.result ? [{ id: row.id, result }] : [row],
+  } } as unknown as PrismaClient;
+  const page = await listAdminUsageErrors(db, { days: 1, limit: 25 }, now);
+  assert.equal(page.items[0]?.status, 'PROCESSING');
+  assert.equal(page.items[0]?.diagnostic?.code, 'IMAGE_TASK_RECOVERY_REQUIRED');
+  assert.equal(page.items[0]?.recovery?.taskId, 'imgtask-accepted');
+  assert.ok(JSON.stringify(queries).includes('manual_confirmation_required'));
+  assert.ok(!JSON.stringify(page).includes('private.example'));
+  assert.ok(!JSON.stringify(page).includes('secret'));
+});
 test('invalid pagination/range/snapshot is rejected before database access', async () => {
   const db = {} as PrismaClient;
   for (const input of [
