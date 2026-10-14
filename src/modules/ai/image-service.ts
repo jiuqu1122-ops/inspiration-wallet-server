@@ -1034,7 +1034,12 @@ function appendImageString(value: string, output: string[], contextKey: string) 
   }
 }
 
-function appendInlineImage(record: Record<string, unknown>, output: string[]) {
+const IMAGE_ASSET_URL_KEYS = new Set(['url', 'signed_url', 'download_url']);
+
+function appendInlineImage(
+  record: Record<string, unknown>, output: string[],
+  aliases: Map<string, string>, preferUrls = false,
+) {
   const inlineMime = record.mime_type ?? record.mimeType ?? record.media_type ?? record.mediaType;
   const inlineData = record.data
     ?? record.base64
@@ -1042,16 +1047,28 @@ function appendInlineImage(record: Record<string, unknown>, output: string[]) {
     ?? record.image_base64
     ?? record.inlineData
     ?? record.inline_data;
-  if (typeof inlineMime !== 'string' || !inlineMime.startsWith('image/') || typeof inlineData !== 'string') {
-    return false;
-  }
-  output.push(IMAGE_DATA_URL_PREFIX.test(inlineData)
-    ? inlineData
-    : `data:${inlineMime};base64,${inlineData}`);
+  const explicitBytes = record.b64_json ?? record.image_base64 ?? record.base64;
+  const bytes = typeof inlineMime === 'string' && inlineMime.startsWith('image/') && typeof inlineData === 'string'
+    ? inlineData : typeof explicitBytes === 'string' ? explicitBytes : '';
+  if (!bytes) return false;
+  const inlineSource = IMAGE_DATA_URL_PREFIX.test(bytes) ? bytes
+    : `data:${typeof inlineMime === 'string' && inlineMime.startsWith('image/') ? inlineMime : rawImageBase64Mime(bytes)};base64,${bytes}`;
+  const urls = ['signed_url', 'download_url', 'url'].flatMap(key => {
+    const value = record[key];
+    return typeof value === 'string' && /^https?:\/\//i.test(value.trim()) ? [value.trim()] : [];
+  });
+  // A descriptor's bytes and URLs are alternate representations of one asset.
+  // Remember aliases across the envelope too: its normalized assets/raw fields
+  // can repeat the same URL outside this descriptor.
+  const source = preferUrls && urls.length ? urls[0]! : inlineSource;
+  for (const url of urls) aliases.set(url, source);
+  output.push(source);
   return true;
 }
 
-export function collectImageStrings(value: unknown, output: string[] = [], contextKey = ''): string[] {
+export function collectImageStrings(value: unknown, output: string[] = [], contextKey = '', preferUrls = false): string[] {
+  const aliases = new Map<string, string>();
+  const firstCollected = output.length;
   const visited = new Set<object>();
   const stack: Array<{ nested: unknown; contextKey: string }> = [{ nested: value, contextKey }];
   while (stack.length) {
@@ -1070,14 +1087,18 @@ export function collectImageStrings(value: unknown, output: string[] = [], conte
       continue;
     }
     const record = current.nested as Record<string, unknown>;
-    const hasInlineImage = appendInlineImage(record, output);
+    const hasInlineImage = appendInlineImage(record, output, aliases, preferUrls);
     const keys = Object.keys(record);
     for (let index = keys.length - 1; index >= 0; index -= 1) {
       const key = keys[index]!;
       const normalized = key.toLowerCase();
-      if (hasInlineImage && INLINE_IMAGE_PAYLOAD_KEYS.has(normalized)) continue;
+      if (hasInlineImage && (INLINE_IMAGE_PAYLOAD_KEYS.has(normalized) || IMAGE_ASSET_URL_KEYS.has(normalized))) continue;
       stack.push({ nested: record[key], contextKey: normalized });
     }
+  }
+  for (let index = firstCollected; index < output.length; index += 1) {
+    const source = output[index]!;
+    if (/^https?:\/\//i.test(source)) output[index] = aliases.get(source.trim()) ?? source;
   }
   return output;
 }
@@ -1821,7 +1842,7 @@ function selectUniqueImages(
   preferUrls: boolean,
 ) {
   const inputs = new Set(inputImages.map(normalizeCollectedImageString));
-  const images = Array.from(new Set(collectImageStrings(value).map(normalizeCollectedImageString).filter(Boolean)))
+  const images = Array.from(new Set(collectImageStrings(value, [], '', preferUrls).map(normalizeCollectedImageString).filter(Boolean)))
     .filter((value) => !inputs.has(value));
   if (preferUrls) {
     images.sort((left, right) => Number(!/^https?:\/\//i.test(left)) - Number(!/^https?:\/\//i.test(right)));
@@ -2527,6 +2548,7 @@ export function summarizeUselgImageStatus(
   let statusUrl = '';
   let resultUrl = '';
   const imageCandidates: string[] = [];
+  const imageAliases = new Map<string, string>();
   const candidateDiagnostics: Array<{
     kind: 'url' | 'inline';
     length: number;
@@ -2607,11 +2629,11 @@ export function summarizeUselgImageStatus(
     }
 
     const candidateCount = imageCandidates.length;
-    const hasInlineImage = appendInlineImage(record, imageCandidates);
+    const hasInlineImage = appendInlineImage(record, imageCandidates, imageAliases, true);
     rememberCandidates(candidateCount, fieldPath);
     for (const key of keys) {
       const normalizedKey = key.toLowerCase();
-      if (hasInlineImage && INLINE_IMAGE_PAYLOAD_KEYS.has(normalizedKey)) continue;
+      if (hasInlineImage && (INLINE_IMAGE_PAYLOAD_KEYS.has(normalizedKey) || IMAGE_ASSET_URL_KEYS.has(normalizedKey))) continue;
       visit(
         record[key],
         normalizedKey,
@@ -2632,7 +2654,7 @@ export function summarizeUselgImageStatus(
     pollAfterMs: uselgPollAfterMs(value),
     ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
     images: uniqueUselgImageCandidates(
-      [...imageCandidates].sort((left, right) => {
+      imageCandidates.map(source => /^https?:\/\//i.test(source) ? imageAliases.get(source.trim()) ?? source : source).sort((left, right) => {
         const rank = (value: string) => assets.some(asset => asset.value === value)
           ? 2
           : /^https?:\/\//i.test(value) ? 0 : 1;
