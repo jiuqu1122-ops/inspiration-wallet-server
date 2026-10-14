@@ -133,6 +133,7 @@ const createCanonicalSchema = z.object({
   billingType: z.enum([
     'token',
     'request',
+    'music_flat',
     'image_resolution',
     'image_flat',
     'image_count',
@@ -276,7 +277,11 @@ export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
   app.post('/unmapped/:discoveryId/create', async (request, reply) => {
     const params = discoveryParamsSchema.safeParse(request.params);
     const body = createCanonicalSchema.safeParse(request.body);
-    if (!params.success || !body.success) return invalid(reply, 'Canonical model data is invalid');
+    if (!params.success) return invalid(reply, 'Discovery ID is invalid');
+    if (!body.success) {
+      const fields = [...new Set(body.error.issues.map(issue => issue.path.join('.') || 'body'))];
+      return invalid(reply, `Canonical model data is invalid: ${fields.join(', ')}`);
+    }
     const input = {
       modality: body.data.modality,
       billingType: body.data.billingType,
