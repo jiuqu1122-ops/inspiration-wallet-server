@@ -23,6 +23,9 @@ export async function buildApp() {
     logger: loggerOptions,
     trustProxy: true,
     bodyLimit: 25 * 1024 * 1024,
+    // Wallet request IDs allow 128 characters. The router's 100-character
+    // default otherwise rejects valid status/recovery URLs before validation.
+    routerOptions: { maxParamLength: 128 },
     requestTimeout: 5 * 60 * 1_000,
     // Image generation handlers can legitimately stay silent for minutes while
     // the upstream model works. Caddy and the client enforce bounded timeouts.

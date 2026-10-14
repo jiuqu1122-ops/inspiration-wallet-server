@@ -6,6 +6,7 @@ readonly PROJECT_DIR="${PROJECT_DIR:-/opt/inspiration-wallet-server}"
 readonly HEALTH_URL="${HEALTH_URL:-https://api.unmind.art/health}"
 readonly PROMPT_SMOKE_URL="${PROMPT_SMOKE_URL:-https://api.unmind.art/v1/inspiration-space?kind=PROMPT&limit=1}"
 readonly MEMBERSHIP_SMOKE_URL="${MEMBERSHIP_SMOKE_URL:-https://api.unmind.art/v1/membership/plans}"
+readonly IMAGE_RECOVERY_SMOKE_BASE_URL="${IMAGE_RECOVERY_SMOKE_BASE_URL:-https://api.unmind.art}"
 readonly BACKEND_IMAGE_REPOSITORY="${BACKEND_IMAGE_REPOSITORY:-ghcr.io/jiuqu1122-ops/inspiration-wallet-server}"
 
 log() {
@@ -108,4 +109,17 @@ if ! curl --fail --silent --show-error --retry 5 --retry-delay 2 --retry-all-err
   docker compose logs --tail=150 api caddy >&2 || true
   fail 'Membership API smoke check failed. Confirm the latest API image was built and the membership routes are running.'
 fi
-log 'Deployment workflow completed and the public health check passed.'
+log 'Checking 128-character image recovery route support...'
+printf -v image_recovery_probe_id 'deploy-smoke-%0115d' 0
+if ! image_recovery_status="$(curl --silent --show-error --max-time 20 \
+  --request POST --header 'Content-Type: application/json' --data '{}' \
+  --output /dev/null --write-out '%{http_code}' \
+  "${IMAGE_RECOVERY_SMOKE_BASE_URL%/}/v1/ai/images/generations/by-request/${image_recovery_probe_id}/recover")"; then
+  fail 'Image recovery route smoke check could not reach the public API.'
+fi
+# No credentials or real request ID: a registered, length-compatible route
+# must reach authentication and return 401, without reading or mutating a job.
+if [[ "$image_recovery_status" != '401' ]]; then
+  fail "Image recovery route smoke check returned HTTP ${image_recovery_status}, expected 401. Confirm the API image includes the recovery route and accepts 128-character IDs."
+fi
+log 'Deployment workflow completed and the public health and recovery route checks passed.'
