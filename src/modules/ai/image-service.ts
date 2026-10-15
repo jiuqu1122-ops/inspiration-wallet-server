@@ -105,6 +105,7 @@ import {
 } from './image-response-diagnostics.js';
 import { normalizeManagedVideoRequest, ManagedVideoRequestError, type NormalizedVideoRequest } from './video-request.js';
 import { imageQualityFields, imageResultLimit, resolveImageOutputCapabilities } from './image-capabilities.js';
+import { aiMediaMidjourneyPrompt, aiMediaMidjourneyRequestHeaders } from './ai-media-midjourney-request.js';
 import { resolveVideoCapabilities, videoAspectRatioAllowed, videoCapabilitiesSupportRequest, videoDurationAllowed } from './video-capabilities.js';
 import { selectManagedVideoRoutes } from './video-routing.js';
 import { getVideoAdapter } from './video-adapters/registry.js';
@@ -5985,7 +5986,7 @@ export async function prepareRouteImageAdapterRequest(
     routeId: route.routeId,
     channelId: route.channelId,
     upstreamModel: route.upstreamModel,
-    prompt: promptWithConstraints(input, provider.kind),
+    prompt: aiMediaMidjourneyPrompt(promptWithConstraints(input, provider.kind), provider, input, route),
     ...(input.negativePrompt ? { negativePrompt: input.negativePrompt } : {}),
     references,
     ...(input.resolution ? { resolution: input.resolution } : {}),
@@ -6168,6 +6169,28 @@ function directPreparedImageResults(
   return images;
 }
 
+function imageAdapterSubmitDiagnosticEndpoint(provider: AiProviderChannel, endpoint: string) {
+  const safeUrl = imageTaskDiagnosticUrl(provider, endpoint);
+  if (/^https?:\/\//i.test(endpoint) || !safeUrl) return safeUrl;
+  // Keep the established relative submit-path log contract while removing any
+  // query credentials and fragment from the actual upstream endpoint.
+  return new URL(safeUrl).pathname;
+}
+
+function imageAdapterPostDiagnostics(
+  provider: Pick<AiProviderChannel, 'kind'>,
+  secrets: ProviderSecrets,
+  body: Record<string, unknown>,
+) {
+  const headerNames = Object.keys(secrets.headers).map(name => name.toLowerCase());
+  return {
+    providerKind: provider.kind,
+    requestBodyFingerprint: createHash('sha256').update(JSON.stringify(body), 'utf8').digest('hex'),
+    hasConfiguredIdempotencyHeader: headerNames.includes('idempotency-key'),
+    hasConfiguredRequestIdHeader: headerNames.includes('x-request-id'),
+  };
+}
+
 export async function generatePreparedImageAdapterImages(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
@@ -6177,6 +6200,7 @@ export async function generatePreparedImageAdapterImages(
   options?: PreparedImageAdapterExecutionOptions,
 ) {
   const resultLimit = imageResultLimit(input.imageCapabilities, input.count);
+  const scopedReceiptHeaders = aiMediaMidjourneyRequestHeaders(provider, input, route);
   const executionMode = imageRouteExecutionMode(route?.executionMode);
   const request: ImageAdapterRequest = options?.request ?? (prepared.execution === 'gemini-native'
     ? (path, body, timeoutOverrideMs, extraHeaders, _onResponseStatus, diagnosticScope) => bigmodelRequest(
@@ -6206,11 +6230,24 @@ export async function generatePreparedImageAdapterImages(
     const images: string[] = [];
     const requestCount = prepared.execution === 'gemini-native' ? input.count : 1;
     for (let index = 0; index < requestCount; index += 1) {
-      const started = await request(
-        prepared.endpoint,
-        prepared.body,
-        IMAGE_GENERATION_TIMEOUT_MS,
-      );
+      const submission = {
+        clientRequestId: input.clientRequestId,
+        canonicalModel: route?.canonicalModelKey ?? input.model,
+        routeId: route?.routeId ?? '', providerId: provider.id,
+        adapterKey: prepared.adapterKey, executionMode, endpoint: imageAdapterSubmitDiagnosticEndpoint(provider, prepared.endpoint),
+        outputIndex: index, method: 'POST',
+      };
+      console.info('[image_adapter_submit_started]', {
+        ...submission, ...imageAdapterPostDiagnostics(provider, secrets, prepared.body),
+      });
+      const submitStartedAt = Date.now();
+      const started = scopedReceiptHeaders
+        ? await request(prepared.endpoint, prepared.body, IMAGE_GENERATION_TIMEOUT_MS, scopedReceiptHeaders)
+        : await request(prepared.endpoint, prepared.body, IMAGE_GENERATION_TIMEOUT_MS);
+      console.info('[image_adapter_submit_completed]', {
+        ...submission, durationMs: Date.now() - submitStartedAt,
+        taskId: getTaskId(started), state: newApiImageTaskState(started),
+      });
       const expectedCount = prepared.execution === 'gemini-native' ? 1 : resultLimit;
       images.push(...(executionMode === 'DIRECT'
         ? directPreparedImageResults(started, input.inputImages, expectedCount)
@@ -6268,6 +6305,13 @@ export async function generatePreparedImageAdapterImages(
     submittedModel: prepared.submittedModel,
     profile: executionConfig.profile,
   };
+  const taskBody = { ...prepared.body };
+  if (executionConfig.asyncParameterName) delete taskBody.async;
+  const submitBody = withImageTaskParameter(
+    taskBody,
+    executionConfig.asyncParameterName,
+    executionConfig.asyncParameterValue,
+  );
   console.info('[image_adapter_submit_started]', {
     clientRequestId: diagnosticContext.clientRequestId,
     canonicalModel: diagnosticContext.canonicalModel,
@@ -6276,7 +6320,9 @@ export async function generatePreparedImageAdapterImages(
     adapterKey: diagnosticContext.adapterKey,
     executionMode,
     profile: executionConfig.profile,
-    endpoint: taskSubmitEndpoint,
+    endpoint: imageAdapterSubmitDiagnosticEndpoint(provider, taskSubmitEndpoint),
+    method: 'POST',
+    ...imageAdapterPostDiagnostics(provider, secrets, submitBody),
   });
 
   const submitStartedAt = Date.now();
@@ -6293,13 +6339,6 @@ export async function generatePreparedImageAdapterImages(
     method: 'POST',
   });
   let started: unknown;
-  const taskBody = { ...prepared.body };
-  if (executionConfig.asyncParameterName) delete taskBody.async;
-  const submitBody = withImageTaskParameter(
-    taskBody,
-    executionConfig.asyncParameterName,
-    executionConfig.asyncParameterValue,
-  );
   try {
     started = (await runImageResponseDiagnosticRequest(
       submitDiagnosticScope,
@@ -6307,7 +6346,7 @@ export async function generatePreparedImageAdapterImages(
         taskSubmitEndpoint,
         submitBody,
         executionConfig.submitTimeoutMs,
-        uselgIdempotencyHeaders(provider, input),
+        scopedReceiptHeaders ?? uselgIdempotencyHeaders(provider, input),
         undefined,
         scope,
       ),
