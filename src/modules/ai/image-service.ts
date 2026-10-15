@@ -2046,6 +2046,11 @@ function newApiExactImageSize(ratio: string, resolution?: string) {
   return sizes[normalizedResolution][requested] ?? sizes[normalizedResolution]['1:1'];
 }
 
+function supportsNativeGptImage25Transparency(model: string, capabilities: unknown) {
+  return isGptImage25Identity(model)
+    && normalizePublicModelCapabilities(capabilities).supportsTransparentBackground === true;
+}
+
 export function newApiImageRequestParams(
   model: string,
   count: number,
@@ -2053,6 +2058,7 @@ export function newApiImageRequestParams(
   resolution?: string,
   outputFormat?: ImageInput['outputFormat'],
   background?: ImageInput['background'],
+  capabilities?: ImageInput['imageCapabilities'],
 ) {
   const family = newApiImageFamily(model);
   const transparentPng = outputFormat === 'png' || background === 'transparent';
@@ -2079,17 +2085,19 @@ export function newApiImageRequestParams(
     ...(family === 'gpt-image-2' ? { quality: 'medium' } : {}),
     ...(transparentPng ? {
       output_format: 'png',
-      // GPT Image 2 does not reliably support native alpha. Sending
+      // Legacy GPT Image 2 does not reliably support native alpha. Sending
       // background=transparent makes some NewAPI channels reject the edits
       // request and can trigger a reference-dropping generations fallback.
       // Its result is chroma-keyed and converted to real alpha below.
-      ...(family === 'gpt-image-2' ? {} : { background: 'transparent' }),
+      ...(family === 'gpt-image-2' && !supportsNativeGptImage25Transparency(model, capabilities)
+        ? {} : { background: 'transparent' }),
     } : {}),
   };
 }
 
 function requiresGptImage2AlphaPostProcessing(input: ImageInput) {
   return newApiImageFamily(input.model) === 'gpt-image-2'
+    && !supportsNativeGptImage25Transparency(input.model, input.imageCapabilities)
     && (input.outputFormat === 'png' || input.background === 'transparent');
 }
 
@@ -2119,7 +2127,8 @@ function promptWithConstraints(
   }
   if (requiresGptImage2AlphaPostProcessing(input)) {
     constraints.push('replace only the background with one perfectly uniform solid RGB(255,0,255) chroma-key color; do not draw a transparency checkerboard, gradient, texture, reflection, or shadow in the background; do not use RGB(255,0,255) on the subject');
-  } else if (input.background === 'transparent') {
+  } else if (input.background === 'transparent'
+    || (input.outputFormat === 'png' && supportsNativeGptImage25Transparency(input.model, input.imageCapabilities))) {
     constraints.push('use a truly transparent background with an alpha channel, not a checkerboard pattern');
   }
   return `${prompt}\n\nStrict image constraints: ${constraints.join(', ')}.`;
@@ -2147,6 +2156,7 @@ export function buildNewApiImageGenerationBody(
     input.resolution,
     input.outputFormat,
     input.background,
+    input.imageCapabilities,
   );
   if (input.imageCapabilities !== undefined) { delete (imageParams as Record<string, unknown>).quality; Object.assign(imageParams, imageQualityFields(input.imageCapabilities, input.quality)); }
   return {

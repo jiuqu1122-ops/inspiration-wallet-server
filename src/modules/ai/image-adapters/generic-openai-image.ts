@@ -4,6 +4,7 @@ import {
   generationEndpoint,
   serializeConfiguredReferences,
 } from './images-api-config.js';
+import { isGptImage25Identity } from '../image-execution.js';
 import { imageAdapterConfig, type ImageModelAdapter } from './types.js';
 
 export function genericOpenAiImageUsesNativeEdit(references: readonly string[], capabilities: unknown) {
@@ -31,11 +32,15 @@ export const genericOpenAiImageAdapter: ImageModelAdapter = {
     const endpoint = genericOpenAiImageUsesNativeEdit(input.references, input.capabilities)
       ? editEndpoint(config)
       : generationEndpoint(config);
+    const nativeTransparentPng = input.background === 'transparent' && input.outputFormat === 'png'
+      && (input.capabilities as { supportsTransparentBackground?: unknown } | undefined)?.supportsTransparentBackground === true
+      && isGptImage25Identity(input.canonicalModelKey, input.upstreamModel);
     const body = {
       model: input.upstreamModel,
       prompt: input.prompt,
       ...(input.count > 1 ? { n: input.count } : {}),
       ...configuredFields,
+      ...(nativeTransparentPng ? { background: 'transparent', output_format: 'png' } : {}),
     };
     serializeConfiguredReferences(body, input.references, config, endpoint);
     return {
