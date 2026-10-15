@@ -45,6 +45,7 @@ import { ReferenceUploadError, resolveReferenceImageSources } from './reference-
 import { prepareSeedreamReference, referenceSourceType, type ReferenceSourceType } from './seedream-references.js';
 import { removeProviderReference } from './provider-reference-store.js';
 import { imageAdapterConfig } from './image-adapters/types.js';
+import { genericOpenAiImageTaskUsesNativeEdit } from './image-adapters/generic-openai-image.js';
 import { seedreamReferenceTransport, usesSeedreamReferences } from './image-adapters/seedream.js';
 import { creditDecimal, serializeCredit } from '../wallets/credit-amount.js';
 import { ensureAiCatalogSeeded } from './catalog-seed.js';
@@ -5930,12 +5931,23 @@ function effectiveImageInputForProvider(
     && !provider.capabilities.includes('IMAGE_NANO_BANANA_2')
     && !provider.capabilities.includes('IMAGE');
   const routeCapabilities = normalizePublicModelCapabilities(routeCapabilitiesOverride);
+  // This route-level flag selects the reference-image protocol. Keep public
+  // quality, output limits and billing on the canonical model capabilities.
+  const routeImageEdit = routeCapabilities.supportsImageEdit;
+  const canonicalCapabilities = input.imageCapabilities
+    && typeof input.imageCapabilities === 'object'
+    && !Array.isArray(input.imageCapabilities)
+    ? input.imageCapabilities as Record<string, unknown>
+    : {};
   const routeResolutions = Array.isArray(routeCapabilities.resolutions)
     ? routeCapabilities.resolutions.map(item => String(item).trim().toLowerCase()).filter(Boolean)
     : [];
   const routeDefaultResolution = routeResolutions.length === 1 ? routeResolutions[0] : undefined;
   return {
     ...input,
+    ...(typeof routeImageEdit === 'boolean' ? {
+      imageCapabilities: { ...canonicalCapabilities, supportsImageEdit: routeImageEdit },
+    } : {}),
     model: input.clientPlatform === 'tablet' && provider.kind === 'XAIS'
       ? resolveXaisPublicImageModel(input.model, input.resolution)
       : resolveImageModel(provider, input.model, input.inputImages.length > 0),
@@ -6287,11 +6299,13 @@ export async function generatePreparedImageAdapterImages(
 
   const adapterExecutionStartedAt = Date.now();
   // Images API adapters choose generation vs edit from the actual reference
-  // payload.  A generic TASK submitEndpoint is only a fallback for adapters
-  // without that distinction; it must not overwrite Seedream's prepared edit
-  // endpoint.
+  // payload. Replace a generic route's ordinary generation endpoint with its
+  // prepared edit endpoint, but preserve independent task-submit contracts.
   const taskSubmitEndpoint = prepared.adapterKey === 'SEEDREAM_IMAGES_API'
     || (input.inputImages.length > 0 && usesSeedreamReferences(prepared.adapterKey, prepared.submittedModel))
+    || (prepared.adapterKey === 'GENERIC_OPENAI_IMAGE'
+      && genericOpenAiImageTaskUsesNativeEdit(input.inputImages, input.imageCapabilities,
+        route?.adapterConfig, executionConfig.submitEndpoint))
     ? prepared.endpoint
     : executionConfig.submitEndpoint;
   const diagnosticContext: ImageAdapterTaskDiagnosticContext = {
@@ -6899,9 +6913,12 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
           preparedAdapterRequest = activeAdapterRoute
             ? await prepareRouteImageAdapterRequest(activeProvider, activeInput, activeAdapterRoute)
             : null;
-          activeEndpoint = taskExecutionConfig?.submitEndpoint
-            ?? preparedAdapterRequest?.endpoint
-            ?? null;
+          activeEndpoint = preparedAdapterRequest
+            && preparedAdapterRequest.adapterKey === 'GENERIC_OPENAI_IMAGE'
+            && genericOpenAiImageTaskUsesNativeEdit(activeInput.inputImages, activeInput.imageCapabilities,
+              activeAdapterRoute?.adapterConfig, taskExecutionConfig?.submitEndpoint ?? '')
+            ? preparedAdapterRequest.endpoint
+            : taskExecutionConfig?.submitEndpoint ?? preparedAdapterRequest?.endpoint ?? null;
         } catch (error) {
           activeEndpoint = error instanceof ImageAdapterError ? error.endpoint ?? null : null;
           throw error;
