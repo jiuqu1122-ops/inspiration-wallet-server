@@ -49,6 +49,10 @@ const adapterConfigSchema = z.object({
   referenceTransport: z.enum(['data_url', 'public_https']).optional(),
   referenceRequestCount: z.literal(1).optional(),
   referenceResponseFormat: z.enum(['url', 'b64_json']).optional(),
+  requestParameters: jsonObjectSchema.optional(),
+  idempotencyHeader: z.literal('Idempotency-Key').optional(),
+  preserveTaskMetadata: z.literal(true).optional(),
+  enableTaskOperations: z.literal(true).optional(),
 }).strict();
 const executionModeSchema = z.enum(['INHERIT', 'DIRECT', 'TASK']);
 const imageTaskExecutionConfigSchema = z.object({

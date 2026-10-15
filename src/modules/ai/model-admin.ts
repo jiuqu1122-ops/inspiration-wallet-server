@@ -398,6 +398,15 @@ export async function updateAdminAiRoute(
         400,
       );
     }
+    const effectiveAdapterKey = input.adapterKey === undefined ? current.adapterKey : input.adapterKey;
+    if (effectiveAdapterKey === 'GENERIC_OPENAI_IMAGE') {
+      const effectiveConfig = imageAdapterConfig(input.adapterConfig === undefined ? current.adapterConfig : input.adapterConfig);
+      const execution = nextExecutionConfig && typeof nextExecutionConfig === 'object' && !Array.isArray(nextExecutionConfig)
+        ? nextExecutionConfig as Record<string, unknown> : {};
+      if (effectiveConfig.enableTaskOperations && (nextExecutionMode !== 'TASK' || execution.profile !== 'GENERIC_TASK')) {
+        throw new AiModelAdminError('INVALID_REQUEST', 'Task operations require Generic TASK execution', 400);
+      }
+    }
     const costChanged = input.costProfile !== undefined
       && JSON.stringify(current.costProfile) !== JSON.stringify(input.costProfile);
     const data: Prisma.AiModelRouteUpdateManyMutationInput = {};

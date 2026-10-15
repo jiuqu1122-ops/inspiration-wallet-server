@@ -29,6 +29,10 @@ export const genericOpenAiImageAdapter: ImageModelAdapter = {
   execution: 'images-api',
   buildRequest(input) {
     const { config, body: configuredFields } = configuredImagesApiFields(input);
+    if (config.requestParameters?.n !== undefined && input.count !== config.requestParameters.n) {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID',
+        `该路由的固定 n=${config.requestParameters.n}，请将生成数量设为 ${config.requestParameters.n}。`);
+    }
     if (input.references.length && config.referenceRequestCount !== undefined
       && input.count !== config.referenceRequestCount) {
       throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID',
@@ -49,6 +53,7 @@ export const genericOpenAiImageAdapter: ImageModelAdapter = {
       ...(input.references.length && config.referenceResponseFormat !== undefined
         ? { response_format: config.referenceResponseFormat } : {}),
       ...configuredFields,
+      ...config.requestParameters,
       ...(nativeTransparentPng ? { background: 'transparent', output_format: 'png' } : {}),
     };
     serializeConfiguredReferences(body, input.references, config, endpoint);

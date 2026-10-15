@@ -1,6 +1,8 @@
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { executeWalletMusicGeneration, getWalletMusicGenerationByRequest } from './music-service.js';
+import { submitWalletImageOperation, getWalletImageOperation } from './image-operation-service.js';
+import { imageOperationInputSchema } from './image-operation-protocol.js';
 import { CloudAiError, listWalletAgentModels } from './service.js';
 import {
   executeWalletImageGeneration,
@@ -145,6 +147,7 @@ const imageModelsQuerySchema = z.object({
 const imageGenerationRequestParamsSchema = z.object({
   clientRequestId: z.string().trim().min(8).max(128),
 }).strict();
+const imageOperationBodySchema = imageOperationInputSchema.omit({ userId: true });
 
 const imageResultQuerySchema = z.object({
   redirect: z.enum(['0', '1']).optional(),
@@ -662,6 +665,46 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', message: '生图请求 ID 无效' });
     try { return await recoverWalletImageGeneration(app.prisma, request.user.sub, parsed.data.clientRequestId); }
     catch (error) { return knownError(reply, error); }
+  });
+
+  app.post('/images/operations', {
+    onRequest: app.authenticateAccessToken,
+    bodyLimit: 150 * 1024 * 1024,
+    config: { rateLimit: { max: 12, timeWindow: '1 minute' } },
+  }, async (request, reply) => {
+    const parsed = imageOperationBodySchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', message: '图片操作请求格式无效' });
+    try {
+      const result = await submitWalletImageOperation(app.prisma, { ...parsed.data, userId: request.user.sub });
+      return reply.code(['success', 'failed', 'canceled', 'client_disconnected'].includes(result.status) ? 200 : 202).send(result);
+    } catch (error) { return knownError(reply, error); }
+  });
+
+  app.get('/images/operations/by-request/:clientRequestId', {
+    preHandler: app.authenticateAccessToken,
+    config: { rateLimit: { max: 120, timeWindow: '1 minute' } },
+  }, async (request, reply) => {
+    const parsed = imageGenerationRequestParamsSchema.safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', message: '图片操作请求 ID 无效' });
+    try {
+      const result = await getWalletImageOperation(app.prisma, request.user.sub, parsed.data.clientRequestId, { refresh: true });
+      return result ?? reply.code(404).send({ error: 'image_operation_not_found', message: '没有找到对应的图片操作任务' });
+    } catch (error) { return knownError(reply, error); }
+  });
+
+  app.post('/images/operations/by-request/:clientRequestId/refresh', {
+    preHandler: app.authenticateAccessToken,
+    config: { rateLimit: { max: 12, timeWindow: '1 minute' } },
+  }, async (request, reply) => {
+    const parsed = imageGenerationRequestParamsSchema.safeParse(request.params);
+    if (!parsed.success || request.body !== undefined && request.body !== null
+      && (!request.body || typeof request.body !== 'object' || Array.isArray(request.body) || Object.keys(request.body).length)) {
+      return reply.code(400).send({ error: 'invalid_request', message: '刷新操作仅接受原请求编号' });
+    }
+    try {
+      const result = await getWalletImageOperation(app.prisma, request.user.sub, parsed.data.clientRequestId, { refresh: true });
+      return result ?? reply.code(404).send({ error: 'image_operation_not_found', message: '没有找到对应的图片操作任务' });
+    } catch (error) { return knownError(reply, error); }
   });
 
   app.post(

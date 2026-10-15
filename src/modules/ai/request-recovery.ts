@@ -5,6 +5,16 @@ import { releaseMembershipQuota } from '../membership/quota-billing.js';
 const ACTIVE_REQUEST_STATUSES = ['RESERVED', 'PROCESSING'] as const;
 const STALE_REQUEST_MESSAGE = '任务长时间未完成，已自动释放预留积分';
 
+function hasImageOperationTariff(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const snapshot = value as Record<string, unknown>;
+  const request = snapshot.request;
+  if (snapshot.modality !== 'image' || !request || typeof request !== 'object' || Array.isArray(request)) return false;
+  const tariff = request as Record<string, unknown>;
+  return typeof tariff.operation === 'string' && typeof tariff.speed === 'string'
+    && typeof tariff.operationUnitCredits === 'string';
+}
+
 function staleFailureDiagnostic(now: Date) {
   return {
     version: 1,
@@ -28,7 +38,8 @@ export async function recoverStaleAiRequests(
   staleBefore: Date,
   limit = 100,
 ) {
-  const candidates = await prisma.aiRequest.findMany({
+  const batchSize = Math.max(1, Math.min(500, Math.round(limit)));
+  const fetchCandidates = (cursor?: string) => prisma.aiRequest.findMany({
     where: {
       // Agent/chat and inspiration-analysis requests have their own AiTask
       // heartbeat/recovery lifecycle. This sweeper owns image/video credits.
@@ -38,7 +49,8 @@ export async function recoverStaleAiRequests(
       completedAt: null,
     },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-    take: Math.max(1, Math.min(500, Math.round(limit))),
+    take: batchSize,
+    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     select: {
       id: true,
       userId: true,
@@ -49,8 +61,28 @@ export async function recoverStaleAiRequests(
     },
   });
 
+  let candidates = await fetchCandidates();
+  let offset = 0;
+  let scanned = 0;
+  let eligible = 0;
   let recovered = 0;
-  for (const candidate of candidates) {
+  while (eligible < batchSize) {
+    if (offset >= candidates.length) {
+      if (candidates.length < batchSize) break;
+      // Held operations stay in this queue. Page beyond them so they cannot
+      // permanently hide newer legacy reservations from the maintenance job.
+      const cursor = candidates.at(-1)?.id;
+      if (!cursor) break;
+      candidates = await fetchCandidates(cursor);
+      offset = 0;
+      if (!candidates.length) break;
+    }
+    const candidate = candidates[offset++]!;
+    scanned += 1;
+    // An operation may have been accepted upstream even before its task receipt
+    // reached us. Only its explicit terminal state can release this hold.
+    if (hasImageOperationTariff(candidate.pricingSnapshot)) continue;
+    eligible += 1;
     const now = new Date();
     try {
       const released = await prisma.$transaction(async transaction => {
@@ -130,5 +162,5 @@ export async function recoverStaleAiRequests(
     }
   }
 
-  return { scanned: candidates.length, recovered };
+  return { scanned, recovered };
 }

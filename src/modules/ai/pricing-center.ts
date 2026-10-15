@@ -9,11 +9,13 @@ import {
   ModelCatalogError,
   catalogDelegateAvailable,
   isGptImage2CatalogIdentity,
+  routeCanReceiveTraffic,
   type AiModality,
 } from './model-catalog.js';
 import { env } from '../../config/env.js';
 import { isFixedCanvasLlmUsageContext } from './usage-context.js';
 import type { MembershipQuotaReservationSnapshot } from '../membership/quota-billing.js';
+import { isImageOperation, isImageOperationSpeed, normalizeImageOperationCreditAmount, quoteImageOperation, validateImageOperationCredits } from './image-operation-pricing.js';
 
 const CREDIT_SCALE = 1_000_000n;
 const TOKENS_PER_MILLION = 1_000_000n;
@@ -208,7 +210,8 @@ export function chatPriceToCatalogProfile(price: ChatModelCreditPrice): CatalogP
 
 export function imagePriceToCatalogProfile(price: ImageModelCreditPrice): CatalogPricingProfile {
   if (price.billingType === 'image_flat' && price.creditsPerRequest !== undefined) {
-    return { billingType: 'image_flat', creditsPerRequest: price.creditsPerRequest };
+    return { billingType: 'image_flat', creditsPerRequest: price.creditsPerRequest,
+      ...(price.creditsPerOperation !== undefined ? { creditsPerOperation: toInputJson(validateImageOperationCredits(price.creditsPerOperation)) } : {}) };
   }
   if (price.billingType === 'image_count' && price.creditsPerImage !== undefined) {
     return { billingType: 'image_count', creditsPerImage: price.creditsPerImage };
@@ -278,11 +281,16 @@ export function catalogProfileToImagePrice(
   if (profile.billingType === 'image_flat') {
     const creditsPerRequest = scalarText(profile.creditsPerRequest);
     if (!creditPattern.test(creditsPerRequest)) return null;
+    let creditsPerOperation;
+    try {
+      if (profile.creditsPerOperation !== undefined) creditsPerOperation = validateImageOperationCredits(profile.creditsPerOperation);
+    } catch { return null; }
     return {
       model,
       creditsByResolutionQuality: profile.creditsPerImageByResolutionQuality as Record<string, Record<string, string>> | undefined,
       billingType: 'image_flat',
       creditsPerRequest,
+      ...(creditsPerOperation !== undefined ? { creditsPerOperation } : {}),
       credits1k: creditsPerRequest,
       credits2k: creditsPerRequest,
       credits4k: creditsPerRequest,
@@ -376,6 +384,10 @@ export function catalogProfileToVideoPrice(
 export function validatePricingProfile(modality: AiModality, profile: unknown): CatalogPricingProfile {
   const pricing = plainObject(profile);
   if (!pricing || typeof pricing.billingType !== 'string') throw new Error('Pricing profile is invalid');
+  if (pricing.creditsPerOperation !== undefined) {
+    if (modality !== 'image' || pricing.billingType !== 'image_flat') throw new Error('Image operation prices require image_flat billing');
+    validateImageOperationCredits(pricing.creditsPerOperation);
+  }
   if (modality === 'audio') {
     if (pricing.billingType !== 'music_flat' || !creditPattern.test(scalarText(pricing.creditsPerRequest))) throw new Error('Music requires a flat request price');
   } else if (modality === 'chat') {
@@ -491,6 +503,8 @@ export async function capturePricingSnapshot(
       let override: Record<string, unknown> | null = null;
       if (candidate.billingType || candidate.creditsPerRequest || candidate.creditsPerImage || candidate.creditsPerImageByResolution) {
         override = candidate;
+      } else if (model.modality === 'image' && profile.billingType === 'image_flat' && candidate.creditsPerOperation !== undefined) {
+        override = { ...profile, creditsPerOperation: candidate.creditsPerOperation };
       } else if (model.modality === 'image' && ['image1K', 'image2K', 'image4K', '1k', '2k', '4k'].some(key => candidate[key] !== undefined)) {
         const base = plainObject(profile.creditsPerImageByResolution) ?? {};
         override = {
@@ -513,7 +527,11 @@ export async function capturePricingSnapshot(
       }
       if (override) {
         try {
-          const validated = validatePricingProfile(model.modality as AiModality, override);
+          const operationAwareOverride = model.modality === 'image' && profile.billingType === 'image_flat'
+            && profile.creditsPerOperation !== undefined && override.creditsPerOperation === undefined
+            ? { ...override, creditsPerOperation: profile.creditsPerOperation }
+            : override;
+          const validated = validatePricingProfile(model.modality as AiModality, operationAwareOverride);
           if (validated.billingType === model.billingType) {
             profile = validated;
             membershipPlanId = membership?.planId;
@@ -544,6 +562,11 @@ export async function capturePricingSnapshot(
       }
     }
   }
+  let capturedRequest = request;
+  if (model.modality === 'image' && (request.operation !== undefined || request.speed !== undefined)) {
+    const quote = quoteImageOperation(profile, { operation: request.operation, speed: request.speed });
+    capturedRequest = { ...request, operation: quote.operation, speed: quote.speed, operationUnitCredits: quote.credits };
+  }
   return {
     schemaVersion: 1,
     canonicalModelId: model.id,
@@ -554,7 +577,7 @@ export async function capturePricingSnapshot(
     priceVersion: pricing.currentVersion.version,
     billingType: model.billingType,
     pricing: structuredClone(profile),
-    request: structuredClone(request),
+    request: structuredClone(capturedRequest),
     capturedAt: new Date().toISOString(),
     ...(membershipPlanId ? { membershipPlanId } : {}),
     ...(membershipPlanVersionId ? { membershipPlanVersionId } : {}),
@@ -563,6 +586,17 @@ export async function capturePricingSnapshot(
 }
 
 function imageCharge(snapshot: PricingSnapshot, generatedCount?: number): ChargeBreakdown {
+  if (snapshot.request.operation !== undefined || snapshot.request.speed !== undefined) {
+    if (snapshot.pricing.billingType !== 'image_flat' || !isImageOperation(snapshot.request.operation) || !isImageOperationSpeed(snapshot.request.speed)) {
+      throw new ModelCatalogError('PRICING_NOT_AVAILABLE', 'The image operation price snapshot is invalid', 503);
+    }
+    let unit: string;
+    try { unit = normalizeImageOperationCreditAmount(snapshot.request.operationUnitCredits); }
+    catch { throw new ModelCatalogError('PRICING_NOT_AVAILABLE', 'The image operation price snapshot has no locked unit price', 503); }
+    return { schemaVersion: 1, model: snapshot.canonicalModelKey, modality: 'image', route: snapshot.routeId,
+      priceVersion: snapshot.priceVersion, billingType: snapshot.billingType, quantity: '1', baseCharge: unit, surcharges: [], totalCredits: unit,
+      details: { operation: snapshot.request.operation, speed: snapshot.request.speed, operationUnitCredits: unit } };
+  }
   const prices = plainObject(snapshot.pricing.creditsPerImageByResolution) ?? {};
   const resolution = (scalarText(snapshot.request.resolution) || '2k').toLowerCase();
   const requestedCount = Math.max(1, Math.floor(Number(snapshot.request.count) || 1));
@@ -914,7 +948,10 @@ export async function buildClientPricingProjection(prisma: PrismaClient) {
         status: 'PUBLISHED',
         pricing: { is: { currentVersionId: { not: null } } },
       },
-      include: { pricing: { include: { currentVersion: true } } },
+      include: {
+        pricing: { include: { currentVersion: true } },
+        routes: { include: { channel: { select: { status: true } } }, orderBy: [{ priority: 'asc' }, { id: 'asc' }] },
+      },
       orderBy: [{ sortOrder: 'asc' }, { canonicalModelKey: 'asc' }],
     }),
     prisma.aiUsageModelBinding.findMany({
@@ -935,7 +972,23 @@ export async function buildClientPricingProjection(prisma: PrismaClient) {
       if (creditPattern.test(creditsPerRequest)) musicModels.push({ model: model.canonicalModelKey, billingType: 'music_flat', creditsPerRequest });
     } else if (model.modality === 'image') {
       const legacy = catalogProfileToImagePrice(model.canonicalModelKey, profile);
-      if (legacy) imageModels.push(legacy);
+      if (legacy) {
+        const availableRoutes = (model.routes ?? []).filter(routeCanReceiveTraffic);
+        const route = availableRoutes.find(candidate => candidate.id === model.defaultRouteId) ?? availableRoutes[0];
+        if (!route && (model.routes ?? []).some(candidate => candidate.adapterKey === 'GENERIC_OPENAI_IMAGE'
+          && candidate.executionMode === 'TASK' && plainObject(candidate.adapterConfig)?.enableTaskOperations === true)) continue;
+        const config = plainObject(route?.adapterConfig);
+        if (route?.adapterKey === 'GENERIC_OPENAI_IMAGE' && route.executionMode === 'TASK'
+          && config?.enableTaskOperations === true) {
+          const parameters = plainObject(config.requestParameters);
+          const execution = plainObject(route.executionConfig);
+          if (parameters?.operation !== 'imagine' || parameters.n !== 1 || execution?.profile !== 'GENERIC_TASK') continue;
+          try {
+            const { credits } = quoteImageOperation(profile, { operation: parameters.operation, speed: parameters.speed });
+            imageModels.push({ ...legacy, creditsPerRequest: credits, credits1k: credits, credits2k: credits, credits4k: credits });
+          } catch { /* An unpriced operation must not advertise the unrelated legacy flat price. */ }
+        } else imageModels.push(legacy);
+      }
     } else if (model.modality === 'video') {
       const legacy = catalogProfileToVideoPrice(model.canonicalModelKey, profile);
       if (legacy) {

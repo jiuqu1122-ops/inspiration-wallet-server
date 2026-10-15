@@ -1,5 +1,6 @@
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { env } from '../../config/env.js';
+import type { ImageOperationCredits } from './image-operation-pricing.js';
 
 export type ImageBillingType = 'image_flat' | 'image_count' | 'image_resolution';
 
@@ -7,6 +8,7 @@ export type ImageModelCreditPrice = {
   model: string;
   billingType?: ImageBillingType | undefined;
   creditsPerRequest?: string | undefined;
+  creditsPerOperation?: ImageOperationCredits | undefined;
   creditsPerImage?: string | undefined;
   creditsByResolution?: Record<string, string> | undefined;
   creditsByResolutionQuality?: Record<string, Record<string, string>> | undefined;

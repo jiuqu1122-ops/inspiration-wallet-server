@@ -46,6 +46,10 @@ import { prepareGenericImageDataUrlReference, prepareSeedreamReference, referenc
 import { removeProviderReference } from './provider-reference-store.js';
 import { imageAdapterConfig } from './image-adapters/types.js';
 import { genericOpenAiImageTaskUsesNativeEdit } from './image-adapters/generic-openai-image.js';
+import { genericImageRequestHeaders } from './image-adapters/generic-request-headers.js';
+import { extractImageTaskMetadata, mergeImageTaskMetadata, projectImageTaskMetadata, type ImageTaskMetadata } from './image-task-metadata.js';
+import { imageOperationProviderFingerprint, parseImageOperationContext, type ImageOperationContext } from './image-operation-protocol.js';
+import { isImageOperation, isImageOperationSpeed } from './image-operation-pricing.js';
 import { seedreamReferenceTransport, usesSeedreamReferences } from './image-adapters/seedream.js';
 import { creditDecimal, serializeCredit } from '../wallets/credit-amount.js';
 import { ensureAiCatalogSeeded } from './catalog-seed.js';
@@ -153,6 +157,7 @@ const imageReferenceCache = new Map<string, { dataUrl: string; expiresAt: number
 const pendingImageReferenceFetches = new Map<string, Promise<string>>();
 
 export type WalletImageGenerationResult = {
+  taskMetadata?: ImageTaskMetadata;
   imageAssets?: Array<{ assetType: 'image'; url: string }>;
   images: string[];
   provider: string;
@@ -177,7 +182,28 @@ const isWalletImageGenerationResult = (value: unknown): value is WalletImageGene
 
 export const parseWalletImageGenerationResult = (
   value: Prisma.JsonValue | null | undefined,
-): WalletImageGenerationResult | null => isWalletImageGenerationResult(value) ? value : null;
+): WalletImageGenerationResult | null => {
+  if (!isWalletImageGenerationResult(value)) return null;
+  const taskMetadata = projectImageTaskMetadata(value.taskMetadata);
+  return {
+    images: value.images, provider: value.provider, providerChannelId: value.providerChannelId,
+    providerChannelName: value.providerChannelName, model: value.model, chargedCredits: value.chargedCredits,
+    ...(value.imageAssets ? { imageAssets: value.imageAssets } : {}),
+    ...(taskMetadata ? { taskMetadata } : {}),
+  };
+};
+
+/** Read the actual owned result file; never infer mask dimensions from references. */
+export async function imageOperationResultDimensions(images: readonly string[]) {
+  if (images.length !== 1 || !isStoredImageResultUrl(images[0]!)) return undefined;
+  const stored = await getImageResult(images[0]!.split('/').at(-1)!);
+  if (!stored) return undefined;
+  try {
+    const info = await sharp(stored.path, { limitInputPixels: 40_000_000 }).timeout({ seconds: 5 }).metadata();
+    if (info.width && info.height && (info.pages ?? 1) === 1) return { width: info.width, height: info.height };
+  } catch { /* Image delivery succeeds even if an optional operation has no readable dimensions. */ }
+  return undefined;
+}
 const xaisAttachmentCache = new Map<string, { name: string; expiresAt: number }>();
 const pendingXaisAttachmentUploads = new Map<string, Promise<string>>();
 const XAIS_MODEL_MAP: Record<string, string> = {
@@ -1954,7 +1980,7 @@ function shouldUseNewApiAsyncImageTask(input: ImageInput) {
     || input.count > 1;
 }
 
-async function providerImageContentRequest(
+export async function providerImageContentRequest(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
   path: string,
@@ -3137,7 +3163,7 @@ function imageTaskTemplate(template: string | undefined, taskId: string) {
   return template.replaceAll('{taskId}', encodeURIComponent(taskId));
 }
 
-function configuredImageTaskEnvelope(
+export function configuredImageTaskEnvelope(
   value: unknown,
   config: ImageTaskExecutionConfig,
   knownTaskId = '',
@@ -3255,7 +3281,7 @@ function imageTaskDiagnosticUrl(provider: AiProviderChannel, value: string) {
   } catch { return ''; }
 }
 
-function imageTaskResultContent(provider: AiProviderChannel, secrets: ProviderSecrets, path: string, timeoutMs: number) {
+export function imageTaskResultContent(provider: AiProviderChannel, secrets: ProviderSecrets, path: string, timeoutMs: number) {
   const target = /^https?:\/\//i.test(path) ? new URL(path) : new URL(providerRequestUrl(provider, path));
   const authenticated = target.origin === new URL(provider.baseUrl).origin;
   return providerImageContentRequest(provider, secrets, target.toString(), timeoutMs, authenticated);
@@ -3305,13 +3331,15 @@ export async function resolveImageAdapterResponse(
   request?: (path: string, body?: unknown, timeoutOverrideMs?: number) => Promise<unknown>,
   diagnosticContext?: ImageAdapterTaskDiagnosticContext,
   resultRequest?: (path: string, timeoutMs: number) => Promise<unknown>,
+  onTaskMetadata?: (metadata: ImageTaskMetadata) => void,
 ) {
   const statusRequest = request ?? ((path, body, timeoutMs) => providerRequest(provider, secrets, path, body, timeoutMs));
   const resultRead = resultRequest ?? (request
     ? (path: string, timeoutMs: number) => request(path, undefined, timeoutMs)
     : (path: string, timeoutMs: number) => imageTaskResultContent(provider, secrets, path, timeoutMs));
   const seedreamTask = imageModelToken(diagnosticContext?.submittedModel ?? '').startsWith('seedream');
-  const summarize = (value: unknown): ImageTaskSnapshot => {
+  type MetadataSnapshot = ImageTaskSnapshot & { taskMetadata?: ImageTaskMetadata };
+  const summarize = (value: unknown): MetadataSnapshot => {
     const seenAssets = new Set<string>();
     const assets = collectUselgTaskAssets(value).filter(asset => {
       const key = asset.key + ':' + asset.value;
@@ -3322,6 +3350,7 @@ export async function resolveImageAdapterResponse(
     // it cannot be forwarded to the client's unauthenticated image downloader.
     const assetUrls = new Set(assets.map(asset => asset.value));
     const failure = getFailure(value);
+    const taskMetadata = onTaskMetadata ? extractImageTaskMetadata(value, imageExplicitTaskId(value)) : undefined;
     return {
       taskId: imageExplicitTaskId(value), state: newApiImageTaskState(value),
       statusUrl: nestedStringByKeys(value, new Set(['status_url', 'poll_url'])),
@@ -3329,9 +3358,11 @@ export async function resolveImageAdapterResponse(
       pollAfterMs: imagePollDelayMs(value), retryAfterMs: imageRetryAfterMs(value),
       images: uniqueImageAdapterImages(value, inputImages, count).filter(source => !assetUrls.has(source)),
       assets, ...(failure ? { failure } : {}),
+      ...(taskMetadata ? { taskMetadata } : {}),
     };
   };
   const initial = summarize(started);
+  let collectedMetadata = initial.taskMetadata;
   let taskId = initial.taskId;
   let sourceType: UselgImageResolveSourceType = 'immediate';
   let attempt = 0;
@@ -3348,6 +3379,7 @@ export async function resolveImageAdapterResponse(
     taskId,
   });
   const complete = (images: string[]) => {
+    if (collectedMetadata) onTaskMetadata?.(collectedMetadata);
     if (diagnosticContext) console.info('[image_adapter_resolved]', {
       ...contextFields(), sourceType,
       totalDurationMs: Date.now() - diagnosticContext.adapterExecutionStartedAt,
@@ -3385,6 +3417,7 @@ export async function resolveImageAdapterResponse(
       return Array.from(new Set(acquired)).slice(0, Math.max(1, count));
     },
     onObserved: snapshot => {
+      collectedMetadata = mergeImageTaskMetadata(collectedMetadata, (snapshot as MetadataSnapshot).taskMetadata);
       taskId = snapshot.taskId;
       if (diagnosticContext && attempt > 0) console.info('[image_adapter_poll_state]', {
         ...contextFields(), attempt, phase,
@@ -5701,7 +5734,12 @@ async function reserveImageCredits(
       );
       if (result) return { replayResult: result } as const;
     }
-    const reusableRequest = existing?.status === 'FAILED'
+    const previousSnapshot = existing?.pricingSnapshot as PricingSnapshot | null;
+    const previousResult = existing?.result as Prisma.JsonObject | null;
+    const operationReceipt = typeof pricingSnapshot?.request.operationUnitCredits === 'string'
+      || typeof previousSnapshot?.request?.operationUnitCredits === 'string'
+      || previousResult?.imageOperationVersion === 1;
+    const reusableRequest = existing?.status === 'FAILED' && !operationReceipt
       ? existing
       : null;
     if (reusableRequest) {
@@ -5842,7 +5880,7 @@ async function settleImageCredits(
   requestId: string,
   unitCredits: string,
   generatedCount: number,
-  result: Omit<WalletImageGenerationResult, 'chargedCredits'>,
+  result: Omit<WalletImageGenerationResult, 'chargedCredits'> & { imageOperationContext?: ImageOperationContext },
   pricingSnapshot?: PricingSnapshot,
   actualRouteId?: string | null,
 ) {
@@ -6163,6 +6201,8 @@ async function rememberImageTaskIdentity(
     routeId?: string | null;
     submittedModel?: string;
     executionConfig?: unknown;
+    taskMetadata?: ImageTaskMetadata;
+    imageOperationContext?: ImageOperationContext;
   },
 ) {
   await prisma.$transaction(async (transaction) => {
@@ -6179,6 +6219,8 @@ async function rememberImageTaskIdentity(
       where: { id: requestId, userId, status: 'PROCESSING' },
       data: {
         result: toInputJson({
+          ...(identity.taskMetadata ? { taskMetadata: identity.taskMetadata } : {}),
+          ...(identity.imageOperationContext ? { imageOperationContext: identity.imageOperationContext } : {}),
           kind: 'image_task_submission',
           state: 'PROCESSING',
           tasks: [
@@ -6213,10 +6255,13 @@ type ImageAdapterRequest = (
 type PreparedImageAdapterExecutionOptions = {
   request?: ImageAdapterRequest;
   wait?: (milliseconds: number) => Promise<unknown>;
+  onTaskMetadata?: (metadata: ImageTaskMetadata) => void;
   onTaskSubmitted?: (identity: {
     taskId: string;
     statusUrl: string;
     profile: ImageTaskExecutionConfig['profile'];
+    taskMetadata?: ImageTaskMetadata;
+    imageOperationContext?: ImageOperationContext;
   }) => Promise<void>;
 };
 
@@ -6293,7 +6338,8 @@ export async function generatePreparedImageAdapterImages(
   options?: PreparedImageAdapterExecutionOptions,
 ) {
   const resultLimit = imageResultLimit(input.imageCapabilities, input.count);
-  const scopedReceiptHeaders = aiMediaMidjourneyRequestHeaders(provider, input, route);
+  const scopedReceiptHeaders = aiMediaMidjourneyRequestHeaders(provider, input, route)
+    ?? genericImageRequestHeaders(provider, input, route);
   const executionMode = imageRouteExecutionMode(route?.executionMode);
   const request: ImageAdapterRequest = options?.request ?? (prepared.execution === 'gemini-native'
     ? (path, body, timeoutOverrideMs, extraHeaders, _onResponseStatus, diagnosticScope) => bigmodelRequest(
@@ -6515,9 +6561,28 @@ export async function generatePreparedImageAdapterImages(
     resultUrl: imageTaskDiagnosticUrl(provider, nestedStringByKeys(configuredEnvelope, new Set(['result_url']))),
   });
   if (finalSubmitImages.length) return finalSubmitImages;
+  const preserveMetadata = prepared.adapterKey === 'GENERIC_OPENAI_IMAGE'
+    && executionConfig.profile === 'GENERIC_TASK'
+    && imageAdapterConfig(route?.adapterConfig).preserveTaskMetadata === true;
+  const initialTaskMetadata = preserveMetadata ? mergeImageTaskMetadata(
+    extractImageTaskMetadata({ operation: submitBody.operation, speed: submitBody.speed }, submitSummary.taskId),
+    extractImageTaskMetadata(configuredEnvelope, submitSummary.taskId),
+  ) : undefined;
+  const operationConfig = prepared.adapterKey === 'GENERIC_OPENAI_IMAGE' ? imageAdapterConfig(route?.adapterConfig) : {};
+  const imageOperationContext: ImageOperationContext | undefined = preserveMetadata && operationConfig.enableTaskOperations
+    && route?.routeId && initialTaskMetadata && isImageOperation(initialTaskMetadata.operation)
+    && isImageOperationSpeed(initialTaskMetadata.speed)
+    ? { version: 1, protocol: 'GENERIC_TASK', providerId: provider.id, routeId: route.routeId,
+      submittedModel: prepared.submittedModel, taskId: initialTaskMetadata.taskId,
+      operation: initialTaskMetadata.operation, speed: initialTaskMetadata.speed,
+      providerConnectionFingerprint: imageOperationProviderFingerprint(provider),
+      ...(statusUrl ? { statusUrl } : {}) } : undefined;
+  if (initialTaskMetadata) options?.onTaskMetadata?.(initialTaskMetadata);
   try {
     await options?.onTaskSubmitted?.({
       taskId: submitSummary.taskId, statusUrl, profile: executionConfig.profile,
+      ...(initialTaskMetadata ? { taskMetadata: initialTaskMetadata } : {}),
+      ...(imageOperationContext ? { imageOperationContext } : {}),
     });
   } catch (cause) {
     throw new ImageTaskRecoveryRequiredError({
@@ -6586,6 +6651,7 @@ export async function generatePreparedImageAdapterImages(
       executionConfig,
       submitSummary.taskId,
     ),
+    preserveMetadata ? options?.onTaskMetadata : undefined,
   );
 }
 
@@ -6608,7 +6674,7 @@ async function generateImagesFromProvider(
   provider: AiProviderChannel,
   effectiveInput: ImageInput,
   adapterRoute?: ImageAdapterRouteContext,
-  executionOptions?: Pick<PreparedImageAdapterExecutionOptions, 'onTaskSubmitted'> & { preparedReferences?: string[] },
+  executionOptions?: Pick<PreparedImageAdapterExecutionOptions, 'onTaskSubmitted' | 'onTaskMetadata'> & { preparedReferences?: string[] },
 ) {
   const startedAt = Date.now();
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
@@ -6830,6 +6896,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     return {
       images: existingResult.images,
       ...(existingResult.imageAssets ? { imageAssets: existingResult.imageAssets } : {}),
+      ...(existingResult.taskMetadata ? { taskMetadata: existingResult.taskMetadata } : {}),
       provider: existingResult.provider,
       providerChannelId: existingResult.providerChannelId,
       providerChannelName: existingResult.providerChannelName,
@@ -6950,6 +7017,9 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     ? await capturePricingSnapshot(prisma, catalogResolution.model, primaryRoute?.id ?? null, {
       resolution: reservationInput.resolution ?? '2k',
       count: imageResultLimit(validatedInput.imageCapabilities, validatedInput.count),
+      ...(primaryRoute?.adapterKey === 'GENERIC_OPENAI_IMAGE' && imageAdapterConfig(primaryRoute.adapterConfig).enableTaskOperations
+        ? { operation: imageAdapterConfig(primaryRoute.adapterConfig).requestParameters!.operation!,
+          speed: imageAdapterConfig(primaryRoute.adapterConfig).requestParameters!.speed! } : {}),
       ...(validatedInput.quality ? { quality: validatedInput.quality } : {}),
       ...(resolveImageOutputCapabilities(validatedInput.imageCapabilities).billingMode ? { billingMode: resolveImageOutputCapabilities(validatedInput.imageCapabilities).billingMode } : {}),
     }, input.userId)
@@ -7088,22 +7158,28 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
             reservation.requestId,
           );
         }
+        let taskMetadata: ImageTaskMetadata | undefined;
+        let imageOperationContext: ImageOperationContext | undefined;
         const images = await generateImagesFromProvider(
           activeProvider,
           activeInput,
           activeAdapterRoute,
           {
             ...(preparedAdapterRequest?.preparedReferences ? { preparedReferences: preparedAdapterRequest.preparedReferences } : {}),
-            onTaskSubmitted: async (identity) => rememberImageTaskIdentity(
-              prisma,
-              validatedInput.userId,
-              reservation.requestId,
-              { ...identity, clientRequestId: activeInput.clientRequestId, providerId: activeProvider.id,
-                routeId: activeRoute?.id ?? null, submittedModel: activeInput.model,
-                executionConfig: activeAdapterRoute?.executionConfig },
-            ),
+            onTaskMetadata: metadata => { taskMetadata = mergeImageTaskMetadata(taskMetadata, metadata); },
+            onTaskSubmitted: async (identity) => {
+              imageOperationContext = identity.imageOperationContext;
+              await rememberImageTaskIdentity(prisma, validatedInput.userId, reservation.requestId,
+                { ...identity, clientRequestId: activeInput.clientRequestId, providerId: activeProvider.id,
+                  routeId: activeRoute?.id ?? null, submittedModel: activeInput.model,
+                  executionConfig: activeAdapterRoute?.executionConfig });
+            },
           },
         );
+        if (imageOperationContext) {
+          const imageDimensions = await imageOperationResultDimensions(images);
+          if (imageDimensions) imageOperationContext = { ...imageOperationContext, imageDimensions };
+        }
         const charged = await settleImageCredits(
           prisma,
           activeInput,
@@ -7113,6 +7189,8 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
           {
             images,
             imageAssets: images.map(url => ({ assetType: 'image', url })),
+            ...(taskMetadata ? { taskMetadata } : {}),
+            ...(imageOperationContext ? { imageOperationContext } : {}),
             provider: publicWalletImageProviderKind(activeProvider),
             providerChannelId: activeProvider.id,
             providerChannelName: activeProvider.name,
@@ -7146,6 +7224,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         return {
           images,
           imageAssets: images.map(url => ({ assetType: 'image' as const, url })),
+          ...(taskMetadata ? { taskMetadata } : {}),
           provider: publicWalletImageProviderKind(activeProvider),
           providerChannelId: activeProvider.id,
           providerChannelName: activeProvider.name,
@@ -7165,6 +7244,14 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
           throw new ImageTaskRecoveryRequiredError({ taskId: '', statusUrl: '', resultUrl: '' },
             'status', 'submission_outcome_unknown', error);
         }
+        if (activeRoute?.adapterKey === 'GENERIC_OPENAI_IMAGE'
+          && imageAdapterConfig(activeRoute.adapterConfig).enableTaskOperations) {
+          if (error instanceof UpstreamImageError && ![400, 401, 403, 404, 422].includes(error.status)) {
+            throw new ImageTaskRecoveryRequiredError({ taskId: '', statusUrl: '', resultUrl: '' },
+              'status', 'submission_outcome_unknown', error);
+          }
+          throw error;
+        }
         const nextProvider = providers[index + 1];
         const canFailOver = validatedInput.clientPlatform === 'tablet'
           ? isTabletImageProviderFailoverStatus(error instanceof UpstreamImageError ? error.status : -1)
@@ -7172,6 +7259,10 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         if (!(error instanceof UpstreamImageError)
           || !canFailOver
           || !nextProvider) throw error;
+        const nextRoute = compatibleCatalogRoutes.find(route => route.channelId === nextProvider.id);
+        // A normal-generation snapshot cannot fund an operation-priced route.
+        if (nextRoute?.adapterKey === 'GENERIC_OPENAI_IMAGE'
+          && imageAdapterConfig(nextRoute.adapterConfig).enableTaskOperations) throw error;
         console.warn('[image_provider_failover]', {
           clientRequestId: input.clientRequestId,
           model: input.model,
@@ -7361,6 +7452,14 @@ async function resumeWalletImageGeneration(prisma: PrismaClient, userId: string,
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
   const resultLimit = Math.max(1, Math.min(16, Math.floor(Number(snapshot.request.count) || 1)));
   const submittedModel = typeof receipt.submittedModel === 'string' ? receipt.submittedModel : route.upstreamModelId;
+  let taskMetadata = projectImageTaskMetadata(journal.taskMetadata);
+  let imageOperationContext = parseImageOperationContext(journal.imageOperationContext);
+  if (imageOperationContext?.providerConnectionFingerprint
+    && imageOperationContext.providerConnectionFingerprint !== imageOperationProviderFingerprint(provider)) {
+    throw new CloudAiError('IMAGE_TASK_RECOVERY_REQUIRED', '原任务渠道账户已变化，需要管理员核对；不会重新生成', 409);
+  }
+  const preserveMetadata = route.adapterKey === 'GENERIC_OPENAI_IMAGE' && config.profile === 'GENERIC_TASK'
+    && imageAdapterConfig(route.adapterConfig).preserveTaskMetadata === true;
   const input: ImageInput = {
     userId, clientRequestId, model: snapshot.canonicalModelKey, prompt: '', inputImages: [],
     aspectRatio: '1:1', resolution: typeof snapshot.request.resolution === 'string' ? snapshot.request.resolution : undefined,
@@ -7380,14 +7479,21 @@ async function resumeWalletImageGeneration(prisma: PrismaClient, userId: string,
         submittedModel, profile: config.profile,
         adapterExecutionStartedAt: Date.now(),
       }, async (path, timeoutMs) => configuredImageTaskEnvelope(
-        await imageTaskResultContent(provider, secrets, path, timeoutMs), config, identity.taskId));
+        await imageTaskResultContent(provider, secrets, path, timeoutMs), config, identity.taskId),
+      preserveMetadata ? metadata => { taskMetadata = mergeImageTaskMetadata(taskMetadata, metadata); } : undefined);
     const images = await persistGeneratedImageResultsAndScheduleMirrors(sources, provider.name, {
       clientRequestId, canonicalModel: snapshot.canonicalModelKey, routeId: route.id,
       providerId: provider.id, adapterKey: route.adapterKey || 'LEGACY',
     });
     if (!images.length) throw new ImageTaskRecoveryRequiredError(initialIdentity(initial), 'result', 'result_not_ready');
+    if (imageOperationContext) {
+      const imageDimensions = await imageOperationResultDimensions(images);
+      if (imageDimensions) imageOperationContext = { ...imageOperationContext, imageDimensions };
+    }
     await settleImageCredits(prisma, input, request.id, '0', images.length, {
       images, imageAssets: images.map(url => ({ assetType: 'image', url })),
+      ...(taskMetadata ? { taskMetadata } : {}),
+      ...(imageOperationContext ? { imageOperationContext } : {}),
       provider: publicWalletImageProviderKind(provider), providerChannelId: provider.id,
       providerChannelName: provider.name, model: snapshot.canonicalModelKey,
     }, snapshot, route.id);

@@ -10,6 +10,8 @@ export const IMAGE_ADAPTER_KEYS = [
 
 export type ImageAdapterKey = typeof IMAGE_ADAPTER_KEYS[number];
 
+export type ImageRequestParameters = Record<string, string | number | boolean>;
+
 export type ImageAdapterConfig = {
   resolutionParameter?: 'none' | 'size' | 'resolution';
   resolutionValueMode?: 'label' | 'exact';
@@ -22,6 +24,11 @@ export type ImageAdapterConfig = {
   referenceTransport?: 'data_url' | 'public_https';
   referenceRequestCount?: 1;
   referenceResponseFormat?: 'url' | 'b64_json';
+  /** Fixed body fields for explicitly configured Generic Images API routes. */
+  requestParameters?: ImageRequestParameters;
+  idempotencyHeader?: 'Idempotency-Key';
+  preserveTaskMetadata?: true;
+  enableTaskOperations?: true;
 };
 
 export type ImageAdapterInput = {
@@ -78,6 +85,46 @@ export class ImageAdapterError extends Error {
   }
 }
 
+const protectedRequestParameters = new Set([
+  'model', 'prompt', 'image', 'images', 'input', 'input_images', 'mask', 'mask_base64',
+  'size', 'resolution', 'aspect_ratio', 'quality', 'background', 'output_format',
+  'output_compression', 'stream', 'async', 'prototype',
+  ...Object.getOwnPropertyNames(Object.prototype).map(key => key.toLowerCase()),
+]);
+
+function imageRequestParameters(value: unknown): ImageRequestParameters {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'requestParameters must be a JSON object');
+  }
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'requestParameters must be a JSON object');
+  }
+  const entries = Object.entries(value);
+  if (entries.length > 20) {
+    throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'requestParameters supports at most 20 fields');
+  }
+  const parameters: ImageRequestParameters = {};
+  for (const [key, parameter] of entries) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(key) || protectedRequestParameters.has(key.toLowerCase())) {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', `Protected or invalid requestParameters field: ${key}`);
+    }
+    if (!(typeof parameter === 'string' && parameter.length <= 1000)
+      && !(typeof parameter === 'number' && Number.isFinite(parameter))
+      && typeof parameter !== 'boolean') {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', `Invalid requestParameters value for ${key}`);
+    }
+    if (key === 'n' && (typeof parameter !== 'number' || !Number.isInteger(parameter) || parameter < 1 || parameter > 10)) {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'requestParameters.n must be an integer from 1 to 10');
+    }
+    if (key === 'response_format' && parameter !== 'url' && parameter !== 'b64_json') {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'Invalid requestParameters.response_format');
+    }
+    parameters[key] = parameter;
+  }
+  return parameters;
+}
+
 export function imageAdapterConfig(value: unknown): ImageAdapterConfig {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   const source = value as Record<string, unknown>;
@@ -94,6 +141,10 @@ export function imageAdapterConfig(value: unknown): ImageAdapterConfig {
     'referenceTransport',
     'referenceRequestCount',
     'referenceResponseFormat',
+    'requestParameters',
+    'idempotencyHeader',
+    'preserveTaskMetadata',
+    'enableTaskOperations',
   ]);
   const unknown = Object.keys(source).find(key => !allowed.has(key));
   if (unknown) {
@@ -176,6 +227,40 @@ export function imageAdapterConfig(value: unknown): ImageAdapterConfig {
       throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'Invalid referenceResponseFormat');
     }
     config.referenceResponseFormat = source.referenceResponseFormat;
+  }
+  if (source.requestParameters !== undefined) {
+    const parameters = imageRequestParameters(source.requestParameters);
+    if (Object.keys(parameters).length) config.requestParameters = parameters;
+    if (parameters.n !== undefined && config.referenceRequestCount !== undefined
+      && parameters.n !== config.referenceRequestCount) {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'requestParameters.n conflicts with referenceRequestCount');
+    }
+    if (parameters.response_format !== undefined && config.referenceResponseFormat !== undefined
+      && parameters.response_format !== config.referenceResponseFormat) {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'requestParameters.response_format conflicts with referenceResponseFormat');
+    }
+  }
+  if (source.idempotencyHeader !== undefined) {
+    if (source.idempotencyHeader !== 'Idempotency-Key') {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'Invalid idempotencyHeader');
+    }
+    config.idempotencyHeader = source.idempotencyHeader;
+  }
+  if (source.preserveTaskMetadata !== undefined) {
+    if (source.preserveTaskMetadata !== true) {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'preserveTaskMetadata must be true when configured');
+    }
+    config.preserveTaskMetadata = true;
+  }
+  if (source.enableTaskOperations !== undefined) {
+    if (source.enableTaskOperations !== true || config.preserveTaskMetadata !== true
+      || config.idempotencyHeader !== 'Idempotency-Key'
+      || config.requestParameters?.operation !== 'imagine' || config.requestParameters.n !== 1
+      || !['fast', 'relax', 'turbo'].includes(String(config.requestParameters.speed))) {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID',
+        'Task operations require metadata, Idempotency-Key and fixed imagine/speed/n=1 parameters');
+    }
+    config.enableTaskOperations = true;
   }
   return config;
 }
