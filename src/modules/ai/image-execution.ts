@@ -59,6 +59,12 @@ export function imageRouteExecutionMode(value: unknown): ImageRouteExecutionMode
   return value === 'DIRECT' || value === 'TASK' ? value : 'INHERIT';
 }
 
+export function isGptImage25Identity(...values: Array<string | null | undefined>) {
+  return values.some(value => /^(?:gptimage25|image25)/.test(
+    String(value ?? '').toLowerCase().replace(/[^a-z0-9]/g, ''),
+  ));
+}
+
 function executionConfigRecord(value: unknown) {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -95,7 +101,9 @@ function executionString(
 
 export function normalizeImageTaskExecutionConfig(
   value: unknown,
-  defaults: Partial<Pick<ImageTaskExecutionConfig, 'submitEndpoint' | 'statusEndpointTemplate' | 'asyncParameterName'>> = {},
+  defaults: Partial<Pick<ImageTaskExecutionConfig, 'submitEndpoint' | 'statusEndpointTemplate' | 'asyncParameterName'>> & {
+    modelIdentities?: readonly (string | null | undefined)[];
+  } = {},
 ): ImageTaskExecutionConfig {
   const source = executionConfigRecord(value);
   const profile = source.profile;
@@ -132,7 +140,14 @@ export function normalizeImageTaskExecutionConfig(
       'Image task submitTimeoutMs must be an integer between 45000 and 90000',
     );
   }
-  const asyncParameterName = executionString(source, 'asyncParameterName', defaults.asyncParameterName);
+  const standardUselgAsync = profile === 'USELG_IMAGE_TASK'
+    && isGptImage25Identity(...(defaults.modelIdentities ?? []))
+    && (submitEndpoint === '/v1/images/generations' || submitEndpoint === '/v1/images/edits');
+  const asyncParameterName = executionString(
+    source,
+    'asyncParameterName',
+    defaults.asyncParameterName ?? (standardUselgAsync ? 'async' : undefined),
+  );
   if (asyncParameterName && !/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(asyncParameterName)) {
     throw new ImageAdapterError(
       'IMAGE_ADAPTER_CONFIG_INVALID',

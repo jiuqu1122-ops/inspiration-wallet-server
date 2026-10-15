@@ -89,6 +89,7 @@ import {
 } from './image-adapters/registry.js';
 import {
   imageRouteExecutionMode,
+  isGptImage25Identity,
   normalizeImageTaskExecutionConfig,
   type ImageTaskExecutionConfig,
 } from './image-execution.js';
@@ -3195,6 +3196,46 @@ function isFinalImageTaskResponse(value: unknown) {
   });
 }
 
+function imageTaskSubmitFinalImages(
+  value: unknown,
+  config: ImageTaskExecutionConfig,
+  inputImages: string[],
+  count: number,
+) {
+  if (!isFinalImageTaskResponse(value)) return [];
+  const row = value as Record<string, unknown>;
+  const validImageDescriptor = (image: Record<string, unknown>) => {
+    if (image.error || image.errors || image.err) return false;
+    const validInline = (candidate: unknown) => typeof candidate === 'string'
+      && (looksLikeRawImageBase64(candidate)
+        || /^data:image\/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=\s]+$/i.test(candidate));
+    if (validInline(image.b64_json) || validInline(image.url)) return true;
+    if (typeof image.url !== 'string') return false;
+    try {
+      const url = new URL(image.url);
+      return ['http:', 'https:'].includes(url.protocol) && Boolean(url.hostname);
+    } catch { return false; }
+  };
+  if (!(row.data as Record<string, unknown>[]).every(validImageDescriptor)) return [];
+  if (getFailure(value)
+    || imageTaskPathString(value, config.taskIdPath)
+    || imageExplicitTaskId(value)
+    || nestedStringByKeys(value, new Set(['status_url', 'statusurl', 'poll_url', 'pollurl', 'result_url', 'resulturl']))) return [];
+  const completed = (state: string) => config.completedStatuses.includes(state)
+    || /^(?:success|succeeded|complete|completed|done|finished)$/.test(state);
+  const onlyFinalStates = (record: Record<string, unknown>) => ['status', 'state', 'task_status', 'taskStatus', 'phase'].every(key => {
+    const state = record[key];
+    return state === undefined || state === null || state === ''
+      || (typeof state === 'string' && completed(state.trim().toLowerCase()));
+  });
+  const configuredState = imageTaskPathString(value, config.statusPath).toLowerCase();
+  if ((configuredState && !completed(configuredState)) || !onlyFinalStates(row)
+    || !(row.data as Record<string, unknown>[]).every(onlyFinalStates)) return [];
+  // Inspect only final descriptors: request echoes and diagnostic URLs outside
+  // data must never become additional generated outputs.
+  return uniqueImageAdapterImages({ data: row.data }, inputImages, count);
+}
+
 function imageTaskDiagnosticUrl(provider: AiProviderChannel, value: string) {
   if (!value) return '';
   try {
@@ -4144,9 +4185,18 @@ async function providerNewApiImageEditRequest(
   input: ImageInput,
   images: StagedNewApiEditImage[],
   asyncOverride?: boolean,
+  options?: {
+    body?: Record<string, unknown>;
+    timeoutMs?: number | undefined;
+    diagnosticScope?: ImageResponseDiagnosticScope | undefined;
+  },
 ) {
   const boundary = `inspiration-${randomUUID().replace(/-/g, '')}`;
-  const textParts = newApiEditFields(input, asyncOverride, provider.kind).map(([name, value]) => (
+  const fields = options?.body
+    ? Object.entries(options.body).filter(([name, value]) => name !== 'image' && name !== 'images'
+      && ['string', 'number', 'boolean'].includes(typeof value)).map(([name, value]) => [name, String(value)] as const)
+    : newApiEditFields(input, asyncOverride, provider.kind);
+  const textParts = fields.map(([name, value]) => (
     newApiMultipartTextPart(boundary, name, value)
   ));
   const fileHeaders = images.map((image) => newApiMultipartFileHeader(boundary, image));
@@ -4173,7 +4223,10 @@ async function providerNewApiImageEditRequest(
   })());
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), IMAGE_GENERATION_TIMEOUT_MS);
+  const timeout = setTimeout(() => {
+    if (options?.diagnosticScope) options.diagnosticScope.timeoutTriggered = true;
+    controller.abort();
+  }, options?.timeoutMs ?? IMAGE_GENERATION_TIMEOUT_MS);
   try {
     const headers = upstreamHeaders(
       secrets,
@@ -4190,7 +4243,13 @@ async function providerNewApiImageEditRequest(
       duplex: 'half',
     };
     const response = await fetch(providerEndpoint(provider.baseUrl, '/v1/images/edits'), request);
+    if (options?.diagnosticScope) markImageResponseHeaders(options.diagnosticScope, response);
+    const bodyStartedAt = performance.now();
     const text = await response.text();
+    if (options?.diagnosticScope) markImageResponseBodyComplete(options.diagnosticScope, text, bodyStartedAt);
+    const parseStartedAt = performance.now();
+    const parsed = parseProviderResponse(text);
+    if (options?.diagnosticScope) markImageResponseParseComplete(options.diagnosticScope, parsed, parseStartedAt);
     if (!response.ok) {
       throw new UpstreamImageError(
         response.status,
@@ -4198,7 +4257,7 @@ async function providerNewApiImageEditRequest(
         parseProviderValue(text),
       );
     }
-    return parseProviderValue(text);
+    return parsed.value;
   } catch (error) {
     if (error instanceof UpstreamImageError) throw error;
     throw new UpstreamImageError(0, error instanceof Error ? error.message : String(error));
@@ -6284,11 +6343,25 @@ export async function generatePreparedImageAdapterImages(
     && typeof (rawTaskConfig as Record<string, unknown>).submitEndpoint !== 'string'
     ? { ...(rawTaskConfig as Record<string, unknown>), submitEndpoint: prepared.endpoint }
     : rawTaskConfig;
-  const executionConfig = normalizeImageTaskExecutionConfig(taskConfigForNormalization, seedreamImagesTask ? {
-    submitEndpoint: prepared.endpoint,
-    statusEndpointTemplate: '/v1/images/tasks/{taskId}?view=summary',
-    asyncParameterName: 'async',
-  } : {});
+  const image25Task = isGptImage25Identity(input.model, prepared.submittedModel, route?.canonicalModelKey);
+  const executionConfig = normalizeImageTaskExecutionConfig(taskConfigForNormalization, {
+    modelIdentities: [input.model, prepared.submittedModel, route?.canonicalModelKey],
+    ...(seedreamImagesTask ? {
+      submitEndpoint: prepared.endpoint,
+      statusEndpointTemplate: '/v1/images/tasks/{taskId}?view=summary',
+      asyncParameterName: 'async',
+    } : {}),
+  });
+  const explicitTaskConfig = taskConfigForNormalization && typeof taskConfigForNormalization === 'object' && !Array.isArray(taskConfigForNormalization)
+    ? taskConfigForNormalization as Record<string, unknown> : {};
+  // A protocol default must not override an explicit adapter-level async flag.
+  // Explicit execution parameters still take precedence over the adapter body.
+  if (image25Task && executionConfig.asyncParameterName === 'async'
+    && explicitTaskConfig.asyncParameterName == null
+    && explicitTaskConfig.asyncParameterValue == null
+    && typeof prepared.body.async === 'boolean') {
+    executionConfig.asyncParameterValue = prepared.body.async;
+  }
   if (executionConfig.profile === 'USELG_IMAGE_TASK' && provider.kind !== 'USELG') {
     throw new ImageAdapterError(
       'IMAGE_ADAPTER_CONFIG_INVALID',
@@ -6376,6 +6449,8 @@ export async function generatePreparedImageAdapterImages(
     throw error;
   }
 
+  const finalSubmitImages = image25Task
+    ? imageTaskSubmitFinalImages(started, executionConfig, input.inputImages, resultLimit) : [];
   const configuredEnvelope = configuredImageTaskEnvelope(started, executionConfig);
   const submitSummary = executionConfig.profile === 'USELG_IMAGE_TASK'
     ? summarizeUselgImageStatus(
@@ -6385,12 +6460,12 @@ export async function generatePreparedImageAdapterImages(
       submitDiagnosticScope,
     )
     : {
-      taskId: getTaskId(configuredEnvelope),
+      taskId: image25Task ? imageExplicitTaskId(configuredEnvelope) : getTaskId(configuredEnvelope),
       state: newApiImageTaskState(configuredEnvelope),
       statusUrl: nestedStringByKeys(configuredEnvelope, new Set(['status_url', 'poll_url'])),
     };
   const statusUrl = 'statusUrl' in submitSummary ? submitSummary.statusUrl : '';
-  if (!submitSummary.taskId && !statusUrl) {
+  if (!submitSummary.taskId && !statusUrl && !finalSubmitImages.length) {
     throw new UpstreamImageError(
       502,
       'TASK submit response contained neither task_id nor status_url',
@@ -6406,17 +6481,18 @@ export async function generatePreparedImageAdapterImages(
     durationMs: Date.now() - submitStartedAt,
     hasTaskId: Boolean(submitSummary.taskId),
     taskId: submitSummary.taskId,
-    state: submitSummary.state,
+    state: finalSubmitImages.length ? 'success' : submitSummary.state,
     hasStatusUrl: Boolean(statusUrl),
     statusUrl: imageTaskDiagnosticUrl(provider, statusUrl),
     profile: executionConfig.profile,
     upstreamModel: route?.upstreamModel ?? prepared.submittedModel,
     configuredModel: diagnosticContext.configuredModel,
     submittedModel: prepared.submittedModel,
-    status: submitSummary.state,
-    assetCount: collectUselgTaskAssets(configuredEnvelope).length,
+    status: finalSubmitImages.length ? 'success' : submitSummary.state,
+    assetCount: finalSubmitImages.length || collectUselgTaskAssets(configuredEnvelope).length,
     resultUrl: imageTaskDiagnosticUrl(provider, nestedStringByKeys(configuredEnvelope, new Set(['result_url']))),
   });
+  if (finalSubmitImages.length) return finalSubmitImages;
   try {
     await options?.onTaskSubmitted?.({
       taskId: submitSummary.taskId, statusUrl, profile: executionConfig.profile,
@@ -6491,6 +6567,21 @@ export async function generatePreparedImageAdapterImages(
   );
 }
 
+function legacyUselgTaskUsesNativeEdit(
+  provider: AiProviderChannel,
+  input: ImageInput,
+  route: ImageAdapterRouteContext | undefined,
+  prepared: PreparedImageAdapterRequest | null,
+  config: ImageTaskExecutionConfig | null,
+) {
+  return !prepared && provider.kind === 'USELG' && config?.profile === 'USELG_IMAGE_TASK'
+    && (config.submitEndpoint === '/v1/images/generations' || config.submitEndpoint === '/v1/images/edits')
+    && config.asyncParameterName === 'async' && typeof config.asyncParameterValue === 'boolean'
+    && isGptImage25Identity(input.model, route?.canonicalModelKey)
+    && input.inputImages.length > 0
+    && (input.imageCapabilities as { supportsImageEdit?: boolean } | undefined)?.supportsImageEdit !== false;
+}
+
 async function generateImagesFromProvider(
   provider: AiProviderChannel,
   effectiveInput: ImageInput,
@@ -6529,7 +6620,9 @@ async function generateImagesFromProvider(
   const generateBatch = async (input: ImageInput) => {
     const executionMode = imageRouteExecutionMode(adapterRoute?.executionMode);
     const taskExecutionConfig = executionMode === 'TASK'
-      ? normalizeImageTaskExecutionConfig(adapterRoute?.executionConfig)
+      ? normalizeImageTaskExecutionConfig(adapterRoute?.executionConfig, {
+        modelIdentities: [input.model, adapterRoute?.canonicalModelKey],
+      })
       : null;
     const prepared = adapterRoute
       ? await prepareRouteImageAdapterRequest(provider, input, adapterRoute, executionOptions?.preparedReferences)
@@ -6543,23 +6636,38 @@ async function generateImagesFromProvider(
       }
       const legacyBody = buildNewApiImageGenerationBody(input, input.inputImages, false, provider.kind);
       delete legacyBody.async;
+      const legacyEdit = legacyUselgTaskUsesNativeEdit(provider, input, adapterRoute, prepared, taskExecutionConfig);
+      const taskRoute = legacyEdit ? { ...adapterRoute,
+        executionConfig: { ...taskExecutionConfig!, submitEndpoint: '/v1/images/edits' },
+      } : adapterRoute;
       const taskPrepared: PreparedImageAdapterRequest = prepared ?? {
         adapterKey: 'LEGACY',
         execution: 'images-api',
         submittedModel: input.model,
-        endpoint: taskExecutionConfig!.submitEndpoint,
+        endpoint: legacyEdit ? '/v1/images/edits' : taskExecutionConfig!.submitEndpoint,
         method: 'POST',
         contentType: 'application/json',
         body: legacyBody,
       };
-      return generatePreparedImageAdapterImages(
-        provider,
-        secrets,
-        input,
-        taskPrepared,
-        adapterRoute,
-        executionOptions,
-      );
+      const stagedImages: StagedNewApiEditImage[] = [];
+      try {
+        if (legacyEdit) {
+          for (const [index, source] of input.inputImages.entries()) {
+            stagedImages.push(await stageNewApiEditImage(source, index));
+          }
+        }
+        return await generatePreparedImageAdapterImages(
+          provider, secrets, input, taskPrepared, taskRoute,
+          legacyEdit ? { ...executionOptions,
+            request: async (path, body, timeoutMs, headers, onResponseStatus, diagnosticScope) => body === undefined
+              ? providerRequest(provider, secrets, path, undefined, timeoutMs, headers, onResponseStatus, diagnosticScope)
+              : providerNewApiImageEditRequest(provider, secrets, input, stagedImages, undefined,
+                { body: body as Record<string, unknown>, timeoutMs, diagnosticScope }),
+          } : executionOptions,
+        );
+      } finally {
+        await Promise.all(stagedImages.map(image => image.cleanup().catch(() => {})));
+      }
     }
     if (prepared) {
       return generatePreparedImageAdapterImages(
@@ -6908,12 +7016,17 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         try {
           const routeExecutionMode = imageRouteExecutionMode(activeAdapterRoute?.executionMode);
           const taskExecutionConfig = routeExecutionMode === 'TASK'
-            ? normalizeImageTaskExecutionConfig(activeAdapterRoute?.executionConfig)
+            ? normalizeImageTaskExecutionConfig(activeAdapterRoute?.executionConfig, {
+              modelIdentities: [activeInput.model, activeAdapterRoute?.canonicalModelKey],
+            })
             : null;
           preparedAdapterRequest = activeAdapterRoute
             ? await prepareRouteImageAdapterRequest(activeProvider, activeInput, activeAdapterRoute)
             : null;
-          activeEndpoint = preparedAdapterRequest
+          activeEndpoint = legacyUselgTaskUsesNativeEdit(activeProvider, activeInput, activeAdapterRoute,
+            preparedAdapterRequest, taskExecutionConfig)
+            ? '/v1/images/edits'
+            : preparedAdapterRequest
             && preparedAdapterRequest.adapterKey === 'GENERIC_OPENAI_IMAGE'
             && genericOpenAiImageTaskUsesNativeEdit(activeInput.inputImages, activeInput.imageCapabilities,
               activeAdapterRoute?.adapterConfig, taskExecutionConfig?.submitEndpoint ?? '')
