@@ -172,10 +172,10 @@ describe('Seedream reference preparation and edit serialization', () => {
     expect(console.info).not.toHaveBeenCalled();
   });
 
-  it('does not change reference serialization for an unrelated Generic model', async () => {
+  it('does not change reference serialization for a Generic model without Data URL opt-in', async () => {
     const other = 'grok-imagine-image';
     const fetch = vi.fn(); vi.stubGlobal('fetch', fetch);
-    const selectedRoute = { ...route({}, 'GENERIC_OPENAI_IMAGE'), requestedCanonicalModel: other, resolvedCanonicalModel: other, upstreamModel: other };
+    const selectedRoute = { ...route({ referenceTransport: undefined }, 'GENERIC_OPENAI_IMAGE'), requestedCanonicalModel: other, resolvedCanonicalModel: other, upstreamModel: other };
     const prepared = await prepareRouteImageAdapterRequest(provider, { ...input([cosUrl]), model: other }, selectedRoute);
     expect(prepared!.body.images).toEqual([cosUrl]); expect(fetch).not.toHaveBeenCalled();
   });

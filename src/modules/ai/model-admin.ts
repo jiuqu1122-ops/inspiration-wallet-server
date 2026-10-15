@@ -19,6 +19,7 @@ import {
   type CatalogPricingProfile,
 } from './pricing-center.js';
 import { validateGenericAsyncVideoConfig } from './video-adapters/generic-async-video.js';
+import { imageAdapterConfig } from './image-adapters/types.js';
 import {
   imageRouteExecutionMode,
   normalizeImageTaskExecutionConfig,
@@ -424,7 +425,9 @@ export async function updateAdminAiRoute(
         ? Prisma.DbNull
         : nextAdapterKey === 'GENERIC_ASYNC_VIDEO' || nextAdapterKey === 'AI_MEDIA_VIDEOS_API'
           ? toInputJson(validateGenericAsyncVideoConfig(input.adapterConfig))
-          : input.adapterConfig;
+          : nextAdapterKey === 'GENERIC_OPENAI_IMAGE'
+            ? toInputJson(imageAdapterConfig(input.adapterConfig))
+            : input.adapterConfig;
     }
     if (input.executionMode !== undefined) data.executionMode = input.executionMode;
     if (input.executionConfig !== undefined) {

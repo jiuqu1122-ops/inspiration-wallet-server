@@ -20,6 +20,8 @@ export type ImageAdapterConfig = {
   exactDimensions?: Record<string, Record<string, string>>;
   referenceSerializer?: 'json_image' | 'json_images' | 'object_image_url';
   referenceTransport?: 'data_url' | 'public_https';
+  referenceRequestCount?: 1;
+  referenceResponseFormat?: 'url' | 'b64_json';
 };
 
 export type ImageAdapterInput = {
@@ -90,6 +92,8 @@ export function imageAdapterConfig(value: unknown): ImageAdapterConfig {
     'exactDimensions',
     'referenceSerializer',
     'referenceTransport',
+    'referenceRequestCount',
+    'referenceResponseFormat',
   ]);
   const unknown = Object.keys(source).find(key => !allowed.has(key));
   if (unknown) {
@@ -160,6 +164,18 @@ export function imageAdapterConfig(value: unknown): ImageAdapterConfig {
     if (source.referenceTransport === 'data_url' || source.referenceTransport === 'public_https') {
       config.referenceTransport = source.referenceTransport;
     } else throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'Invalid referenceTransport');
+  }
+  if (source.referenceRequestCount !== undefined) {
+    if (source.referenceRequestCount !== 1) {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'Invalid referenceRequestCount: only 1 is supported');
+    }
+    config.referenceRequestCount = 1;
+  }
+  if (source.referenceResponseFormat !== undefined) {
+    if (source.referenceResponseFormat !== 'url' && source.referenceResponseFormat !== 'b64_json') {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'Invalid referenceResponseFormat');
+    }
+    config.referenceResponseFormat = source.referenceResponseFormat;
   }
   return config;
 }

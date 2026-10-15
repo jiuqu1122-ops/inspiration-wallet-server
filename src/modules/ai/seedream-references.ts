@@ -52,9 +52,9 @@ function publicReferenceIp(address: string) {
     && !/^2002:|^2001:0(?:000)?:/i.test(address));
 }
 
-async function validatedImage(bytes: Buffer, declaredMime = '') {
-  if (!bytes.length || bytes.length > REFERENCE_UPLOAD_MAX_BYTES) {
-    throw new ReferenceUploadError('Reference image size must be between 1 byte and 10 MiB');
+async function validatedImage(bytes: Buffer, declaredMime = '', maximumBytes = REFERENCE_UPLOAD_MAX_BYTES) {
+  if (!bytes.length || bytes.length > maximumBytes) {
+    throw new ReferenceUploadError(`Reference image size must be between 1 byte and ${maximumBytes / 1024 / 1024} MiB`);
   }
   const headerMime = declaredMime.split(';')[0]!.trim().toLowerCase();
   let mime: string;
@@ -75,34 +75,34 @@ async function validatedImage(bytes: Buffer, declaredMime = '') {
   return { bytes, mime };
 }
 
-async function readImageResponse(response: Response) {
+async function readImageResponse(response: Response, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES) {
   const length = Number(response.headers.get('content-length') || 0);
   if (!response.body) throw new ReferenceUploadError('Reference image response is empty');
   const reader = response.body.getReader();
   let complete = false;
   try {
-    if (length > REFERENCE_UPLOAD_MAX_BYTES) throw new ReferenceUploadError('Reference image exceeds 10 MiB');
+    if (length > maximumBytes) throw new ReferenceUploadError(`Reference image exceeds ${maximumBytes / 1024 / 1024} MiB`);
     const chunks: Buffer[] = [];
     let size = 0;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > REFERENCE_UPLOAD_MAX_BYTES) throw new ReferenceUploadError('Reference image exceeds 10 MiB');
+      if (size > maximumBytes) throw new ReferenceUploadError(`Reference image exceeds ${maximumBytes / 1024 / 1024} MiB`);
       chunks.push(Buffer.from(value));
     }
     complete = true;
     if (length > 0 && !response.headers.get('content-encoding') && length !== size) {
       throw new ReferenceUploadError('Reference image download was incomplete');
     }
-    return validatedImage(Buffer.concat(chunks), response.headers.get('content-type') || '');
+    return validatedImage(Buffer.concat(chunks), response.headers.get('content-type') || '', maximumBytes);
   } finally {
     if (!complete) await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }
 
-async function fetchPublicReference(source: string, signal: AbortSignal) {
+async function fetchPublicReference(source: string, signal: AbortSignal, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES) {
   let current = publicReferenceUrl(source);
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
     const hostname = current.hostname.replace(/^\[|\]$/g, '');
@@ -136,7 +136,7 @@ async function fetchPublicReference(source: string, signal: AbortSignal) {
         await response.body?.cancel().catch(() => {});
         throw new ReferenceUploadError(`Reference image download returned HTTP ${response.status}`);
       }
-      return await readImageResponse(response);
+      return await readImageResponse(response, maximumBytes);
     } finally {
       await dispatcher.destroy();
     }
@@ -144,18 +144,18 @@ async function fetchPublicReference(source: string, signal: AbortSignal) {
   throw new ReferenceUploadError('Reference image redirect limit exceeded');
 }
 
-async function readReference(source: string, signal: AbortSignal) {
+async function readReference(source: string, signal: AbortSignal, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES) {
   const value = source.trim();
   if (/^data:/i.test(value)) {
     const match = /^data:(image\/(?:png|jpe?g|webp|gif));base64,([a-z0-9+/=\s]+)$/i.exec(value);
     if (!match) throw new ReferenceUploadError('Reference image Data URL is invalid');
     const base64 = match[2]!.replace(/\s/g, '');
-    if (base64.length > Math.ceil(REFERENCE_UPLOAD_MAX_BYTES / 3) * 4) {
-      throw new ReferenceUploadError('Reference image exceeds 10 MiB');
+    if (base64.length > Math.ceil(maximumBytes / 3) * 4) {
+      throw new ReferenceUploadError(`Reference image exceeds ${maximumBytes / 1024 / 1024} MiB`);
     }
     const bytes = Buffer.from(base64, 'base64');
     if (bytes.toString('base64') !== base64) throw new ReferenceUploadError('Reference image base64 is invalid');
-    return validatedImage(bytes, match[1]);
+    return validatedImage(bytes, match[1], maximumBytes);
   }
   const url = publicReferenceUrl(value);
   const cachedKey = providerReferenceKey(value);
@@ -163,8 +163,8 @@ async function readReference(source: string, signal: AbortSignal) {
     : isStoredImageResultUrl(value) ? await getImageResult(url.pathname.split('/').at(-1)!) : null;
   if (cachedKey || isStoredImageResultUrl(value)) {
     if (!cached) throw new ReferenceUploadError('Cached reference image is missing or expired');
-    if (cached.size > REFERENCE_UPLOAD_MAX_BYTES) throw new ReferenceUploadError('Reference image exceeds 10 MiB');
-    return validatedImage(await readFile(cached.path), cached.mime);
+    if (cached.size > maximumBytes) throw new ReferenceUploadError(`Reference image exceeds ${maximumBytes / 1024 / 1024} MiB`);
+    return validatedImage(await readFile(cached.path), cached.mime, maximumBytes);
   }
   const objectKey = storageService.tryResolveObjectKeyFromUrl(value);
   if (objectKey) {
@@ -181,21 +181,34 @@ async function readReference(source: string, signal: AbortSignal) {
         const entry = Object.entries(stored.headers).find(([key]) => key.toLowerCase() === name)?.[1];
         if (typeof entry === 'string' || typeof entry === 'number') headers.set(name, String(entry));
       }
-      return await readImageResponse(new Response(Readable.toWeb(stored.stream) as BodyInit, { headers }));
+      return await readImageResponse(new Response(Readable.toWeb(stored.stream) as BodyInit, { headers }), maximumBytes);
     } finally {
       signal.removeEventListener('abort', abort);
       stored.stream.destroy();
     }
   }
-  return fetchPublicReference(value, signal);
+  return fetchPublicReference(value, signal, maximumBytes);
 }
 
-export async function prepareSeedreamReference(source: string, transport: ReferenceTransport) {
+async function prepareReference(
+  source: string,
+  transport: ReferenceTransport,
+  maximumBytes = REFERENCE_UPLOAD_MAX_BYTES,
+  pngJpegOnly = false,
+) {
   const controller = new AbortController();
   let temporaryUrl: string | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const work = async () => {
-    const image = await readReference(source, controller.signal);
+    let image = await readReference(source, controller.signal, maximumBytes);
+    if (pngJpegOnly && image.mime === 'image/webp') {
+      const png = await sharp(image.bytes, { failOn: 'warning', limitInputPixels: 8192 * 8192 })
+        .timeout({ seconds: 10 }).png().toBuffer();
+      image = await validatedImage(png, 'image/png', maximumBytes);
+    }
+    if (pngJpegOnly && image.mime !== 'image/png' && image.mime !== 'image/jpeg') {
+      throw new ReferenceUploadError('参考图仅支持 PNG/JPEG 或可转换为 PNG 的 WebP 图片，请转换图片格式后重试。');
+    }
     controller.signal.throwIfAborted();
     if (transport === 'data_url') {
       return { value: `data:${image.mime};base64,${image.bytes.toString('base64')}`, mime: image.mime, sizeBytes: image.bytes.length };
@@ -203,7 +216,7 @@ export async function prepareSeedreamReference(source: string, transport: Refere
     temporaryUrl = await createProviderReference(image.bytes, image.mime);
     try {
       // Check the actual anonymous public route, including every redirect.
-      const served = await fetchPublicReference(temporaryUrl, controller.signal);
+      const served = await fetchPublicReference(temporaryUrl, controller.signal, maximumBytes);
       if (!served.bytes.equals(image.bytes)) throw new ReferenceUploadError('Temporary reference content did not match');
       return { value: temporaryUrl, mime: image.mime, sizeBytes: image.bytes.length };
     } catch (error) {
@@ -226,4 +239,14 @@ export async function prepareSeedreamReference(source: string, transport: Refere
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+export function prepareSeedreamReference(source: string, transport: ReferenceTransport) {
+  return prepareReference(source, transport);
+}
+
+/** Explicit Generic Data URL routes use their own limits and image contract;
+ * existing readers retain the original 10 MiB and format behavior. */
+export function prepareGenericImageDataUrlReference(source: string) {
+  return prepareReference(source, 'data_url', 20 * 1024 * 1024, true);
 }

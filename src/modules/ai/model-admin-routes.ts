@@ -47,6 +47,8 @@ const adapterConfigSchema = z.object({
   ).optional(),
   referenceSerializer: z.enum(['json_image', 'json_images', 'object_image_url']).optional(),
   referenceTransport: z.enum(['data_url', 'public_https']).optional(),
+  referenceRequestCount: z.literal(1).optional(),
+  referenceResponseFormat: z.enum(['url', 'b64_json']).optional(),
 }).strict();
 const executionModeSchema = z.enum(['INHERIT', 'DIRECT', 'TASK']);
 const imageTaskExecutionConfigSchema = z.object({

@@ -42,7 +42,7 @@ import { storageService } from '../storage/service.js';
 import { imageResultFallbackStore, safeImageDeliveryError } from './image-result-fallback.js';
 import { mirrorGeneratedVideoResultToStorage } from './video-result-store.js';
 import { ReferenceUploadError, resolveReferenceImageSources } from './reference-upload-service.js';
-import { prepareSeedreamReference, referenceSourceType, type ReferenceSourceType } from './seedream-references.js';
+import { prepareGenericImageDataUrlReference, prepareSeedreamReference, referenceSourceType, type ReferenceSourceType } from './seedream-references.js';
 import { removeProviderReference } from './provider-reference-store.js';
 import { imageAdapterConfig } from './image-adapters/types.js';
 import { genericOpenAiImageTaskUsesNativeEdit } from './image-adapters/generic-openai-image.js';
@@ -6082,8 +6082,20 @@ export async function prepareRouteImageAdapterRequest(
   // Validate the existing route contract before downloading or creating any
   // temporary references. A missing serializer must never be guessed.
   const prepared = prepareImageAdapterRequest(adapter, adapterInput);
-  if (!prepared || preparedReferences || !references.length || !usesSeedreamReferences(adapter.key, route.upstreamModel)) return prepared;
+  if (!prepared || !references.length) return prepared;
   const config = imageAdapterConfig(route.adapterConfig);
+  const configuredGenericDataUrl = adapter.key === 'GENERIC_OPENAI_IMAGE'
+    && config.referenceTransport === 'data_url' && !usesSeedreamReferences(adapter.key, route.upstreamModel);
+  if (configuredGenericDataUrl) {
+    if (references.length > 5) {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', '该路由的 Data URL 参考图最多支持 5 张。', prepared.endpoint);
+    }
+    const converted: string[] = [];
+    for (const source of references) converted.push((await prepareGenericImageDataUrlReference(source)).value);
+    const convertedRequest = prepareImageAdapterRequest(adapter, { ...adapterInput, references: converted });
+    return convertedRequest ? { ...convertedRequest, preparedReferences: converted } : null;
+  }
+  if (preparedReferences || !usesSeedreamReferences(adapter.key, route.upstreamModel)) return prepared;
   const transport = seedreamReferenceTransport(config);
   const converted: string[] = [];
   try {

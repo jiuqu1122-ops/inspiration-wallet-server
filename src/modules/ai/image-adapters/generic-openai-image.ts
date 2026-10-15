@@ -5,7 +5,7 @@ import {
   serializeConfiguredReferences,
 } from './images-api-config.js';
 import { isGptImage25Identity } from '../image-execution.js';
-import { imageAdapterConfig, type ImageModelAdapter } from './types.js';
+import { ImageAdapterError, imageAdapterConfig, type ImageModelAdapter } from './types.js';
 
 export function genericOpenAiImageUsesNativeEdit(references: readonly string[], capabilities: unknown) {
   return references.length > 0
@@ -29,6 +29,11 @@ export const genericOpenAiImageAdapter: ImageModelAdapter = {
   execution: 'images-api',
   buildRequest(input) {
     const { config, body: configuredFields } = configuredImagesApiFields(input);
+    if (input.references.length && config.referenceRequestCount !== undefined
+      && input.count !== config.referenceRequestCount) {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID',
+        '该路由的参考图请求每次只支持 1 组任务，请将生成数量设为 1。');
+    }
     const endpoint = genericOpenAiImageUsesNativeEdit(input.references, input.capabilities)
       ? editEndpoint(config)
       : generationEndpoint(config);
@@ -39,6 +44,10 @@ export const genericOpenAiImageAdapter: ImageModelAdapter = {
       model: input.upstreamModel,
       prompt: input.prompt,
       ...(input.count > 1 ? { n: input.count } : {}),
+      ...(input.references.length && config.referenceRequestCount !== undefined
+        ? { n: config.referenceRequestCount } : {}),
+      ...(input.references.length && config.referenceResponseFormat !== undefined
+        ? { response_format: config.referenceResponseFormat } : {}),
       ...configuredFields,
       ...(nativeTransparentPng ? { background: 'transparent', output_format: 'png' } : {}),
     };
