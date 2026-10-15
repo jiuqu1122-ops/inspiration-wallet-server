@@ -1,3 +1,5 @@
+import { buildFailureDiagnostic } from './failure-diagnostic.js';
+
 /** Read-side image recovery. Never invokes a generation POST or wallet mutation. */
 export type ImageReadStage = 'status' | 'result' | 'asset';
 export type ImageTaskIdentity = { taskId: string; statusUrl: string; resultUrl: string };
@@ -23,7 +25,9 @@ export class ImageTaskRecoveryRequiredError extends Error {
 export class ImageTaskTerminalFailureError extends Error {
   readonly code = 'IMAGE_TASK_FAILED';
   constructor(readonly taskId: string, readonly taskState: string, cause?: unknown) {
-    super(`上游图片任务明确失败（${taskState}）`, { cause });
+    const diagnostic = buildFailureDiagnostic(cause, { stage: 'image_generation' });
+    const detail = diagnostic.code === 'GENERATION_FAILED' ? '' : `: ${diagnostic.message}`;
+    super(`上游图片任务明确失败（${taskState}）${detail}`, { cause });
     this.name = 'ImageTaskTerminalFailureError';
   }
 }

@@ -8,7 +8,7 @@ import {
   isTransientImageTransferError,
   pollAcceptedImageTask, type ImageTaskSnapshot,
 } from './image-task-retry.js';
-import { buildFailureDiagnostic, type FailureDiagnostic } from './failure-diagnostic.js';
+import { buildFailureDiagnostic, imageProviderFailureCode, readFailureDiagnostic, type FailureDiagnostic } from './failure-diagnostic.js';
 import { Prisma } from '@prisma/client';
 import type { AiCapability, AiProviderChannel, PrismaClient } from '@prisma/client';
 import { createHash, randomUUID } from 'node:crypto';
@@ -112,6 +112,7 @@ import {
 import { normalizeManagedVideoRequest, ManagedVideoRequestError, type NormalizedVideoRequest } from './video-request.js';
 import { imageQualityFields, imageResultLimit, resolveImageOutputCapabilities } from './image-capabilities.js';
 import { aiMediaMidjourneyPrompt, aiMediaMidjourneyRequestHeaders } from './ai-media-midjourney-request.js';
+import { isUselgMidjourneyImagine, uselgMidjourneyImagineHeaders, validateUselgMidjourneyImagineSubmission } from './uselg-midjourney-imagine.js';
 import { resolveVideoCapabilities, videoAspectRatioAllowed, videoCapabilitiesSupportRequest, videoDurationAllowed } from './video-capabilities.js';
 import { selectManagedVideoRoutes } from './video-routing.js';
 import { getVideoAdapter } from './video-adapters/registry.js';
@@ -5423,12 +5424,14 @@ function getFailure(value: unknown, depth = 0): string {
       if (failure) return failure;
     } else if (candidate && typeof candidate === 'object') {
       const candidateRecord = candidate as Record<string, unknown>;
+      const providerCode = imageProviderFailureCode(candidateRecord.code);
       for (const messageKey of ['message', 'msg', 'detail']) {
         const message = candidateRecord[messageKey];
         if (typeof message !== 'string') continue;
         const failure = normalizeXaisFailure(message);
-        if (failure) return failure;
+        if (failure) return providerCode ? `${providerCode}: ${failure}` : failure;
       }
+      if (providerCode) return providerCode;
       const found = getFailure(candidate, depth + 1);
       if (found) return found;
     }
@@ -6105,7 +6108,10 @@ export async function prepareRouteImageAdapterRequest(
     routeId: route.routeId,
     channelId: route.channelId,
     upstreamModel: route.upstreamModel,
-    prompt: aiMediaMidjourneyPrompt(promptWithConstraints(input, provider.kind), provider, input, route),
+    // This upstream owns version/size handling. Do not append natural-language
+    // constraints after a user's native Midjourney parameters.
+    prompt: aiMediaMidjourneyPrompt(isUselgMidjourneyImagine(provider, route)
+      ? input.prompt.trim() : promptWithConstraints(input, provider.kind), provider, input, route),
     ...(input.negativePrompt ? { negativePrompt: input.negativePrompt } : {}),
     references,
     ...(input.resolution ? { resolution: input.resolution } : {}),
@@ -6339,8 +6345,13 @@ export async function generatePreparedImageAdapterImages(
 ) {
   const resultLimit = imageResultLimit(input.imageCapabilities, input.count);
   const scopedReceiptHeaders = aiMediaMidjourneyRequestHeaders(provider, input, route)
+    ?? uselgMidjourneyImagineHeaders(provider, input, route)
     ?? genericImageRequestHeaders(provider, input, route);
   const executionMode = imageRouteExecutionMode(route?.executionMode);
+  if (isUselgMidjourneyImagine(provider, route) && executionMode !== 'TASK') {
+    throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID',
+      'Midjourney V8.2 Imagine requires asynchronous TASK execution, not DIRECT or INHERIT.', prepared.endpoint);
+  }
   const request: ImageAdapterRequest = options?.request ?? (prepared.execution === 'gemini-native'
     ? (path, body, timeoutOverrideMs, extraHeaders, _onResponseStatus, diagnosticScope) => bigmodelRequest(
       provider,
@@ -6467,6 +6478,7 @@ export async function generatePreparedImageAdapterImages(
     executionConfig.asyncParameterName,
     executionConfig.asyncParameterValue,
   );
+  validateUselgMidjourneyImagineSubmission(provider, route, taskSubmitEndpoint, submitBody);
   console.info('[image_adapter_submit_started]', {
     clientRequestId: diagnosticContext.clientRequestId,
     canonicalModel: diagnosticContext.canonicalModel,
@@ -7235,7 +7247,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         // No accepted-task failure may trigger another generation POST.
         if (error instanceof ImageTaskRecoveryRequiredError) throw error;
         if (error instanceof ImageTaskTerminalFailureError) {
-          throw new UpstreamImageError(502, error.message, undefined);
+          throw new UpstreamImageError(502, error.message, undefined, { cause: error });
         }
         // A missing HTTP status means the POST outcome is unknown. A returned
         // 5xx is still the existing channel-failover signal and must not be
@@ -7385,6 +7397,7 @@ export async function getWalletImageGenerationByRequest(
       capability: true,
       status: true,
       result: true,
+      failureDiagnostic: true,
       completedAt: true,
     },
   });
@@ -7392,12 +7405,15 @@ export async function getWalletImageGenerationByRequest(
   const result = parseWalletImageGenerationResult(
     storageService.rewriteStoredUrls(request.result) as Prisma.JsonValue | null,
   );
+  const failure = request.status === 'FAILED' || request.status === 'REFUNDED'
+    ? readFailureDiagnostic(request.failureDiagnostic) : null;
   return {
     status: request.status.toLowerCase(),
     ...(request.status === 'PROCESSING' && request.result && typeof request.result === 'object'
       && !Array.isArray(request.result) && 'recovery' in request.result
       ? { confirmationRequired: true, recoveryStatus: 'manual_confirmation_required' } : {}),
     completedAt: request.completedAt?.getTime() ?? null,
+    ...(failure ? { error: { code: failure.code, message: failure.message, httpStatus: failure.httpStatus } } : {}),
     ...(result ?? {}),
   };
 }

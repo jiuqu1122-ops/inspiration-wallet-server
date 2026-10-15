@@ -124,6 +124,62 @@ function successfulTransport(metadata: Record<string, unknown> = upstreamMetadat
 }
 
 describe('Generic task metadata through real wallet dispatch and read-side recovery', () => {
+  it.each([0, 1, 5])('dispatches the documented V8.2 model from its internal alias with %i references', async referenceCount => {
+    const state = fixture();
+    state.route.channel.baseUrl = 'https://api.uselg.top';
+    state.route.upstreamModelId = 'midjourney-v8.2';
+    state.model.canonicalModelKey = 'midjourney-v8-2';
+    state.input.model = state.model.canonicalModelKey;
+    state.input.prompt = 'a quiet village --stylize 100';
+    Object.assign(state.model.capabilities, { outputMode: 'single_asset', maxOutputImages: 1,
+      supportsReferenceImage: true, supportsImageEdit: true, minReferenceImages: 0, maxReferenceImages: 5 });
+    Object.assign(state.route.adapterConfig, { generationEndpoint: '/v1/images/generations', editEndpoint: '/v1/images/generations',
+      requestParameters: { operation: 'imagine', speed: 'fast', n: 1 }, aspectRatioParameter: 'aspect_ratio',
+      referenceSerializer: 'object_image_url', referenceTransport: 'data_url', referenceRequestCount: 1 });
+    const references = await Promise.all(Array.from({ length: referenceCount }, async (_, index) =>
+      `data:image/png;base64,${(await sharp({ create: { width: 2, height: 2, channels: 3,
+        background: { r: 30 + index, g: 60, b: 90 } } }).png().toBuffer()).toString('base64')}`));
+    Object.assign(state.input, { inputImages: references });
+    const fetch = successfulTransport();
+    const result = await executeWalletImageGeneration(state.prisma, state.input);
+    expect(result.images).toHaveLength(1);
+    expect(result.chargedCredits).toBe('25.000000');
+    const post = fetch.mock.calls.find(([, init]) => init?.method === 'POST')!;
+    expect(String(post[0])).toBe('https://api.uselg.top/v1/images/generations');
+    expect(JSON.parse(post[1]!.body as string)).toEqual({ model: 'midjourney-v8.2', operation: 'imagine', speed: 'fast',
+      n: 1, aspect_ratio: '16:9', prompt: state.input.prompt,
+      ...(referenceCount ? { images: references.map(image_url => ({ image_url })) } : {}) });
+    expect(new Headers(post[1]!.headers).get('Idempotency-Key')).toMatch(/^[a-f0-9]{64}$/);
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+    expect(state.balance()).toEqual({ available: '75', reserved: '0' });
+    expect(state.transaction.aiBillingSettlement.create).toHaveBeenCalledOnce();
+  });
+
+  it.each(['quota_not_enough', 'content_policy_violation'])(
+    'preserves a terminal %s diagnostic through wallet release and request lookup', async reason => {
+      vi.useFakeTimers();
+      try {
+        const state = fixture();
+        const fetch = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => Response.json({ task_id: taskId,
+          status: init?.method === 'POST' ? 'queued' : 'failed', ...(init?.method === 'POST' ? {} : {
+            error: { code: reason, message: 'https://private.example/prompt-secret.png Bearer private-token' } }) }));
+        vi.stubGlobal('fetch', fetch);
+        const pending = executeWalletImageGeneration(state.prisma, state.input).catch(error => error);
+        await vi.advanceTimersByTimeAsync(2500);
+        const failure = await pending;
+        const code = reason === 'quota_not_enough' ? 'PROVIDER_QUOTA_EXCEEDED' : 'PROVIDER_CONTENT_REJECTED';
+        expect(failure).toMatchObject({ code: 'provider_request_failed' });
+        expect(state.getRow()?.failureDiagnostic).toMatchObject({ code });
+        const lookup = await getWalletImageGenerationByRequest(state.prisma, 'owner', clientRequestId);
+        expect(lookup).toMatchObject({ error: { code } });
+        expect(JSON.stringify([failure.message, lookup, state.getRow()?.failureDiagnostic]))
+          .not.toMatch(/private-token|prompt-secret|private\.example/);
+        expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+        expect(state.balance()).toEqual({ available: '100', reserved: '0' });
+        expect(state.transaction.aiBillingSettlement.create).not.toHaveBeenCalled();
+      } finally { vi.useRealTimers(); }
+    });
+
   it('pins an enabled normal generation for future actions and charges its locked imagine price once', async () => {
     const state = fixture(true, true, true);
     const fetch = successfulTransport();

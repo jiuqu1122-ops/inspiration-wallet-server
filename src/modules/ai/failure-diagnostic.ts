@@ -8,7 +8,10 @@ const KNOWN_MESSAGES: Record<string, string> = {
   STORAGE_WRITE_FAILED: '本地文件或对象存储写入失败',
   PROVIDER_AUTH_FAILED: '上游鉴权失败，请检查渠道权限和密钥',
   PROVIDER_RATE_LIMITED: '上游限流或额度不足',
+  PROVIDER_QUOTA_EXCEEDED: '上游额度不足，请管理员检查该渠道分组及余额',
+  PROVIDER_CONTENT_REJECTED: '上游安全策略拒绝了提示词或参考图片',
   PROVIDER_INVALID_REQUEST: '上游拒绝请求参数，请核对模型规格及素材要求',
+  PROVIDER_IMAGE_URL_BLOCKED: '渠道拒绝参考图片 URL，请配置渠道确认支持的 Data URL 或允许的公开 HTTPS 图片地址',
   PROVIDER_SERVER_ERROR: '上游服务返回错误',
   PROVIDER_HTTP_ERROR: '上游 HTTP 请求失败',
   REQUEST_CANCELLED: '请求已取消',
@@ -21,6 +24,18 @@ const SAFE_CAUSE_CODES = new Set([
   'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
   'IMAGE_PROVIDER_RESPONSE_TIMEOUT', 'IMAGE_RESULT_PERSISTENCE_FAILED',
 ]);
+
+const PROVIDER_FAILURE_CODES = new Set([
+  'quota_not_enough', 'insufficient_quota', 'insufficient_balance',
+  'content_policy_violation', 'content_policy_rejected', 'moderation_blocked', 'safety_system',
+]);
+
+/** Only recognized public error codes may influence a persisted safe summary. */
+export function imageProviderFailureCode(value: unknown): string {
+  if (typeof value !== 'string' || value.length > 128) return '';
+  const code = value.trim().toLowerCase();
+  return PROVIDER_FAILURE_CODES.has(code) ? code : '';
+}
 
 export type FailureDiagnostic = {
   version: 1;
@@ -54,6 +69,8 @@ export function buildFailureDiagnostic(
       const value = current as Record<string, unknown>;
       if (typeof value.message === 'string') texts.push(value.message.slice(0, 2_000));
       if (typeof value.name === 'string') texts.push(value.name.slice(0, 80));
+      const providerCode = imageProviderFailureCode(value.code);
+      if (providerCode) texts.push(providerCode);
       if (typeof value.code === 'string' && SAFE_CAUSE_CODES.has(value.code)) causeCode = value.code;
       if (value.code === 'IMAGE_RESULT_PERSISTENCE_FAILED') persistence = true;
       const status = Number(value.status ?? value.statusCode);
@@ -63,10 +80,16 @@ export function buildFailureDiagnostic(
   } catch { /* A hostile getter must not break the original release/settlement path. */ }
   const text = texts.join('\n');
   if (httpStatus === null) {
-    const match = text.match(/\bHTTP\s+(4\d\d|5\d\d)\b/i);
+    const match = text.match(/(?:\bHTTP\s+|upstream\s+error\s*:\s*)(4\d\d|5\d\d)\b/i);
     if (match) httpStatus = Number(match[1]);
   }
-  if (/too large|size is invalid|exceeds? (?:the )?(?:size|byte)|大小超|超出.{0,8}限制/i.test(text)) code = 'IMAGE_SIZE_LIMIT';
+  if (/Image URL is blocked|图片\s*URL\s*不符合安全策略/i.test(text)) {
+    code = 'PROVIDER_IMAGE_URL_BLOCKED';
+    httpStatus = 400;
+  }
+  else if (/\b(?:quota_not_enough|insufficient_quota|insufficient_balance)\b/i.test(text)) code = 'PROVIDER_QUOTA_EXCEEDED';
+  else if (/\b(?:content_policy_violation|content_policy_rejected|moderation_blocked|safety_system)\b/i.test(text)) code = 'PROVIDER_CONTENT_REJECTED';
+  else if (/too large|size is invalid|exceeds? (?:the )?(?:size|byte)|大小超|超出.{0,8}限制/i.test(text)) code = 'IMAGE_SIZE_LIMIT';
   else if (/valid image bytes|empty image bytes|content-length mismatch|no bytes|没有返回图片数据/i.test(text)) code = 'IMAGE_INVALID_CONTENT';
   else if (/cancelled|canceled|已取消/i.test(text)) code = 'REQUEST_CANCELLED';
   else if (/timeout|timed\s*out|exceeded.{0,30}deadline|AbortError|超时/i.test(`${text} ${causeCode || ''}`)) code = 'PROVIDER_TIMEOUT';

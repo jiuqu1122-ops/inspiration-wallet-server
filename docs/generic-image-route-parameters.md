@@ -19,7 +19,7 @@ It derives a submission key from the authenticated user, provider, route, and
 logical client request ID. A new generation needs a new request ID; retrying the
 same logical request retains the key even if a signed reference URL changes.
 It does not enable automatic POST retries. Existing gateway-specific receipt
-handling retains priority. Polling and downloads do not use this generated header.
+handling (including the confirmed USELG V8.2 Imagine contract below) retains priority. Polling and downloads do not use this generated header.
 
 ## Example: Midjourney V8.2 Imagine
 
@@ -74,6 +74,32 @@ SSRF, redirect, MIME, and 20 MiB per-image checks. Private asset URLs are resolv
 to bytes rather than sent as URLs. Verification tests use mocked upstream
 responses; production acceptance still requires a configured channel and a real
 generation.
+
+### Confirmed USELG V8.2 Imagine compatibility
+
+For the exact HTTPS host `api.uselg.top`, upstream model `midjourney-v8.2`,
+Generic adapter and fixed `operation: "imagine"`, text and reference requests
+preserve the user's prompt rather than appending generic resolution or background
+instructions after native Midjourney parameters. The server always derives the
+same owner/provider/route/logical-request Idempotency-Key used by the explicit
+Generic opt-in. It does not depend on the channel's USELG versus NEW_API kind,
+and changing signed reference URLs does not create a new logical receipt.
+Keeping the explicit header option enabled is still recommended for clarity.
+
+Before any generation POST, this confirmed contract rejects the edits endpoint,
+unsupported JSON fields (including size, quality, background, output_format,
+stream and async), a non-fast speed, n other than 1, and references not serialized
+as 1-5 complete PNG/JPEG/WebP Data URLs in `images[].image_url`. Text-only requests
+omit `images`. Existing reference-byte validation and per-image 20 MiB limits
+remain unchanged. Other hosts, model IDs, operations, V7 routes and Generic
+request-parameter opt-ins retain their previous behavior.
+
+Mocked HTTP and wallet tests cover text, one reference, five references, internal
+model-alias mapping, queued/dispatching/running/success polling, authenticated
+relative asset downloads, single settlement, and no generation resubmission after
+failure. Recognized quota and content-policy codes produce fixed safe failure
+summaries; raw upstream error text, URLs, prompts and credentials are not exposed.
+These tests are not a production generation or proof of upstream availability.
 
 ## Reserving task information for future operation controls
 
