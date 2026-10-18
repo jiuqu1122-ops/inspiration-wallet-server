@@ -113,6 +113,7 @@ import { normalizeManagedVideoRequest, ManagedVideoRequestError, type Normalized
 import { imageQualityFields, imageResultLimit, resolveImageOutputCapabilities } from './image-capabilities.js';
 import { aiMediaMidjourneyPrompt, aiMediaMidjourneyRequestHeaders } from './ai-media-midjourney-request.js';
 import { isUselgMidjourneyImagine, uselgMidjourneyImagineHeaders, validateUselgMidjourneyImagineSubmission } from './uselg-midjourney-imagine.js';
+import { isUselgMidjourneyFull, uselgMidjourneyFullPrompt, uselgMidjourneyFullHeaders, validateUselgMidjourneyFullSubmission } from './uselg-midjourney-full.js';
 import { resolveVideoCapabilities, videoAspectRatioAllowed, videoCapabilitiesSupportRequest, videoDurationAllowed } from './video-capabilities.js';
 import { selectManagedVideoRoutes } from './video-routing.js';
 import { getVideoAdapter } from './video-adapters/registry.js';
@@ -6110,8 +6111,9 @@ export async function prepareRouteImageAdapterRequest(
     upstreamModel: route.upstreamModel,
     // This upstream owns version/size handling. Do not append natural-language
     // constraints after a user's native Midjourney parameters.
-    prompt: aiMediaMidjourneyPrompt(isUselgMidjourneyImagine(provider, route)
-      ? input.prompt.trim() : promptWithConstraints(input, provider.kind), provider, input, route),
+    prompt: isUselgMidjourneyFull(provider, route) ? uselgMidjourneyFullPrompt(input.prompt)
+      : aiMediaMidjourneyPrompt(isUselgMidjourneyImagine(provider, route)
+        ? input.prompt.trim() : promptWithConstraints(input, provider.kind), provider, input, route),
     ...(input.negativePrompt ? { negativePrompt: input.negativePrompt } : {}),
     references,
     ...(input.resolution ? { resolution: input.resolution } : {}),
@@ -6346,8 +6348,14 @@ export async function generatePreparedImageAdapterImages(
   const resultLimit = imageResultLimit(input.imageCapabilities, input.count);
   const scopedReceiptHeaders = aiMediaMidjourneyRequestHeaders(provider, input, route)
     ?? uselgMidjourneyImagineHeaders(provider, input, route)
+    ?? uselgMidjourneyFullHeaders(provider, input, route)
     ?? genericImageRequestHeaders(provider, input, route);
   const executionMode = imageRouteExecutionMode(route?.executionMode);
+  const midjourneyFullTask = isUselgMidjourneyFull(provider, route);
+  if (midjourneyFullTask && executionMode !== 'TASK') {
+    throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID',
+      'Midjourney V8.2-full 请使用异步 TASK 执行方式，不能配置为 DIRECT 或 INHERIT。', prepared.endpoint);
+  }
   if (isUselgMidjourneyImagine(provider, route) && executionMode !== 'TASK') {
     throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID',
       'Midjourney V8.2 Imagine requires asynchronous TASK execution, not DIRECT or INHERIT.', prepared.endpoint);
@@ -6479,6 +6487,7 @@ export async function generatePreparedImageAdapterImages(
     executionConfig.asyncParameterValue,
   );
   validateUselgMidjourneyImagineSubmission(provider, route, taskSubmitEndpoint, submitBody);
+  validateUselgMidjourneyFullSubmission(provider, route, taskSubmitEndpoint, submitBody);
   console.info('[image_adapter_submit_started]', {
     clientRequestId: diagnosticContext.clientRequestId,
     canonicalModel: diagnosticContext.canonicalModel,
@@ -6529,7 +6538,10 @@ export async function generatePreparedImageAdapterImages(
     throw error;
   }
 
-  const finalSubmitImages = image25Task
+  // Only confirmed model contracts may finish TASK submission with receipt-free
+  // OpenAI data[]; unrelated Generic routes retain their existing semantics.
+  const acceptsFinalSubmitImages = image25Task || midjourneyFullTask;
+  const finalSubmitImages = acceptsFinalSubmitImages
     ? imageTaskSubmitFinalImages(started, executionConfig, input.inputImages, resultLimit) : [];
   const configuredEnvelope = configuredImageTaskEnvelope(started, executionConfig);
   const submitSummary = executionConfig.profile === 'USELG_IMAGE_TASK'
@@ -6540,7 +6552,7 @@ export async function generatePreparedImageAdapterImages(
       submitDiagnosticScope,
     )
     : {
-      taskId: image25Task ? imageExplicitTaskId(configuredEnvelope) : getTaskId(configuredEnvelope),
+      taskId: acceptsFinalSubmitImages ? imageExplicitTaskId(configuredEnvelope) : getTaskId(configuredEnvelope),
       state: newApiImageTaskState(configuredEnvelope),
       statusUrl: nestedStringByKeys(configuredEnvelope, new Set(['status_url', 'poll_url'])),
     };

@@ -124,6 +124,44 @@ function successfulTransport(metadata: Record<string, unknown> = upstreamMetadat
 }
 
 describe('Generic task metadata through real wallet dispatch and read-side recovery', () => {
+  it.each(['async', 'sync'].flatMap(mode => [0, 1, 5].map(references => [mode, references] as const)))(
+    'settles V8.2-full %s text/reference generation with %i references once for all four images', async (mode, references) => {
+      const state = fixture(false);
+      state.route.channel.baseUrl = 'https://api.uselg.top';
+      state.route.upstreamModelId = 'midjourney-v8.2-full';
+      state.model.canonicalModelKey = 'midjourney-v8-2-full';
+      state.input.model = state.model.canonicalModelKey;
+      state.input.prompt = 'a village --stylize 100';
+      Object.assign(state.model.capabilities, { supportsReferenceImage: true, supportsImageEdit: true,
+        minReferenceImages: 0, maxReferenceImages: 5 });
+      Object.assign(state.route.adapterConfig, { generationEndpoint: '/v1/images/generations', editEndpoint: '/v1/images/edits',
+        referenceSerializer: 'object_image_url', referenceTransport: 'data_url', referenceRequestCount: 1,
+        resolutionParameter: 'size', resolutionValueMode: 'exact', exactDimensions: { '2K': { '16:9': '1600x900' } },
+        requestParameters: { n: 1, response_format: 'b64_json' } });
+      Object.assign(state.route.executionConfig, { asyncParameterName: 'async', asyncParameterValue: true });
+      const reference = `data:image/png;base64,${(await sharp({ create: { width: 2, height: 2, channels: 3, background: '#123456' } }).png().toBuffer()).toString('base64')}`;
+      Object.assign(state.input, { inputImages: Array(references).fill(reference) });
+      const fetch = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => mode === 'async' && init?.method === 'POST'
+        ? Response.json({ task_id: taskId, status: 'queued' }, { status: 202 })
+        : Response.json({ ...(mode === 'async' ? { task_id: taskId, status: 'success' } : {}), data: outputData }));
+      vi.stubGlobal('fetch', fetch);
+      const result = await executeWalletImageGeneration(state.prisma, state.input);
+      expect(result.images).toHaveLength(4); expect(result.chargedCredits).toBe('25.000000');
+      const posts = fetch.mock.calls.filter(([, init]) => init?.method === 'POST');
+      expect(posts).toHaveLength(1);
+      expect(String(posts[0]![0])).toBe(`https://api.uselg.top/v1/images/${references ? 'edits' : 'generations'}`);
+      expect(JSON.parse(posts[0]![1]!.body as string)).toEqual({ model: 'midjourney-v8.2-full', prompt: state.input.prompt,
+        size: '1600x900', n: 1, async: true, response_format: 'b64_json',
+        ...(references ? { images: Array.from({ length: references }, () => ({ image_url: reference })) } : {}) });
+      expect(new Headers(posts[0]![1]!.headers).get('Idempotency-Key')).toMatch(/^[0-9a-f]{64}$/);
+      expect(state.balance()).toEqual({ available: '75', reserved: '0' });
+      expect(state.transaction.aiBillingSettlement.create).toHaveBeenCalledOnce();
+      const replay = await executeWalletImageGeneration(state.prisma, state.input);
+      expect(replay).toEqual(result);
+      expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+      expect(state.transaction.aiBillingSettlement.create).toHaveBeenCalledOnce();
+    });
+
   it.each([0, 1, 5])('dispatches the documented V8.2 model from its internal alias with %i references', async referenceCount => {
     const state = fixture();
     state.route.channel.baseUrl = 'https://api.uselg.top';
