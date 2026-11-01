@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { Prisma } from '@prisma/client';
 import { env } from '../../config/env.js';

@@ -97,7 +97,7 @@ export function hashCloudLicenseId(licenseId: string) {
 
 function verifySignedLicenseDocument(
   content: string,
-  submittedMachineId?: string | undefined,
+  submittedMachineId?: string,
   allowExpired = false,
 ): VerifiedLicenseWithCustomer {
   const fileResult = licenseFileSchema.safeParse(parseJson(content, 'License file is not valid JSON'));
@@ -207,14 +207,14 @@ export function verifySignedLicense(content: string, submittedMachineId?: string
 
 export function verifySignedLicenseForProvision(
   content: string,
-  submittedMachineId?: string | undefined,
+  submittedMachineId?: string,
 ): VerifiedLicenseWithCustomer {
   return verifySignedLicenseDocument(content, submittedMachineId);
 }
 
 export function verifySignedLicenseForMigration(
   content: string,
-  submittedMachineId?: string | undefined,
+  submittedMachineId?: string,
 ): VerifiedLicenseWithCustomer {
   return verifySignedLicenseDocument(content, submittedMachineId, true);
 }
