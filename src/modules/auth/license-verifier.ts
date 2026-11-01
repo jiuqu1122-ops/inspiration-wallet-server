@@ -16,7 +16,7 @@ const licensePayloadSchema = z.object({
   license_id: z.string().min(16).max(128).regex(/^[a-zA-Z0-9_-]+$/).optional(),
   product: z.string().min(1).max(128),
   customer: z.string().min(1).max(512),
-  machine_id: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  machine_id: z.string().regex(/^[a-fA-F0-9]{64}$/).optional(),
   edition: z.enum(['trial', 'pro', 'enterprise']),
   features: z.array(z.string().max(128)).max(200).default([]),
   expire_at: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
@@ -24,13 +24,13 @@ const licensePayloadSchema = z.object({
 
 export type VerifiedLicense = {
   codeHash: string;
-  machineIdHash: string;
+  machineIdHash: string | null;
   edition: 'TRIAL' | 'PRO' | 'ENTERPRISE';
   features: string[];
   expiresAt: Date;
 };
 
-export type VerifiedLicenseWithCustomer = VerifiedLicense & { customer: string };
+export type VerifiedLicenseWithCustomer = VerifiedLicense & { customer: string; machineId?: string | undefined };
 
 export type LicenseVerificationErrorCode =
   | 'malformed_license'
@@ -97,7 +97,7 @@ export function hashCloudLicenseId(licenseId: string) {
 
 function verifySignedLicenseDocument(
   content: string,
-  submittedMachineId?: string,
+  submittedMachineId?: string | undefined,
   allowExpired = false,
 ): VerifiedLicenseWithCustomer {
   const fileResult = licenseFileSchema.safeParse(parseJson(content, 'License file is not valid JSON'));
@@ -155,9 +155,12 @@ function verifySignedLicenseDocument(
   if (payload.product.trim() !== productName) {
     throw new LicenseVerificationError('product_mismatch', 'License product does not match');
   }
-  const machineId = payload.machine_id.trim().toLowerCase();
+  const machineId = payload.machine_id?.trim().toLowerCase();
+  if (!machineId && !payload.license_id) {
+    throw new LicenseVerificationError('malformed_license', 'An account credential must include its signed license ID');
+  }
   const claimedMachineId = submittedMachineId?.trim().toLowerCase();
-  if (claimedMachineId !== undefined && claimedMachineId !== machineId) {
+  if (machineId && claimedMachineId !== undefined && claimedMachineId !== machineId) {
     throw new LicenseVerificationError('machine_mismatch', 'License machine ID does not match');
   }
 
@@ -175,11 +178,12 @@ function verifySignedLicenseDocument(
       .update('\0')
       .update(signatureBytes)
       .digest('hex');
-  const machineIdHash = hashLicenseMachineId(machineId);
+  const machineIdHash = machineId ? hashLicenseMachineId(machineId) : null;
 
   return {
     codeHash,
     customer: payload.customer.trim(),
+    machineId,
     machineIdHash,
     edition: 'ENTERPRISE',
     features: ['*'],
@@ -203,14 +207,14 @@ export function verifySignedLicense(content: string, submittedMachineId?: string
 
 export function verifySignedLicenseForProvision(
   content: string,
-  submittedMachineId?: string,
+  submittedMachineId?: string | undefined,
 ): VerifiedLicenseWithCustomer {
   return verifySignedLicenseDocument(content, submittedMachineId);
 }
 
 export function verifySignedLicenseForMigration(
   content: string,
-  submittedMachineId: string,
+  submittedMachineId?: string | undefined,
 ): VerifiedLicenseWithCustomer {
   return verifySignedLicenseDocument(content, submittedMachineId, true);
 }

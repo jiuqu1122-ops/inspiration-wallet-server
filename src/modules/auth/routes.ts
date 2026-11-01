@@ -12,7 +12,7 @@ import { requestEmailCode, syncEmailLicense, verifyEmailCode } from './email-aut
 const exchangeBodySchema = z
   .object({
     license: z.string().min(1).max(350_000),
-    machineId: z.string().regex(/^[a-fA-F0-9]{64}$/),
+    machineId: z.string().regex(/^[a-fA-F0-9]{64}$/).optional(),
     appVersion: z.string().trim().min(1).max(64).optional(),
   })
   .strict();
@@ -34,7 +34,7 @@ const emailCodeVerifySchema = z
     email: z.string().trim().email().max(254),
     challengeId: z.string().uuid(),
     code: z.string().regex(/^\d{6}$/),
-    machineId: z.string().regex(/^[a-fA-F0-9]{64}$/),
+    machineId: z.string().regex(/^[a-fA-F0-9]{64}$/).optional(),
     displayName: z.string().trim().min(2).max(32).optional(),
     inviteCode: z.string().trim().min(6).max(32).optional(),
     legacyLicense: z.string().min(1).max(350_000).optional(),
@@ -108,7 +108,7 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     async (request, reply) => {
       const parsed = exchangeBodySchema.safeParse(request.body);
       if (!parsed.success) {
-        return invalidRequest(reply, 'A signed license and matching machineId are required');
+        return invalidRequest(reply, 'A signed account credential is required');
       }
       try {
         return await syncEmailLicense(app, parsed.data);
@@ -126,7 +126,7 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     async (request, reply) => {
       const parsed = exchangeBodySchema.safeParse(request.body);
       if (!parsed.success) {
-        return invalidRequest(reply, 'A signed license and matching machineId are required');
+        return invalidRequest(reply, 'A signed account credential is required');
       }
       try {
         return await exchangeLicense(app, parsed.data);

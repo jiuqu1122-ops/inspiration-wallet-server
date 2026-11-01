@@ -63,16 +63,15 @@ npm run build
   "email": "designer@example.com",
   "challengeId": "验证码挑战 ID",
   "code": "123456",
-  "machineId": "64 位十六进制机器 ID",
   "displayName": "张三设计",
   "legacyLicense": "可选：本机旧版 License 完整文本",
   "appVersion": "4.6.13"
 }
 ```
 
-新邮箱首次验证会获得 30 天高级版，邮箱是账户身份；同一邮箱换设备时继承原账户到期时间，不会重新计算 30 天。机器 ID 只用于当前设备授权和识别本机旧授权。旧版试用版、专业版和高级版在新系统中统一按高级版处理。验证码只保存 HMAC 哈希且单次使用；邮件由通用 SMTP 配置发送。
+新邮箱首次验证会获得 30 天高级版，邮箱是账户身份；同一邮箱在不同设备登录时继承原账户权益，不会重新计算 30 天。旧版试用版、专业版和高级版在新系统中统一按高级版处理。验证码只保存 HMAC 哈希且单次使用；邮件由通用 SMTP 配置发送。
 
-服务器签发的设备 License 会在客户端启动时通过 `POST /v1/auth/email/sync` 同步管理员修改后的用户名、账户状态和到期日。网络暂时不可用时客户端继续验证本地签名 License；服务器明确返回停用或过期时会清除本机云端 License。
+服务器签发的账号 License 会在客户端启动时通过 `POST /v1/auth/email/sync` 同步管理员修改后的用户名、账户状态和到期日。网络暂时不可用时客户端继续验证本地签名 License；服务器明确返回停用或过期时会清除本机云端 License。
 
 ### License 换取会话
 
@@ -81,12 +80,11 @@ npm run build
 ```json
 {
   "license": "{\"payload\":\"...\",\"signature\":\"...\"}",
-  "machineId": "64 位十六进制机器 ID",
   "appVersion": "1.0.0"
 }
 ```
 
-成功后返回 Access Token、Refresh Token 和安全的账户快照。`license` 是现有 `license.json` 的完整文本，不是文件路径。首次使用会原子创建用户和钱包；同一机器续签新 License 会继续使用原账户。
+成功后返回 Access Token、Refresh Token 和安全的账户快照。`license` 是现有 `license.json` 的完整文本，不是文件路径。首次使用会原子创建用户和钱包；同一账户续签新 License 会继续使用原账户。
 
 ### 会话操作
 

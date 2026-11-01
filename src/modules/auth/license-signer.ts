@@ -12,7 +12,7 @@ const ed25519Pkcs8Prefix = Buffer.from('302e020100300506032b657004220420', 'hex'
 type ServerLicenseInput = {
   licenseId: string;
   customer: string;
-  machineId: string;
+  machineId?: string | undefined;
   edition: 'trial' | 'pro' | 'enterprise';
   features: string[];
   expiresAt: Date;
@@ -53,7 +53,7 @@ export function signServerLicense(input: ServerLicenseInput) {
     license_id: input.licenseId,
     product: productName,
     customer: input.customer,
-    machine_id: input.machineId.trim().toLowerCase(),
+    ...(input.machineId ? { machine_id: input.machineId.trim().toLowerCase() } : {}),
     edition: input.edition,
     features: input.features,
     expire_at: input.expiresAt.toISOString().slice(0, 10),

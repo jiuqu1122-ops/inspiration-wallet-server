@@ -78,11 +78,11 @@ export async function resolveLicenseIdentity(
         return { userId: existing.userId, licenseId: license.id };
       }
 
-      const priorMachineLicense = await transaction.license.findFirst({
+      const priorMachineLicense = verified.machineIdHash ? await transaction.license.findFirst({
         where: { machineIdHash: verified.machineIdHash },
         orderBy: { createdAt: 'desc' },
         include: { user: { select: { status: true } } },
-      });
+      }) : null;
 
       let userId: string;
       if (priorMachineLicense) {
@@ -140,7 +140,7 @@ async function createSession(
 
 export async function exchangeLicense(
   app: FastifyInstance,
-  input: { license: string; machineId: string },
+  input: { license: string; machineId?: string | undefined },
 ) {
   const verified = verifySignedLicenseForProvision(input.license, input.machineId);
   let identity: { userId: string; licenseId: string };

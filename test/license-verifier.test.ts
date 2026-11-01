@@ -19,7 +19,7 @@ type LicensePayload = {
   license_id?: string;
   product: string;
   customer: string;
-  machine_id: string;
+  machine_id?: string;
   edition: string;
   features: string[];
   expire_at: string;
@@ -88,6 +88,20 @@ describe('verifyLicense', () => {
     signed.payload = Buffer.from(JSON.stringify(tampered), 'utf8').toString('base64');
 
     expectLicenseError(() => verifySignedLicense(JSON.stringify(signed), machineId), 'invalid_signature');
+  });
+
+  it('accepts an account license without a hardware identifier', () => {
+    const payload = { ...validPayload(), license_id: `acct_${'b'.repeat(32)}` };
+    const result = verifySignedLicense(signPayload({ ...payload, machine_id: undefined } as LicensePayload), undefined);
+    expect(result.machineIdHash).toBeNull();
+  });
+
+  it('accepts a signed account credential with no hardware identifier', () => {
+    const { machine_id: _legacyMachineId, ...accountPayload } = validPayload();
+    const accountCredential = { ...accountPayload, license_id: `emailacct_${'f'.repeat(32)}` };
+    const verified = verifySignedLicense(signPayload(accountCredential));
+    expect(verified.machineIdHash).toBeNull();
+    expect(verified.codeHash).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it('rejects a license bound to a different machine', () => {

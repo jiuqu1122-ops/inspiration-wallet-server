@@ -1,4 +1,4 @@
-import { createHmac, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { Prisma } from '@prisma/client';
 import { env } from '../../config/env.js';
@@ -30,6 +30,7 @@ function hashMatches(expected: string, actual: string) {
   const actualBytes = Buffer.from(actual, 'hex');
   return expectedBytes.length === actualBytes.length && timingSafeEqual(expectedBytes, actualBytes);
 }
+
 
 function compatibilityLicenseExpiration() {
   const expiresAt = new Date();
@@ -104,7 +105,7 @@ type VerifyEmailInput = {
   email: string;
   challengeId: string;
   code: string;
-  machineId: string;
+  machineId?: string | undefined;
   displayName?: string | undefined;
   legacyLicense?: string | undefined;
   inviteCode?: string | undefined;
@@ -160,8 +161,8 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
     throw new AuthFlowError('email_code_reused', 'Verification code was already used', 400);
   }
 
-  const machineId = input.machineId.trim().toLowerCase();
-  const machineIdHash = hashLicenseMachineId(machineId);
+  const machineId = input.machineId?.trim().toLowerCase();
+  const machineIdHash = machineId ? hashLicenseMachineId(machineId) : null;
   const legacy = input.legacyLicense
     ? verifySignedLicenseForMigration(input.legacyLicense, machineId)
     : null;
@@ -173,11 +174,11 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
         legacy
           ? transaction.license.findUnique({ where: { codeHash: legacy.codeHash }, include: { user: true } })
           : null,
-        transaction.license.findFirst({
+        machineIdHash ? transaction.license.findFirst({
           where: { machineIdHash },
           orderBy: { updatedAt: 'desc' },
           include: { user: true },
-        }),
+        }) : null,
       ]);
 
       const candidateUsers = [emailUser, legacyLicense?.user, priorMachineLicense?.user]
@@ -197,6 +198,9 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
         throw new AuthFlowError('device_already_bound', 'This device is bound to another email', 409);
       }
 
+      if (user && user.status !== 'ACTIVE') {
+        throw new AuthFlowError('account_disabled', 'The account is disabled', 403);
+      }
       const requestedDisplayName = validDisplayName(input.displayName);
       const displayName = user?.displayName
         ?? legacy?.customer
@@ -268,7 +272,7 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
         });
       }
 
-      const deviceLicenseId = `emaildev_${machineIdHash}`;
+      const deviceLicenseId = machineIdHash ? `emaildev_${machineIdHash}` : `emailacct_${user.id}`;
       const deviceLicenseExpiresAt = entitlementExpiresAt ?? compatibilityLicenseExpiration();
       const existingDeviceLicense = await transaction.license.findUnique({
         where: { id: deviceLicenseId },
@@ -340,7 +344,7 @@ export async function verifyEmailCode(app: FastifyInstance, input: VerifyEmailIn
 
 export async function syncEmailLicense(
   app: FastifyInstance,
-  input: { license: string; machineId: string },
+  input: { license: string; machineId?: string | undefined },
 ) {
   if (!canSignServerLicenses()) {
     throw new AuthFlowError(
@@ -355,7 +359,11 @@ export async function syncEmailLicense(
     where: { codeHash: verified.codeHash },
     include: { user: true },
   });
-  if (!storedLicense || storedLicense.machineIdHash !== verified.machineIdHash) {
+  if (
+    !storedLicense
+    || (verified.machineIdHash && storedLicense.machineIdHash !== verified.machineIdHash)
+    || storedLicense.status === 'REVOKED'
+  ) {
     throw new AuthFlowError('license_revoked', 'Cloud license was not found', 403);
   }
   if (storedLicense.user.status !== 'ACTIVE') {
@@ -381,7 +389,7 @@ export async function syncEmailLicense(
   const license = signServerLicense({
     licenseId: storedLicense.id,
     customer: storedLicense.user.displayName ?? storedLicense.customer ?? storedLicense.user.email ?? 'Unmind User',
-    machineId: input.machineId,
+    machineId: input.machineId ?? verified.machineId,
     edition: 'enterprise',
     features: ['*'],
     expiresAt,
