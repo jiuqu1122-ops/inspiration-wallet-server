@@ -30,11 +30,7 @@ export type VerifiedLicense = {
   expiresAt: Date;
 };
 
-<<<<<<< HEAD
 export type VerifiedLicenseWithCustomer = VerifiedLicense & { customer: string; machineId?: string | undefined };
-=======
-export type VerifiedLicenseWithCustomer = VerifiedLicense & { customer: string; machineId?: string };
->>>>>>> 3df5687 (feat(auth): use account login without hardware machine ids)
 
 export type LicenseVerificationErrorCode =
   | 'malformed_license'
@@ -187,11 +183,7 @@ function verifySignedLicenseDocument(
   return {
     codeHash,
     customer: payload.customer.trim(),
-<<<<<<< HEAD
-    machineId,
-=======
     ...(machineId ? { machineId } : {}),
->>>>>>> 3df5687 (feat(auth): use account login without hardware machine ids)
     machineIdHash,
     edition: 'ENTERPRISE',
     features: ['*'],
@@ -222,11 +214,7 @@ export function verifySignedLicenseForProvision(
 
 export function verifySignedLicenseForMigration(
   content: string,
-<<<<<<< HEAD
   submittedMachineId?: string | undefined,
-=======
-  submittedMachineId?: string,
->>>>>>> 3df5687 (feat(auth): use account login without hardware machine ids)
 ): VerifiedLicenseWithCustomer {
   return verifySignedLicenseDocument(content, submittedMachineId, true);
 }
