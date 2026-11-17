@@ -14,7 +14,7 @@ vi.mock('../src/modules/storage/service.js', () => ({ storageService: storage })
 import { aiRoutes } from '../src/modules/ai/routes.js';
 import { prepareRouteImageAdapterRequest, generatePreparedImageAdapterImages } from '../src/modules/ai/image-service.js';
 import { imageAdapterConfig } from '../src/modules/ai/image-adapters/types.js';
-import { prepareSeedreamReference, referenceSourceType } from '../src/modules/ai/seedream-references.js';
+import { prepareSeedreamReference, stageMultipartImageReference, referenceSourceType } from '../src/modules/ai/seedream-references.js';
 import { resolveReferenceImageSources } from '../src/modules/ai/reference-upload-service.js';
 import {
   createProviderReference, getProviderReference, providerReferenceKey, removeProviderReference, PROVIDER_REFERENCE_TTL_MS,
@@ -334,5 +334,38 @@ describe('public HTTPS temporary Seedream references', () => {
     await expect(prepareSeedreamReference(url, 'data_url')).resolves.toMatchObject({ value: dataUrl() });
     expect(fetch).not.toHaveBeenCalled();
     expect(await getProviderReference('../private.png')).toBeNull();
+  });
+});
+
+
+describe('multipart reference reader reuses ownership and pinned URL checks', () => {
+  it('reads an authorized uploaded reference through the Storage SDK and preserves actual bytes', async () => {
+    const key = 'reference-images/upload.png';
+    const prisma = { referenceUpload: { findFirst: vi.fn().mockResolvedValue({ id: 'ticket', sizeBytes: png.length,
+      contentType: 'image/png', status: 'UPLOADED' }), update: vi.fn() } };
+    storage.tryResolveObjectKeyFromUrl.mockImplementation((url: string) => url === cosUrl ? key : null);
+    const fetch = vi.fn(); vi.stubGlobal('fetch', fetch);
+    const sources = await resolveReferenceImageSources(prisma as never, 'fixture-user', [key]);
+    const staged = await stageMultipartImageReference(sources[0]!, 0);
+    try { expect(await readFile(staged.path)).toEqual(png); expect(staged.mime).toBe('image/png'); }
+    finally { await staged.cleanup(); }
+    expect(storage.getObjectStream).toHaveBeenCalledWith(key); expect(fetch).not.toHaveBeenCalled();
+  });
+  it('does not read an upload belonging to another user', async () => {
+    const fetch = vi.fn(); vi.stubGlobal('fetch', fetch);
+    const prisma = { referenceUpload: { findFirst: vi.fn().mockResolvedValue(null) } };
+    await expect(resolveReferenceImageSources(prisma as never, 'foreign-user', ['reference-images/private.png'])).rejects.toThrow();
+    expect(fetch).not.toHaveBeenCalled(); expect(storage.getObjectStream).not.toHaveBeenCalled();
+  });
+  it('blocks a public reference redirecting to a private host without contacting it', async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response(null, { status: 302, headers: { location: 'https://127.0.0.1/secret' } }));
+    vi.stubGlobal('fetch', fetch);
+    await expect(stageMultipartImageReference('https://example.com/reference.png', 0)).rejects.toThrow(/public HTTPS|blocked/);
+    expect(fetch).toHaveBeenCalledOnce(); expect(new Headers(fetch.mock.calls[0]![1].headers).has('authorization')).toBe(false);
+  });
+  it('rejects a declared oversized reference before reading its body', async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response(png, { headers: { 'content-type': 'image/png', 'content-length': String(11 * 1024 * 1024) } }));
+    vi.stubGlobal('fetch', fetch);
+    await expect(stageMultipartImageReference('https://example.com/reference.png', 0)).rejects.toThrow(/exceeds/);
   });
 });

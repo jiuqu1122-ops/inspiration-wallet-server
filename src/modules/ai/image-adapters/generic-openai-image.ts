@@ -46,6 +46,7 @@ export const genericOpenAiImageAdapter: ImageModelAdapter = {
       && isGptImage25Identity(input.canonicalModelKey, input.upstreamModel);
     const body = {
       model: input.upstreamModel,
+      ...(config.referenceSerializer === 'multipart_image_array' ? { n: 1, response_format: config.referenceResponseFormat ?? 'url' } : {}),
       prompt: input.prompt,
       ...(input.count > 1 ? { n: input.count } : {}),
       ...(input.references.length && config.referenceRequestCount !== undefined
@@ -63,7 +64,10 @@ export const genericOpenAiImageAdapter: ImageModelAdapter = {
       submittedModel: input.upstreamModel,
       endpoint,
       method: 'POST',
-      contentType: 'application/json',
+      contentType: input.references.length && config.referenceSerializer === 'multipart_image_array'
+        ? 'multipart/form-data' : 'application/json',
+      ...(input.references.length && config.referenceSerializer === 'multipart_image_array'
+        ? { fileReferences: input.references } : {}),
       body,
     };
   },

@@ -101,7 +101,7 @@ const imageSchema = z.object({
   prompt: z.string().trim().min(1).max(50_000),
   negativePrompt: optionalString(20_000),
   preserveReferenceIdentity: z.boolean().default(false),
-  inputImages: z.array(z.string().min(1).max(12_000_000)).max(9).default([]),
+  inputImages: z.array(z.string().min(1).max(12_000_000)).max(10).default([]),
   aspectRatio: imageAspectRatioSchema.default('1:1'),
   resolution: optionalString(20),
   quality: optionalString(32),
@@ -621,6 +621,9 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
     async (request, reply) => {
       const parsed = imageSchema.safeParse(request.body);
       if (!parsed.success) {
+        if (parsed.error.issues.some(issue => issue.path[0] === 'inputImages' && issue.code === 'too_big' && issue.maximum === 10)) {
+          return reply.code(400).send({ error: 'invalid_request', message: 'Image requests accept at most 10 reference images; the selected route may allow fewer' });
+        }
         return reply.code(400).send({ error: 'invalid_request', message: '生图请求格式无效' });
       }
       try {

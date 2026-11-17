@@ -3,7 +3,7 @@ import { configuredCatalogFallback } from './configured-catalog-fallback.js';
 import { imageRecoveryDiagnostic } from './image-recovery-diagnostic.js';
 import {
   retryImageRead, imageExplicitTaskId, imagePollDelayMs, imageRetryAfterMs, withoutImageControlFields,
-  parseImageRetryAfter, withImagePollHint,
+  parseImageRetryAfter, withImagePollHint, imageTaskStopPollingReason,
   ImageTaskRecoveryRequiredError, ImageTaskTerminalFailureError,
   isTransientImageTransferError,
   pollAcceptedImageTask, type ImageTaskSnapshot,
@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { Readable } from 'node:stream';
+import { finished } from 'node:stream/promises';
 import sharp from 'sharp';
 import { Agent } from 'undici';
 import { env } from '../../config/env.js';
@@ -42,9 +43,10 @@ import { storageService } from '../storage/service.js';
 import { imageResultFallbackStore, safeImageDeliveryError } from './image-result-fallback.js';
 import { mirrorGeneratedVideoResultToStorage } from './video-result-store.js';
 import { ReferenceUploadError, resolveReferenceImageSources } from './reference-upload-service.js';
-import { prepareGenericImageDataUrlReference, prepareSeedreamReference, referenceSourceType, type ReferenceSourceType } from './seedream-references.js';
+import { prepareGenericImageDataUrlReference, prepareSeedreamReference, stageMultipartImageReference, referenceSourceType, type ReferenceSourceType } from './seedream-references.js';
 import { removeProviderReference } from './provider-reference-store.js';
 import { imageAdapterConfig } from './image-adapters/types.js';
+import { validateConfiguredImagesInput } from './image-adapters/images-api-config.js';
 import { genericOpenAiImageTaskUsesNativeEdit } from './image-adapters/generic-openai-image.js';
 import { genericImageRequestHeaders } from './image-adapters/generic-request-headers.js';
 import { extractImageTaskMetadata, mergeImageTaskMetadata, projectImageTaskMetadata, type ImageTaskMetadata } from './image-task-metadata.js';
@@ -613,6 +615,7 @@ export function providerCanServeImageAlongsideAgent(
   return provider.kind === 'BIGMODEL'
     || provider.kind === 'MIKOTO'
     || provider.kind === 'USELG'
+    || provider.kind === 'OPENAI_COMPATIBLE'
     || !provider.capabilities.includes('LLM');
 }
 
@@ -1043,6 +1046,13 @@ function appendImageString(value: string, output: string[], contextKey: string) 
     return;
   }
   const normalizedContextKey = contextKey.toLowerCase();
+  // Structured image URLs are values, not prose. Preserve their full path and
+  // query (including parentheses/trailing punctuation in valid signed tokens).
+  if (['url', 'signed_url', 'download_url'].includes(normalizedContextKey) && /^https?:\/\//i.test(value)) {
+    if (!isUselgTaskControlUrl(value)) output.push(value.trim());
+    return;
+  }
+
   if (value && EXPLICIT_IMAGE_BASE64_CONTEXT_KEYS.has(normalizedContextKey)) {
     output.push(`data:${rawImageBase64Mime(value)};base64,${value}`);
     return;
@@ -1142,11 +1152,16 @@ function normalizeCollectedImageString(value: string) {
 
 export function collectProviderModelIds(value: unknown) {
   if (!value || typeof value !== 'object') return [];
-  const data: unknown = (value as Record<string, unknown>).data;
+  const root = value as Record<string, unknown>;
+  const data: unknown = root.data ?? root.models;
   if (!Array.isArray(data)) return [];
-  return Array.from(new Set(data.map((item: unknown) => (
-    item && typeof item === 'object' ? (item as Record<string, unknown>).id : null
-  )).filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+  return Array.from(new Set(data.map((item: unknown) => {
+    if (typeof item === 'string') return item;
+    if (!item || typeof item !== 'object') return null;
+    const record = item as Record<string, unknown>;
+    const id = record.id ?? record.name ?? record.model ?? record.model_id;
+    return typeof id === 'string' ? id.replace(/^models\//, '') : null;
+  }).filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
     .map((id) => id.trim())))
     .slice(0, 200);
 }
@@ -3186,7 +3201,7 @@ export function configuredImageTaskEnvelope(
     ?? nestedStringByKeys(value, new Set(['poll_after_ms', 'pollAfterMs']));
   const pollAfterMs = typeof rawPollAfter === 'number'
     ? rawPollAfter
-    : typeof rawPollAfter === 'string' ? Number(rawPollAfter) : undefined;
+    : typeof rawPollAfter === 'string' && rawPollAfter.trim() ? Number(rawPollAfter) : undefined;
   const rawAssets = imageTaskPathValue(value, config.assetArrayPath);
   const assets = Array.isArray(rawAssets)
     ? rawAssets.flatMap((asset) => {
@@ -3315,7 +3330,7 @@ async function imageTaskAssetContent(
   const target = /^https?:\/\//i.test(asset.value)
     ? new URL(asset.value) : new URL(providerRequestUrl(provider, asset.value));
   const sameProvider = target.origin === new URL(provider.baseUrl).origin;
-  if (asset.key !== 'signed_url' && sameProvider) {
+  if (sameProvider && (asset.key !== 'signed_url' || downloadSignedAssets)) {
     return providerImageContentRequest(provider, secrets, target.toString(), timeoutMs);
   }
   return readPublicImageTaskAsset(target.toString(), timeoutMs);
@@ -3334,6 +3349,7 @@ export async function resolveImageAdapterResponse(
   diagnosticContext?: ImageAdapterTaskDiagnosticContext,
   resultRequest?: (path: string, timeoutMs: number) => Promise<unknown>,
   onTaskMetadata?: (metadata: ImageTaskMetadata) => void,
+  strictFileRoute = false,
 ) {
   const statusRequest = request ?? ((path, body, timeoutMs) => providerRequest(provider, secrets, path, body, timeoutMs));
   const resultRead = resultRequest ?? (request
@@ -3350,16 +3366,26 @@ export async function resolveImageAdapterResponse(
     });
     // An authenticated download URL must be read before it can be delivered;
     // it cannot be forwarded to the client's unauthenticated image downloader.
+    if (strictFileRoute) {
+      for (const source of uniqueImageAdapterImages(value, inputImages, count)) {
+        if (/^https?:\/\//i.test(source) && !isStoredImageResultUrl(source)
+          && !assets.some(asset => asset.value === source)) assets.push({ key: 'url', value: source });
+      }
+    }
     const assetUrls = new Set(assets.map(asset => asset.value));
     const failure = getFailure(value);
     const taskMetadata = onTaskMetadata ? extractImageTaskMetadata(value, imageExplicitTaskId(value)) : undefined;
+    const stopPollingReason = strictFileRoute ? imageTaskStopPollingReason(value) : undefined;
+    const state = stopPollingReason && ['paused', 'uncertain', 'client_disconnected', 'pending_confirmation'].includes(stopPollingReason)
+      ? stopPollingReason : newApiImageTaskState(value);
     return {
-      taskId: imageExplicitTaskId(value), state: newApiImageTaskState(value),
+      taskId: imageExplicitTaskId(value), state,
       statusUrl: nestedStringByKeys(value, new Set(['status_url', 'poll_url'])),
       resultUrl: nestedStringByKeys(value, new Set(['result_url'])),
       pollAfterMs: imagePollDelayMs(value), retryAfterMs: imageRetryAfterMs(value),
       images: uniqueImageAdapterImages(value, inputImages, count).filter(source => !assetUrls.has(source)),
       assets, ...(failure ? { failure } : {}),
+      ...(strictFileRoute ? { stopPollingReason } : {}),
       ...(taskMetadata ? { taskMetadata } : {}),
     };
   };
@@ -3388,13 +3414,13 @@ export async function resolveImageAdapterResponse(
     });
     return images;
   };
-  if (initial.images.length && !initial.assets.length) return complete(initial.images);
-  if (!taskId && !initial.statusUrl && !initial.assets.length && !initial.resultUrl) {
+  if (!strictFileRoute && initial.images.length && !initial.assets.length) return complete(initial.images);
+  if (!taskId && !initial.statusUrl && !initial.images.length && !initial.assets.length && !initial.resultUrl) {
     throw new UpstreamImageError(502, 'Image adapter response contained neither images, task_id, nor status_url', started);
   }
   const images = await pollAcceptedImageTask({
     initial: started, summarize, wait, deadline: Date.now() + IMAGE_GENERATION_TIMEOUT_MS,
-    ...(seedreamTask ? { normalizeStatusUrl: (url: string, id: string) => normalizeUselgImageStatusUrl(provider, url, id) } : {}),
+    ...(seedreamTask || strictFileRoute ? { normalizeStatusUrl: (url: string, id: string) => normalizeUselgImageStatusUrl(provider, url, id) } : {}),
     read: async (url, stage, timeoutMs) => {
       phase = stage;
       sourceType = stage === 'result' ? 'result_url' : 'status';
@@ -3411,7 +3437,7 @@ export async function resolveImageAdapterResponse(
       for (const asset of snapshot.assets) {
         const remaining = acquisitionDeadline - Date.now();
         if (remaining <= 0) throw new ImageTaskRecoveryRequiredError(snapshot, 'asset', 'read_budget_exhausted');
-        const content = await imageTaskAssetContent(provider, secrets, asset, remaining, seedreamTask);
+        const content = await imageTaskAssetContent(provider, secrets, asset, remaining, seedreamTask || strictFileRoute);
         acquired.push(...uniqueImageAdapterImages(content, inputImages, count));
         sourceType = asset.key === 'signed_url' && !seedreamTask ? 'signed_url' : 'asset_content';
         if (acquired.length >= count) break;
@@ -4146,9 +4172,9 @@ function newApiMultipartTextPart(boundary: string, name: string, value: string) 
   );
 }
 
-function newApiMultipartFileHeader(boundary: string, image: StagedNewApiEditImage) {
+function newApiMultipartFileHeader(boundary: string, image: StagedNewApiEditImage, fieldName = 'image') {
   return Buffer.from(
-    `--${boundary}\r\nContent-Disposition: form-data; name="image"; filename="${image.filename}"\r\nContent-Type: ${image.mime}\r\n\r\n`,
+    `--${boundary}\r\nContent-Disposition: form-data; name="${fieldName}"; filename="${image.filename}"\r\nContent-Type: ${image.mime}\r\n\r\n`,
     'utf8',
   );
 }
@@ -4232,6 +4258,10 @@ async function providerNewApiImageEditRequest(
   asyncOverride?: boolean,
   options?: {
     body?: Record<string, unknown>;
+    endpoint?: string;
+    fieldName?: 'image[]';
+    extraHeaders?: Record<string, string> | undefined;
+    onResponseStatus?: ((status: number) => void) | undefined;
     timeoutMs?: number | undefined;
     diagnosticScope?: ImageResponseDiagnosticScope | undefined;
   },
@@ -4244,7 +4274,7 @@ async function providerNewApiImageEditRequest(
   const textParts = fields.map(([name, value]) => (
     newApiMultipartTextPart(boundary, name, value)
   ));
-  const fileHeaders = images.map((image) => newApiMultipartFileHeader(boundary, image));
+  const fileHeaders = images.map((image) => newApiMultipartFileHeader(boundary, image, options?.fieldName));
   const fileFooters = images.map(() => Buffer.from('\r\n', 'utf8'));
   const closing = Buffer.from(`--${boundary}--\r\n`, 'utf8');
   const contentLength = textParts.reduce((total, part) => total + part.byteLength, 0)
@@ -4268,14 +4298,19 @@ async function providerNewApiImageEditRequest(
   })());
 
   const controller = new AbortController();
+  let rejectDeadline: (error: Error) => void = () => {};
+  const deadline = new Promise<never>((_resolve, reject) => { rejectDeadline = reject; });
+  const bounded = <T>(operation: Promise<T>) => Promise.race([operation, deadline]);
+  const timeoutMs = options?.timeoutMs ?? IMAGE_GENERATION_TIMEOUT_MS;
   const timeout = setTimeout(() => {
     if (options?.diagnosticScope) options.diagnosticScope.timeoutTriggered = true;
+    rejectDeadline(new ProviderResponseTimeoutError(timeoutMs));
     controller.abort();
-  }, options?.timeoutMs ?? IMAGE_GENERATION_TIMEOUT_MS);
+  }, timeoutMs);
   try {
     const headers = upstreamHeaders(
       secrets,
-      uselgIdempotencyHeaders(provider, input),
+      options?.extraHeaders ?? uselgIdempotencyHeaders(provider, input),
     );
     headers.set('content-type', `multipart/form-data; boundary=${boundary}`);
     headers.set('content-length', String(contentLength));
@@ -4287,10 +4322,11 @@ async function providerNewApiImageEditRequest(
       signal: controller.signal,
       duplex: 'half',
     };
-    const response = await fetch(providerEndpoint(provider.baseUrl, '/v1/images/edits'), request);
+    const response = await bounded(fetch(providerRequestUrl(provider, options?.endpoint ?? '/v1/images/edits'), request));
+    options?.onResponseStatus?.(response.status);
     if (options?.diagnosticScope) markImageResponseHeaders(options.diagnosticScope, response);
     const bodyStartedAt = performance.now();
-    const text = await response.text();
+    const text = await bounded(response.text());
     if (options?.diagnosticScope) markImageResponseBodyComplete(options.diagnosticScope, text, bodyStartedAt);
     const parseStartedAt = performance.now();
     const parsed = parseProviderResponse(text);
@@ -4302,13 +4338,14 @@ async function providerNewApiImageEditRequest(
         parseProviderValue(text),
       );
     }
-    return parsed.value;
+    return withImagePollHint(parsed.value, response.headers.get('retry-after'));
   } catch (error) {
     if (error instanceof UpstreamImageError) throw error;
     throw new UpstreamImageError(0, error instanceof Error ? error.message : String(error));
   } finally {
     clearTimeout(timeout);
     bodyStream.destroy();
+    await finished(bodyStream).catch(() => {});
   }
 }
 
@@ -6111,7 +6148,8 @@ export async function prepareRouteImageAdapterRequest(
     upstreamModel: route.upstreamModel,
     // This upstream owns version/size handling. Do not append natural-language
     // constraints after a user's native Midjourney parameters.
-    prompt: isUselgMidjourneyFull(provider, route) ? uselgMidjourneyFullPrompt(input.prompt)
+    prompt: imageAdapterConfig(route.adapterConfig).referenceSerializer === 'multipart_image_array' ? input.prompt.trim()
+      : isUselgMidjourneyFull(provider, route) ? uselgMidjourneyFullPrompt(input.prompt)
       : aiMediaMidjourneyPrompt(isUselgMidjourneyImagine(provider, route)
         ? input.prompt.trim() : promptWithConstraints(input, provider.kind), provider, input, route),
     ...(input.negativePrompt ? { negativePrompt: input.negativePrompt } : {}),
@@ -6131,6 +6169,7 @@ export async function prepareRouteImageAdapterRequest(
   if (!prepared || !references.length) return prepared;
   const config = imageAdapterConfig(route.adapterConfig);
   const configuredGenericDataUrl = adapter.key === 'GENERIC_OPENAI_IMAGE'
+    && config.referenceSerializer !== 'multipart_image_array'
     && config.referenceTransport === 'data_url' && !usesSeedreamReferences(adapter.key, route.upstreamModel);
   if (configuredGenericDataUrl) {
     if (references.length > 5) {
@@ -6141,7 +6180,7 @@ export async function prepareRouteImageAdapterRequest(
     const convertedRequest = prepareImageAdapterRequest(adapter, { ...adapterInput, references: converted });
     return convertedRequest ? { ...convertedRequest, preparedReferences: converted } : null;
   }
-  if (preparedReferences || !usesSeedreamReferences(adapter.key, route.upstreamModel)) return prepared;
+  if (config.referenceSerializer === 'multipart_image_array' || preparedReferences || !usesSeedreamReferences(adapter.key, route.upstreamModel)) return prepared;
   const transport = seedreamReferenceTransport(config);
   const converted: string[] = [];
   try {
@@ -6204,6 +6243,7 @@ async function rememberImageTaskIdentity(
     taskId: string;
     statusUrl: string;
     profile: ImageTaskExecutionConfig['profile'];
+    directImageSources?: string[];
     clientRequestId: string;
     providerId?: string;
     routeId?: string | null;
@@ -6236,6 +6276,7 @@ async function rememberImageTaskIdentity(
             {
               taskId: identity.taskId,
               statusUrl: identity.statusUrl,
+              ...(identity.directImageSources ? { directImageSources: identity.directImageSources } : {}),
               profile: identity.profile,
               clientRequestId: identity.clientRequestId,
               providerId: identity.providerId,
@@ -6268,6 +6309,7 @@ type PreparedImageAdapterExecutionOptions = {
     taskId: string;
     statusUrl: string;
     profile: ImageTaskExecutionConfig['profile'];
+    directImageSources?: string[];
     taskMetadata?: ImageTaskMetadata;
     imageOperationContext?: ImageOperationContext;
   }) => Promise<void>;
@@ -6345,12 +6387,16 @@ export async function generatePreparedImageAdapterImages(
   route?: ImageAdapterRouteContext,
   options?: PreparedImageAdapterExecutionOptions,
 ) {
-  const resultLimit = imageResultLimit(input.imageCapabilities, input.count);
   const scopedReceiptHeaders = aiMediaMidjourneyRequestHeaders(provider, input, route)
     ?? uselgMidjourneyImagineHeaders(provider, input, route)
     ?? uselgMidjourneyFullHeaders(provider, input, route)
     ?? genericImageRequestHeaders(provider, input, route);
   const executionMode = imageRouteExecutionMode(route?.executionMode);
+  const fileRoute = ['GENERIC_OPENAI_IMAGE', 'SEEDREAM_IMAGES_API'].includes(prepared.adapterKey)
+    && imageAdapterConfig(route?.adapterConfig).referenceSerializer === 'multipart_image_array';
+  const resultLimit = fileRoute ? 1 : imageResultLimit(input.imageCapabilities, input.count);
+  if (fileRoute && executionMode !== 'TASK') throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID',
+    'Multipart file-array routes require TASK execution to preserve accepted receipts');
   const midjourneyFullTask = isUselgMidjourneyFull(provider, route);
   if (midjourneyFullTask && executionMode !== 'TASK') {
     throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID',
@@ -6360,7 +6406,21 @@ export async function generatePreparedImageAdapterImages(
     throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID',
       'Midjourney V8.2 Imagine requires asynchronous TASK execution, not DIRECT or INHERIT.', prepared.endpoint);
   }
-  const request: ImageAdapterRequest = options?.request ?? (prepared.execution === 'gemini-native'
+  const request: ImageAdapterRequest = options?.request ?? (prepared.contentType === 'multipart/form-data'
+    ? async (path, body, timeoutOverrideMs, extraHeaders, onResponseStatus, diagnosticScope) => {
+      if (body === undefined) return providerRequest(provider, secrets, path, undefined, timeoutOverrideMs, extraHeaders, onResponseStatus, diagnosticScope);
+      const staged: StagedNewApiEditImage[] = [];
+      try {
+        for (const [index, source] of (prepared.fileReferences ?? []).entries()) {
+          staged.push(await stageMultipartImageReference(source, index));
+        }
+        return await providerNewApiImageEditRequest(provider, secrets, input, staged, undefined, {
+          body: body as Record<string, unknown>, endpoint: path, fieldName: 'image[]', extraHeaders,
+          timeoutMs: timeoutOverrideMs, diagnosticScope, onResponseStatus,
+        });
+      } finally { await Promise.all(staged.map(image => image.cleanup().catch(() => {}))); }
+    }
+    : prepared.execution === 'gemini-native'
     ? (path, body, timeoutOverrideMs, extraHeaders, _onResponseStatus, diagnosticScope) => bigmodelRequest(
       provider,
       secrets,
@@ -6461,7 +6521,7 @@ export async function generatePreparedImageAdapterImages(
   // Images API adapters choose generation vs edit from the actual reference
   // payload. Replace a generic route's ordinary generation endpoint with its
   // prepared edit endpoint, but preserve independent task-submit contracts.
-  const taskSubmitEndpoint = prepared.adapterKey === 'SEEDREAM_IMAGES_API'
+  const taskSubmitEndpoint = fileRoute || prepared.adapterKey === 'SEEDREAM_IMAGES_API'
     || (input.inputImages.length > 0 && usesSeedreamReferences(prepared.adapterKey, prepared.submittedModel))
     || (prepared.adapterKey === 'GENERIC_OPENAI_IMAGE'
       && genericOpenAiImageTaskUsesNativeEdit(input.inputImages, input.imageCapabilities,
@@ -6528,7 +6588,8 @@ export async function generatePreparedImageAdapterImages(
       ),
     )).value;
   } catch (error) {
-    if (isAmbiguousImageTaskSubmitError(error)) {
+    if (isAmbiguousImageTaskSubmitError(error) || fileRoute && error instanceof UpstreamImageError
+      && (error.status >= 500 || error.status === 408)) {
       throw new AmbiguousImageTaskSubmissionError(
         error.status,
         `Image task submission outcome is uncertain: ${error.message}`,
@@ -6540,7 +6601,7 @@ export async function generatePreparedImageAdapterImages(
 
   // Only confirmed model contracts may finish TASK submission with receipt-free
   // OpenAI data[]; unrelated Generic routes retain their existing semantics.
-  const acceptsFinalSubmitImages = image25Task || midjourneyFullTask;
+  const acceptsFinalSubmitImages = image25Task || midjourneyFullTask || fileRoute;
   const finalSubmitImages = acceptsFinalSubmitImages
     ? imageTaskSubmitFinalImages(started, executionConfig, input.inputImages, resultLimit) : [];
   const configuredEnvelope = configuredImageTaskEnvelope(started, executionConfig);
@@ -6558,6 +6619,7 @@ export async function generatePreparedImageAdapterImages(
     };
   const statusUrl = 'statusUrl' in submitSummary ? submitSummary.statusUrl : '';
   if (!submitSummary.taskId && !statusUrl && !finalSubmitImages.length) {
+    if (fileRoute) throw new ImageTaskRecoveryRequiredError({ taskId: '', statusUrl: '', resultUrl: '' }, 'status', 'missing_task_receipt');
     throw new UpstreamImageError(
       502,
       'TASK submit response contained neither task_id nor status_url',
@@ -6584,7 +6646,20 @@ export async function generatePreparedImageAdapterImages(
     assetCount: finalSubmitImages.length || collectUselgTaskAssets(configuredEnvelope).length,
     resultUrl: imageTaskDiagnosticUrl(provider, nestedStringByKeys(configuredEnvelope, new Set(['result_url']))),
   });
-  if (finalSubmitImages.length) return finalSubmitImages;
+  if (finalSubmitImages.length) {
+    if (!fileRoute) return finalSubmitImages;
+    const directImageSources = finalSubmitImages.filter(source => /^https?:\/\//i.test(source));
+    if (directImageSources.length) {
+      try {
+        await options?.onTaskSubmitted?.({ taskId: '', statusUrl: '', profile: executionConfig.profile, directImageSources });
+      } catch (cause) {
+        throw new ImageTaskRecoveryRequiredError({ taskId: '', statusUrl: '', resultUrl: directImageSources[0]! },
+          'result', 'receipt_persistence_failed', cause);
+      }
+    }
+    return resolveImageAdapterResponse(provider, secrets, started, input.inputImages, resultLimit, options?.wait,
+      undefined, diagnosticContext, undefined, undefined, true);
+  }
   const preserveMetadata = prepared.adapterKey === 'GENERIC_OPENAI_IMAGE'
     && executionConfig.profile === 'GENERIC_TASK'
     && imageAdapterConfig(route?.adapterConfig).preserveTaskMetadata === true;
@@ -6676,6 +6751,7 @@ export async function generatePreparedImageAdapterImages(
       submitSummary.taskId,
     ),
     preserveMetadata ? options?.onTaskMetadata : undefined,
+    fileRoute,
   );
 }
 
@@ -6955,11 +7031,10 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     imageCapabilities: catalogResolution?.model.capabilities,
     quality: resolveImageOutputCapabilities(catalogResolution?.model.capabilities).supportedQualities.length ? input.quality : undefined,
     referenceSourceTypes: input.inputImages.map(referenceSourceType),
-    inputImages: await resolveReferenceImageSources(prisma, input.userId, input.inputImages),
+    inputImages: input.inputImages,
   };
   try { imageQualityFields(validatedInput.imageCapabilities, validatedInput.quality); }
   catch { throw new CloudAiError('invalid_request', 'Unsupported image quality', 400); }
-  const referencesResolvedAt = Date.now();
   if (catalogResolution
     && !catalogModelSupportsImageRequest(
       withGptImage2DimensionCapabilities(
@@ -7029,6 +7104,7 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
   const primaryRoute = compatibleCatalogRoutes.find(route => route.channelId === primaryProvider.id)
     ?? (catalogResolution?.route?.channelId === null ? catalogResolution.route : null)
     ?? null;
+  let primaryFileRoute = false;
   const reservationInput = {
     ...effectiveImageInputForProvider(
       primaryProvider,
@@ -7037,10 +7113,30 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
     ),
     ...(primaryRoute ? { model: primaryRoute.upstreamModelId } : {}),
   };
+  try {
+    const configured = primaryRoute && ['GENERIC_OPENAI_IMAGE', 'SEEDREAM_IMAGES_API'].includes(primaryRoute.adapterKey ?? '')
+      ? imageAdapterConfig(primaryRoute.adapterConfig) : {};
+    primaryFileRoute = configured.referenceSerializer === 'multipart_image_array';
+    validateConfiguredImagesInput({ prompt: input.prompt.trim(), references: input.inputImages, count: input.count,
+      capabilities: validatedInput.imageCapabilities }, configured);
+    const override = primaryRoute ? effectiveRouteCapabilitiesOverride(primaryRoute, managedRouting) : undefined;
+    if (override) validateConfiguredImagesInput({ prompt: input.prompt.trim(), references: input.inputImages,
+      count: input.count, capabilities: override }, configured);
+    if (configured.referenceSerializer === 'multipart_image_array' && imageRouteExecutionMode(primaryRoute?.executionMode) !== 'TASK') {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'Multipart file-array routes require TASK execution');
+    }
+  } catch (error) {
+    if (error instanceof ImageAdapterError) throw new CloudAiError(error.code, error.message, 400);
+    throw error;
+  }
+  validatedInput.inputImages = await resolveReferenceImageSources(prisma, input.userId, input.inputImages);
+  reservationInput.inputImages = validatedInput.inputImages;
+  const referencesResolvedAt = Date.now();
   const pricingSnapshot = catalogResolution
     ? await capturePricingSnapshot(prisma, catalogResolution.model, primaryRoute?.id ?? null, {
       resolution: reservationInput.resolution ?? '2k',
-      count: imageResultLimit(validatedInput.imageCapabilities, validatedInput.count),
+      count: primaryFileRoute ? 1 : imageResultLimit(validatedInput.imageCapabilities, validatedInput.count),
+      ...(primaryFileRoute ? { submissionMode: 'multipart_image_array' } : {}),
       ...(primaryRoute?.adapterKey === 'GENERIC_OPENAI_IMAGE' && imageAdapterConfig(primaryRoute.adapterConfig).enableTaskOperations
         ? { operation: imageAdapterConfig(primaryRoute.adapterConfig).requestParameters!.operation!,
           speed: imageAdapterConfig(primaryRoute.adapterConfig).requestParameters!.speed! } : {}),
@@ -7143,9 +7239,11 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
             preparedAdapterRequest, taskExecutionConfig)
             ? '/v1/images/edits'
             : preparedAdapterRequest
-            && preparedAdapterRequest.adapterKey === 'GENERIC_OPENAI_IMAGE'
-            && genericOpenAiImageTaskUsesNativeEdit(activeInput.inputImages, activeInput.imageCapabilities,
-              activeAdapterRoute?.adapterConfig, taskExecutionConfig?.submitEndpoint ?? '')
+            && ((activeInput.inputImages.length > 0
+              && usesSeedreamReferences(preparedAdapterRequest.adapterKey, preparedAdapterRequest.submittedModel))
+              || (preparedAdapterRequest.adapterKey === 'GENERIC_OPENAI_IMAGE'
+                && genericOpenAiImageTaskUsesNativeEdit(activeInput.inputImages, activeInput.imageCapabilities,
+                  activeAdapterRoute?.adapterConfig, taskExecutionConfig?.submitEndpoint ?? '')))
             ? preparedAdapterRequest.endpoint
             : taskExecutionConfig?.submitEndpoint ?? preparedAdapterRequest?.endpoint ?? null;
         } catch (error) {
@@ -7340,6 +7438,8 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
       },
     );
     if (error instanceof AmbiguousImageTaskSubmissionError) {
+      if (primaryFileRoute) await retainImageRetryRecovery(prisma, input.userId, reservation.requestId,
+        new ImageTaskRecoveryRequiredError({ taskId: '', statusUrl: '', resultUrl: '' }, 'status', 'submission_outcome_unknown', error), activeProvider.id);
       console.warn('[image_adapter_submit_ambiguous]', {
         clientRequestId: input.clientRequestId,
         canonicalModel: canonicalModelKey,
@@ -7357,8 +7457,8 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         503,
       );
     }
-    await releaseImageCredits(prisma, reservationInput, reservation.requestId, reservation.estimated,
-      buildFailureDiagnostic(error, { stage: 'image_generation', resolution: input.resolution }));
+    const failureDiagnostic = buildFailureDiagnostic(error, { stage: 'image_generation', resolution: input.resolution });
+    await releaseImageCredits(prisma, reservationInput, reservation.requestId, reservation.estimated, failureDiagnostic);
     if (error instanceof CloudAiError || error instanceof ModelCatalogError || error instanceof ReferenceUploadError) throw error;
     if (error instanceof ImageResultPersistenceError) {
       throw new CloudAiError(error.code, error.message, 502);
@@ -7381,7 +7481,9 @@ export async function executeWalletImageGeneration(prisma: PrismaClient, input: 
         error.status === 401 ? 'provider_auth_failed' : 'provider_request_failed',
         error.status === 401
           ? '生图渠道鉴权失败，请管理员检查渠道密钥'
-          : `生图渠道请求失败：${error.message}`,
+          : failureDiagnostic.detail
+            ? `${failureDiagnostic.message}: ${failureDiagnostic.detail}`
+            : failureDiagnostic.message,
         502,
       );
     }
@@ -7425,7 +7527,9 @@ export async function getWalletImageGenerationByRequest(
       && !Array.isArray(request.result) && 'recovery' in request.result
       ? { confirmationRequired: true, recoveryStatus: 'manual_confirmation_required' } : {}),
     completedAt: request.completedAt?.getTime() ?? null,
-    ...(failure ? { error: { code: failure.code, message: failure.message, httpStatus: failure.httpStatus } } : {}),
+    ...(failure ? { error: {
+      code: failure.code, message: failure.message, detail: failure.detail, httpStatus: failure.httpStatus,
+    } } : {}),
     ...(result ?? {}),
   };
 }
@@ -7463,7 +7567,10 @@ async function resumeWalletImageGeneration(prisma: PrismaClient, userId: string,
   const snapshot = request.pricingSnapshot as PricingSnapshot | null;
   // Historical requests without a receipt or captured tariff require manual
   // handling. Never guess a task, switch channels, or use today's price.
-  if (!identity?.taskId || !identity.statusUrl || tasks.length !== 1 || !receipt
+  const directImageSources = Array.isArray(receipt?.directImageSources) && receipt.directImageSources.length <= 16
+    && receipt.directImageSources.every(source => typeof source === 'string' && /^https?:\/\//i.test(source))
+    ? receipt.directImageSources as string[] : [];
+  if ((!identity?.taskId || !identity.statusUrl) && !directImageSources.length || tasks.length !== 1 || !receipt
     || !snapshot || snapshot.schemaVersion !== 1 || snapshot.modality !== 'image'
     || !snapshot.request || !snapshot.pricing) {
     throw new CloudAiError('IMAGE_TASK_RECOVERY_REQUIRED', '原任务回执或原始价格不完整，需要管理员核对；不会重新生成', 409);
@@ -7476,6 +7583,9 @@ async function resumeWalletImageGeneration(prisma: PrismaClient, userId: string,
     || route.canonicalModelId !== request.canonicalModelId) {
     throw new CloudAiError('IMAGE_TASK_RECOVERY_REQUIRED', '原任务渠道或模型映射已变化，需要管理员核对；不会重新生成', 409);
   }
+  const strictFileRoute = snapshot.request.submissionMode === 'multipart_image_array'
+    || imageAdapterConfig(route.adapterConfig).referenceSerializer === 'multipart_image_array';
+  if (directImageSources.length && !strictFileRoute) throw new CloudAiError('IMAGE_TASK_RECOVERY_REQUIRED', 'Direct-result recovery requires the original multipart route', 409);
   const config = normalizeImageTaskExecutionConfig(receipt.executionConfig ?? route.executionConfig);
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
   const resultLimit = Math.max(1, Math.min(16, Math.floor(Number(snapshot.request.count) || 1)));
@@ -7493,27 +7603,30 @@ async function resumeWalletImageGeneration(prisma: PrismaClient, userId: string,
     aspectRatio: '1:1', resolution: typeof snapshot.request.resolution === 'string' ? snapshot.request.resolution : undefined,
     outputFormat: 'png', count: resultLimit,
   };
+  const recoveryIdentity = { taskId: identity?.taskId ?? '', statusUrl: identity?.statusUrl ?? '',
+    resultUrl: identity?.resultUrl || directImageSources[0] || '' };
   try {
     await assertPublicProviderUrl(provider.baseUrl);
-    const initial = { task_id: identity.taskId, status: 'processing', status_url: identity.statusUrl,
-      ...(identity.resultUrl ? { result_url: identity.resultUrl } : {}) };
+    const initial = directImageSources.length ? { status: 'success', data: directImageSources.map(url => ({ url })) }
+      : { task_id: identity!.taskId, status: 'processing', status_url: identity!.statusUrl,
+        ...(identity!.resultUrl ? { result_url: identity!.resultUrl } : {}) };
     const sources = await resolveImageAdapterResponse(provider, secrets, initial, [], resultLimit, undefined,
       async (path, body, timeoutMs) => {
         if (body !== undefined) throw new Error('Image recovery only permits GET');
-        return configuredImageTaskEnvelope(await providerRequest(provider, secrets, path, undefined, timeoutMs), config, identity.taskId);
+        return configuredImageTaskEnvelope(await providerRequest(provider, secrets, path, undefined, timeoutMs), config, identity?.taskId ?? '');
       }, {
         clientRequestId, canonicalModel: snapshot.canonicalModelKey, routeId: route.id, providerId: provider.id,
         adapterKey: route.adapterKey || 'LEGACY', configuredModel: submittedModel,
         submittedModel, profile: config.profile,
         adapterExecutionStartedAt: Date.now(),
       }, async (path, timeoutMs) => configuredImageTaskEnvelope(
-        await imageTaskResultContent(provider, secrets, path, timeoutMs), config, identity.taskId),
-      preserveMetadata ? metadata => { taskMetadata = mergeImageTaskMetadata(taskMetadata, metadata); } : undefined);
+        await imageTaskResultContent(provider, secrets, path, timeoutMs), config, identity?.taskId ?? ''),
+      preserveMetadata ? metadata => { taskMetadata = mergeImageTaskMetadata(taskMetadata, metadata); } : undefined, strictFileRoute);
     const images = await persistGeneratedImageResultsAndScheduleMirrors(sources, provider.name, {
       clientRequestId, canonicalModel: snapshot.canonicalModelKey, routeId: route.id,
       providerId: provider.id, adapterKey: route.adapterKey || 'LEGACY',
     });
-    if (!images.length) throw new ImageTaskRecoveryRequiredError(initialIdentity(initial), 'result', 'result_not_ready');
+    if (!images.length) throw new ImageTaskRecoveryRequiredError(recoveryIdentity, 'result', 'result_not_ready');
     if (imageOperationContext) {
       const imageDimensions = await imageOperationResultDimensions(images);
       if (imageDimensions) imageOperationContext = { ...imageOperationContext, imageDimensions };
@@ -7525,7 +7638,7 @@ async function resumeWalletImageGeneration(prisma: PrismaClient, userId: string,
       provider: publicWalletImageProviderKind(provider), providerChannelId: provider.id,
       providerChannelName: provider.name, model: snapshot.canonicalModelKey,
     }, snapshot, route.id);
-    console.info('[image_task_recovered]', { clientRequestId, taskId: identity.taskId, resultCount: images.length, newGenerationSubmitted: false });
+    console.info('[image_task_recovered]', { clientRequestId, taskId: recoveryIdentity.taskId, resultCount: images.length, newGenerationSubmitted: false });
     return getWalletImageGenerationByRequest(prisma, userId, clientRequestId);
   } catch (error) {
     if (error instanceof ImageTaskTerminalFailureError) {
@@ -7534,15 +7647,12 @@ async function resumeWalletImageGeneration(prisma: PrismaClient, userId: string,
       return getWalletImageGenerationByRequest(prisma, userId, clientRequestId);
     }
     const pending = error instanceof ImageTaskRecoveryRequiredError ? error
-      : new ImageTaskRecoveryRequiredError({ taskId: identity.taskId, statusUrl: identity.statusUrl, resultUrl: identity.resultUrl || '' }, 'result', 'read_not_retryable', error);
+      : new ImageTaskRecoveryRequiredError(recoveryIdentity, 'result', 'read_not_retryable', error);
     await retainImageRetryRecovery(prisma, userId, request.id, pending, provider.id);
     throw new CloudAiError('IMAGE_TASK_RECOVERY_REQUIRED', '原任务结果仍待确认，已保留预扣积分；不会重新生成', 503);
   }
 }
 
-function initialIdentity(value: { task_id: string; status_url: string; result_url?: string }) {
-  return { taskId: value.task_id, statusUrl: value.status_url, resultUrl: value.result_url || '' };
-}
 
 export type VideoInput = {
   userId: string;

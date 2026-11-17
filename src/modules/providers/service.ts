@@ -88,9 +88,10 @@ function serializeProvider(provider: AiProviderChannel) {
   };
 }
 
-function defaultCapabilities(kind: AiProviderKind): AiCapability[] {
+export function defaultProviderCapabilities(kind: AiProviderKind): AiCapability[] {
   if (kind === 'MINIMAX') return ['VIDEO_MINIMAX'];
   if (kind === 'USELG' || kind === 'BIGMODEL') return ['IMAGE'];
+  if (kind === 'OPENAI_COMPATIBLE') return ['LLM', 'IMAGE'];
   return ['LLM'];
 }
 
@@ -167,7 +168,7 @@ export async function createProvider(prisma: PrismaClient, input: ProviderInput)
   } catch (error) {
     configurationError(error);
   }
-  const capabilities = input.capabilities ?? defaultCapabilities(input.kind);
+  const capabilities = input.capabilities ?? defaultProviderCapabilities(input.kind);
 
   try {
     return await prisma.$transaction(async (tx) => {
@@ -554,6 +555,8 @@ export async function getProviderBalance(prisma: PrismaClient, providerId: strin
       ? [{ name: 'MiniMax video endpoint', path: '/api/minimax/v2/query/video_generation?task_id=probe' }]
     : provider.kind === 'BIGMODEL'
       ? [{ name: 'Bigmodel /v1beta/models', path: '/v1beta/models', headers: { 'x-goog-api-key': secrets.apiKey } }]
+    : provider.kind === 'OPENAI_COMPATIBLE'
+      ? [{ name: 'OpenAI-compatible /v1/models', path: '/v1/models' }]
     : [
       { name: 'NewAPI /api/usage/token/', path: '/api/usage/token/' },
       { name: 'NewAPI /api/user/self', path: '/api/user/self' },
@@ -602,14 +605,14 @@ function modelIds(value: unknown) {
   if (!Array.isArray(data)) return [];
   return data
     .map((item: unknown) => {
+      if (typeof item === 'string') return item;
       if (!item || typeof item !== 'object') return null;
       const itemRecord = item as Record<string, unknown>;
-      if (typeof itemRecord.id === 'string') return itemRecord.id;
-      return typeof itemRecord.name === 'string'
-        ? itemRecord.name.replace(/^models\//, '')
-        : null;
+      const id = itemRecord.id ?? itemRecord.name ?? itemRecord.model ?? itemRecord.model_id;
+      return typeof id === 'string' ? id.replace(/^models\//, '') : null;
     })
-    .filter((id): id is string => typeof id === 'string' && id.length > 0)
+    .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+    .map(id => id.trim())
     .slice(0, 50);
 }
 

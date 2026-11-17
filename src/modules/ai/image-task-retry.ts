@@ -142,7 +142,29 @@ export async function retryImageRead<T>(
   throw new ImageTaskRecoveryRequiredError(options.identity, options.stage, 'read_budget_exhausted', last);
 }
 
+/** Only task-envelope fields are inspected, never prompts, assets or arbitrary strings. */
+export function imageTaskStopPollingReason(value: unknown): string | undefined {
+  const visited = new Set<object>();
+  const visit = (value: unknown, depth: number): string | undefined => {
+    const row = record(value);
+    if (!row || depth > 8 || visited.has(row)) return;
+    visited.add(row);
+    if (row.auto_poll === false || row.auto_poll === 'false' || row.autoPoll === false) return 'auto_poll_disabled';
+    if (row.poll_after_ms === 0 || row.poll_after_ms === '0' || row.pollAfterMs === 0) return 'polling_paused';
+    if (row.paused === true) return 'paused';
+    const rawState = row.status ?? row.state;
+    const state = typeof rawState === 'string' ? rawState.toLowerCase() : '';
+    if (['paused', 'uncertain', 'client_disconnected', 'pending_confirmation'].includes(state)) return state;
+    for (const key of ['data', 'result', 'task', 'response', 'raw']) {
+      const reason = visit(row[key], depth + 1);
+      if (reason) return reason;
+    }
+  };
+  return visit(value, 0);
+}
+
 export type ImageTaskSnapshot = ImageTaskIdentity & {
+  stopPollingReason?: string | undefined;
   state: string; pollAfterMs: number; images: string[]; failure?: string; retryAfterMs?: number | undefined;
   assets: Array<{ key: 'signed_url' | 'download_url' | 'url'; value: string }>;
 };
@@ -230,6 +252,7 @@ export async function pollAcceptedImageTask(options: ImageTaskPollOptions): Prom
   };
   const initialResult = await readCompletedResult();
   if (initialResult.length) return initialResult;
+  if (snapshot.stopPollingReason) throw new ImageTaskRecoveryRequiredError(identity, 'status', snapshot.stopPollingReason);
   if (!identity.taskId && !identity.statusUrl) {
     throw new ImageTaskRecoveryRequiredError(identity, 'status', 'missing_task_receipt');
   }
@@ -254,6 +277,7 @@ export async function pollAcceptedImageTask(options: ImageTaskPollOptions): Prom
     // Never probe result on every queued/processing status; this used to add 45s stalls.
     const resultImages = await readCompletedResult();
     if (resultImages.length) return resultImages;
+    if (snapshot.stopPollingReason) throw new ImageTaskRecoveryRequiredError(identity, 'status', snapshot.stopPollingReason);
     // completed without readable assets is delivery-pending, not a generation failure.
   }
   throw new ImageTaskRecoveryRequiredError(identity, completedAt === undefined ? 'status' : 'result',

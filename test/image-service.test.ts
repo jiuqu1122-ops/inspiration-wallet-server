@@ -527,6 +527,7 @@ describe('dual-protocol image channels', () => {
       kind: 'BIGMODEL',
       capabilities: ['LLM'],
     })).toBe(false);
+    expect(providerCanServeImageAlongsideAgent({ kind: 'OPENAI_COMPATIBLE', capabilities: ['LLM', 'IMAGE'] } as never)).toBe(true);
   });
 });
 

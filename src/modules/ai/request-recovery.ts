@@ -5,14 +5,15 @@ import { releaseMembershipQuota } from '../membership/quota-billing.js';
 const ACTIVE_REQUEST_STATUSES = ['RESERVED', 'PROCESSING'] as const;
 const STALE_REQUEST_MESSAGE = '任务长时间未完成，已自动释放预留积分';
 
-function hasImageOperationTariff(value: unknown) {
+function requiresConfirmedImageOutcome(value: unknown) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const snapshot = value as Record<string, unknown>;
   const request = snapshot.request;
   if (snapshot.modality !== 'image' || !request || typeof request !== 'object' || Array.isArray(request)) return false;
   const tariff = request as Record<string, unknown>;
-  return typeof tariff.operation === 'string' && typeof tariff.speed === 'string'
-    && typeof tariff.operationUnitCredits === 'string';
+  return tariff.submissionMode === 'multipart_image_array'
+    || typeof tariff.operation === 'string' && typeof tariff.speed === 'string'
+      && typeof tariff.operationUnitCredits === 'string';
 }
 
 function staleFailureDiagnostic(now: Date) {
@@ -81,7 +82,7 @@ export async function recoverStaleAiRequests(
     scanned += 1;
     // An operation may have been accepted upstream even before its task receipt
     // reached us. Only its explicit terminal state can release this hold.
-    if (hasImageOperationTariff(candidate.pricingSnapshot)) continue;
+    if (requiresConfirmedImageOutcome(candidate.pricingSnapshot)) continue;
     eligible += 1;
     const now = new Date();
     try {

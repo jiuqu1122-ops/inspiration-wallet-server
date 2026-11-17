@@ -25,8 +25,41 @@ function exactDimension(
   return value.trim();
 }
 
+/** Route opt-in limits, also called before reading references or reserving credits. */
+export function validateConfiguredImagesInput(input: Pick<ImageAdapterInput, 'prompt' | 'references' | 'count' | 'capabilities'>, config: ImageAdapterConfig) {
+  const capabilities = input.capabilities && typeof input.capabilities === 'object'
+    ? input.capabilities as Record<string, unknown> : {};
+  let maximum = config.referenceSerializer === 'multipart_image_array' ? config.maxReferenceImages ?? 9 : 9;
+  if (config.maxReferenceImages !== undefined) maximum = Math.min(maximum, config.maxReferenceImages);
+  if (typeof capabilities.maxReferenceImages === 'number') maximum = Math.min(maximum, capabilities.maxReferenceImages);
+  if (capabilities.supportsReferenceImages === false || capabilities.supportsReferenceImage === false) maximum = 0;
+  if (input.references.length > maximum) throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID',
+    `This image route accepts at most ${maximum} reference images; received ${input.references.length}`);
+  if (config.referenceSerializer === 'json_image' && input.references.length > 1) {
+    throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'The configured json_image serializer accepts exactly one reference image');
+  }
+  if (config.maxPromptCharacters !== undefined && Array.from(input.prompt).length > config.maxPromptCharacters) {
+    throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', `Prompt exceeds the configured ${config.maxPromptCharacters} character limit`);
+  }
+  if (config.referenceSerializer === 'multipart_image_array' && input.references.length && capabilities.supportsImageEdit === false) {
+    throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'This route does not support reference image edits');
+  }
+  if (config.referenceSerializer === 'multipart_image_array' && input.count !== 1) {
+    throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'Multipart image-array routes output exactly one image per request');
+  }
+  if (config.referenceSerializer === 'multipart_image_array' && !input.prompt.trim()) {
+    throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'Prompt must not be empty');
+  }
+  if (config.referenceSerializer === 'multipart_image_array'
+    && (config.requestParameters?.n !== undefined && input.count !== config.requestParameters.n
+      || input.references.length > 0 && config.referenceRequestCount !== undefined && input.count !== config.referenceRequestCount)) {
+    throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'Requested output count does not match the configured route count');
+  }
+}
+
 export function configuredImagesApiFields(input: ImageAdapterInput) {
   const config = imageAdapterConfig(input.adapterConfig);
+  validateConfiguredImagesInput(input, config);
   const body: Record<string, unknown> = {};
   const parameter = config.resolutionParameter ?? 'none';
   const mode = config.resolutionValueMode ?? 'label';
@@ -49,7 +82,7 @@ export function serializeConfiguredReferences(
   config: ImageAdapterConfig,
   endpoint: string,
 ) {
-  if (references.length === 0) return;
+  if (references.length === 0 || config.referenceSerializer === 'multipart_image_array') return;
   if (config.referenceSerializer === 'json_image') {
     if (references.length !== 1) {
       throw new ImageAdapterError(

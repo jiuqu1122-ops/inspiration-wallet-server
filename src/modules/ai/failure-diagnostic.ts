@@ -11,6 +11,7 @@ const KNOWN_MESSAGES: Record<string, string> = {
   PROVIDER_QUOTA_EXCEEDED: '上游额度不足，请管理员检查该渠道分组及余额',
   PROVIDER_CONTENT_REJECTED: '上游安全策略拒绝了提示词或参考图片',
   PROVIDER_INVALID_REQUEST: '上游拒绝请求参数，请核对模型规格及素材要求',
+  PROVIDER_PROMPT_TOO_LONG: '\u63d0\u793a\u8bcd\u8d85\u8fc7\u5f53\u524d\u6a21\u578b\u6216\u751f\u56fe\u6e20\u9053\u652f\u6301\u7684\u957f\u5ea6\u4e0a\u9650',
   PROVIDER_IMAGE_URL_BLOCKED: '渠道拒绝参考图片 URL，请配置渠道确认支持的 Data URL 或允许的公开 HTTPS 图片地址',
   PROVIDER_SERVER_ERROR: '上游服务返回错误',
   PROVIDER_HTTP_ERROR: '上游 HTTP 请求失败',
@@ -41,12 +42,40 @@ export type FailureDiagnostic = {
   version: 1;
   code: string;
   message: string;
+  /** A bounded, redacted upstream reason. Never contains prompts, URLs, keys, or response bodies. */
+  detail: string | null;
   stage: string;
   httpStatus: number | null;
   causeCode: string | null;
   recordedAt: string;
   resolution: string | null;
 };
+
+const SAFE_FAILURE_DETAILS = new Set([
+  'The prompt exceeds the upstream image service character limit.',
+  'The prompt exceeds the upstream model context limit.',
+  'The upstream provider does not recognize the configured model ID.',
+  'The upstream provider rejected a model parameter or output setting.',
+  'The upstream provider rejected or could not read a reference image.',
+  'The upstream provider rejected the request under its content policy.',
+]);
+
+function safeFailureDetail(text: string, code: string): string | null {
+  // Upstream messages may echo prompts, API credentials or signed URLs. Store
+  // only curated cause categories, never a raw response substring.
+  if (code === 'PROVIDER_PROMPT_TOO_LONG') {
+    if (/(?:prompt|input|\u63d0\u793a\u8bcd).{0,80}(?:token|context)|(?:token|context).{0,80}(?:prompt|input|\u63d0\u793a\u8bcd)/i.test(text)) {
+      return 'The prompt exceeds the upstream model context limit.';
+    }
+    return 'The prompt exceeds the upstream image service character limit.';
+  }
+  if (/(?:prompt|input).{0,80}(?:token|context).{0,50}(?:limit|maximum|exceed)/i.test(text)) return 'The prompt exceeds the upstream model context limit.';
+  if (/(?:unknown|unsupported|not supported|invalid).{0,50}(?:model)|(?:model).{0,50}(?:not found|unknown|unsupported)/i.test(text)) return 'The upstream provider does not recognize the configured model ID.';
+  if (/(?:unsupported|unknown|invalid|not allowed).{0,60}(?:parameter|field|aspect.ratio|resolution|quality)|(?:parameter|field|aspect.ratio|resolution|quality).{0,60}(?:unsupported|unknown|invalid)/i.test(text)) return 'The upstream provider rejected a model parameter or output setting.';
+  if (/(?:reference|input).{0,50}image.{0,50}(?:invalid|unsupported|too large|size|url|fetch|download)|(?:invalid|unsupported|too large).{0,50}(?:reference|input).{0,30}image/i.test(text)) return 'The upstream provider rejected or could not read a reference image.';
+  if (/(?:content policy|moderation|safety|blocked|not allowed)/i.test(text)) return 'The upstream provider rejected the request under its content policy.';
+  return null;
+}
 
 export function buildFailureDiagnostic(
   error: unknown,
@@ -87,6 +116,7 @@ export function buildFailureDiagnostic(
     code = 'PROVIDER_IMAGE_URL_BLOCKED';
     httpStatus = 400;
   }
+  else if (/(?:prompt|\u63d0\u793a\u8bcd).{0,60}(?:too long|exceeds?|is over.{0,20}limit)|(?:prompt|\u63d0\u793a\u8bcd).{0,60}(?:length|characters?|tokens?|size).{0,40}(?:limit|maximum|exceeds?|too long|\u8d85\u51fa|\u4e0a\u9650)|(?:maximum|limit).{0,60}(?:prompt|\u63d0\u793a\u8bcd).{0,60}(?:length|characters?|tokens?|size)|(?:\u63d0\u793a\u8bcd).{0,20}(?:\u8d85\u957f|\u8d85\u51fa.{0,12}\u9650\u5236|\u957f\u5ea6\u4e0a\u9650|\u5b57\u6570\u4e0a\u9650)/i.test(text)) code = 'PROVIDER_PROMPT_TOO_LONG';
   else if (/\b(?:quota_not_enough|insufficient_quota|insufficient_balance)\b/i.test(text)) code = 'PROVIDER_QUOTA_EXCEEDED';
   else if (/\b(?:content_policy_violation|content_policy_rejected|moderation_blocked|safety_system)\b/i.test(text)) code = 'PROVIDER_CONTENT_REJECTED';
   else if (/too large|size is invalid|exceeds? (?:the )?(?:size|byte)|大小超|超出.{0,8}限制/i.test(text)) code = 'IMAGE_SIZE_LIMIT';
@@ -104,7 +134,7 @@ export function buildFailureDiagnostic(
   const resolution = typeof context.resolution === 'string' && /^(?:\d{1,4}[kp]|\d{1,5}x\d{1,5})$/i.test(context.resolution.trim())
     ? context.resolution.trim() : null;
   return {
-    version: 1, code, message: KNOWN_MESSAGES[code]!,
+    version: 1, code, message: KNOWN_MESSAGES[code]!, detail: safeFailureDetail(text, code),
     stage: persistence ? 'result_persistence' : SAFE_STAGES.has(context.stage) ? context.stage : 'image_generation',
     httpStatus, causeCode, recordedAt: now.toISOString(), resolution,
   };
@@ -118,6 +148,7 @@ export function readFailureDiagnostic(value: unknown): FailureDiagnostic | null 
   if (typeof record.recordedAt !== 'string' || !Number.isFinite(Date.parse(record.recordedAt))) return null;
   return {
     version: 1, code: record.code, message: KNOWN_MESSAGES[record.code]!,
+    detail: typeof record.detail === 'string' && SAFE_FAILURE_DETAILS.has(record.detail) ? record.detail : null,
     stage: typeof record.stage === 'string' && SAFE_STAGES.has(record.stage) ? record.stage : 'image_generation',
     recordedAt: new Date(record.recordedAt).toISOString(),
     httpStatus: typeof record.httpStatus === 'number' && Number.isInteger(record.httpStatus)

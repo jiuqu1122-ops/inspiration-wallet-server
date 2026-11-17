@@ -103,6 +103,7 @@ enum AiRouteExecutionMode {
 
 enum AiProviderKind {
   NEW_API
+  OPENAI_COMPATIBLE
   XAIS
   MIKOTO
   BIGMODEL

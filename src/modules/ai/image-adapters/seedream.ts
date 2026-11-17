@@ -38,9 +38,11 @@ export const seedreamImagesApiAdapter: ImageModelAdapter = {
       : generationEndpoint(config);
     const body = {
       model: input.upstreamModel,
+      ...(config.referenceSerializer === 'multipart_image_array' ? { n: 1, response_format: config.referenceResponseFormat ?? 'url' } : {}),
       prompt: input.prompt,
       ...(input.count > 1 ? { n: input.count } : {}),
       ...configuredFields,
+      ...(config.referenceSerializer === 'multipart_image_array' ? config.requestParameters : {}),
     };
     serializeConfiguredReferences(body, input.references, config, endpoint);
     return {
@@ -49,7 +51,10 @@ export const seedreamImagesApiAdapter: ImageModelAdapter = {
       submittedModel: input.upstreamModel,
       endpoint,
       method: 'POST',
-      contentType: 'application/json',
+      contentType: input.references.length && config.referenceSerializer === 'multipart_image_array'
+        ? 'multipart/form-data' : 'application/json',
+      ...(input.references.length && config.referenceSerializer === 'multipart_image_array'
+        ? { fileReferences: input.references } : {}),
       body,
     };
   },

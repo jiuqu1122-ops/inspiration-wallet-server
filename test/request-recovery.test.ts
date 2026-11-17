@@ -73,3 +73,15 @@ describe('stale AI request recovery', () => {
     expect(transaction.aiVideoTask.updateMany).not.toHaveBeenCalled();
   });
 });
+
+
+describe('explicit multipart submission safety holds', () => {
+  it('does not auto-refund an old accepted or unknown multipart submission', async () => {
+    const { prisma, transaction } = makePrisma();
+    prisma.aiRequest.findMany.mockResolvedValue([{ id: 'held-image', userId: 'owner', capability: 'IMAGE',
+      estimatedCredits: new Prisma.Decimal('25'), clientRequestId: 'file-request',
+      pricingSnapshot: { modality: 'image', request: { submissionMode: 'multipart_image_array' } } } as never]);
+    expect(await recoverStaleAiRequests(prisma as never, new Date())).toEqual({ scanned: 1, recovered: 0 });
+    expect(transaction.wallet.update).not.toHaveBeenCalled(); expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+});

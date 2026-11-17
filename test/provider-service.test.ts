@@ -2,11 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 import { encryptProviderSecrets } from '../src/lib/provider-secrets.js';
 import {
   buildProviderProbeBody,
+  defaultProviderCapabilities,
   testProvider,
 } from '../src/modules/providers/service.js';
 
 function provider(
-  kind: 'MIKOTO' | 'BIGMODEL' | 'MINIMAX' | 'USELG',
+  kind: 'MIKOTO' | 'BIGMODEL' | 'MINIMAX' | 'USELG' | 'OPENAI_COMPATIBLE',
   capabilities: string[],
   defaultModel = 'gpt-5.4',
 ) {
@@ -32,6 +33,51 @@ function prismaFor(value: unknown) {
 }
 
 describe('provider connection probes', () => {
+  it('defaults generic OpenAI-compatible channels to independent LLM and image capabilities', () => {
+    expect(defaultProviderCapabilities('OPENAI_COMPATIBLE')).toEqual(['LLM', 'IMAGE']);
+  });
+  it('checks a generic OpenAI-compatible channel through /v1/models without NewAPI management endpoints', async () => {
+    const discovered = Array.from({ length: 18 }, (_, index) => ({ id: `provider-model-${index + 1}` }));
+    discovered[0] = { id: 'gpt-image-2' };
+    discovered[1] = { id: 'gpt-5.6-sol' };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: discovered }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: 'OK' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await testProvider(
+      prismaFor(provider('OPENAI_COMPATIBLE', ['LLM', 'IMAGE'], 'gpt-5.6-sol')),
+      'provider-test-1',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.modelCount).toBe(18);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://example.com/v1/models');
+    expect(String(fetchMock.mock.calls[1]?.[0])).toBe('https://example.com/v1/chat/completions');
+  });
+
+  it('discovers string and alternate object model IDs from compatible model catalogs', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ models: [
+        'gpt-5.6-sol', { model_id: 'image-model-1' }, { name: 'models/gpt-5.4' }, { model: 'vision-model-1' },
+      ] }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: 'OK' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await testProvider(
+      prismaFor(provider('OPENAI_COMPATIBLE', ['LLM'], '')),
+      'provider-test-1',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.modelCount).toBe(4);
+    expect(result.message).toContain('LLM probe passed (gpt-5.6-sol)');
+  });
+
   it('checks Mikoto with a real OpenAI-compatible completion request', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({

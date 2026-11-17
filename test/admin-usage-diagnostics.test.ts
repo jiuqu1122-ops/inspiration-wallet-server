@@ -79,6 +79,32 @@ test('circular causes and throwing error getters cannot break failure handling',
   assert.equal(buildFailureDiagnostic(cyclic, { stage: 'text_request' }, now).code, 'NETWORK_ERROR');
   assert.doesNotThrow(() => buildFailureDiagnostic({ get message() { throw new Error('bad getter'); } }, { stage: 'text_request' }, now));
 });
+test('preserves a redacted concrete prompt-limit detail without storing prompt content', () => {
+  const result = buildFailureDiagnostic({
+    status: 400,
+    message: 'HTTP 400: The prompt exceeds the character limit of the currently available image service. prompt=secret words',
+  }, { stage: 'image_generation' }, now);
+  assert.equal(result.code, 'PROVIDER_PROMPT_TOO_LONG');
+  assert.equal(result.message, '\u63d0\u793a\u8bcd\u8d85\u8fc7\u5f53\u524d\u6a21\u578b\u6216\u751f\u56fe\u6e20\u9053\u652f\u6301\u7684\u957f\u5ea6\u4e0a\u9650');
+  assert.match(result.detail ?? '', /character limit/i);
+  assert.ok(!JSON.stringify(result).includes('secret words'));
+  assert.equal(readFailureDiagnostic(result)?.detail, result.detail);
+});
+
+test('classifies common prompt-limit word orders without exposing the upstream text', () => {
+  for (const message of [
+    'Prompt length exceeds the maximum of 4000 characters: private prompt text',
+    'Your prompt is too long for this model. trace=https://provider.example/private',
+    'prompt 9001 characters exceeds maximum length 4000',
+  ]) {
+    const result = buildFailureDiagnostic({ status: 400, message }, { stage: 'image_generation' }, now);
+    assert.equal(result.code, 'PROVIDER_PROMPT_TOO_LONG');
+    assert.equal(result.detail, 'The prompt exceeds the upstream image service character limit.');
+    assert.ok(!JSON.stringify(result).includes('private prompt text'));
+    assert.ok(!JSON.stringify(result).includes('provider.example'));
+  }
+});
+
 test('HTTP 429, server failures, timeouts and cancellations have separate codes', () => {
   assert.equal(buildFailureDiagnostic({ status: 429 }, { stage: 'text_request' }, now).code, 'PROVIDER_RATE_LIMITED');
   assert.equal(buildFailureDiagnostic({ status: 503 }, { stage: 'text_request' }, now).code, 'PROVIDER_SERVER_ERROR');

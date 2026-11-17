@@ -16,7 +16,7 @@ export function genericImageRequestHeaders(
   input: RequestIdentity,
   route: RouteIdentity | undefined,
 ) {
-  if (route?.adapterKey !== 'GENERIC_OPENAI_IMAGE'
+  if (!route || !['GENERIC_OPENAI_IMAGE', 'SEEDREAM_IMAGES_API'].includes(route?.adapterKey ?? '')
     || imageAdapterConfig(route.adapterConfig).idempotencyHeader !== 'Idempotency-Key') return undefined;
   const fingerprint = createHash('sha256').update(JSON.stringify([
     'generic-image-idempotency-v1', input.userId, provider.id, route.routeId, input.clientRequestId,

@@ -399,10 +399,13 @@ export async function updateAdminAiRoute(
       );
     }
     const effectiveAdapterKey = input.adapterKey === undefined ? current.adapterKey : input.adapterKey;
-    if (effectiveAdapterKey === 'GENERIC_OPENAI_IMAGE') {
+    if (effectiveAdapterKey === 'GENERIC_OPENAI_IMAGE' || effectiveAdapterKey === 'SEEDREAM_IMAGES_API') {
       const effectiveConfig = imageAdapterConfig(input.adapterConfig === undefined ? current.adapterConfig : input.adapterConfig);
       const execution = nextExecutionConfig && typeof nextExecutionConfig === 'object' && !Array.isArray(nextExecutionConfig)
         ? nextExecutionConfig as Record<string, unknown> : {};
+      if (effectiveConfig.referenceSerializer === 'multipart_image_array' && (nextExecutionMode !== 'TASK' || execution.profile !== 'GENERIC_TASK')) {
+        throw new AiModelAdminError('INVALID_REQUEST', 'Multipart image-array routes require Generic TASK execution', 400);
+      }
       if (effectiveConfig.enableTaskOperations && (nextExecutionMode !== 'TASK' || execution.profile !== 'GENERIC_TASK')) {
         throw new AiModelAdminError('INVALID_REQUEST', 'Task operations require Generic TASK execution', 400);
       }
@@ -434,7 +437,7 @@ export async function updateAdminAiRoute(
         ? Prisma.DbNull
         : nextAdapterKey === 'GENERIC_ASYNC_VIDEO' || nextAdapterKey === 'AI_MEDIA_VIDEOS_API'
           ? toInputJson(validateGenericAsyncVideoConfig(input.adapterConfig))
-          : nextAdapterKey === 'GENERIC_OPENAI_IMAGE'
+          : nextAdapterKey === 'GENERIC_OPENAI_IMAGE' || nextAdapterKey === 'SEEDREAM_IMAGES_API'
             ? toInputJson(imageAdapterConfig(input.adapterConfig))
             : input.adapterConfig;
     }

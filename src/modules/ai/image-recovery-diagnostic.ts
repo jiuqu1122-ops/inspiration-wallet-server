@@ -21,7 +21,7 @@ export function imageRecoveryDiagnostic(result: unknown, now = new Date()) {
   const diagnostic: FailureDiagnostic = {
     version: 1, code: 'IMAGE_TASK_RECOVERY_REQUIRED',
     message: reasons[reason] ?? '原任务结果待确认，已停止自动重新生成',
-    stage: 'request_recovery', httpStatus: null, causeCode: null, recordedAt, resolution: null,
+    detail: null, stage: 'request_recovery', httpStatus: null, causeCode: null, recordedAt, resolution: null,
   };
   return {
     diagnostic,

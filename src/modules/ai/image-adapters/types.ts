@@ -20,7 +20,9 @@ export type ImageAdapterConfig = {
   generationEndpoint?: string;
   editEndpoint?: string;
   exactDimensions?: Record<string, Record<string, string>>;
-  referenceSerializer?: 'json_image' | 'json_images' | 'object_image_url';
+  referenceSerializer?: 'json_image' | 'json_images' | 'object_image_url' | 'multipart_image_array';
+  maxReferenceImages?: number;
+  maxPromptCharacters?: number;
   referenceTransport?: 'data_url' | 'public_https';
   referenceRequestCount?: 1;
   referenceResponseFormat?: 'url' | 'b64_json';
@@ -58,7 +60,8 @@ export type PreparedImageAdapterRequest = {
   submittedModel: string;
   endpoint: string;
   method: 'POST';
-  contentType: 'application/json';
+  contentType: 'application/json' | 'multipart/form-data';
+  fileReferences?: string[];
   body: Record<string, unknown>;
   preparedReferences?: string[];
 };
@@ -138,6 +141,8 @@ export function imageAdapterConfig(value: unknown): ImageAdapterConfig {
     'editEndpoint',
     'exactDimensions',
     'referenceSerializer',
+    'maxReferenceImages',
+    'maxPromptCharacters',
     'referenceTransport',
     'referenceRequestCount',
     'referenceResponseFormat',
@@ -207,9 +212,20 @@ export function imageAdapterConfig(value: unknown): ImageAdapterConfig {
   }
   if (source.referenceSerializer !== undefined) {
     if (source.referenceSerializer === 'json_image' || source.referenceSerializer === 'json_images'
-      || source.referenceSerializer === 'object_image_url') {
+      || source.referenceSerializer === 'object_image_url' || source.referenceSerializer === 'multipart_image_array') {
       config.referenceSerializer = source.referenceSerializer;
     } else throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', 'Invalid referenceSerializer');
+  }
+  for (const [key, maximum] of [['maxReferenceImages', 10], ['maxPromptCharacters', 32000]] as const) {
+    const value = source[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > maximum) {
+      throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', `Invalid ${key}: expected 1-${maximum}`);
+    }
+    config[key] = value;
+  }
+  if (config.maxReferenceImages === 10 && config.referenceSerializer !== 'multipart_image_array') {
+    throw new ImageAdapterError('IMAGE_ADAPTER_CONFIG_INVALID', '10 references require explicit multipart_image_array serialization');
   }
   if (source.referenceTransport !== undefined) {
     if (source.referenceTransport === 'data_url' || source.referenceTransport === 'public_https') {

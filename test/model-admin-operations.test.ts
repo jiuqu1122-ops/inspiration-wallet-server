@@ -149,6 +149,25 @@ describe('AI Model Center route operations', () => {
     });
   });
 
+  it('changes reference transport without replacing dimensions, task execution, model mapping or costs', async () => {
+    const adapterConfig = { referenceSerializer: 'json_images', resolutionParameter: 'size', resolutionValueMode: 'exact',
+      exactDimensions: { '2K': { '1:1': '2048x2048' } }, generationEndpoint: '/v1/images/generations', editEndpoint: '/v1/images/edits' };
+    const route = { id: 'route-seedream', canonicalModelId: 'model-seedream', canonicalModel: { modality: 'image' },
+      upstreamModelId: 'seedream-5.0-pro', enabled: true, costProfile: { currency: 'CNY', cnyPerImage: '0.3' }, metadata: null,
+      adapterKey: 'GENERIC_OPENAI_IMAGE', adapterConfig, executionMode: 'TASK', executionConfig: {
+        profile: 'GENERIC_TASK', submitEndpoint: '/v1/images/generations', statusEndpointTemplate: '/v1/images/tasks/{taskId}?view=summary',
+      }, updatedAt };
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const transaction = { aiModelRoute: { findUnique: vi.fn(async () => route), updateMany, findUniqueOrThrow: vi.fn(async () => route) } };
+    await updateAdminAiRoute(withTransaction(transaction), route.id, {
+      adapterConfig: { ...adapterConfig, referenceTransport: 'data_url' }, expectedUpdatedAt: updatedAt.toISOString(),
+    }, context);
+    expect(updateMany).toHaveBeenCalledWith({ where: { id: route.id, updatedAt }, data: {
+      adapterConfig: { ...adapterConfig, referenceTransport: 'data_url' },
+    } });
+    expect(route.adapterConfig).toEqual(adapterConfig);
+  });
+
   it('deletes only an unused hidden draft model and records the operation', async () => {
     const model = {
       id: 'model-unused',
@@ -979,5 +998,25 @@ describe('AI Model Center route operations', () => {
       status: 'MAPPED',
       suggestedModelId: 'model-remapped',
     });
+  });
+});
+
+
+describe('explicit multipart image route settings persistence', () => {
+  it.each(['GENERIC_OPENAI_IMAGE', 'SEEDREAM_IMAGES_API'])('saves and reloads multipart config for %s without changing price or mapping', async adapterKey => {
+    const adapterConfig = { referenceSerializer: 'multipart_image_array', maxReferenceImages: 10, maxPromptCharacters: 8000,
+      idempotencyHeader: 'Idempotency-Key', resolutionParameter: 'resolution', requestParameters: { n: 1, response_format: 'url' } };
+    const executionConfig = { profile: 'GENERIC_TASK', submitEndpoint: '/v1/images/generations',
+      statusEndpointTemplate: '/v1/images/tasks/{taskId}?view=summary', resultEndpointTemplate: '/v1/images/tasks/{taskId}' };
+    let saved = { id: 'file-route', canonicalModelId: 'seedream55', canonicalModel: { modality: 'image' },
+      adapterKey, adapterConfig: null, executionMode: 'TASK', executionConfig, updatedAt,
+      costProfile: { currency: 'CNY', cnyPerImage: '1' } };
+    const updateMany = vi.fn(async ({ data }) => { saved = { ...saved, ...data }; return { count: 1 }; });
+    const tx = { aiModelRoute: { findUnique: vi.fn(async () => saved), updateMany, findUniqueOrThrow: vi.fn(async () => saved) } };
+    const result = await updateAdminAiRoute(withTransaction(tx), saved.id,
+      { adapterConfig, expectedUpdatedAt: updatedAt.toISOString() }, context);
+    expect(result.adapterConfig).toEqual(adapterConfig); expect(result.canonicalModelId).toBe('seedream55');
+    expect(updateMany.mock.calls[0]![0].data).toEqual({ adapterConfig });
+    expect(result.costProfile).toEqual({ currency: 'CNY', cnyPerImage: '1' }); expect(result.executionConfig).toEqual(executionConfig);
   });
 });

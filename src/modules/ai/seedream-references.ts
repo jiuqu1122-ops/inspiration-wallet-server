@@ -1,5 +1,7 @@
 import { lookup } from 'node:dns/promises';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { isIP } from 'node:net';
 import { Readable } from 'node:stream';
 import { Agent } from 'undici';
@@ -249,4 +251,38 @@ export function prepareSeedreamReference(source: string, transport: ReferenceTra
  * existing readers retain the original 10 MiB and format behavior. */
 export function prepareGenericImageDataUrlReference(source: string) {
   return prepareReference(source, 'data_url', 20 * 1024 * 1024, true);
+}
+
+/** Ordered, bounded staging for explicit multipart routes. Uses the same verified
+ * ownership-resolved source reader, DNS pinning, redirect and decoder limits. */
+export async function stageMultipartImageReference(source: string, index: number) {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let directory: string | undefined;
+  try {
+    const image = await Promise.race([readReference(source, controller.signal), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new ReferenceUploadError('Reference image preparation timed out', 'reference_image_timeout', 504));
+      }, FETCH_TIMEOUT_MS);
+    })]);
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(image.mime)) {
+      throw new ReferenceUploadError('Multipart reference images support PNG, JPEG and WebP only');
+    }
+    controller.signal.throwIfAborted();
+    directory = await mkdtemp(join(tmpdir(), 'inspiration-multipart-ref-'));
+    const filename = `reference-${index + 1}.${image.mime === 'image/jpeg' ? 'jpg' : image.mime.split('/')[1]}`;
+    const path = join(directory, filename);
+    await writeFile(path, image.bytes, { flag: 'wx' });
+    const ownedDirectory = directory;
+    return { filename, path, mime: image.mime, size: image.bytes.length,
+      cleanup: () => rm(ownedDirectory, { recursive: true, force: true }) };
+  } catch (error) {
+    if (directory) await rm(directory, { recursive: true, force: true }).catch(() => {});
+    if (error instanceof ReferenceUploadError) throw error;
+    throw new ReferenceUploadError('Reference image could not be read or validated');
+  } finally {
+    if (timer) clearTimeout(timer);
+    controller.abort();
+  }
 }
