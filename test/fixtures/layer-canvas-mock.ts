@@ -17,6 +17,7 @@ export async function startLayerMock(port = 4137) {
   const { encryptProviderSecrets } = await import('../../src/lib/provider-secrets.js');
   const { creditDecimal } = await import('../../src/modules/wallets/credit-amount.js');
   const { createImageResultFromResponse } = await import('../../src/modules/ai/image-result-store.js');
+  const { waitForGeneratedImageResultStorageMirrors } = await import('../../src/modules/ai/image-service.js');
   const { layerCapability } = await import('../../src/modules/ai/layer-canvas-config.js');
   const fingerprint = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
   const png = (width: number, height: number, rgba: Parameters<typeof sharp>[0]) => sharp(rgba).resize(width, height).png().toBuffer();
@@ -281,5 +282,10 @@ export async function startLayerMock(port = 4137) {
     },
     uselgReads: () => [...uselgReads],
     failureDiagnostic: (clientRequestId: string) => records.find(row => row.clientRequestId === clientRequestId)?.failureDiagnostic as unknown,
-    close: async () => { globalThis.fetch = realFetch; await app.close(); } };
+    close: async () => {
+      try {
+        await app.close();
+        await waitForGeneratedImageResultStorageMirrors();
+      } finally { globalThis.fetch = realFetch; }
+    } };
 }

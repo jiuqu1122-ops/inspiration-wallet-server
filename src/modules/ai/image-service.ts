@@ -3911,6 +3911,10 @@ export function scheduleGeneratedImageResultStorageMirror(
   return task;
 }
 
+export async function waitForGeneratedImageResultStorageMirrors() {
+  await Promise.all(pendingImageStorageMirrors.values());
+}
+
 export async function persistGeneratedImageResultsAndScheduleMirrors(
   images: string[],
   providerName: string,
