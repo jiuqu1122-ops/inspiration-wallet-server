@@ -3,6 +3,7 @@ import type { AiModelRoute, AiProviderChannel, Prisma, PrismaClient } from '@pri
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl } from '../providers/url.js';
 import { isStoredImageResultUrl } from './image-result-store.js';
+import { storageService } from '../storage/service.js';
 import { configuredImageTaskEnvelope, imageTaskResultContent, providerRequest, resolveImageAdapterResponse,
   persistGeneratedImageResultsAndScheduleMirrors } from './image-service.js';
 import { normalizeImageTaskExecutionConfig } from './image-execution.js';
@@ -13,9 +14,19 @@ import { canvasLayerEditOutput, canvasResultBytes, canvasSourceDimensions, decod
 import { CloudAiError, releaseCredits, reserveCredits, settleCredits } from './service.js';
 import { serializeCredit } from '../wallets/credit-amount.js';
 import { toInputJson } from './pricing-center.js';
+import { authorizeReferenceObject } from './reference-upload-service.js';
+import { prepareGenericImageDataUrlReference } from './seedream-references.js';
 
 const identity = (userId: string, clientRequestId: string) => ({ userId_clientRequestId: { userId, clientRequestId } });
 const unavailable = () => new CloudAiError('layer_route_unavailable', '该操作尚未配置可用的模型、渠道或价格', 409);
+
+async function readLayerInputImage(prisma: PrismaClient, userId: string, image: string) {
+  if (!image.startsWith('reference-images/')) return image;
+  const objectKey = await authorizeReferenceObject(prisma, userId, image);
+  const prepared = await prepareGenericImageDataUrlReference(storageService.getDownloadUrl(objectKey));
+  return prepared.value;
+}
+
 const stageMessages = {
   canvas_layer_submit: '提交给上游渠道时失败。',
   canvas_layer_result: '未能从上游任务取回编辑图片。',
@@ -101,8 +112,10 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
   if (input.expectedCredits !== undefined && serializeCredit(input.expectedCredits) !== chargedCredits) {
     throw new CloudAiError('layer_price_changed', '积分价格已调整，请核对后重新运行', 409);
   }
+  const image = await readLayerInputImage(prisma, userId, input.image);
+  const preparedInput = { ...input, image };
   let source;
-  try { source = await canvasSourceDimensions(input.image); }
+  try { source = await canvasSourceDimensions(image); }
   catch { throw new CloudAiError('invalid_source_image', '输入图片损坏、格式不受支持或尺寸超限', 400); }
   const journal = { canvasLayersVersion: 1, fingerprint, operation, adapter: config.adapter, creditsPerRequest: chargedCredits };
   let requestId;
@@ -123,12 +136,14 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
   try {
     await assertPublicProviderUrl(provider.baseUrl);
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
-    const body = await layerUpstreamBody(config.adapter, input, route.upstreamModelId, source);
+    const body = await layerUpstreamBody(config.adapter, preparedInput, route.upstreamModelId, source, {
+      maxLayers: config.maxLayers, canonicalModelKey: model.canonicalModelKey,
+    });
     const upstream = await providerRequest(provider, secrets, config.endpoint, body, 180_000,
       { 'Idempotency-Key': requestId });
     stage = 'canvas_layer_result';
     const reply = operation === 'edit' ? await resolveLayerEditTask(
-      provider, secrets, route, config, upstream, input.image, async id => {
+      provider, secrets, route, config, upstream, image, async id => {
         upstreamTaskId = id;
         await prisma.aiRequest.updateMany({
           where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },

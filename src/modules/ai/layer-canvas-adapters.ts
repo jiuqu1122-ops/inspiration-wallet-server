@@ -17,7 +17,10 @@ export const canvasLayerInput = z.strictObject({
   // Older clients can still send a canonical model. New clients use server routing.
   model: z.string().trim().min(1).max(128).optional(),
   expectedCredits: layerCreditsSchema.optional(),
-  image: z.string().max(28_000_080).regex(/^data:image\/(png|jpeg|webp);base64,[a-zA-Z0-9+/]+=*$/),
+  image: z.union([
+    z.string().max(28_000_080).regex(/^data:image\/(png|jpeg|webp);base64,[a-zA-Z0-9+/]+=*$/),
+    z.string().max(256).startsWith('reference-images/'),
+  ]),
   selection: selectionSchema.optional(),
   prompt: z.string().trim().max(4000).default(''),
   clientRequestId: z.string().regex(/^[a-zA-Z0-9_.:-]{8,128}$/),
@@ -50,22 +53,36 @@ type DecodedLayer = RasterSize & {
 type DecodedResult = { operation: 'edit'; output: Raster }
   | (RasterSize & { operation: 'split'; base: Raster; layers: DecodedLayer[] });
 
-async function arkEditReference(image: string, { width, height }: SourceImage, selection?: Selection) {
-  if (!selection && !image.startsWith('data:image/webp;')) return image;
-  const raster = sharp(dataBytes(image), { limitInputPixels: 64_000_000, failOn: 'warning' });
-  if (selection) {
-    const line = Math.max(2, Math.round(Math.min(width, height) / 180));
-    const x = selection.x * width;
-    const y = selection.y * height;
-    const shape = selection.kind === 'point'
-      ? `<circle cx="${Math.min(width - 1, x)}" cy="${Math.min(height - 1, y)}" r="${line * 2}" fill="#ff3050" stroke="white" stroke-width="${line / 2}" />`
-      : `<rect x="${x}" y="${y}" width="${selection.width * width}" height="${selection.height * height}" fill="none" stroke="#ff3050" stroke-width="${line}" />`;
-    raster.composite([{ input: Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">${shape}</svg>`) }]);
-  }
-  return 'data:image/png;base64,' + (await raster.png().toBuffer()).toString('base64');
+async function arkSplitReference(image: string) {
+  if (!image.startsWith('data:image/webp;')) return image;
+  return 'data:image/png;base64,' + (await canvasRaster(dataBytes(image)).png().toBuffer()).toString('base64');
 }
 
-export async function layerUpstreamBody(adapter: LayerRoute['adapter'], input: CanvasLayerInput, model: string, source: SourceImage) {
+const arkCoordinate = (value: number) => Math.min(999, Math.max(0, Math.round(value * 1000)));
+
+function arkEditPrompt(prompt: string, selection?: Selection) {
+  if (!selection) return prompt;
+  if (selection.kind === 'point') {
+    return `${prompt}\n目标位置：图1<point>${arkCoordinate(selection.x)} ${arkCoordinate(selection.y)}</point>。`;
+  }
+  // Even a very small selection must enclose at least one coordinate unit.
+  const left = Math.min(998, arkCoordinate(selection.x));
+  const top = Math.min(998, arkCoordinate(selection.y));
+  const right = Math.max(left + 1, arkCoordinate(selection.x + selection.width));
+  const bottom = Math.max(top + 1, arkCoordinate(selection.y + selection.height));
+  return `${prompt}\n目标区域：图1<bbox>${left} ${top} ${right} ${bottom}</bbox>。`;
+}
+
+function isArkSeedream55(upstreamModel: string, canonicalModelKey: string) {
+  const officialModel = /^doubao-seedream-5-5(?:-\d{6})?$/i;
+  if (/^doubao-seedream-/i.test(upstreamModel)) return officialModel.test(upstreamModel);
+  return officialModel.test(canonicalModelKey) || /^seedream-5[.-]5$/i.test(canonicalModelKey);
+}
+
+export async function layerUpstreamBody(
+  adapter: LayerRoute['adapter'], input: CanvasLayerInput, model: string, source: SourceImage,
+  { maxLayers, canonicalModelKey }: { maxLayers: number; canonicalModelKey: string },
+) {
   const { operation, image, prompt, selection } = input;
   const { width, height } = source;
   if (adapter === 'canvas-json') return { operation, model, image, prompt, selection };
@@ -73,13 +90,12 @@ export async function layerUpstreamBody(adapter: LayerRoute['adapter'], input: C
     // URL responses keep a multi-layer result out of the single JSON body limit.
     const fields = { model, output_format: 'png', response_format: 'url', watermark: false };
     if (operation === 'split') return { ...fields, layer_decomposition: true, size: 'auto',
-      image: await arkEditReference(image, source), prompt: prompt || '请将图片拆分成底图和独立的可编辑图层。' };
+      image: await arkSplitReference(image), ...(prompt ? { prompt } : {}),
+      ...(isArkSeedream55(model, canonicalModelKey) ? { layer_decomposition_options: { max_images: maxLayers + 1 } } : {}) };
     const exactSizeSupported = width * height >= 921_600 && width * height <= 4_624_220
       && width / height >= 1 / 16 && width / height <= 16;
-    const region = selection?.kind === 'point' ? '红色标记点所指的位置' : '红色矩形标记的区域';
     const transparent = source.alpha && !(await sharp(dataBytes(image), { limitInputPixels: 64_000_000 }).stats()).isOpaque;
-    return { ...fields, image: await arkEditReference(image, source, selection),
-      prompt: selection ? `${prompt}\n请以${region}为编辑参考，并在输出中移除标记。` : prompt,
+    return { ...fields, image, prompt: arkEditPrompt(prompt, selection),
       ...(exactSizeSupported ? { size: `${width}x${height}` } : {}),
       ...(transparent ? { background: 'transparent' } : {}) };
   }

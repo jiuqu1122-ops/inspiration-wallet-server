@@ -143,7 +143,7 @@ export async function getLayerCatalog(prisma: PrismaClient) {
     }
     return [mode, [...models.values()]] as const;
   }));
-  return Object.fromEntries(entries);
+  return { ...Object.fromEntries(entries), referenceUpload: true };
 }
 
 export async function updateLayerRoute(

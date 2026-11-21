@@ -1,6 +1,8 @@
-import { afterAll, beforeAll, expect, test } from 'vitest';
+import { afterAll, beforeAll, expect, test, vi } from 'vitest';
+import { Readable } from 'node:stream';
 import sharp from 'sharp';
 import { startLayerMock } from './fixtures/layer-canvas-mock.js';
+import { storageService } from '../src/modules/storage/service.js';
 
 let mock: Awaited<ReturnType<typeof startLayerMock>>;
 beforeAll(async () => { mock = await startLayerMock(4147); }, 15000);
@@ -154,7 +156,7 @@ test('creates and checks an Ark channel with the authenticated, read-only model 
   expect(probed.json()).toMatchObject({ ok: true, models: ['doubao-seedream-fixture'], modelCount: 1 });
 });
 
-test('routes Ark split and edit, positions cropped layers, and only draws guidance on the upstream copy', async () => {
+test('routes Ark split and edit, downloads layers, and sends official point guidance without painting the image', async () => {
   const common = { enabled: true, maxMegapixels: 2, maxLayers: 32 };
   const save = (mode: 'split' | 'edit', config: object) => mock.app.inject({
     method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/' + mode, payload: { config },
@@ -173,6 +175,8 @@ test('routes Ark split and edit, positions cropped layers, and only draws guidan
         { name: '云朵', order: 1, x: 100, y: 175, width: 96, height: 56, alpha: true, transparent: true },
       ] } });
     expect(mock.upstreamCalls().at(-1)?.body).toMatchObject({ image: mock.paths.poster, layer_decomposition: true, response_format: 'url' });
+    expect(mock.upstreamCalls().at(-1)?.body).not.toHaveProperty('prompt');
+    expect(mock.upstreamCalls().at(-1)?.body).not.toHaveProperty('layer_decomposition_options');
     const layer = await mock.app.inject(new URL(split.result.assets[2]).pathname);
     expect(await sharp(layer.rawPayload).metadata()).toMatchObject({ width: 96, height: 56, hasAlpha: true });
 
@@ -181,16 +185,34 @@ test('routes Ark split and edit, positions cropped layers, and only draws guidan
     expect(edit).toMatchObject({ status: 'success', chargedCredits: '8.000000',
       result: { operation: 'edit', image: { width: 320, height: 400 } } });
     const sent = mock.upstreamCalls().at(-1)?.body;
-    expect(sent?.prompt).toContain('红色标记点');
-    const marker = await sharp(Buffer.from(String(sent?.image).split(',')[1]!, 'base64'))
-      .extract({ left: 80, top: 200, width: 1, height: 1 }).removeAlpha().raw().toBuffer();
-    expect([...marker]).toEqual([255, 48, 80]);
+    expect(sent?.prompt).toContain('图1<point>250 500</point>');
+    expect(sent?.image).toBe(mock.paths.poster);
     expect(sent).not.toHaveProperty('n');
   } finally {
     await save('split', { ...common, endpoint: '/split', adapter: 'canvas-json', creditsPerRequest: '12' });
     await save('edit', { ...common, endpoint: '/edit', adapter: 'canvas-json', creditsPerRequest: '8' });
   }
 }, 15_000);
+
+test('sends Ark split options only for identified Seedream 5.5 and clamps edit coordinates', async () => {
+  const { layerUpstreamBody } = await import('../src/modules/ai/layer-canvas-adapters.js');
+  const source = { width: 320, height: 400, alpha: false };
+  const split = { operation: 'split', image: mock.paths.poster, prompt: '只拆云朵', clientRequestId: 'ark-settings-test' } as const;
+  const settings = { maxLayers: 32, canonicalModelKey: 'local-layer-model' };
+  const build = (model: string, canonicalModelKey = settings.canonicalModelKey) => layerUpstreamBody(
+    'volcengine-ark', split, model, source, { ...settings, canonicalModelKey },
+  );
+  await expect(build('doubao-seedream-5-5-261028')).resolves.toMatchObject({
+    prompt: '只拆云朵', layer_decomposition_options: { max_images: 33 },
+  });
+  await expect(build('ep-known-5-5', 'seedream-5-5')).resolves.toHaveProperty('layer_decomposition_options.max_images', 33);
+  await expect(build('doubao-seedream-5-0-flash-260915', 'seedream-5-5')).resolves.not.toHaveProperty('layer_decomposition_options');
+  await expect(build('ep-unknown')).resolves.not.toHaveProperty('layer_decomposition_options');
+  const edge = await layerUpstreamBody('volcengine-ark', { ...split, operation: 'edit',
+    selection: { kind: 'rect', x: 0.9999, y: 0.9999, width: 0.0001, height: 0.0001 },
+  }, 'doubao-seedream-5-0-flash-260915', source, settings);
+  expect(edge).toMatchObject({ image: mock.paths.poster, prompt: expect.stringContaining('图1<bbox>998 998 999 999</bbox>') });
+});
 
 test('delivers USELG synchronous or asynchronous edit images with one submission per request', async () => {
   const common = { enabled: true, maxMegapixels: 2, maxLayers: 1, creditsPerRequest: '8', adapter: 'canvas-json' };
@@ -303,5 +325,47 @@ test('allows hidden images only for the layer tasks they are explicitly assigned
     expect(mock.upstreamCalls()).toHaveLength(upstreamCalls);
   } finally {
     await setVisibility(true);
+  }
+});
+
+test('uses an owned reference key for canvas layer input and deduplicates retries', async () => {
+  const objectKey = 'reference-images/layer-test-source.png';
+  const foreignKey = 'reference-images/foreign-layer-test-source.png';
+  const posterBytes = Buffer.from(mock.paths.poster.split(',')[1]!, 'base64');
+  const url = `https://1.1.1.1/${objectKey}?signed=fixture`;
+  const head = vi.spyOn(storageService, 'headObject').mockResolvedValue({
+    objectKey, contentLength: posterBytes.length, contentType: 'image/png', metadata: {}, headers: {},
+  });
+  const downloadUrl = vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(url);
+  const resolveKey = vi.spyOn(storageService, 'tryResolveObjectKeyFromUrl').mockImplementation(value => value === url ? objectKey : null);
+  const read = vi.spyOn(storageService, 'getObjectStream').mockImplementation(async () => ({
+    stream: Readable.from([posterBytes]), statusCode: 200,
+    headers: { 'content-type': 'image/png', 'content-length': String(posterBytes.length) },
+  }));
+  try {
+    const catalog = (await mock.app.inject('/v1/ai/catalog')).json().canvasLayers;
+    expect(catalog.referenceUpload).toBe(true);
+    const credits = catalog.edit[0].creditsPerRequest;
+    const submit = (image: string, clientRequestId: string) => mock.app.inject({
+      method: 'POST', url: '/v1/ai/canvas-layers', payload: { operation: 'edit', clientRequestId,
+        prompt: 'Color', image, expectedCredits: credits },
+    });
+    const upstreamCalls = mock.upstreamCalls().length;
+    const denied = await submit(foreignKey, 'foreign-reference-001');
+    expect(denied.statusCode).toBe(400);
+    expect(denied.json()).toMatchObject({ error: 'invalid_reference_image' });
+    expect(head).not.toHaveBeenCalled();
+    expect(mock.upstreamCalls()).toHaveLength(upstreamCalls);
+
+    const accepted = await submit(objectKey, 'owned-reference-001');
+    expect(accepted.json()).toMatchObject({ status: 'success', chargedCredits: credits });
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(read).toHaveBeenCalledWith(objectKey);
+    expect(mock.upstreamCalls().at(-1)?.body.image).toEqual(mock.paths.poster);
+    expect((await submit(objectKey, 'owned-reference-001')).json()).toEqual(accepted.json());
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 1);
+  } finally {
+    for (const spy of [head, downloadUrl, resolveKey, read]) spy.mockRestore();
   }
 });

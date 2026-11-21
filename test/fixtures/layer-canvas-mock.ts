@@ -67,6 +67,13 @@ export async function startLayerMock(port = 4137) {
       if (new Headers(init.headers).has('authorization')) return new Response(null, { status: 403 });
       return new Response(new Uint8Array(poster), { headers: { 'content-type': 'image/png' } });
     }
+    if (target.origin === 'https://9.9.9.9' && target.pathname.startsWith('/ark-layers/') && init?.method === 'GET') {
+      const asset = { base, title, cloud }[target.pathname.slice('/ark-layers/'.length, -'.png'.length) as 'base' | 'title' | 'cloud'];
+      if (!asset || target.searchParams.get('signature') !== 'fixture' || new Headers(init.headers).has('authorization')) {
+        return new Response(null, { status: 403 });
+      }
+      return new Response(new Uint8Array(asset), { headers: { 'content-type': 'image/png' } });
+    }
     const route = routes.find(entry => entry.channel.baseUrl === target.origin);
     if (!route) {
       if (target.hostname === '127.0.0.1') return realFetch(url, init);
@@ -100,10 +107,10 @@ export async function startLayerMock(port = 4137) {
     if (target.pathname === '/images/generations') {
       if (body.layer_decomposition === true) {
         return Response.json({ data: [
-          { b64_json: cloud.toString('base64'), size: '120x70', z_index: 2, name: '云朵',
+          { url: 'https://9.9.9.9/ark-layers/cloud.png?signature=fixture', size: '120x70', z_index: 2, name: '云朵',
             bounding_box: { absolute: [100, 175, 196, 231] } },
-          { b64_json: base.toString('base64'), size: '320x400', z_index: 0 },
-          { b64_json: title.toString('base64'), size: '210x76', z_index: 1, name: '标题',
+          { url: 'https://9.9.9.9/ark-layers/base.png?signature=fixture', size: '320x400', z_index: 0 },
+          { url: 'https://9.9.9.9/ark-layers/title.png?signature=fixture', size: '210x76', z_index: 1, name: '标题',
             bounding_box: { absolute: [27, 37, 237, 113] } },
         ] });
       }
@@ -193,6 +200,16 @@ export async function startLayerMock(port = 4137) {
       update: async ({ where, data }: any) => Object.assign(routes.find(route => route.id === where.id)!, data),
     },
     aiUpstreamDiscovery: { findMany: async () => [] },
+    referenceUpload: {
+      findFirst: async ({ where }: { where: { objectKey: string; userId: string } }) => {
+        const ownerByObject: Record<string, string> = {
+          'reference-images/layer-test-source.png': 'local-test-user',
+          'reference-images/foreign-layer-test-source.png': 'different-test-user',
+        };
+        if (ownerByObject[where.objectKey] !== where.userId) return null;
+        return { id: where.objectKey, objectKey: where.objectKey, status: 'UPLOADED', sizeBytes: poster.length, contentType: 'image/png' };
+      },
+    },
     aiUsageModelBinding: {
       findMany: async () => [],
       findFirst: async ({ where }: { where: { canonicalModelId: string; key: { in: string[] } } }) =>
