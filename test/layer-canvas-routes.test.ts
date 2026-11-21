@@ -2,6 +2,7 @@ import { afterAll, beforeAll, expect, test, vi } from 'vitest';
 import { Readable } from 'node:stream';
 import sharp from 'sharp';
 import { startLayerMock } from './fixtures/layer-canvas-mock.js';
+import { readFailureDiagnostic } from '../src/modules/ai/failure-diagnostic.js';
 import { storageService } from '../src/modules/storage/service.js';
 
 vi.mock('node:dns/promises', async importOriginal => ({
@@ -214,6 +215,139 @@ test('routes Ark split and edit, downloads layers, and sends official point guid
     mock.useMockAProviderKind('NEW_API');
     await save('split', { ...common, endpoint: '/split', adapter: 'canvas-json', creditsPerRequest: '12' });
     await save('edit', { ...common, endpoint: '/edit', adapter: 'canvas-json', creditsPerRequest: '8' });
+  }
+}, 15_000);
+
+test('checks the signed split source anonymously before reserving credits or submitting to Ark', async () => {
+  const { splitPoster, splitSourceKey, signedSplitSourceUrl, deniedSplitSourceUrl } = mock.paths;
+  const posterBytes = Buffer.from(splitPoster.split(',')[1]!, 'base64');
+  const head = vi.spyOn(storageService, 'headObject').mockResolvedValue({
+    objectKey: splitSourceKey, contentLength: posterBytes.length, contentType: 'image/png', metadata: {}, headers: {},
+  });
+  const downloadUrl = vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(signedSplitSourceUrl);
+  const resolveKey = vi.spyOn(storageService, 'tryResolveObjectKeyFromUrl').mockImplementation(value =>
+    value === signedSplitSourceUrl || value === deniedSplitSourceUrl ? splitSourceKey : null);
+  const read = vi.spyOn(storageService, 'getObjectStream').mockImplementation(async () => ({
+    stream: Readable.from([posterBytes]), statusCode: 200,
+    headers: { 'content-type': 'image/png', 'content-length': String(posterBytes.length) },
+  }));
+  const save = (endpoint: string, adapter: string, creditsPerRequest: string) => mock.app.inject({
+    method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/split',
+    payload: { config: { enabled: true, maxMegapixels: 2, maxLayers: 32, endpoint, adapter, creditsPerRequest } },
+  });
+  const submit = (clientRequestId: string) => mock.app.inject({
+    method: 'POST', url: '/v1/ai/canvas-layers',
+    payload: { operation: 'split', image: splitSourceKey, clientRequestId, expectedCredits: '1' },
+  });
+  try {
+    expect((await save('/images/generations', 'volcengine-ark', '1')).statusCode).toBe(200);
+    mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
+    const beforeReads = mock.signedSplitSourceReads().length;
+    const beforeCalls = mock.upstreamCalls().length;
+    const accepted = await submit('ark-split-readable-url');
+    expect(accepted.statusCode).toBe(200);
+    expect(accepted.json()).toMatchObject({ status: 'success', chargedCredits: '1.000000' });
+    expect(downloadUrl).toHaveBeenLastCalledWith(splitSourceKey, { expiresSeconds: 600 });
+    expect(mock.upstreamCalls().at(-1)?.body).toMatchObject({ image: signedSplitSourceUrl, layer_decomposition: true });
+    expect(mock.signedSplitSourceReads().slice(beforeReads)).toEqual([
+      { url: signedSplitSourceUrl, submissions: beforeCalls },
+      { url: signedSplitSourceUrl, submissions: beforeCalls + 1 },
+    ]);
+
+    downloadUrl.mockReturnValue(deniedSplitSourceUrl);
+    const beforeDenied = (await mock.app.inject('/fixture/receipt')).json();
+    const denied = await submit('ark-split-denied-url');
+    expect(denied.statusCode).toBe(400);
+    expect(denied.json()).toMatchObject({ error: 'invalid_reference_image', message: 'Reference image download returned HTTP 403' });
+    expect(denied.body).not.toContain(deniedSplitSourceUrl);
+    expect((await mock.app.inject('/fixture/receipt')).json()).toEqual(beforeDenied);
+    expect((await mock.app.inject('/v1/ai/canvas-layers/by-request/ark-split-denied-url')).statusCode).toBe(404);
+    expect(mock.signedSplitSourceReads().at(-1)).toEqual({ url: deniedSplitSourceUrl, submissions: beforeCalls + 1 });
+    expect(mock.upstreamCalls()).toHaveLength(beforeCalls + 1);
+    expect(read).not.toHaveBeenCalled();
+  } finally {
+    for (const spy of [head, downloadUrl, resolveKey, read]) spy.mockRestore();
+    mock.useMockAProviderKind('NEW_API');
+    await save('/split', 'canvas-json', '12');
+  }
+}, 15_000);
+
+test('reports a rejected Ark output-layer download separately from image decoding', async () => {
+  const save = (endpoint: string, adapter: string) => mock.app.inject({
+    method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/split',
+    payload: { config: { enabled: true, maxMegapixels: 2, maxLayers: 32, endpoint, adapter, creditsPerRequest: '12' } },
+  });
+  expect((await save('/images/generations', 'volcengine-ark')).statusCode).toBe(200);
+  mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
+  try {
+    const before = (await mock.app.inject('/fixture/receipt')).json();
+    const clientRequestId = 'ark-split-expired-layer';
+    const result = await mock.app.inject({ method: 'POST', url: '/v1/ai/canvas-layers', payload: {
+      operation: 'split', clientRequestId, image: mock.paths.splitPoster, prompt: 'ark-expired-layer-asset-fixture', expectedCredits: '12',
+    } });
+    expect(result.statusCode).toBe(200);
+    expect(result.json()).toMatchObject({ status: 'failed', chargedCredits: '0.000000',
+      message: '上游返回了图片地址，但下载失败。预留积分已释放。' });
+    expect(mock.failureDiagnostic(clientRequestId)).toMatchObject({ stage: 'canvas_layer_download' });
+    const after = (await mock.app.inject('/fixture/receipt')).json();
+    expect(after.calls).toHaveLength(before.calls.length + 1);
+    expect(after.balance).toBe(before.balance);
+    expect(after.reservations).toBe(before.reservations);
+    expect(after.ledger.slice(before.ledger.length)).toEqual([{ type: 'RESERVE', amount: '-12' }, { type: 'RELEASE', amount: '12' }]);
+  } finally {
+    mock.useMockAProviderKind('NEW_API');
+    await save('/split', 'canvas-json');
+  }
+}, 15_000);
+
+test('records safe Ark split rejection diagnostics and releases credits without re-submitting', async () => {
+  const route = '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/split';
+  const common = { enabled: true, maxMegapixels: 2, maxLayers: 32, creditsPerRequest: '12' };
+  const save = (endpoint: string, adapter: string) => mock.app.inject({
+    method: 'PUT', url: route, payload: { config: { ...common, endpoint, adapter } },
+  });
+  expect((await save('/images/generations', 'volcengine-ark')).statusCode).toBe(200);
+  mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
+  try {
+    const posterBytes = Buffer.from(mock.paths.poster.split(',')[1]!, 'base64');
+    const image = 'data:image/png;base64,' + (await sharp(posterBytes).resize(640, 800).png().toBuffer()).toString('base64');
+    const clientRequestId = 'ark-split-unsupported-parameter';
+    const payload = { operation: 'split', image, clientRequestId, expectedCredits: '12', prompt: 'ark-unsupported-parameter-fixture' };
+    const post = () => mock.app.inject({ method: 'POST', url: '/v1/ai/canvas-layers', payload });
+    const before = (await mock.app.inject('/fixture/receipt')).json();
+
+    const rejected = await post();
+    expect(rejected.statusCode).toBe(200);
+    expect(rejected.json()).toMatchObject({ status: 'failed', chargedCredits: '0.000000' });
+    const diagnostic = mock.failureDiagnostic(clientRequestId);
+    expect(diagnostic).toMatchObject({
+      stage: 'canvas_layer_submit', httpStatus: 400,
+      ark: { code: 'InvalidParameter.UnsupportedParameter', parameter: 'layer_decomposition' },
+    });
+    const restored = readFailureDiagnostic(diagnostic);
+    expect(restored).toEqual(diagnostic);
+    expect(readFailureDiagnostic({ ...restored, ark: {
+      code: 'InvalidParameter.UnsupportedParameter', parameter: 'https://example.test/fake-secret',
+    } })?.ark).toEqual({ code: 'InvalidParameter.UnsupportedParameter' });
+    expect(readFailureDiagnostic({ ...restored, ark: {
+      code: 'InvalidParameter.fake-secret', parameter: 'layer_decomposition',
+    } })?.ark).toEqual({ parameter: 'layer_decomposition' });
+    for (const output of [JSON.stringify(diagnostic), rejected.body]) {
+      expect(output).not.toContain('fake-secret');
+      expect(output).not.toContain('https://example.test');
+      expect(output).not.toContain('fixture-secret');
+    }
+
+    const after = (await mock.app.inject('/fixture/receipt')).json();
+    expect(after.balance).toBe(before.balance);
+    expect(after.reservations).toBe(before.reservations);
+    expect(after.ledger.slice(before.ledger.length)).toEqual([{ type: 'RESERVE', amount: '-12' }, { type: 'RELEASE', amount: '12' }]);
+    expect(after.calls).toHaveLength(before.calls.length + 1);
+    expect((await post()).json()).toEqual(rejected.json());
+    expect((await mock.app.inject('/fixture/receipt')).json()).toEqual(after);
+  } finally {
+    mock.useMockAProviderKind('NEW_API');
+    await save('/split', 'canvas-json');
   }
 }, 15_000);
 

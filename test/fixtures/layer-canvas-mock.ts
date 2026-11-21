@@ -25,6 +25,7 @@ export async function startLayerMock(port = 4137) {
   const title = await png(210, 76, Buffer.from('<svg width="210" height="76" xmlns="http://www.w3.org/2000/svg"><text x="2" y="52" font-family="sans-serif" font-size="47" font-weight="bold" fill="#482836">CLOUD</text></svg>'));
   const cloud = await png(120, 70, Buffer.from('<svg width="120" height="70" xmlns="http://www.w3.org/2000/svg"><path fill="#fff6ec" d="M22 58C-8 58-5 25 22 25C25 4 57 4 67 23C89 10 118 28 116 45C115 60 101 59 90 59Z"/></svg>'));
   const poster = await sharp(base).composite([{ input: title, left: 27, top: 37 }, { input: cloud, left: 100, top: 175 }]).png().toBuffer();
+  const splitPoster = await sharp(poster).resize(640, 800).png().toBuffer();
   const data = (bytes: Buffer) => 'data:image/png;base64,' + bytes.toString('base64');
   const limits = { enabled: true, maxMegapixels: 2, maxLayers: 32 };
   const model = {
@@ -58,6 +59,10 @@ export async function startLayerMock(port = 4137) {
   const calls: { channel: string; body: Record<string, unknown>; customTransport: boolean; arkClientRequestId: string | null }[] = [];
   const sourceKey = 'reference-images/layer-test-source.png';
   const signedSourceUrl = `https://1.1.1.1/${sourceKey}?signed=fixture`;
+  const splitSourceKey = 'reference-images/layer-test-split-source.png';
+  const signedSplitSourceUrl = `https://1.1.1.1/${splitSourceKey}?signed=fixture`;
+  const deniedSplitSourceUrl = `https://1.1.1.1/${splitSourceKey}?signed=denied-fixture`;
+  const signedSplitSourceReads: { url: string; submissions: number }[] = [];
   const uselgReads: string[] = [];
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
@@ -68,6 +73,13 @@ export async function startLayerMock(port = 4137) {
     if (target.href === signedSourceUrl && init?.method === 'GET') {
       if (new Headers(init.headers).has('authorization')) return new Response(null, { status: 403 });
       return new Response(new Uint8Array(poster), { headers: { 'content-type': 'image/png' } });
+    }
+    if ((target.href === signedSplitSourceUrl || target.href === deniedSplitSourceUrl) && init?.method === 'GET') {
+      signedSplitSourceReads.push({ url: target.href, submissions: calls.length });
+      if (target.href === deniedSplitSourceUrl || new Headers(init.headers).has('authorization')) {
+        return new Response(null, { status: 403 });
+      }
+      return new Response(new Uint8Array(splitPoster), { headers: { 'content-type': 'image/png', 'content-length': String(splitPoster.length) } });
     }
     if (target.origin === 'https://9.9.9.9' && target.pathname === '/canvas-edit.png' && init?.method === 'GET') {
       uselgReads.push(target.origin + target.pathname);
@@ -113,6 +125,13 @@ export async function startLayerMock(port = 4137) {
       return Response.json({ task_id: 'imgtask-layer-edit-fixture', status: 'queued', poll_after_ms: 1000 }, { status: 202 });
     }
     if (target.pathname === '/images/generations' || target.pathname === '/api/v3/images/generations') {
+      if (body.layer_decomposition === true && body.prompt === 'ark-unsupported-parameter-fixture') {
+        return Response.json({ error: {
+          code: 'InvalidParameter.UnsupportedParameter',
+          param: 'layer_decomposition',
+          message: 'Unsupported parameter layer_decomposition for fake-secret and https://example.test/signed.png?signature=fixture-secret',
+        } }, { status: 400 });
+      }
       if (body.prompt === 'ark-timeout-fixture') {
         throw Object.assign(new Error('Provider response exceeded the deadline'), { code: 'IMAGE_PROVIDER_RESPONSE_TIMEOUT' });
       }
@@ -126,8 +145,9 @@ export async function startLayerMock(port = 4137) {
         bytes = Buffer.from(source.split(',')[1] ?? '', 'base64');
       }
       if (body.layer_decomposition === true) {
+        const cloudSignature = body.prompt === 'ark-expired-layer-asset-fixture' ? 'expired' : 'fixture';
         return Response.json({ data: [
-          { url: 'https://9.9.9.9/ark-layers/cloud.png?signature=fixture', size: '120x70', z_index: 2, name: '云朵',
+          { url: `https://9.9.9.9/ark-layers/cloud.png?signature=${cloudSignature}`, size: '120x70', z_index: 2, name: '云朵',
             bounding_box: { absolute: [100, 175, 196, 231] } },
           { url: 'https://9.9.9.9/ark-layers/base.png?signature=fixture', size: '320x400', z_index: 0 },
           { url: 'https://9.9.9.9/ark-layers/title.png?signature=fixture', size: '210x76', z_index: 1, name: '标题',
@@ -223,10 +243,12 @@ export async function startLayerMock(port = 4137) {
       findFirst: async ({ where }: { where: { objectKey: string; userId: string } }) => {
         const ownerByObject: Record<string, string> = {
           [sourceKey]: 'local-test-user',
+          [splitSourceKey]: 'local-test-user',
           'reference-images/foreign-layer-test-source.png': 'different-test-user',
         };
         if (ownerByObject[where.objectKey] !== where.userId) return null;
-        return { id: where.objectKey, objectKey: where.objectKey, status: 'UPLOADED', sizeBytes: poster.length, contentType: 'image/png' };
+        return { id: where.objectKey, objectKey: where.objectKey, status: 'UPLOADED',
+          sizeBytes: where.objectKey === splitSourceKey ? splitPoster.length : poster.length, contentType: 'image/png' };
       },
     },
     aiUsageModelBinding: {
@@ -291,11 +313,13 @@ export async function startLayerMock(port = 4137) {
     return { url: await createImageResultFromResponse(new Response(new Uint8Array(bytes), { headers: { 'content-type': 'image/png' } })) };
   });
   await app.listen({ port, host: '127.0.0.1' });
-  return { app, paths: { base: data(base), poster: data(poster), sourceKey, signedSourceUrl }, upstreamCalls: () => [...calls],
+  return { app, paths: { base: data(base), poster: data(poster), sourceKey, signedSourceUrl,
+    splitPoster: data(splitPoster), splitSourceKey, signedSplitSourceUrl, deniedSplitSourceUrl }, upstreamCalls: () => [...calls],
     useMockAProviderKind(kind: AiProviderChannel['kind'], baseUrl = 'https://1.1.1.1') {
       Object.assign(routes[0]!.channel, { kind, baseUrl });
     },
     uselgReads: () => [...uselgReads],
+    signedSplitSourceReads: () => [...signedSplitSourceReads],
     failureDiagnostic: (clientRequestId: string) => records.find(row => row.clientRequestId === clientRequestId)?.failureDiagnostic as unknown,
     close: async () => {
       try {

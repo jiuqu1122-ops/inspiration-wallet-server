@@ -26,15 +26,19 @@ const beijingArkLayerDispatcher = new Agent({ connect: { family: 4, timeout: 30_
 const BEIJING_ARK_LAYER_SUBMIT_TIMEOUT_MS = 240_000;
 const ARK_SOURCE_URL_EXPIRY_SECONDS = 600;
 
-async function readLayerInputImage(prisma: PrismaClient, userId: string, image: string, officialBeijingArk: boolean) {
+async function readLayerInputImage(prisma: PrismaClient, userId: string,
+  { image, operation }: Pick<CanvasLayerInput, 'image' | 'operation'>, officialBeijingArk: boolean) {
   if (!image.startsWith('reference-images/')) return { image };
   const objectKey = await authorizeReferenceObject(prisma, userId, image);
   const downloadUrl = storageService.getDownloadUrl(objectKey,
     officialBeijingArk ? { expiresSeconds: ARK_SOURCE_URL_EXPIRY_SECONDS } : undefined);
-  const prepared = await prepareGenericImageDataUrlReference(downloadUrl);
   // The reference reader normalizes WebP to PNG. Only pass through the URL
   // if it points to the original, verified PNG or JPEG.
   const arkImageUrl = officialBeijingArk && /\.(?:png|jpe?g)$/i.test(objectKey) ? downloadUrl : undefined;
+  const prepared = await prepareGenericImageDataUrlReference(downloadUrl, {
+    // The storage SDK can read the object even when its public signature fails.
+    verifyPublicSource: operation === 'split' && arkImageUrl !== undefined,
+  });
   return { image: prepared.value, arkImageUrl };
 }
 
@@ -125,7 +129,7 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
   }
   const officialBeijingArk = config.adapter === 'volcengine-ark' && provider.kind === 'VOLCENGINE_ARK'
     && new URL(provider.baseUrl).origin === 'https://ark.cn-beijing.volces.com';
-  const { image, arkImageUrl } = await readLayerInputImage(prisma, userId, input.image, officialBeijingArk);
+  const { image, arkImageUrl } = await readLayerInputImage(prisma, userId, input, officialBeijingArk);
   const preparedInput = { ...input, image };
   let source;
   try { source = await canvasSourceDimensions(image); }
@@ -181,13 +185,15 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
       },
     ) : upstream;
     stage = 'canvas_layer_decode';
-    const decoded = await decodeCanvasLayerResult(config, operation, reply, operation === 'edit' ? async source => {
-      if (!/^(?:https?:\/\/|\/(?!\/))/i.test(source) || isStoredImageResultUrl(source)) return canvasResultBytes(source);
+    const decoded = await decodeCanvasLayerResult(config, operation, reply, async source => {
+      const remote = operation === 'edit' ? /^(?:https?:\/\/|\/(?!\/))/i.test(source) : /^https:\/\//i.test(source);
+      if (!remote || isStoredImageResultUrl(source)) return canvasResultBytes(source);
       stage = 'canvas_layer_download';
-      const bytes = await canvasResultBytes(await readLayerEditAsset(provider, secrets, source));
+      const asset = operation === 'edit' ? await readLayerEditAsset(provider, secrets, source) : source;
+      const bytes = await canvasResultBytes(asset);
       stage = 'canvas_layer_decode';
       return bytes;
-    } : undefined);
+    });
     stage = 'result_persistence';
     const assets = await persistGeneratedImageResultsAndScheduleMirrors(decoded.assets, provider.name, {
       clientRequestId, canonicalModel: model.canonicalModelKey, routeId: route.id, providerId: provider.id, adapterKey: config.adapter,
@@ -202,11 +208,13 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
         creditsPerRequest: chargedCredits, totalCredits: chargedCredits },
     });
   } catch (error) {
-    const diagnostic = buildFailureDiagnostic(error, { stage });
+    const diagnostic = buildFailureDiagnostic(error, { stage,
+      ...(officialBeijingArk && stage === 'canvas_layer_submit' ? { provider: 'volcengine-ark' } : {}) });
     console.warn('[canvas_layer_failed]', { clientRequestId, routeId: route.id, adapter: config.adapter,
       ...taskIdentity(), stage: diagnostic.stage, code: diagnostic.code, httpStatus: diagnostic.httpStatus,
       ...(officialBeijingArk ? { arkClientRequestId: requestId, arkRequestId: arkRequestId ?? null,
-        arkImageTransport: arkImageUrl ? 'signed-url' : 'inline' } : {}),
+        arkImageTransport: arkImageUrl ? 'signed-url' : 'inline',
+        arkErrorCode: diagnostic.ark?.code ?? null, arkErrorParameter: diagnostic.ark?.parameter ?? null } : {}),
       upstreamResponseStatus: upstreamResponseStatus ?? null, elapsedMs: Math.round(performance.now() - processingStartedAt) });
     const message = stage === 'canvas_layer_submit' && diagnostic.code === 'PROVIDER_TIMEOUT'
       ? '等待上游渠道响应超时。' : stageMessages[stage];

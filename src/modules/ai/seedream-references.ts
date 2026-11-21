@@ -195,15 +195,16 @@ async function readReference(source: string, signal: AbortSignal, maximumBytes =
 async function prepareReference(
   source: string,
   transport: ReferenceTransport,
-  maximumBytes = REFERENCE_UPLOAD_MAX_BYTES,
-  pngJpegOnly = false,
+  { maximumBytes = REFERENCE_UPLOAD_MAX_BYTES, pngJpegOnly = false, verifyPublicSource = false }:
+  { maximumBytes?: number; pngJpegOnly?: boolean; verifyPublicSource?: boolean } = {},
 ) {
   const controller = new AbortController();
   let temporaryUrl: string | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const work = async () => {
-    let image = await readReference(source, controller.signal, maximumBytes);
-    if (pngJpegOnly && image.mime === 'image/webp') {
+    const load = verifyPublicSource ? fetchPublicReference : readReference;
+    let image = await load(source, controller.signal, maximumBytes);
+    if (pngJpegOnly && image.mime === 'image/webp' && !verifyPublicSource) {
       const png = await sharp(image.bytes, { failOn: 'warning', limitInputPixels: 8192 * 8192 })
         .timeout({ seconds: 10 }).png().toBuffer();
       image = await validatedImage(png, 'image/png', maximumBytes);
@@ -249,8 +250,8 @@ export function prepareSeedreamReference(source: string, transport: ReferenceTra
 
 /** Explicit Generic Data URL routes use their own limits and image contract;
  * existing readers retain the original 10 MiB and format behavior. */
-export function prepareGenericImageDataUrlReference(source: string) {
-  return prepareReference(source, 'data_url', 20 * 1024 * 1024, true);
+export function prepareGenericImageDataUrlReference(source: string, { verifyPublicSource = false } = {}) {
+  return prepareReference(source, 'data_url', { maximumBytes: 20 * 1024 * 1024, pngJpegOnly: true, verifyPublicSource });
 }
 
 /** Ordered, bounded staging for explicit multipart routes. Uses the same verified

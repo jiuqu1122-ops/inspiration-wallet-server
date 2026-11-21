@@ -31,6 +31,41 @@ const PROVIDER_FAILURE_CODES = new Set([
   'quota_not_enough', 'insufficient_quota', 'insufficient_balance',
   'content_policy_violation', 'content_policy_rejected', 'moderation_blocked', 'safety_system',
 ]);
+const ARK_ERROR_CODES = new Set([
+  'InvalidParameter', 'InvalidParameter.UnsupportedParameter', 'InvalidParameter.TosURLInvalid',
+  'MissingParameter', 'InvalidImageURL.EmptyURL', 'InvalidImageURL.InvalidFormat',
+  'InvalidEndpoint.ClosedEndpoint', 'InvalidEndpointOrModel.NotFound',
+  'AuthenticationError', 'AccessDenied', 'OperationDenied.ServiceNotOpen',
+  'InputImageRiskDetection', 'OutputImageRiskDetection', 'ContentSecurityDetectionError',
+  'SensitiveContentDetected',
+]);
+const ARK_ERROR_PARAMETERS = new Set([
+  'model', 'image', 'prompt', 'size', 'output_format', 'response_format', 'background', 'watermark',
+  'layer_decomposition', 'layer_decomposition_options', 'layer_decomposition_options.max_images',
+]);
+
+type ArkFailureDiagnostic = { code?: string; parameter?: string };
+
+function readArkFailure(value: unknown): ArkFailureDiagnostic | undefined {
+  if (!value || typeof value !== 'object') return;
+  const { code, parameter } = value as Record<string, unknown>;
+  const safeCode = typeof code === 'string' && ARK_ERROR_CODES.has(code) ? code : undefined;
+  const safeParameter = typeof parameter === 'string' && ARK_ERROR_PARAMETERS.has(parameter) ? parameter : undefined;
+  if (safeCode || safeParameter) return { ...(safeCode ? { code: safeCode } : {}), ...(safeParameter ? { parameter: safeParameter } : {}) };
+}
+
+function arkFailureFromResponse(value: unknown) {
+  if (!value || typeof value !== 'object') return;
+  const { error } = value as Record<string, unknown>;
+  if (!error || typeof error !== 'object') return;
+  const { code, param, message } = error as Record<string, unknown>;
+  // Some Ark endpoints name the field only in their error message. The
+  // allowlist also applies to fields extracted from that untrusted text.
+  const namedParameter = typeof message === 'string'
+    ? /\bparameters?\s+([`'"])([a-z_.]+)\1/i.exec(message.slice(0, 800))?.[2] : undefined;
+  const parameter = typeof param === 'string' && ARK_ERROR_PARAMETERS.has(param) ? param : namedParameter;
+  return readArkFailure({ code, parameter });
+}
 
 /** Only recognized public error codes may influence a persisted safe summary. */
 export function imageProviderFailureCode(value: unknown): string {
@@ -50,6 +85,7 @@ export type FailureDiagnostic = {
   causeCode: string | null;
   recordedAt: string;
   resolution: string | null;
+  ark?: ArkFailureDiagnostic;
 };
 
 const SAFE_FAILURE_DETAILS = new Set([
@@ -80,7 +116,7 @@ function safeFailureDetail(text: string, code: string): string | null {
 
 export function buildFailureDiagnostic(
   error: unknown,
-  context: { stage: string; resolution?: string | undefined },
+  context: { stage: string; resolution?: string | undefined; provider?: 'volcengine-ark' },
   now = new Date(),
 ): FailureDiagnostic {
   // Error payloads are untrusted. Classification reads bounded text, but never returns it.
@@ -88,6 +124,7 @@ export function buildFailureDiagnostic(
   let httpStatus: number | null = null;
   let causeCode: string | null = null;
   let persistence = false;
+  let ark: ArkFailureDiagnostic | undefined;
   const texts: string[] = [];
   const visited = new Set<object>();
   try {
@@ -97,6 +134,7 @@ export function buildFailureDiagnostic(
       if (typeof current !== 'object' || visited.has(current)) break;
       visited.add(current);
       const value = current as Record<string, unknown>;
+      if (depth === 0 && context.provider === 'volcengine-ark') ark = arkFailureFromResponse(value.responseValue);
       if (typeof value.message === 'string') texts.push(value.message.slice(0, 2_000));
       if (typeof value.name === 'string') texts.push(value.name.slice(0, 80));
       const providerCode = imageProviderFailureCode(value.code);
@@ -137,7 +175,7 @@ export function buildFailureDiagnostic(
   return {
     version: 1, code, message: KNOWN_MESSAGES[code]!, detail: safeFailureDetail(text, code),
     stage: persistence ? 'result_persistence' : SAFE_STAGES.has(context.stage) ? context.stage : 'image_generation',
-    httpStatus, causeCode, recordedAt: now.toISOString(), resolution,
+    httpStatus, causeCode, recordedAt: now.toISOString(), resolution, ...(ark ? { ark } : {}),
   };
 }
 
@@ -147,6 +185,7 @@ export function readFailureDiagnostic(value: unknown): FailureDiagnostic | null 
   const record = value as Record<string, unknown>;
   if (record.version !== 1 || typeof record.code !== 'string' || !Object.hasOwn(KNOWN_MESSAGES, record.code)) return null;
   if (typeof record.recordedAt !== 'string' || !Number.isFinite(Date.parse(record.recordedAt))) return null;
+  const ark = readArkFailure(record.ark);
   return {
     version: 1, code: record.code, message: KNOWN_MESSAGES[record.code]!,
     detail: typeof record.detail === 'string' && SAFE_FAILURE_DETAILS.has(record.detail) ? record.detail : null,
@@ -157,5 +196,6 @@ export function readFailureDiagnostic(value: unknown): FailureDiagnostic | null 
     causeCode: typeof record.causeCode === 'string' && SAFE_CAUSE_CODES.has(record.causeCode) ? record.causeCode : null,
     resolution: typeof record.resolution === 'string' && /^(?:\d{1,4}[kp]|\d{1,5}x\d{1,5})$/i.test(record.resolution)
       ? record.resolution : null,
+    ...(ark ? { ark } : {}),
   };
 }

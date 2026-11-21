@@ -202,12 +202,12 @@ export async function canvasResultBytes(source: string) {
   return dataBytes(dataUrl);
 }
 
-type ReadEditAsset = (source: string) => Promise<Buffer>;
+type ReadLayerAsset = (source: string) => Promise<Buffer>;
 
 async function normalizeRaster(value: Raster, remainingPixels: number, expected?: RasterSize, resize?: RasterSize,
-  readEditAsset?: ReadEditAsset) {
+  readAsset?: ReadLayerAsset) {
   const source = typeof value === 'string' ? value : 'url' in value ? value.url : value.b64_json;
-  const image = canvasRaster(await (readEditAsset ?? canvasResultBytes)(source));
+  const image = canvasRaster(await (readAsset ?? canvasResultBytes)(source));
   const dimensions = await canvasRasterDimensions(image);
   const originalPixels = dimensions.width * dimensions.height;
   const output = resize ?? dimensions;
@@ -223,21 +223,21 @@ async function normalizeRaster(value: Raster, remainingPixels: number, expected?
     dataUrl: 'data:image/png;base64,' + bytes.toString('base64') };
 }
 
-export async function decodeCanvasLayerResult(config: LayerRoute, operation: LayerMode, reply: unknown, readEditAsset?: ReadEditAsset) {
+export async function decodeCanvasLayerResult(config: LayerRoute, operation: LayerMode, reply: unknown, readAsset?: ReadLayerAsset) {
   const decoded = decodeResponse(config.adapter, operation, reply, config.maxLayers);
   let pixels = 0;
   let usedBudgetPixels = 0;
   const assets: string[] = [];
-  const read = async (raster: Raster, dimensions?: RasterSize, resize?: RasterSize, reader?: ReadEditAsset) => {
+  const read = async (raster: Raster, dimensions?: RasterSize, resize?: RasterSize) => {
     const { dataUrl, originalPixels, budgetPixels, ...meta } = await normalizeRaster(raster,
-      config.maxMegapixels * 1_000_000 - usedBudgetPixels, dimensions, resize, reader);
+      config.maxMegapixels * 1_000_000 - usedBudgetPixels, dimensions, resize, readAsset);
     pixels += originalPixels;
     usedBudgetPixels += budgetPixels;
     assets.push(dataUrl);
     return meta;
   };
   if (decoded.operation === 'edit') {
-    const image = await read(decoded.output, undefined, undefined, readEditAsset);
+    const image = await read(decoded.output);
     return { assets, pixels, structure: { operation, image: { ...image, asset: 0 } } };
   }
   const base = await read(decoded.base, decoded);
