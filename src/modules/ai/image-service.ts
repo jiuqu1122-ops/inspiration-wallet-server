@@ -924,7 +924,7 @@ export async function providerRequest(
   body?: unknown,
   timeoutOverrideMs?: number,
   extraHeaders?: Record<string, string>,
-  onResponseStatus?: (status: number) => void,
+  onResponseStatus?: (status: number, headers: Headers) => void,
   diagnosticScope?: ImageResponseDiagnosticScope,
   dispatcher?: Agent,
 ) {
@@ -966,7 +966,7 @@ export async function providerRequest(
       signal: controller.signal,
     }));
     if (diagnosticScope) markImageResponseHeaders(diagnosticScope, response);
-    onResponseStatus?.(response.status);
+    onResponseStatus?.(response.status, response.headers);
     const bodyStartedAt = performance.now();
     const text = await readProviderResponseText(
       response,

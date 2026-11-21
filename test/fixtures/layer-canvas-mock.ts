@@ -55,13 +55,19 @@ export async function startLayerMock(port = 4137) {
   ]));
   const operations = new Map<string, { idempotencyKey: string; result: unknown }>();
   const usageBindings = new Map<string, { key: string; canonicalModelId: string }>();
-  const calls: { channel: string; body: Record<string, unknown>; customTransport: boolean }[] = [];
+  const calls: { channel: string; body: Record<string, unknown>; customTransport: boolean; arkClientRequestId: string | null }[] = [];
+  const sourceKey = 'reference-images/layer-test-source.png';
+  const signedSourceUrl = `https://1.1.1.1/${sourceKey}?signed=fixture`;
   const uselgReads: string[] = [];
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     const target = new URL(String(url));
     if (target.href === 'https://8.8.8.8/api/v3/models' && init?.method === 'GET') {
       return Response.json({ object: 'list', data: [{ id: 'doubao-seedream-fixture', domain: 'ImageGeneration' }] });
+    }
+    if (target.href === signedSourceUrl && init?.method === 'GET') {
+      if (new Headers(init.headers).has('authorization')) return new Response(null, { status: 403 });
+      return new Response(new Uint8Array(poster), { headers: { 'content-type': 'image/png' } });
     }
     if (target.origin === 'https://9.9.9.9' && target.pathname === '/canvas-edit.png' && init?.method === 'GET') {
       uselgReads.push(target.origin + target.pathname);
@@ -96,7 +102,8 @@ export async function startLayerMock(port = 4137) {
         assets: [{ download_url: '/v1/images/tasks/imgtask-layer-edit-fixture/assets/0' }] });
     }
     const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    calls.push({ channel: route.id, body, customTransport: Boolean((init as RequestInit & { dispatcher?: unknown })?.dispatcher) });
+    calls.push({ channel: route.id, body, customTransport: Boolean((init as RequestInit & { dispatcher?: unknown })?.dispatcher),
+      arkClientRequestId: new Headers(init?.headers).get('x-client-request-id') });
     await new Promise(resolve => setTimeout(resolve, 1200));
     const pixel = route.id === 'mock-b';
     if (target.pathname === '/v1/images/edits') {
@@ -109,6 +116,15 @@ export async function startLayerMock(port = 4137) {
       if (body.prompt === 'ark-timeout-fixture') {
         throw Object.assign(new Error('Provider response exceeded the deadline'), { code: 'IMAGE_PROVIDER_RESPONSE_TIMEOUT' });
       }
+      const source = String(body.image);
+      let bytes;
+      if (source.startsWith('https://')) {
+        const reference = await fetch(source, { method: 'GET' });
+        if (!reference.ok) return Response.json({ error: 'Mock Ark could not read source image' }, { status: 400 });
+        bytes = Buffer.from(await reference.arrayBuffer());
+      } else {
+        bytes = Buffer.from(source.split(',')[1] ?? '', 'base64');
+      }
       if (body.layer_decomposition === true) {
         return Response.json({ data: [
           { url: 'https://9.9.9.9/ark-layers/cloud.png?signature=fixture', size: '120x70', z_index: 2, name: '云朵',
@@ -118,7 +134,6 @@ export async function startLayerMock(port = 4137) {
             bounding_box: { absolute: [27, 37, 237, 113] } },
         ] });
       }
-      const bytes = Buffer.from(String(body.image).split(',')[1] ?? '', 'base64');
       const output = await sharp(bytes).tint('#8b95ed').png().toBuffer();
       return Response.json({ data: [{ b64_json: output.toString('base64') }] });
     }
@@ -207,7 +222,7 @@ export async function startLayerMock(port = 4137) {
     referenceUpload: {
       findFirst: async ({ where }: { where: { objectKey: string; userId: string } }) => {
         const ownerByObject: Record<string, string> = {
-          'reference-images/layer-test-source.png': 'local-test-user',
+          [sourceKey]: 'local-test-user',
           'reference-images/foreign-layer-test-source.png': 'different-test-user',
         };
         if (ownerByObject[where.objectKey] !== where.userId) return null;
@@ -276,7 +291,7 @@ export async function startLayerMock(port = 4137) {
     return { url: await createImageResultFromResponse(new Response(new Uint8Array(bytes), { headers: { 'content-type': 'image/png' } })) };
   });
   await app.listen({ port, host: '127.0.0.1' });
-  return { app, paths: { base: data(base), poster: data(poster) }, upstreamCalls: () => [...calls],
+  return { app, paths: { base: data(base), poster: data(poster), sourceKey, signedSourceUrl }, upstreamCalls: () => [...calls],
     useMockAProviderKind(kind: AiProviderChannel['kind'], baseUrl = 'https://1.1.1.1') {
       Object.assign(routes[0]!.channel, { kind, baseUrl });
     },

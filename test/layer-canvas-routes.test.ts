@@ -175,14 +175,22 @@ test('routes Ark split and edit, downloads layers, and sends official point guid
   expect((await save('edit', { ...ark, creditsPerRequest: '8' })).statusCode).toBe(200);
   mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
   try {
-    const split = (await run({ operation: 'split', clientRequestId: 'ark-split-001', expectedCredits: '12' })).json();
+    const invalid = await run({ operation: 'split', clientRequestId: 'ark-split-too-small', expectedCredits: '12' });
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json()).toMatchObject({ error: 'invalid_source_image' });
+    const missing = await mock.app.inject('/v1/ai/canvas-layers/by-request/ark-split-too-small');
+    expect(missing.statusCode).toBe(404);
+    const largerPoster = await sharp(Buffer.from(mock.paths.poster.split(',')[1]!, 'base64')).resize(640, 800).png().toBuffer();
+    const image = 'data:image/png;base64,' + largerPoster.toString('base64');
+    const split = (await run({ operation: 'split', image, clientRequestId: 'ark-split-001', expectedCredits: '12' })).json();
     expect(split).toMatchObject({ status: 'success', chargedCredits: '12.000000', result: { width: 320, height: 400,
       layers: [
         { name: '标题', order: 0, x: 27, y: 37, width: 210, height: 76 },
         { name: '云朵', order: 1, x: 100, y: 175, width: 96, height: 56, alpha: true, transparent: true },
       ] } });
-    expect(mock.upstreamCalls().at(-1)?.body).toMatchObject({ image: mock.paths.poster, layer_decomposition: true, response_format: 'url' });
+    expect(mock.upstreamCalls().at(-1)?.body).toMatchObject({ image, layer_decomposition: true, response_format: 'url' });
     expect(mock.upstreamCalls().at(-1)?.customTransport).toBe(true);
+    expect(mock.upstreamCalls().at(-1)?.arkClientRequestId).toMatch(/^[a-zA-Z0-9-]+$/);
     expect(mock.upstreamCalls().at(-1)?.body).not.toHaveProperty('prompt');
     expect(mock.upstreamCalls().at(-1)?.body).not.toHaveProperty('layer_decomposition_options');
     const layer = await mock.app.inject(new URL(split.result.assets[2]).pathname);
@@ -223,6 +231,10 @@ test('sends Ark split options only for identified Seedream 5.5 and clamps edit c
   await expect(build('ep-known-5-5', 'seedream-5-5')).resolves.toHaveProperty('layer_decomposition_options.max_images', 33);
   await expect(build('doubao-seedream-5-0-flash-260915', 'seedream-5-5')).resolves.not.toHaveProperty('layer_decomposition_options');
   await expect(build('ep-unknown')).resolves.not.toHaveProperty('layer_decomposition_options');
+  await expect(layerUpstreamBody('volcengine-ark', split, 'doubao-seedream-5-0-flash-260915', source,
+    { ...settings, arkImageUrl: mock.paths.signedSourceUrl })).resolves.toMatchObject({
+    layer_decomposition: true, image: mock.paths.signedSourceUrl,
+  });
   const edge = await layerUpstreamBody('volcengine-ark', { ...split, operation: 'edit',
     selection: { kind: 'rect', x: 0.9999, y: 0.9999, width: 0.0001, height: 0.0001 },
   }, 'doubao-seedream-5-0-flash-260915', source, settings);
@@ -344,10 +356,9 @@ test('allows hidden images only for the layer tasks they are explicitly assigned
 });
 
 test('uses an owned reference key for canvas layer input and deduplicates retries', async () => {
-  const objectKey = 'reference-images/layer-test-source.png';
+  const { sourceKey: objectKey, signedSourceUrl: url } = mock.paths;
   const foreignKey = 'reference-images/foreign-layer-test-source.png';
   const posterBytes = Buffer.from(mock.paths.poster.split(',')[1]!, 'base64');
-  const url = `https://1.1.1.1/${objectKey}?signed=fixture`;
   const head = vi.spyOn(storageService, 'headObject').mockResolvedValue({
     objectKey, contentLength: posterBytes.length, contentType: 'image/png', metadata: {}, headers: {},
   });
@@ -380,6 +391,27 @@ test('uses an owned reference key for canvas layer input and deduplicates retrie
     expect((await submit(objectKey, 'owned-reference-001')).json()).toEqual(accepted.json());
     expect(read).toHaveBeenCalledTimes(1);
     expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 1);
+
+    const common = { enabled: true, maxMegapixels: 2, maxLayers: 32, creditsPerRequest: credits };
+    const save = (endpoint: string, adapter: string) => mock.app.inject({ method: 'PUT',
+      url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/edit', payload: { config: { ...common, endpoint, adapter } },
+    });
+    expect((await save('/images/generations', 'volcengine-ark')).statusCode).toBe(200);
+    mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
+    try {
+      const official = await submit(objectKey, 'owned-reference-ark-001');
+      expect(official.json()).toMatchObject({ status: 'success', chargedCredits: credits,
+        result: { operation: 'edit', image: { width: 320, height: 400 } } });
+      expect(downloadUrl).toHaveBeenLastCalledWith(objectKey, { expiresSeconds: 600 });
+      expect(mock.upstreamCalls().at(-1)).toMatchObject({ body: { image: url }, arkClientRequestId: expect.any(String) });
+      expect(official.body).not.toContain(url);
+      expect((await submit(objectKey, 'owned-reference-ark-001')).json()).toEqual(official.json());
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 2);
+    } finally {
+      mock.useMockAProviderKind('NEW_API');
+      await save('/edit', 'canvas-json');
+    }
   } finally {
     for (const spy of [head, downloadUrl, resolveKey, read]) spy.mockRestore();
   }

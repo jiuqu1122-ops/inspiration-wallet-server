@@ -81,7 +81,7 @@ function isArkSeedream55(upstreamModel: string, canonicalModelKey: string) {
 
 export async function layerUpstreamBody(
   adapter: LayerRoute['adapter'], input: CanvasLayerInput, model: string, source: SourceImage,
-  { maxLayers, canonicalModelKey }: { maxLayers: number; canonicalModelKey: string },
+  { maxLayers, canonicalModelKey, arkImageUrl }: { maxLayers: number; canonicalModelKey: string; arkImageUrl?: string | undefined },
 ) {
   const { operation, image, prompt, selection } = input;
   const { width, height } = source;
@@ -90,12 +90,12 @@ export async function layerUpstreamBody(
     // URL responses keep a multi-layer result out of the single JSON body limit.
     const fields = { model, output_format: 'png', response_format: 'url', watermark: false };
     if (operation === 'split') return { ...fields, layer_decomposition: true, size: 'auto',
-      image: await arkSplitReference(image), ...(prompt ? { prompt } : {}),
+      image: arkImageUrl ?? await arkSplitReference(image), ...(prompt ? { prompt } : {}),
       ...(isArkSeedream55(model, canonicalModelKey) ? { layer_decomposition_options: { max_images: maxLayers + 1 } } : {}) };
     const exactSizeSupported = width * height >= 921_600 && width * height <= 4_624_220
       && width / height >= 1 / 16 && width / height <= 16;
     const transparent = source.alpha && !(await sharp(dataBytes(image), { limitInputPixels: 64_000_000 }).stats()).isOpaque;
-    return { ...fields, image, prompt: arkEditPrompt(prompt, selection),
+    return { ...fields, image: arkImageUrl ?? image, prompt: arkEditPrompt(prompt, selection),
       ...(exactSizeSupported ? { size: `${width}x${height}` } : {}),
       ...(transparent ? { background: 'transparent' } : {}) };
   }

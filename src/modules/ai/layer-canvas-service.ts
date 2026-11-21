@@ -24,12 +24,18 @@ const unavailable = () => new CloudAiError('layer_route_unavailable', '该操作
 // outlast Node's default dual-stack connection attempt window.
 const beijingArkLayerDispatcher = new Agent({ connect: { family: 4, timeout: 30_000 } });
 const BEIJING_ARK_LAYER_SUBMIT_TIMEOUT_MS = 240_000;
+const ARK_SOURCE_URL_EXPIRY_SECONDS = 600;
 
-async function readLayerInputImage(prisma: PrismaClient, userId: string, image: string) {
-  if (!image.startsWith('reference-images/')) return image;
+async function readLayerInputImage(prisma: PrismaClient, userId: string, image: string, officialBeijingArk: boolean) {
+  if (!image.startsWith('reference-images/')) return { image };
   const objectKey = await authorizeReferenceObject(prisma, userId, image);
-  const prepared = await prepareGenericImageDataUrlReference(storageService.getDownloadUrl(objectKey));
-  return prepared.value;
+  const downloadUrl = storageService.getDownloadUrl(objectKey,
+    officialBeijingArk ? { expiresSeconds: ARK_SOURCE_URL_EXPIRY_SECONDS } : undefined);
+  const prepared = await prepareGenericImageDataUrlReference(downloadUrl);
+  // The reference reader normalizes WebP to PNG. Only pass through the URL
+  // if it points to the original, verified PNG or JPEG.
+  const arkImageUrl = officialBeijingArk && /\.(?:png|jpe?g)$/i.test(objectKey) ? downloadUrl : undefined;
+  return { image: prepared.value, arkImageUrl };
 }
 
 const stageMessages = {
@@ -117,11 +123,20 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
   if (input.expectedCredits !== undefined && serializeCredit(input.expectedCredits) !== chargedCredits) {
     throw new CloudAiError('layer_price_changed', '积分价格已调整，请核对后重新运行', 409);
   }
-  const image = await readLayerInputImage(prisma, userId, input.image);
+  const officialBeijingArk = config.adapter === 'volcengine-ark' && provider.kind === 'VOLCENGINE_ARK'
+    && new URL(provider.baseUrl).origin === 'https://ark.cn-beijing.volces.com';
+  const { image, arkImageUrl } = await readLayerInputImage(prisma, userId, input.image, officialBeijingArk);
   const preparedInput = { ...input, image };
   let source;
   try { source = await canvasSourceDimensions(image); }
   catch { throw new CloudAiError('invalid_source_image', '输入图片损坏、格式不受支持或尺寸超限', 400); }
+  if (officialBeijingArk && operation === 'split') {
+    const pixels = source.width * source.height;
+    const ratio = source.width / source.height;
+    if (pixels < 512 * 512 || pixels > 6000 * 6000 || ratio < 1 / 16 || ratio > 16) {
+      throw new CloudAiError('invalid_source_image', '火山方舟图层拆分要求图片总像素在 262,144 至 36,000,000 之间，宽高比在 1:16 至 16:1 之间', 400);
+    }
+  }
   const journal = { canvasLayersVersion: 1, fingerprint, operation, adapter: config.adapter, creditsPerRequest: chargedCredits };
   let requestId;
   let stage: keyof typeof stageMessages = 'canvas_layer_submit';
@@ -140,17 +155,20 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
   }
   const processingStartedAt = performance.now();
   let upstreamResponseStatus: number | undefined;
+  let arkRequestId: string | undefined;
   try {
     await assertPublicProviderUrl(provider.baseUrl);
-    const officialBeijingArk = config.adapter === 'volcengine-ark' && provider.kind === 'VOLCENGINE_ARK'
-      && new URL(provider.baseUrl).hostname === 'ark.cn-beijing.volces.com';
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
     const body = await layerUpstreamBody(config.adapter, preparedInput, route.upstreamModelId, source, {
-      maxLayers: config.maxLayers, canonicalModelKey: model.canonicalModelKey,
+      maxLayers: config.maxLayers, canonicalModelKey: model.canonicalModelKey, arkImageUrl,
     });
     const upstream = await providerRequest(provider, secrets, config.endpoint, body,
       officialBeijingArk ? BEIJING_ARK_LAYER_SUBMIT_TIMEOUT_MS : 180_000,
-      { 'Idempotency-Key': requestId }, status => { upstreamResponseStatus = status; }, undefined,
+      { 'Idempotency-Key': requestId, ...(officialBeijingArk ? { 'X-Client-Request-Id': requestId } : {}) }, (status, headers) => {
+        upstreamResponseStatus = status;
+        const id = officialBeijingArk ? headers.get('x-request-id') : null;
+        if (id && /^[a-zA-Z0-9_.:-]{1,128}$/.test(id)) arkRequestId = id;
+      }, undefined,
       officialBeijingArk ? beijingArkLayerDispatcher : undefined);
     stage = 'canvas_layer_result';
     const reply = operation === 'edit' ? await resolveLayerEditTask(
@@ -187,6 +205,8 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
     const diagnostic = buildFailureDiagnostic(error, { stage });
     console.warn('[canvas_layer_failed]', { clientRequestId, routeId: route.id, adapter: config.adapter,
       ...taskIdentity(), stage: diagnostic.stage, code: diagnostic.code, httpStatus: diagnostic.httpStatus,
+      ...(officialBeijingArk ? { arkClientRequestId: requestId, arkRequestId: arkRequestId ?? null,
+        arkImageTransport: arkImageUrl ? 'signed-url' : 'inline' } : {}),
       upstreamResponseStatus: upstreamResponseStatus ?? null, elapsedMs: Math.round(performance.now() - processingStartedAt) });
     const message = stage === 'canvas_layer_submit' && diagnostic.code === 'PROVIDER_TIMEOUT'
       ? '等待上游渠道响应超时。' : stageMessages[stage];
