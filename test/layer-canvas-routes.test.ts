@@ -150,3 +150,60 @@ test('routes Ark split and edit, positions cropped layers, and only draws guidan
     await save('edit', { ...common, endpoint: '/edit', adapter: 'canvas-json', creditsPerRequest: '8' });
   }
 }, 15_000);
+
+test('delivers USELG synchronous or asynchronous edit images with one submission per request', async () => {
+  const common = { enabled: true, maxMegapixels: 2, maxLayers: 1, creditsPerRequest: '8', adapter: 'canvas-json' };
+  const save = (endpoint: string) => mock.app.inject({
+    method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/edit',
+    payload: { config: { ...common, endpoint } },
+  });
+  const submit = (clientRequestId: string, prompt: string) => mock.app.inject({
+    method: 'POST', url: '/v1/ai/canvas-layers',
+    payload: { operation: 'edit', clientRequestId, prompt, expectedCredits: '8', image: mock.paths.poster },
+  });
+  expect((await save('/v1/images/edits')).statusCode).toBe(200);
+  mock.useMockAProviderKind('USELG');
+  try {
+    const initialSubmissions = mock.upstreamCalls().length;
+    const initialReads = mock.uselgReads().length;
+    const [first, duplicate] = await Promise.all([
+      submit('uselg-layer-async-fixture', 'task receipt'),
+      submit('uselg-layer-async-fixture', 'task receipt'),
+    ]);
+    expect([first.statusCode, duplicate.statusCode].sort()).toEqual([200, 202]);
+    const completed = (first.statusCode === 200 ? first : duplicate).json();
+    expect(completed).toMatchObject({ status: 'success', chargedCredits: '8.000000',
+      result: { operation: 'edit', image: { width: 320, height: 400 } } });
+    const asset = await mock.app.inject(new URL(completed.result.assets[0]).pathname);
+    expect(asset.statusCode).toBe(200);
+    expect(await sharp(asset.rawPayload).metadata()).toMatchObject({ width: 320, height: 400 });
+    expect(mock.uselgReads().slice(initialReads)).toEqual([
+      '/v1/images/tasks/imgtask-layer-edit-fixture?view=summary',
+      '/v1/images/tasks/imgtask-layer-edit-fixture',
+      '/v1/images/tasks/imgtask-layer-edit-fixture/assets/0',
+    ]);
+    expect((await submit('uselg-layer-async-fixture', 'task receipt')).json()).toEqual(completed);
+    expect(mock.upstreamCalls().length).toBe(initialSubmissions + 1);
+
+    expect((await submit('uselg-layer-direct-fixture', 'direct asset')).json()).toMatchObject({
+      status: 'success', chargedCredits: '8.000000', result: { operation: 'edit', assets: [expect.any(String)] },
+    });
+    expect(mock.uselgReads().at(-1)).toBe('/v1/images/tasks/direct/assets/0');
+
+    expect((await submit('uselg-layer-signed-fixture', 'signed asset')).json()).toMatchObject({
+      status: 'success', chargedCredits: '8.000000', result: { operation: 'edit', assets: [expect.any(String)] },
+    });
+    expect(mock.uselgReads().at(-1)).toBe('https://9.9.9.9/canvas-edit.png');
+
+    expect((await submit('uselg-layer-expired-fixture', 'expired asset')).json()).toMatchObject({
+      status: 'failed', chargedCredits: '0.000000', message: '上游返回了图片地址，但下载失败。预留积分已释放。',
+    });
+    expect(mock.failureDiagnostic('uselg-layer-expired-fixture')).toMatchObject({
+      stage: 'canvas_layer_download', code: 'PROVIDER_AUTH_FAILED', httpStatus: 403,
+    });
+    expect(mock.upstreamCalls().length).toBe(initialSubmissions + 4);
+  } finally {
+    mock.useMockAProviderKind('NEW_API');
+    await save('/edit');
+  }
+}, 20_000);

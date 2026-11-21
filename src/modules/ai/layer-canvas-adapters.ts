@@ -1,5 +1,7 @@
-import sharp from 'sharp';
+import sharp, { type Sharp } from 'sharp';
 import { z } from 'zod';
+import { readFile } from 'node:fs/promises';
+import { getImageResult, isStoredImageResultUrl } from './image-result-store.js';
 import { jsonRecord, layerCreditsSchema, type LayerMode, type LayerRoute } from './layer-canvas-config.js';
 import { prepareGenericImageDataUrlReference } from './seedream-references.js';
 
@@ -25,8 +27,15 @@ const dimension = z.number().int().min(1).max(8192);
 const placement = z.number().int().min(-8192).max(8192);
 const opacity = z.number().min(0).max(1).default(1);
 const name = z.string().trim().min(1).max(160);
-const raster = z.union([z.string().min(1), z.object({ url: z.string().min(1) }), z.object({ b64_json: z.string().min(1) })]);
+const raster = z.union([
+  z.string().min(1),
+  z.object({ b64_json: z.string().min(1) }),
+  z.object({ url: z.string().min(1) }),
+  z.object({ signed_url: z.string().min(1) }).transform(({ signed_url }) => ({ url: signed_url })),
+  z.object({ download_url: z.string().min(1) }).transform(({ download_url }) => ({ url: download_url })),
+]);
 type Raster = z.infer<typeof raster>;
+const maximumRasterBytes = 20 * 1024 ** 2;
 
 type SourceImage = { width: number; height: number; alpha: boolean | undefined };
 type RasterSize = Pick<SourceImage, 'width' | 'height'>;
@@ -114,13 +123,20 @@ function decodeArkSplit(data: unknown, maxLayers: number) {
   };
 }
 
+export function canvasLayerEditOutput(adapter: LayerRoute['adapter'], raw: unknown): Raster | undefined {
+  const root = jsonRecord(raw);
+  const preferred = adapter === 'pixel-json' ? jsonRecord(root.result).output : jsonRecord(root.data).image;
+  const imageList: unknown = Array.isArray(root.data) && root.data.length === 1 ? root.data[0] : undefined;
+  const decoded = raster.safeParse(preferred ?? imageList);
+  return decoded.success ? decoded.data : undefined;
+}
+
 function decodeResponse(adapter: LayerRoute['adapter'], operation: LayerMode, raw: unknown, maxLayers: number): DecodedResult {
   const root = jsonRecord(raw);
   if (operation === 'edit') {
-    const listResponse = adapter === 'images-api-edit' || adapter === 'volcengine-ark';
-    const output: unknown = listResponse && Array.isArray(root.data) && root.data.length === 1 ? root.data[0]
-      : adapter === 'pixel-json' ? jsonRecord(root.result).output : jsonRecord(root.data).image;
-    return { operation, output: raster.parse(output) };
+    const output = canvasLayerEditOutput(adapter, raw);
+    if (!output) throw new Error('No image was found in the canvas edit response');
+    return { operation, output };
   }
   if (adapter === 'volcengine-ark') return decodeArkSplit(root.data, maxLayers);
   if (adapter === 'pixel-json') {
@@ -142,28 +158,46 @@ const dataBytes = (source: string) => {
   const match = /^data:image\/(?:png|jpe?g|webp);base64,([a-zA-Z0-9+/]+={0,2})$/i.exec(source);
   if (!match) throw new Error('Invalid image encoding');
   const bytes = Buffer.from(match[1]!, 'base64');
-  if (!bytes.length || bytes.length > 20 * 1024 ** 2 || bytes.toString('base64') !== match[1]) throw new Error('Invalid image bytes');
+  if (!bytes.length || bytes.length > maximumRasterBytes || bytes.toString('base64') !== match[1]) throw new Error('Invalid image bytes');
   return bytes;
 };
-export async function canvasSourceDimensions(source: string) {
-  const image = sharp(dataBytes(source), { limitInputPixels: 64_000_000, failOn: 'warning' });
+function canvasRaster(bytes: Buffer) {
+  return sharp(bytes, { limitInputPixels: 64_000_000, failOn: 'warning' });
+}
+async function canvasRasterDimensions(image: Sharp) {
   const info = await image.metadata();
   if (!info.width || !info.height || !['png', 'jpeg', 'webp'].includes(info.format ?? '') || (info.pages ?? 1) > 1
     || info.width > 8192 || info.height > 8192) throw new Error('Unsupported image dimensions or format');
   return { width: info.width, height: info.height, alpha: info.hasAlpha };
 }
+export function canvasSourceDimensions(source: string) {
+  return canvasRasterDimensions(canvasRaster(dataBytes(source)));
+}
 
-async function normalizeRaster(value: Raster, remainingPixels: number, expected?: RasterSize, resize?: RasterSize) {
-  const source = typeof value === 'string' ? value : 'url' in value ? value.url : value.b64_json;
-  const dataUrl = source.startsWith('https://') ? (await prepareGenericImageDataUrlReference(source)).value
+export async function canvasResultBytes(source: string) {
+  if (isStoredImageResultUrl(source)) {
+    const cached = await getImageResult(new URL(source).pathname.split('/').at(-1)!);
+    if (!cached) throw new Error('Cached image result is missing or expired');
+    if (cached.size > maximumRasterBytes) throw new Error('Cached image result is too large');
+    return readFile(cached.path);
+  }
+  const dataUrl = /^https:\/\//i.test(source) ? (await prepareGenericImageDataUrlReference(source)).value
     : source.startsWith('data:') ? source : 'data:image/png;base64,' + source;
-  const dimensions = await canvasSourceDimensions(dataUrl);
+  return dataBytes(dataUrl);
+}
+
+type ReadEditAsset = (source: string) => Promise<Buffer>;
+
+async function normalizeRaster(value: Raster, remainingPixels: number, expected?: RasterSize, resize?: RasterSize,
+  readEditAsset?: ReadEditAsset) {
+  const source = typeof value === 'string' ? value : 'url' in value ? value.url : value.b64_json;
+  const image = canvasRaster(await (readEditAsset ?? canvasResultBytes)(source));
+  const dimensions = await canvasRasterDimensions(image);
   const originalPixels = dimensions.width * dimensions.height;
   const output = resize ?? dimensions;
   const budgetPixels = Math.max(originalPixels, output.width * output.height);
   if (budgetPixels > remainingPixels
     || expected && (dimensions.width !== expected.width || dimensions.height !== expected.height)) throw new Error('Invalid result dimensions or configured output budget exceeded');
-  const image = sharp(dataBytes(dataUrl), { limitInputPixels: 64_000_000, failOn: 'warning' });
   if (resize && (resize.width !== dimensions.width || resize.height !== dimensions.height)) {
     image.resize(resize.width, resize.height, { fit: 'fill' });
   }
@@ -173,21 +207,21 @@ async function normalizeRaster(value: Raster, remainingPixels: number, expected?
     dataUrl: 'data:image/png;base64,' + bytes.toString('base64') };
 }
 
-export async function decodeCanvasLayerResult(config: LayerRoute, operation: LayerMode, reply: unknown) {
+export async function decodeCanvasLayerResult(config: LayerRoute, operation: LayerMode, reply: unknown, readEditAsset?: ReadEditAsset) {
   const decoded = decodeResponse(config.adapter, operation, reply, config.maxLayers);
   let pixels = 0;
   let usedBudgetPixels = 0;
   const assets: string[] = [];
-  const read = async (raster: Raster, dimensions?: RasterSize, resize?: RasterSize) => {
+  const read = async (raster: Raster, dimensions?: RasterSize, resize?: RasterSize, reader?: ReadEditAsset) => {
     const { dataUrl, originalPixels, budgetPixels, ...meta } = await normalizeRaster(raster,
-      config.maxMegapixels * 1_000_000 - usedBudgetPixels, dimensions, resize);
+      config.maxMegapixels * 1_000_000 - usedBudgetPixels, dimensions, resize, reader);
     pixels += originalPixels;
     usedBudgetPixels += budgetPixels;
     assets.push(dataUrl);
     return meta;
   };
   if (decoded.operation === 'edit') {
-    const image = await read(decoded.output);
+    const image = await read(decoded.output, undefined, undefined, readEditAsset);
     return { assets, pixels, structure: { operation, image: { ...image, asset: 0 } } };
   }
   const base = await read(decoded.base, decoded);

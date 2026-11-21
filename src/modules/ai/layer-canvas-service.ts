@@ -1,17 +1,75 @@
 import { createHash } from 'node:crypto';
-import type { Prisma, PrismaClient } from '@prisma/client';
-import { decryptProviderSecrets } from '../../lib/provider-secrets.js';
+import type { AiModelRoute, AiProviderChannel, Prisma, PrismaClient } from '@prisma/client';
+import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl } from '../providers/url.js';
 import { isStoredImageResultUrl } from './image-result-store.js';
-import { providerRequest, persistGeneratedImageResultsAndScheduleMirrors } from './image-service.js';
-import { jsonRecord, layerCandidates } from './layer-canvas-config.js';
-import { canvasSourceDimensions, decodeCanvasLayerResult, layerUpstreamBody, type CanvasLayerInput } from './layer-canvas-adapters.js';
+import { configuredImageTaskEnvelope, imageTaskResultContent, providerRequest, resolveImageAdapterResponse,
+  persistGeneratedImageResultsAndScheduleMirrors } from './image-service.js';
+import { normalizeImageTaskExecutionConfig } from './image-execution.js';
+import { buildFailureDiagnostic } from './failure-diagnostic.js';
+import { jsonRecord, layerCandidates, type LayerRoute } from './layer-canvas-config.js';
+import { canvasLayerEditOutput, canvasResultBytes, canvasSourceDimensions, decodeCanvasLayerResult, layerUpstreamBody,
+  type CanvasLayerInput } from './layer-canvas-adapters.js';
 import { CloudAiError, releaseCredits, reserveCredits, settleCredits } from './service.js';
 import { serializeCredit } from '../wallets/credit-amount.js';
 import { toInputJson } from './pricing-center.js';
 
 const identity = (userId: string, clientRequestId: string) => ({ userId_clientRequestId: { userId, clientRequestId } });
 const unavailable = () => new CloudAiError('layer_route_unavailable', '该操作尚未配置可用的模型、渠道或价格', 409);
+const stageMessages = {
+  canvas_layer_submit: '提交给上游渠道时失败。',
+  canvas_layer_result: '未能从上游任务取回编辑图片。',
+  canvas_layer_download: '上游返回了图片地址，但下载失败。',
+  canvas_layer_decode: '渠道回包缺少可用图片，或图片格式、图层位置、尺寸超出配置要求。',
+  result_persistence: '上游图片已返回，但保存到灵感抽屉失败。',
+} as const;
+
+async function resolveLayerEditTask(
+  provider: AiProviderChannel,
+  secrets: ProviderSecrets,
+  route: Pick<AiModelRoute, 'executionMode' | 'executionConfig'>,
+  config: LayerRoute,
+  reply: unknown,
+  inputImage: string,
+  onTaskId: (id: string) => Promise<void>,
+) {
+  const taskRoute = route.executionMode === 'TASK';
+  if (provider.kind !== 'USELG' && !taskRoute) return reply;
+
+  const execution = normalizeImageTaskExecutionConfig(
+    taskRoute ? route.executionConfig : {
+      profile: 'USELG_IMAGE_TASK', resultEndpointTemplate: '/v1/images/tasks/{taskId}',
+    },
+    { submitEndpoint: config.endpoint },
+  );
+  const envelope = configuredImageTaskEnvelope(reply, execution);
+  const state = typeof envelope.status === 'string' ? envelope.status : '';
+  const taskId = typeof envelope.task_id === 'string' ? envelope.task_id : '';
+  if (/^[a-zA-Z0-9_.:-]{1,128}$/.test(taskId)) await onTaskId(taskId);
+  if (canvasLayerEditOutput(config.adapter, reply)
+    && !/^(?:queued|pending|processing|running|in_progress|waiting|failed|failure|error|cancelled|canceled|rejected|paused|uncertain|client_disconnected|pending_confirmation)$/.test(state)) return reply;
+  // The shared image reader polls this submitted task and downloads its assets
+  // with GET only. The edit adapter still owns raster validation and placement.
+  const [output] = await resolveImageAdapterResponse(provider, secrets, envelope, [inputImage], 1, undefined,
+    async (path, _body, timeout) => configuredImageTaskEnvelope(
+      await providerRequest(provider, secrets, path, undefined, timeout), execution, taskId,
+    ),
+    undefined,
+    async (path, timeout) => {
+      const result = await imageTaskResultContent(provider, secrets, path, timeout);
+      return typeof result === 'string' ? result : configuredImageTaskEnvelope(result, execution, taskId);
+    },
+    undefined, true);
+  return { data: [{ url: output }] };
+}
+
+async function readLayerEditAsset(provider: AiProviderChannel, secrets: ProviderSecrets, source: string) {
+  const target = new URL(source, provider.baseUrl);
+  if (target.origin !== new URL(provider.baseUrl).origin) return source;
+  const result = await imageTaskResultContent(provider, secrets, target.href, 45_000);
+  if (typeof result !== 'string' || !isStoredImageResultUrl(result)) throw new Error('Asset endpoint did not return image bytes');
+  return result;
+}
 
 export async function getCanvasLayerRequest(prisma: PrismaClient, userId: string, clientRequestId: string, fingerprint?: string) {
   const row = await prisma.aiRequest.findUnique({ where: identity(userId, clientRequestId) });
@@ -48,6 +106,9 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
   catch { throw new CloudAiError('invalid_source_image', '输入图片损坏、格式不受支持或尺寸超限', 400); }
   const journal = { canvasLayersVersion: 1, fingerprint, operation, adapter: config.adapter, creditsPerRequest: chargedCredits };
   let requestId;
+  let stage: keyof typeof stageMessages = 'canvas_layer_submit';
+  let upstreamTaskId = '';
+  const taskIdentity = () => upstreamTaskId ? { upstreamTaskId } : {};
   try {
     requestId = await reserveCredits(prisma, {
       userId, clientRequestId, capability: 'IMAGE', logicalModel: model.canonicalModelKey,
@@ -65,7 +126,25 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
     const body = await layerUpstreamBody(config.adapter, input, route.upstreamModelId, source);
     const upstream = await providerRequest(provider, secrets, config.endpoint, body, 180_000,
       { 'Idempotency-Key': requestId });
-    const decoded = await decodeCanvasLayerResult(config, operation, upstream);
+    stage = 'canvas_layer_result';
+    const reply = operation === 'edit' ? await resolveLayerEditTask(
+      provider, secrets, route, config, upstream, input.image, async id => {
+        upstreamTaskId = id;
+        await prisma.aiRequest.updateMany({
+          where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
+          data: { status: 'PROCESSING', result: { ...journal, upstreamTaskId } },
+        });
+      },
+    ) : upstream;
+    stage = 'canvas_layer_decode';
+    const decoded = await decodeCanvasLayerResult(config, operation, reply, operation === 'edit' ? async source => {
+      if (!/^(?:https?:\/\/|\/(?!\/))/i.test(source) || isStoredImageResultUrl(source)) return canvasResultBytes(source);
+      stage = 'canvas_layer_download';
+      const bytes = await canvasResultBytes(await readLayerEditAsset(provider, secrets, source));
+      stage = 'canvas_layer_decode';
+      return bytes;
+    } : undefined);
+    stage = 'result_persistence';
     const assets = await persistGeneratedImageResultsAndScheduleMirrors(decoded.assets, provider.name, {
       clientRequestId, canonicalModel: model.canonicalModelKey, routeId: route.id, providerId: provider.id, adapterKey: config.adapter,
     });
@@ -74,13 +153,16 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
     }
     await settleCredits(prisma, userId, requestId, {
       chargedCredits, description: '画布图层操作结算',
-      result: toInputJson({ ...journal, result: { ...decoded.structure, assets } }) as Prisma.InputJsonObject,
+      result: toInputJson({ ...journal, ...taskIdentity(), result: { ...decoded.structure, assets } }) as Prisma.InputJsonObject,
       breakdown: { operation, imageCount: assets.length, outputPixels: decoded.pixels,
         creditsPerRequest: chargedCredits, totalCredits: chargedCredits },
     });
-  } catch {
-    await releaseCredits(prisma, userId, requestId, undefined, { ...journal,
-      message: '渠道调用失败，或返回的图片、图层位置和尺寸不符合要求。预留积分已释放。' });
+  } catch (error) {
+    const diagnostic = buildFailureDiagnostic(error, { stage });
+    console.warn('[canvas_layer_failed]', { clientRequestId, routeId: route.id, adapter: config.adapter,
+      ...taskIdentity(), stage: diagnostic.stage, code: diagnostic.code, httpStatus: diagnostic.httpStatus });
+    await releaseCredits(prisma, userId, requestId, diagnostic, { ...journal, ...taskIdentity(),
+      message: stageMessages[stage] + '预留积分已释放。' });
   }
   return getCanvasLayerRequest(prisma, userId, clientRequestId);
 }

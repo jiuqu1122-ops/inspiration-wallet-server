@@ -54,21 +54,48 @@ export async function startLayerMock(port = 4137) {
   ]));
   const operations = new Map<string, { idempotencyKey: string; result: unknown }>();
   const calls: { channel: string; body: Record<string, unknown> }[] = [];
+  const uselgReads: string[] = [];
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     const target = new URL(String(url));
     if (target.href === 'https://8.8.8.8/api/v3/models' && init?.method === 'GET') {
       return Response.json({ object: 'list', data: [{ id: 'doubao-seedream-fixture', domain: 'ImageGeneration' }] });
     }
+    if (target.origin === 'https://9.9.9.9' && target.pathname === '/canvas-edit.png' && init?.method === 'GET') {
+      uselgReads.push(target.origin + target.pathname);
+      if (new Headers(init.headers).has('authorization')) return new Response(null, { status: 403 });
+      return new Response(new Uint8Array(poster), { headers: { 'content-type': 'image/png' } });
+    }
     const route = routes.find(entry => entry.channel.baseUrl === target.origin);
     if (!route) {
       if (target.hostname === '127.0.0.1') return realFetch(url, init);
       throw new Error('Local fixture blocked a non-local fetch');
     }
+    if (init?.method === 'GET' && target.pathname.startsWith('/v1/images/tasks/')) {
+      uselgReads.push(target.pathname + target.search);
+      if (new Headers(init.headers).get('authorization') !== 'Bearer fixture-only') {
+        return Response.json({ error: 'missing fixture credential' }, { status: 401 });
+      }
+      if (target.pathname.endsWith('/assets/0')) {
+        return new Response(new Uint8Array(poster), { headers: { 'content-type': 'image/png' } });
+      }
+      if (target.pathname.endsWith('/expired')) return new Response(null, { status: 403 });
+      if (target.searchParams.get('view') === 'summary') {
+        return Response.json({ task_id: 'imgtask-layer-edit-fixture', status: 'succeeded' });
+      }
+      return Response.json({ task_id: 'imgtask-layer-edit-fixture', status: 'succeeded',
+        assets: [{ download_url: '/v1/images/tasks/imgtask-layer-edit-fixture/assets/0' }] });
+    }
     const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     calls.push({ channel: route.id, body });
     await new Promise(resolve => setTimeout(resolve, 1200));
     const pixel = route.id === 'mock-b';
+    if (target.pathname === '/v1/images/edits') {
+      if (body.prompt === 'direct asset') return Response.json({ data: [{ download_url: '/v1/images/tasks/direct/assets/0' }] });
+      if (body.prompt === 'signed asset') return Response.json({ data: [{ url: 'https://9.9.9.9/canvas-edit.png?signature=fixture' }] });
+      if (body.prompt === 'expired asset') return Response.json({ data: [{ url: '/v1/images/tasks/direct/expired' }] });
+      return Response.json({ task_id: 'imgtask-layer-edit-fixture', status: 'queued', poll_after_ms: 1000 }, { status: 202 });
+    }
     if (target.pathname === '/images/generations') {
       if (body.layer_decomposition === true) {
         return Response.json({ data: [
@@ -202,5 +229,8 @@ export async function startLayerMock(port = 4137) {
   });
   await app.listen({ port, host: '127.0.0.1' });
   return { app, paths: { base: data(base), poster: data(poster) }, upstreamCalls: () => [...calls],
+    useMockAProviderKind(kind: AiProviderChannel['kind']) { routes[0]!.channel.kind = kind; },
+    uselgReads: () => [...uselgReads],
+    failureDiagnostic: (clientRequestId: string) => records.find(row => row.clientRequestId === clientRequestId)?.failureDiagnostic as unknown,
     close: async () => { globalThis.fetch = realFetch; await app.close(); } };
 }
