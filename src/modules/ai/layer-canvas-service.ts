@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { AiModelRoute, AiProviderChannel, Prisma, PrismaClient } from '@prisma/client';
 import { Agent } from 'undici';
+import { env } from '../../config/env.js';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl } from '../providers/url.js';
 import { isStoredImageResultUrl } from './image-result-store.js';
-import { storageService } from '../storage/service.js';
 import { configuredImageTaskEnvelope, imageTaskResultContent, providerRequest, resolveImageAdapterResponse,
   persistGeneratedImageResultsAndScheduleMirrors } from './image-service.js';
 import { normalizeImageTaskExecutionConfig } from './image-execution.js';
@@ -16,7 +16,8 @@ import { CloudAiError, releaseCredits, reserveCredits, settleCredits } from './s
 import { serializeCredit } from '../wallets/credit-amount.js';
 import { toInputJson } from './pricing-center.js';
 import { authorizeReferenceObject } from './reference-upload-service.js';
-import { prepareGenericImageDataUrlReference } from './seedream-references.js';
+import { prepareStoredCanvasReference } from './seedream-references.js';
+import { createProviderReference, removeProviderReference } from './provider-reference-store.js';
 
 const identity = (userId: string, clientRequestId: string) => ({ userId_clientRequestId: { userId, clientRequestId } });
 const unavailable = () => new CloudAiError('layer_route_unavailable', '该操作尚未配置可用的模型、渠道或价格', 409);
@@ -24,25 +25,16 @@ const unavailable = () => new CloudAiError('layer_route_unavailable', '该操作
 // outlast Node's default dual-stack connection attempt window.
 const beijingArkLayerDispatcher = new Agent({ connect: { family: 4, timeout: 30_000 } });
 const BEIJING_ARK_LAYER_SUBMIT_TIMEOUT_MS = 240_000;
-const ARK_SOURCE_URL_EXPIRY_SECONDS = 600;
 
-async function readLayerInputImage(prisma: PrismaClient, userId: string,
-  { image, operation }: Pick<CanvasLayerInput, 'image' | 'operation'>, officialBeijingArk: boolean) {
+async function readLayerInputImage(prisma: PrismaClient, userId: string, image: string) {
   if (!image.startsWith('reference-images/')) return { image };
   const objectKey = await authorizeReferenceObject(prisma, userId, image);
-  const downloadUrl = storageService.getDownloadUrl(objectKey,
-    officialBeijingArk ? { expiresSeconds: ARK_SOURCE_URL_EXPIRY_SECONDS } : undefined);
-  // The reference reader normalizes WebP to PNG. Only pass through the URL
-  // if it points to the original, verified PNG or JPEG.
-  const arkImageUrl = officialBeijingArk && /\.(?:png|jpe?g)$/i.test(objectKey) ? downloadUrl : undefined;
-  const prepared = await prepareGenericImageDataUrlReference(downloadUrl, {
-    // The storage SDK can read the object even when its public signature fails.
-    verifyPublicSource: operation === 'split' && arkImageUrl !== undefined,
-  });
-  return { image: prepared.value, arkImageUrl };
+  const prepared = await prepareStoredCanvasReference(objectKey);
+  return { image: prepared.value, storedMime: prepared.mime };
 }
 
 const stageMessages = {
+  canvas_layer_source: '无法准备供上游读取的临时参考图。',
   canvas_layer_submit: '提交给上游渠道时失败。',
   canvas_layer_result: '未能从上游任务取回编辑图片。',
   canvas_layer_download: '上游返回了图片地址，但下载失败。',
@@ -129,7 +121,7 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
   }
   const officialBeijingArk = config.adapter === 'volcengine-ark' && provider.kind === 'VOLCENGINE_ARK'
     && new URL(provider.baseUrl).origin === 'https://ark.cn-beijing.volces.com';
-  const { image, arkImageUrl } = await readLayerInputImage(prisma, userId, input, officialBeijingArk);
+  const { image, storedMime } = await readLayerInputImage(prisma, userId, input.image);
   const preparedInput = { ...input, image };
   let source;
   try { source = await canvasSourceDimensions(image); }
@@ -160,9 +152,20 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
   const processingStartedAt = performance.now();
   let upstreamResponseStatus: number | undefined;
   let arkRequestId: string | undefined;
+  let arkImageUrl: string | undefined;
   try {
     await assertPublicProviderUrl(provider.baseUrl);
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
+    if (officialBeijingArk && storedMime) {
+      stage = 'canvas_layer_source';
+      if (env.NODE_ENV === 'production' && new URL(env.APP_BASE_URL).protocol !== 'https:') {
+        throw new Error('Ark reference downloads require an HTTPS API origin');
+      }
+      // Serve bytes already checked through the owned storage SDK. Ark does
+      // not need permission or public connectivity to the storage endpoint.
+      arkImageUrl = await createProviderReference(Buffer.from(image.slice(image.indexOf(',') + 1), 'base64'), storedMime);
+      stage = 'canvas_layer_submit';
+    }
     const body = await layerUpstreamBody(config.adapter, preparedInput, route.upstreamModelId, source, {
       maxLayers: config.maxLayers, canonicalModelKey: model.canonicalModelKey, arkImageUrl,
     });
@@ -207,16 +210,17 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
       breakdown: { operation, imageCount: assets.length, outputPixels: decoded.pixels,
         creditsPerRequest: chargedCredits, totalCredits: chargedCredits },
     });
+    if (arkImageUrl) await removeProviderReference(arkImageUrl);
   } catch (error) {
     const diagnostic = buildFailureDiagnostic(error, { stage,
       ...(officialBeijingArk && stage === 'canvas_layer_submit' ? { provider: 'volcengine-ark' } : {}) });
     console.warn('[canvas_layer_failed]', { clientRequestId, routeId: route.id, adapter: config.adapter,
-      ...taskIdentity(), stage: diagnostic.stage, code: diagnostic.code, httpStatus: diagnostic.httpStatus,
+      ...taskIdentity(), stage: diagnostic.stage, code: diagnostic.code, httpStatus: diagnostic.httpStatus, causeCode: diagnostic.causeCode,
       ...(officialBeijingArk ? { arkClientRequestId: requestId, arkRequestId: arkRequestId ?? null,
-        arkImageTransport: arkImageUrl ? 'signed-url' : 'inline',
+        arkImageTransport: arkImageUrl ? 'api-reference' : 'inline',
         arkErrorCode: diagnostic.ark?.code ?? null, arkErrorParameter: diagnostic.ark?.parameter ?? null } : {}),
       upstreamResponseStatus: upstreamResponseStatus ?? null, elapsedMs: Math.round(performance.now() - processingStartedAt) });
-    const message = stage === 'canvas_layer_submit' && diagnostic.code === 'PROVIDER_TIMEOUT'
+    const message = stage === 'canvas_layer_submit' && diagnostic.code === 'PROVIDER_TIMEOUT' && (upstreamResponseStatus ?? 0) < 400
       ? '等待上游渠道响应超时。' : stageMessages[stage];
     await releaseCredits(prisma, userId, requestId, diagnostic, { ...journal, ...taskIdentity(),
       message: message + '预留积分已释放。' });

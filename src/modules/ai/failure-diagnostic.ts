@@ -20,7 +20,7 @@ const KNOWN_MESSAGES: Record<string, string> = {
   GENERATION_FAILED: '请求执行失败，未记录可安全展示的详细原因',
 };
 const SAFE_STAGES = new Set(['image_generation', 'text_request', 'video_task', 'result_persistence', 'request_recovery',
-  'canvas_layer_submit', 'canvas_layer_result', 'canvas_layer_download', 'canvas_layer_decode']);
+  'canvas_layer_source', 'canvas_layer_submit', 'canvas_layer_result', 'canvas_layer_download', 'canvas_layer_decode']);
 const SAFE_CAUSE_CODES = new Set([
   'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'ECONNREFUSED', 'ENOSPC', 'EACCES', 'ENOENT',
   'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',

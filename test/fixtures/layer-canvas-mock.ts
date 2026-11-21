@@ -9,8 +9,11 @@ import sharp from 'sharp';
 import type { AiProviderChannel, PrismaClient } from '@prisma/client';
 
 export async function startLayerMock(port = 4137) {
-  process.env.APP_BASE_URL = 'http://127.0.0.1:' + port;
+  const appAddress = 'http://127.0.0.1:' + port;
+  process.env.APP_BASE_URL = appAddress;
   process.env.IMAGE_RESULT_STORE_DIR = await mkdtemp(join(tmpdir(), 'drawer-layer-test-'));
+  const { env } = await import('../../src/config/env.js');
+  const providerReferenceOrigin = new URL(env.APP_BASE_URL).origin;
   const { aiRoutes } = await import('../../src/modules/ai/routes.js');
   const { aiModelAdminRoutes } = await import('../../src/modules/ai/model-admin-routes.js');
   const { providerAdminRoutes } = await import('../../src/modules/providers/routes.js');
@@ -60,26 +63,13 @@ export async function startLayerMock(port = 4137) {
   const sourceKey = 'reference-images/layer-test-source.png';
   const signedSourceUrl = `https://1.1.1.1/${sourceKey}?signed=fixture`;
   const splitSourceKey = 'reference-images/layer-test-split-source.png';
-  const signedSplitSourceUrl = `https://1.1.1.1/${splitSourceKey}?signed=fixture`;
-  const deniedSplitSourceUrl = `https://1.1.1.1/${splitSourceKey}?signed=denied-fixture`;
-  const signedSplitSourceReads: { url: string; submissions: number }[] = [];
+  const providerReferenceReads: { url: string; type: string | null; hash: string }[] = [];
   const uselgReads: string[] = [];
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     const target = new URL(String(url));
     if (target.href === 'https://8.8.8.8/api/v3/models' && init?.method === 'GET') {
       return Response.json({ object: 'list', data: [{ id: 'doubao-seedream-fixture', domain: 'ImageGeneration' }] });
-    }
-    if (target.href === signedSourceUrl && init?.method === 'GET') {
-      if (new Headers(init.headers).has('authorization')) return new Response(null, { status: 403 });
-      return new Response(new Uint8Array(poster), { headers: { 'content-type': 'image/png' } });
-    }
-    if ((target.href === signedSplitSourceUrl || target.href === deniedSplitSourceUrl) && init?.method === 'GET') {
-      signedSplitSourceReads.push({ url: target.href, submissions: calls.length });
-      if (target.href === deniedSplitSourceUrl || new Headers(init.headers).has('authorization')) {
-        return new Response(null, { status: 403 });
-      }
-      return new Response(new Uint8Array(splitPoster), { headers: { 'content-type': 'image/png', 'content-length': String(splitPoster.length) } });
     }
     if (target.origin === 'https://9.9.9.9' && target.pathname === '/canvas-edit.png' && init?.method === 'GET') {
       uselgReads.push(target.origin + target.pathname);
@@ -135,12 +125,20 @@ export async function startLayerMock(port = 4137) {
       if (body.prompt === 'ark-timeout-fixture') {
         throw Object.assign(new Error('Provider response exceeded the deadline'), { code: 'IMAGE_PROVIDER_RESPONSE_TIMEOUT' });
       }
+      if (body.prompt === 'ark-image-download-timeout-fixture') {
+        return Response.json({ error: { code: 'InvalidParameter', param: 'image', message: 'Image download timeout' } }, { status: 400 });
+      }
       const source = String(body.image);
       let bytes;
-      if (source.startsWith('https://')) {
-        const reference = await fetch(source, { method: 'GET' });
+      if (/^https?:\/\//.test(source)) {
+        const referenceUrl = new URL(source);
+        if (referenceUrl.origin !== providerReferenceOrigin || !referenceUrl.pathname.startsWith('/v1/ai/provider-references/')) {
+          return Response.json({ error: 'Mock Ark only downloads images from the local provider-reference endpoint' }, { status: 400 });
+        }
+        const reference = await realFetch(new URL(referenceUrl.pathname, appAddress), { method: 'GET' });
         if (!reference.ok) return Response.json({ error: 'Mock Ark could not read source image' }, { status: 400 });
         bytes = Buffer.from(await reference.arrayBuffer());
+        providerReferenceReads.push({ url: source, type: reference.headers.get('content-type'), hash: fingerprint(bytes) });
       } else {
         bytes = Buffer.from(source.split(',')[1] ?? '', 'base64');
       }
@@ -314,12 +312,12 @@ export async function startLayerMock(port = 4137) {
   });
   await app.listen({ port, host: '127.0.0.1' });
   return { app, paths: { base: data(base), poster: data(poster), sourceKey, signedSourceUrl,
-    splitPoster: data(splitPoster), splitSourceKey, signedSplitSourceUrl, deniedSplitSourceUrl }, upstreamCalls: () => [...calls],
+    splitPoster: data(splitPoster), splitSourceKey }, providerReferenceOrigin, upstreamCalls: () => [...calls],
     useMockAProviderKind(kind: AiProviderChannel['kind'], baseUrl = 'https://1.1.1.1') {
       Object.assign(routes[0]!.channel, { kind, baseUrl });
     },
     uselgReads: () => [...uselgReads],
-    signedSplitSourceReads: () => [...signedSplitSourceReads],
+    providerReferenceReads: () => [...providerReferenceReads],
     failureDiagnostic: (clientRequestId: string) => records.find(row => row.clientRequestId === clientRequestId)?.failureDiagnostic as unknown,
     close: async () => {
       try {
