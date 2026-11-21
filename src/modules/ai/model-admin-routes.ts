@@ -30,7 +30,7 @@ import {
   updateAdminUsageModelBinding,
 } from './usage-model-binding.js';
 import { IMAGE_ADAPTER_KEYS } from './image-adapters/registry.js';
-import { layerModes, layerRouteSchema, updateLayerRoute } from './layer-canvas-config.js';
+import { getAdminLayerTasks, layerModes, layerRouteSchema, updateLayerRoute } from './layer-canvas-config.js';
 
 const modalitySchema = z.enum(['chat', 'image', 'video', 'audio']);
 const jsonObjectSchema = z.record(z.string(), z.unknown());
@@ -249,6 +249,19 @@ export const aiModelAdminRoutes: FastifyPluginAsync = async (app) => {
   });
 
   app.get('/usage-model-bindings', async () => listAdminUsageModelBindings(app.prisma));
+
+  app.get('/layer-tasks', async () => getAdminLayerTasks(app.prisma));
+
+  app.put('/layer-tasks/:mode', async (request, reply) => {
+    const params = z.object({ mode: z.enum(layerModes) }).safeParse(request.params);
+    const body = z.strictObject({ modelKey: z.string().min(1), routeId: idSchema, config: layerRouteSchema.nullable() }).safeParse(request.body);
+    if (!params.success || !body.success) return invalid(reply, 'Invalid canvas operation route, endpoint or price');
+    const { modelKey, routeId, config } = body.data;
+    return adminOperation(reply, async () => {
+      await updateLayerRoute(app.prisma, modelKey, routeId, params.data.mode, config, true);
+      return { saved: true };
+    });
+  });
 
   app.patch('/usage-model-bindings/:key', async (request, reply) => {
     const params = usageBindingParamsSchema.safeParse(request.params);

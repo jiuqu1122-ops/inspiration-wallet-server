@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   UsageModelBindingError,
   ensureDefaultUsageModelBindings,
+  listAdminUsageModelBindings,
   resolveUsageModelBinding,
   routeSupportsUsage,
 } from '../src/modules/ai/usage-model-binding.js';
@@ -142,5 +143,35 @@ describe('usage model binding routing', () => {
       ...route('route-missing-channel', 'missing-channel'),
       channel: null,
     })).toBe(false);
+  });
+
+  it('lists every eligible Chat model and explains concrete exclusions', async () => {
+    const model = (id: string) => ({
+      id, canonicalModelKey: id, displayName: id, modality: 'chat', enabled: true,
+      status: 'PUBLISHED', capabilities: {}, routes: [route(id, 'channel')],
+    });
+    const requiresVision = model('needs-vision');
+    const models = [
+      { ...model('model-vision'), capabilities: { supportsVision: true } },
+      { ...model('route-vision'), routes: [{ ...route('route-vision', 'channel'), capabilitiesOverride: { supportsVision: true } }] },
+      { ...model('legacy-vision'), routes: [route('legacy-vision', 'channel', ['VISION'])] },
+      { ...model('disabled'), enabled: false },
+      { ...model('draft'), status: 'DRAFT' },
+      { ...model('offline'), routes: [{ ...route('offline', 'channel', ['VISION']), healthStatus: 'DOWN' }] },
+      requiresVision,
+    ];
+    const prisma = {
+      aiModel: { findMany: async () => models },
+      aiUsageModelBinding: { findMany: async () => [] },
+    } as unknown as PrismaClient;
+
+    const settings = await listAdminUsageModelBindings(prisma);
+    expect(settings.candidates.IMAGE_ANALYSIS.map(item => item.id)).toEqual(['model-vision', 'route-vision', 'legacy-vision']);
+    expect(settings.candidates.CANVAS_TEXT).toContainEqual(expect.objectContaining({ id: 'needs-vision' }));
+    expect(Object.fromEntries(settings.imageAnalysisExcluded.map(item => [item.id, item.reason]))).toEqual({
+      disabled: 'DISABLED_MODEL', draft: 'UNPUBLISHED_MODEL', offline: 'NO_ACTIVE_ROUTE', 'needs-vision': 'NO_VISION_CAPABILITY',
+    });
+    requiresVision.capabilities = { supportsVision: true };
+    expect((await listAdminUsageModelBindings(prisma)).candidates.IMAGE_ANALYSIS).toContainEqual(expect.objectContaining({ id: 'needs-vision' }));
   });
 });

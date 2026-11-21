@@ -53,6 +53,7 @@ export async function startLayerMock(port = 4137) {
       createdAt: new Date(), updatedAt: new Date() } as AiProviderChannel,
   ]));
   const operations = new Map<string, { idempotencyKey: string; result: unknown }>();
+  const usageBindings = new Map<string, { key: string; canonicalModelId: string }>();
   const calls: { channel: string; body: Record<string, unknown> }[] = [];
   const uselgReads: string[] = [];
   const realFetch = globalThis.fetch;
@@ -168,16 +169,28 @@ export async function startLayerMock(port = 4137) {
       findMany: async ({ where }: any) => where?.modality === 'chat' ? [] : [details()] },
     aiModelRoute: {
       findMany: async ({ where }: any) => {
-        const mode = where.metadata.path[1] as 'split' | 'edit';
-        const key = where.canonicalModel.canonicalModelKey;
-        return !model.capabilities[layerCapability[mode]] || key && key !== model.canonicalModelKey ? []
-          : routes.filter(route => route.metadata.canvasLayers[mode]?.enabled);
+        const [field, operation] = where.metadata.path as [string, 'split' | 'edit'];
+        if (field === 'canvasLayerTaskPreferred') return routes.filter(route =>
+          route.canonicalModelId === where.canonicalModelId && route.id !== where.id.not
+          && (route.metadata as { canvasLayerTaskPreferred?: Record<string, boolean> }).canvasLayerTaskPreferred?.[operation]);
+        const { id, canonicalModelKey, capabilities } = where.canonicalModel;
+        if ((id && id !== model.id) || (canonicalModelKey && canonicalModelKey !== model.canonicalModelKey)
+          || (capabilities && !model.capabilities[layerCapability[operation]])) return [];
+        return routes.filter(route => route.metadata.canvasLayers[operation]?.enabled);
       },
       findFirst: async ({ where }: any) => routes.find(route => route.id === where.id) ?? null,
       update: async ({ where, data }: any) => Object.assign(routes.find(route => route.id === where.id)!, data),
     },
     aiUpstreamDiscovery: { findMany: async () => [] },
-    aiUsageModelBinding: { findMany: async () => [] },
+    aiUsageModelBinding: {
+      findMany: async () => [],
+      findUnique: async ({ where }: { where: { key: string } }) => {
+        const binding = usageBindings.get(where.key);
+        return binding ? { ...binding, canonicalModel: model } : null;
+      },
+      upsert: async ({ where, create }: { where: { key: string }; create: { key: string; canonicalModelId: string } }) =>
+        usageBindings.set(where.key, create),
+    },
     aiBillingSettlement: { create: async () => ({}) },
     aiRequest: { findUnique: async (query: any) => find(query), findFirst: async (query: any) => find(query),
       create: async ({ data }: any) => { const row = { id: randomUUID(), chargedCredits: 0, ...data }; records.push(row); return row; },

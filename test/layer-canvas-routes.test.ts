@@ -67,6 +67,47 @@ test('uses the former base rate as the fixed price and accepts earlier clients',
   } finally { await save({ ...common, creditsPerRequest: '8' }); }
 });
 
+test('configures each task independently and routes new requests through its selected channel', async () => {
+  const adminPath = '/v1/admin/ai-models/layer-tasks';
+  const modelKey = 'local-layer-model';
+  const routeConfig = { enabled: true, endpoint: '/edit', adapter: 'pixel-json', creditsPerRequest: '3.25', maxMegapixels: 2, maxLayers: 1 };
+  const settings = async () => (await mock.app.inject(adminPath)).json();
+  const save = (routeId: string, config: typeof routeConfig) => mock.app.inject({
+    method: 'PUT', url: `${adminPath}/edit`, payload: { modelKey, routeId, config },
+  });
+  expect((await settings()).items).toMatchObject({
+    split: { modelKey, currentRoute: { id: 'mock-a', creditsPerRequest: '12.000000' } },
+    edit: { modelKey, currentRoute: { id: 'mock-a', creditsPerRequest: '8.000000' } },
+  });
+
+  expect((await save('mock-b', routeConfig)).statusCode).toBe(200);
+  try {
+    const current = await settings();
+    expect(current.items).toMatchObject({
+      split: { modelKey, currentRoute: { id: 'mock-a', creditsPerRequest: '12.000000' } },
+      edit: { modelKey, currentRoute: { id: 'mock-b', creditsPerRequest: '3.250000' } },
+    });
+    expect(current.models[0].routes[1].configs.edit).toMatchObject(routeConfig);
+    expect(current.models[0].routes[1].channel).not.toHaveProperty('encryptedSecrets');
+    expect((await mock.app.inject('/v1/ai/catalog')).json().canvasLayers.edit[0].creditsPerRequest).toBe('3.250000');
+
+    const result = await mock.app.inject({ method: 'POST', url: '/v1/ai/canvas-layers', payload: {
+      operation: 'edit', model: 'previous-client-model', image: mock.paths.poster,
+      prompt: 'Color', clientRequestId: 'layer-task-edit-01', expectedCredits: '3.25',
+      selection: { kind: 'point', x: 0.25, y: 0.25 },
+    } });
+    expect(result.json()).toMatchObject({ status: 'success', model: modelKey, chargedCredits: '3.250000' });
+    expect((await mock.app.inject('/fixture/receipt')).json().calls.at(-1)).toMatchObject({ channel: 'mock-b' });
+
+    const defaultConfig = { ...routeConfig, adapter: 'canvas-json', creditsPerRequest: '8' };
+    expect((await save('mock-a', defaultConfig)).statusCode).toBe(200);
+    expect((await settings()).items.edit.currentRoute.id).toBe('mock-a');
+  } finally {
+    await save('mock-b', { ...routeConfig, creditsPerRequest: '8', maxLayers: 32 });
+    await save('mock-a', { ...routeConfig, adapter: 'canvas-json', creditsPerRequest: '8', maxLayers: 32 });
+  }
+});
+
 test('rejects a changed price before sending upstream and refunds a failed fixed-price request', async () => {
   const route = '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/split';
   const common = { enabled: true, adapter: 'canvas-json', maxMegapixels: 2, maxLayers: 32 };

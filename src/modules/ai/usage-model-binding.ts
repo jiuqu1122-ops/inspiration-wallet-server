@@ -145,29 +145,31 @@ export async function listAdminUsageModelBindings(prisma: PrismaClient) {
       include: { canonicalModel: { include: includeUsageRoutes } },
     }),
     prisma.aiModel.findMany({
-      where: { modality: 'chat', enabled: true, status: 'PUBLISHED' },
+      where: { modality: 'chat' },
       include: includeUsageRoutes,
       orderBy: [{ sortOrder: 'asc' }, { canonicalModelKey: 'asc' }],
     }),
   ]);
   const byKey = new Map(bindings.map(binding => [binding.key, binding]));
+  const eligibleModels = models.filter(model => model.enabled && model.status === 'PUBLISHED');
+  const identity = ({ id, canonicalModelKey, displayName }: UsageModel) => ({ id, canonicalModelKey, displayName });
+  const analysisModels = new Set<string>();
+  const imageAnalysisExcluded = models.flatMap(model => {
+    const reason = !model.enabled ? 'DISABLED_MODEL' : model.status !== 'PUBLISHED' ? 'UNPUBLISHED_MODEL'
+      : !operationalUsageRoutes('CANVAS_TEXT', model).length ? 'NO_ACTIVE_ROUTE'
+      : !operationalUsageRoutes('IMAGE_ANALYSIS', model).length ? 'NO_VISION_CAPABILITY' : null;
+    if (reason) return [{ ...identity(model), reason }];
+    analysisModels.add(model.id);
+    return [];
+  });
   return {
     items: AI_USAGE_MODEL_KEYS.map(key => usageBindingView(key, byKey.get(key) ?? null)),
+    imageAnalysisExcluded,
     candidates: {
-      CANVAS_TEXT: models
+      CANVAS_TEXT: eligibleModels
         .filter(model => operationalUsageRoutes('CANVAS_TEXT', model).length > 0)
-        .map(model => ({
-          id: model.id,
-          canonicalModelKey: model.canonicalModelKey,
-          displayName: model.displayName,
-        })),
-      IMAGE_ANALYSIS: models
-        .filter(model => operationalUsageRoutes('IMAGE_ANALYSIS', model).length > 0)
-        .map(model => ({
-          id: model.id,
-          canonicalModelKey: model.canonicalModelKey,
-          displayName: model.displayName,
-        })),
+        .map(identity),
+      IMAGE_ANALYSIS: models.filter(model => analysisModels.has(model.id)).map(identity),
     },
   };
 }

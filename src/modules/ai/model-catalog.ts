@@ -284,7 +284,7 @@ export function normalizeModelCapabilities(value: Prisma.InputJsonValue): Prisma
     ? value as Prisma.InputJsonObject
     : {};
   const normalized = { ...source };
-  for (const key of ['supportsLayerSplit', 'supportsInteractiveEdit']) {
+  for (const key of ['supportsLayerSplit', 'supportsInteractiveEdit', 'supportsVision']) {
     if (source[key] !== undefined && typeof source[key] !== 'boolean') throw new Error(`${key} must be a boolean`);
   }
   const normalizeStrings = (key: 'supportedResolutions' | 'supportedAspectRatios', pattern: RegExp) => {
