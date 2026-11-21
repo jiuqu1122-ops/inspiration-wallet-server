@@ -248,3 +248,60 @@ test('delivers USELG synchronous or asynchronous edit images with one submission
     await save('/edit');
   }
 }, 20_000);
+
+test('allows hidden images only for the layer tasks they are explicitly assigned to', async () => {
+  const modelKey = 'local-layer-model';
+  const admin = '/v1/admin/ai-models';
+  const setVisibility = (visible: boolean) => mock.app.inject({
+    method: 'PATCH', url: `${admin}/${modelKey}`, payload: { visible },
+  });
+  const getCatalog = async () => (await mock.app.inject('/v1/ai/catalog')).json();
+
+  expect((await setVisibility(false)).statusCode).toBe(200);
+  try {
+    const settings = (await mock.app.inject(`${admin}/layer-tasks`)).json();
+    expect(settings.models).toEqual([expect.objectContaining({ canonicalModelKey: modelKey })]);
+    expect((await getCatalog()).canvasLayers.split).toEqual([]);
+
+    for (const { mode, endpoint, creditsPerRequest } of [
+      { mode: 'split', endpoint: '/split', creditsPerRequest: '1' },
+      { mode: 'edit', endpoint: '/edit', creditsPerRequest: '2' },
+    ] as const) {
+      const saved = await mock.app.inject({
+        method: 'PUT', url: `${admin}/layer-tasks/${mode}`, payload: {
+          modelKey, routeId: 'mock-a', config: {
+            enabled: true, endpoint, adapter: 'canvas-json', creditsPerRequest, maxMegapixels: 2, maxLayers: mode === 'split' ? 24 : 1,
+          },
+        },
+      });
+      expect(saved.statusCode).toBe(200);
+      const result = await mock.app.inject({
+        method: 'POST', url: '/v1/ai/canvas-layers', payload: {
+          clientRequestId: `hidden-layer-${mode}`, operation: mode, image: mock.paths.poster,
+          prompt: 'Color', expectedCredits: creditsPerRequest,
+        },
+      });
+      expect(result.json()).toMatchObject({ status: 'success', model: modelKey, chargedCredits: `${creditsPerRequest}.000000` });
+    }
+
+    const catalog = await getCatalog();
+    expect(catalog.models).toEqual([]);
+    expect(catalog.canvasLayers).toMatchObject({ split: [{ id: modelKey }], edit: [{ id: modelKey }] });
+    const upstreamCalls = mock.upstreamCalls().length;
+    for (const model of [modelKey, 'local-layer-alias']) {
+      for (const path of ['generations', 'operations']) {
+        const response = await mock.app.inject({
+          method: 'POST', url: `/v1/ai/images/${path}`, payload: {
+            clientRequestId: `hidden-${model}-${path}`, model, prompt: 'A poster',
+            ...(path === 'operations' ? { operation: 'imagine' } : {}),
+          },
+        });
+        expect(response.statusCode, `${path} (${model}): ${response.body}`).toBe(409);
+        expect(response.json()).toMatchObject({ error: 'MODEL_NOT_AVAILABLE' });
+      }
+    }
+    expect(mock.upstreamCalls()).toHaveLength(upstreamCalls);
+  } finally {
+    await setVisibility(true);
+  }
+});

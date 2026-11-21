@@ -166,15 +166,26 @@ export async function startLayerMock(port = 4137) {
     aiModel: { count: async () => 1, findUnique: async ({ where }: any) => where.canonicalModelKey === model.canonicalModelKey || where.id === model.id ? details() : null,
       findUniqueOrThrow: async () => details(),
       updateMany: async ({ data }: any) => { Object.assign(model, data, { updatedAt: new Date() }); return { count: 1 }; },
-      findMany: async ({ where }: any) => where?.modality === 'chat' ? [] : [details()] },
+      findMany: async ({ where }: any) => (
+        (where?.modality === undefined || where.modality === model.modality)
+        && (where?.visible === undefined || where.visible === model.visible)
+        && (where?.enabled === undefined || where.enabled === model.enabled)
+        && (where?.status === undefined || where.status === model.status)
+      ) ? [details()] : [] },
+    aiModelAlias: {
+      findUnique: async ({ where }: { where: { modality_aliasKey: { modality: string; aliasKey: string } } }) =>
+        where.modality_aliasKey.modality === 'image' && where.modality_aliasKey.aliasKey === 'locallayeralias'
+          ? { canonicalModel: details() } : null,
+    },
     aiModelRoute: {
       findMany: async ({ where }: any) => {
         const [field, operation] = where.metadata.path as [string, 'split' | 'edit'];
         if (field === 'canvasLayerTaskPreferred') return routes.filter(route =>
           route.canonicalModelId === where.canonicalModelId && route.id !== where.id.not
           && (route.metadata as { canvasLayerTaskPreferred?: Record<string, boolean> }).canvasLayerTaskPreferred?.[operation]);
-        const { id, canonicalModelKey, capabilities } = where.canonicalModel;
+        const { id, canonicalModelKey, capabilities, visible } = where.canonicalModel;
         if ((id && id !== model.id) || (canonicalModelKey && canonicalModelKey !== model.canonicalModelKey)
+          || (visible !== undefined && visible !== model.visible)
           || (capabilities && !model.capabilities[layerCapability[operation]])) return [];
         return routes.filter(route => route.metadata.canvasLayers[operation]?.enabled);
       },
@@ -184,6 +195,9 @@ export async function startLayerMock(port = 4137) {
     aiUpstreamDiscovery: { findMany: async () => [] },
     aiUsageModelBinding: {
       findMany: async () => [],
+      findFirst: async ({ where }: { where: { canonicalModelId: string; key: { in: string[] } } }) =>
+        [...usageBindings.values()].find(binding => binding.canonicalModelId === where.canonicalModelId
+          && where.key.in.includes(binding.key)) ?? null,
       findUnique: async ({ where }: { where: { key: string } }) => {
         const binding = usageBindings.get(where.key);
         return binding ? { ...binding, canonicalModel: model } : null;

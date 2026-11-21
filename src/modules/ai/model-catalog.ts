@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Prisma, PrismaClient } from '@prisma/client';
+import { isLayerTaskModel } from './layer-canvas-config.js';
 
 export type AiModality = 'chat' | 'image' | 'video' | 'audio';
 
@@ -638,9 +639,11 @@ export async function resolveCatalogModel(
   if (!aliased || aliased.modality !== modality) {
     throw new ModelCatalogError('MODEL_NOT_FOUND', `Unknown ${modality} model`, 404);
   }
+  // An explicit layer binding reserves a hidden image model for layer tasks.
   if (options.requireEnabled !== false && (
     !aliased.enabled
     || ('status' in aliased && aliased.status !== undefined && aliased.status !== 'PUBLISHED')
+    || (modality === 'image' && aliased.visible === false && await isLayerTaskModel(prisma, aliased.id))
   )) {
     throw new ModelCatalogError('MODEL_NOT_AVAILABLE', 'The selected model is not available', 409);
   }

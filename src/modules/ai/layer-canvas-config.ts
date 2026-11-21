@@ -39,6 +39,13 @@ async function layerTaskBinding(prisma: PrismaClient, mode: LayerMode) {
   });
 }
 
+export async function isLayerTaskModel(prisma: PrismaClient, canonicalModelId: string) {
+  return Boolean(await prisma.aiUsageModelBinding.findFirst({
+    where: { canonicalModelId, key: { in: Object.values(layerTaskKeys) } },
+    select: { key: true },
+  }));
+}
+
 export async function layerCandidates(prisma: PrismaClient, mode: LayerMode, modelKey?: string) {
   return findLayerCandidates(prisma, mode, await layerTaskBinding(prisma, mode), modelKey);
 }
@@ -51,8 +58,9 @@ async function findLayerCandidates(
       enabled: true, upstreamAvailable: true,
       metadata: { path: ['canvasLayers', mode, 'enabled'], equals: true },
       channel: { status: 'ACTIVE', capabilities: { has: 'IMAGE' } },
-      canonicalModel: { modality: 'image', status: 'PUBLISHED', enabled: true, visible: true,
+      canonicalModel: { modality: 'image', status: 'PUBLISHED', enabled: true,
         ...(binding ? { id: binding.canonicalModelId } : {
+          visible: true,
           capabilities: { path: [layerCapability[mode]], equals: true },
           ...(modelKey ? { canonicalModelKey: modelKey } : {}),
         }) },
@@ -77,7 +85,7 @@ async function findLayerCandidates(
 export async function getAdminLayerTasks(prisma: PrismaClient) {
   const [models, tasks] = await Promise.all([
     prisma.aiModel.findMany({
-      where: { modality: 'image', status: 'PUBLISHED', enabled: true, visible: true },
+      where: { modality: 'image', status: 'PUBLISHED', enabled: true },
       orderBy: [{ sortOrder: 'asc' }, { canonicalModelKey: 'asc' }],
       select: {
         canonicalModelKey: true, displayName: true, defaultRouteId: true,
@@ -158,7 +166,7 @@ export async function updateLayerRoute(
     if (!config?.enabled) delete preferred[mode];
     if (selectForTask && config?.enabled) {
       const model = route.canonicalModel;
-      if (!model?.enabled || !model.visible || model.status !== 'PUBLISHED' || !route.enabled || !route.upstreamAvailable
+      if (!model?.enabled || model.status !== 'PUBLISHED' || !route.enabled || !route.upstreamAvailable
         || route.channel?.status !== 'ACTIVE' || !route.channel.capabilities.includes('IMAGE')) {
         throw new Error('所选模型或渠道当前不可用，请检查模型发布状态和渠道路由');
       }
