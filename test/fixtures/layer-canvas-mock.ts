@@ -12,8 +12,6 @@ export async function startLayerMock(port = 4137) {
   const appAddress = 'http://127.0.0.1:' + port;
   process.env.APP_BASE_URL = appAddress;
   process.env.IMAGE_RESULT_STORE_DIR = await mkdtemp(join(tmpdir(), 'drawer-layer-test-'));
-  const { env } = await import('../../src/config/env.js');
-  const providerReferenceOrigin = new URL(env.APP_BASE_URL).origin;
   const { aiRoutes } = await import('../../src/modules/ai/routes.js');
   const { aiModelAdminRoutes } = await import('../../src/modules/ai/model-admin-routes.js');
   const { providerAdminRoutes } = await import('../../src/modules/providers/routes.js');
@@ -29,6 +27,17 @@ export async function startLayerMock(port = 4137) {
   const cloud = await png(120, 70, Buffer.from('<svg width="120" height="70" xmlns="http://www.w3.org/2000/svg"><path fill="#fff6ec" d="M22 58C-8 58-5 25 22 25C25 4 57 4 67 23C89 10 118 28 116 45C115 60 101 59 90 59Z"/></svg>'));
   const poster = await sharp(base).composite([{ input: title, left: 27, top: 37 }, { input: cloud, left: 100, top: 175 }]).png().toBuffer();
   const splitPoster = await sharp(poster).resize(640, 800).png().toBuffer();
+  const alphaPoster = await sharp(poster).resize(318, 398).ensureAlpha().extend({
+    top: 1, right: 1, bottom: 1, left: 1, background: { r: 0, g: 0, b: 0, alpha: 0 },
+  }).png().toBuffer();
+  const jpegDimensions = { width: 1024, height: 768, channels: 3 as const };
+  const jpegPixels = Buffer.alloc(jpegDimensions.width * jpegDimensions.height * jpegDimensions.channels);
+  let seed = 0x12345678;
+  for (let i = 0; i < jpegPixels.length; i++) {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    jpegPixels[i] = seed >>> 24;
+  }
+  const splitJpeg = await sharp(jpegPixels, { raw: jpegDimensions }).jpeg({ quality: 100, chromaSubsampling: '4:4:4' }).toBuffer();
   const data = (bytes: Buffer) => 'data:image/png;base64,' + bytes.toString('base64');
   const limits = { enabled: true, maxMegapixels: 2, maxLayers: 32 };
   const model = {
@@ -61,9 +70,14 @@ export async function startLayerMock(port = 4137) {
   const usageBindings = new Map<string, { key: string; canonicalModelId: string }>();
   const calls: { channel: string; body: Record<string, unknown>; customTransport: boolean; arkClientRequestId: string | null }[] = [];
   const sourceKey = 'reference-images/layer-test-source.png';
-  const signedSourceUrl = `https://1.1.1.1/${sourceKey}?signed=fixture`;
   const splitSourceKey = 'reference-images/layer-test-split-source.png';
-  const providerReferenceReads: { url: string; type: string | null; hash: string }[] = [];
+  const splitJpegKey = 'reference-images/layer-test-split-source.jpg';
+  const referenceFixtures: Record<string, { bytes: Buffer; contentType: string; owner: string }> = {
+    [sourceKey]: { bytes: alphaPoster, contentType: 'image/png', owner: 'local-test-user' },
+    [splitSourceKey]: { bytes: splitPoster, contentType: 'image/png', owner: 'local-test-user' },
+    [splitJpegKey]: { bytes: splitJpeg, contentType: 'image/jpeg', owner: 'local-test-user' },
+    'reference-images/foreign-layer-test-source.png': { bytes: poster, contentType: 'image/png', owner: 'different-test-user' },
+  };
   const uselgReads: string[] = [];
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
@@ -129,19 +143,10 @@ export async function startLayerMock(port = 4137) {
         return Response.json({ error: { code: 'InvalidParameter', param: 'image', message: 'Image download timeout' } }, { status: 400 });
       }
       const source = String(body.image);
-      let bytes;
-      if (/^https?:\/\//.test(source)) {
-        const referenceUrl = new URL(source);
-        if (referenceUrl.origin !== providerReferenceOrigin || !referenceUrl.pathname.startsWith('/v1/ai/provider-references/')) {
-          return Response.json({ error: 'Mock Ark only downloads images from the local provider-reference endpoint' }, { status: 400 });
-        }
-        const reference = await realFetch(new URL(referenceUrl.pathname, appAddress), { method: 'GET' });
-        if (!reference.ok) return Response.json({ error: 'Mock Ark could not read source image' }, { status: 400 });
-        bytes = Buffer.from(await reference.arrayBuffer());
-        providerReferenceReads.push({ url: source, type: reference.headers.get('content-type'), hash: fingerprint(bytes) });
-      } else {
-        bytes = Buffer.from(source.split(',')[1] ?? '', 'base64');
+      if (!/^data:image\/(?:png|jpeg|webp);base64,/.test(source)) {
+        return Response.json({ error: { code: 'InvalidParameter', param: 'image', message: 'Image download timeout' } }, { status: 400 });
       }
+      const bytes = Buffer.from(source.split(',')[1] ?? '', 'base64');
       if (body.layer_decomposition === true) {
         const cloudSignature = body.prompt === 'ark-expired-layer-asset-fixture' ? 'expired' : 'fixture';
         return Response.json({ data: [
@@ -239,14 +244,10 @@ export async function startLayerMock(port = 4137) {
     aiUpstreamDiscovery: { findMany: async () => [] },
     referenceUpload: {
       findFirst: async ({ where }: { where: { objectKey: string; userId: string } }) => {
-        const ownerByObject: Record<string, string> = {
-          [sourceKey]: 'local-test-user',
-          [splitSourceKey]: 'local-test-user',
-          'reference-images/foreign-layer-test-source.png': 'different-test-user',
-        };
-        if (ownerByObject[where.objectKey] !== where.userId) return null;
+        const reference = referenceFixtures[where.objectKey];
+        if (!reference || reference.owner !== where.userId) return null;
         return { id: where.objectKey, objectKey: where.objectKey, status: 'UPLOADED',
-          sizeBytes: where.objectKey === splitSourceKey ? splitPoster.length : poster.length, contentType: 'image/png' };
+          sizeBytes: reference.bytes.length, contentType: reference.contentType };
       },
     },
     aiUsageModelBinding: {
@@ -311,13 +312,12 @@ export async function startLayerMock(port = 4137) {
     return { url: await createImageResultFromResponse(new Response(new Uint8Array(bytes), { headers: { 'content-type': 'image/png' } })) };
   });
   await app.listen({ port, host: '127.0.0.1' });
-  return { app, paths: { base: data(base), poster: data(poster), sourceKey, signedSourceUrl,
-    splitPoster: data(splitPoster), splitSourceKey }, providerReferenceOrigin, upstreamCalls: () => [...calls],
+  return { app, paths: { base: data(base), poster: data(poster), sourceKey, alphaPoster: data(alphaPoster),
+    splitPoster: data(splitPoster), splitSourceKey, splitJpegKey, splitJpeg }, upstreamCalls: () => [...calls],
     useMockAProviderKind(kind: AiProviderChannel['kind'], baseUrl = 'https://1.1.1.1') {
       Object.assign(routes[0]!.channel, { kind, baseUrl });
     },
     uselgReads: () => [...uselgReads],
-    providerReferenceReads: () => [...providerReferenceReads],
     failureDiagnostic: (clientRequestId: string) => records.find(row => row.clientRequestId === clientRequestId)?.failureDiagnostic as unknown,
     close: async () => {
       try {

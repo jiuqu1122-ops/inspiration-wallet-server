@@ -1,5 +1,4 @@
 import { afterAll, beforeAll, expect, test, vi } from 'vitest';
-import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
 import sharp from 'sharp';
 import { startLayerMock } from './fixtures/layer-canvas-mock.js';
@@ -11,7 +10,6 @@ vi.mock('node:dns/promises', async importOriginal => ({
   lookup: vi.fn(async (hostname: string) => [{ address: hostname === 'cos.internal.example.test' ? '10.0.3.2' : '1.1.1.1', family: 4 }]),
 }));
 
-const providerReferencePath = /^\/v1\/ai\/provider-references\/[a-f0-9]{64}\.png$/;
 let mock: Awaited<ReturnType<typeof startLayerMock>>;
 beforeAll(async () => { mock = await startLayerMock(4147); }, 15000);
 afterAll(async () => { await mock?.close(); });
@@ -217,7 +215,7 @@ test('routes Ark split and edit, downloads layers, and sends official point guid
     const rejected = await run({ operation: 'edit', clientRequestId: 'ark-image-download-timeout-001', expectedCredits: '8',
       prompt: 'ark-image-download-timeout-fixture' });
     expect(rejected.json()).toMatchObject({ status: 'failed', chargedCredits: '0.000000',
-      message: '提交给上游渠道时失败。预留积分已释放。' });
+      message: '方舟处理参考图超时（HTTP 400）。预留积分已释放。' });
     expect(mock.failureDiagnostic('ark-image-download-timeout-001')).toMatchObject({
       httpStatus: 400, ark: { code: 'InvalidParameter', parameter: 'image' },
     });
@@ -229,17 +227,19 @@ test('routes Ark split and edit, downloads layers, and sends official point guid
   }
 }, 15_000);
 
-test('stages an owned Ark split source without requesting the private COS URL', async () => {
-  const { splitPoster, splitSourceKey } = mock.paths;
-  const posterBytes = Buffer.from(splitPoster.split(',')[1]!, 'base64');
+test.each(['png', 'jpeg'] as const)('sends an owned Ark %s split source inline without requesting a private COS URL', async format => {
+  const { splitPoster, splitSourceKey, splitJpeg, splitJpegKey } = mock.paths;
+  const objectKey = format === 'png' ? splitSourceKey : splitJpegKey;
+  const bytes = format === 'png' ? Buffer.from(splitPoster.split(',')[1]!, 'base64') : splitJpeg;
+  const contentType = `image/${format}`;
   const head = vi.spyOn(storageService, 'headObject').mockResolvedValue({
-    objectKey: splitSourceKey, contentLength: posterBytes.length, contentType: 'image/png', metadata: {}, headers: {},
+    objectKey, contentLength: bytes.length, contentType, metadata: {}, headers: {},
   });
-  const privateUrl = `https://cos.internal.example.test/${splitSourceKey}?signed=fixture-only`;
+  const privateUrl = `https://cos.internal.example.test/${objectKey}?signed=fixture-only`;
   const downloadUrl = vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(privateUrl);
   const read = vi.spyOn(storageService, 'getObjectStream').mockImplementation(async () => ({
-    stream: Readable.from([posterBytes]), statusCode: 200,
-    headers: { 'content-type': 'image/png', 'content-length': String(posterBytes.length) },
+    stream: Readable.from([bytes]), statusCode: 200,
+    headers: { 'content-type': contentType, 'content-length': String(bytes.length) },
   }));
   const save = (endpoint: string, adapter: string, creditsPerRequest: string) => mock.app.inject({
     method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/split',
@@ -247,30 +247,35 @@ test('stages an owned Ark split source without requesting the private COS URL', 
   });
   const submit = (clientRequestId: string) => mock.app.inject({
     method: 'POST', url: '/v1/ai/canvas-layers',
-    payload: { operation: 'split', image: splitSourceKey, clientRequestId, expectedCredits: '1' },
+    payload: { operation: 'split', image: objectKey, clientRequestId, expectedCredits: '1' },
   });
   try {
     expect((await save('/images/generations', 'volcengine-ark', '1')).statusCode).toBe(200);
     mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
-    const beforeReads = mock.providerReferenceReads().length;
     const beforeCalls = mock.upstreamCalls().length;
-    const accepted = await submit('ark-split-provider-reference');
+    const requestId = `ark-split-inline-${format}`;
+    const accepted = await submit(requestId);
     expect(accepted.statusCode).toBe(200);
     expect(accepted.json()).toMatchObject({ status: 'success', chargedCredits: '1.000000' });
-    expect(head).toHaveBeenCalledWith(splitSourceKey);
+    expect(head).toHaveBeenCalledWith(objectKey);
     expect(read).toHaveBeenCalledTimes(1);
-    expect(read).toHaveBeenCalledWith(splitSourceKey);
+    expect(read).toHaveBeenCalledWith(objectKey);
     expect(downloadUrl).not.toHaveBeenCalled();
     const image = String(mock.upstreamCalls().at(-1)?.body.image);
-    const stagedReference = new URL(image);
-    expect(stagedReference).toMatchObject({ origin: mock.providerReferenceOrigin, pathname: expect.stringMatching(providerReferencePath), search: '' });
     expect(mock.upstreamCalls().at(-1)?.body).toMatchObject({ layer_decomposition: true });
-    expect(mock.providerReferenceReads().slice(beforeReads)).toEqual([
-      { url: image, type: 'image/png', hash: createHash('sha256').update(posterBytes).digest('hex') },
-    ]);
+    expect(image.startsWith(`data:${contentType};base64,`)).toBe(true);
+    const sentBytes = Buffer.from(image.split(',')[1]!, 'base64');
+    if (format === 'jpeg') {
+      expect(bytes.length).toBeGreaterThan(512 * 1024);
+      expect(sentBytes.length).toBeLessThan(bytes.length);
+      const { width, height, orientation } = await sharp(bytes).metadata();
+      expect(await sharp(sentBytes).metadata()).toMatchObject({ format, width, height });
+      expect((await sharp(sentBytes).metadata()).orientation).toBe(orientation);
+    } else {
+      expect(sentBytes.equals(bytes)).toBe(true);
+    }
     expect(accepted.body).not.toContain(image);
-    expect((await mock.app.inject(stagedReference.pathname)).statusCode).toBe(404);
-    expect((await submit('ark-split-provider-reference')).json()).toEqual(accepted.json());
+    expect((await submit(requestId)).json()).toEqual(accepted.json());
     expect(mock.upstreamCalls()).toHaveLength(beforeCalls + 1);
     expect(read).toHaveBeenCalledTimes(1);
   } finally {
@@ -373,9 +378,8 @@ test('sends Ark split options only for identified Seedream 5.5 and clamps edit c
   await expect(build('ep-known-5-5', 'seedream-5-5')).resolves.toHaveProperty('layer_decomposition_options.max_images', 33);
   await expect(build('doubao-seedream-5-0-flash-260915', 'seedream-5-5')).resolves.not.toHaveProperty('layer_decomposition_options');
   await expect(build('ep-unknown')).resolves.not.toHaveProperty('layer_decomposition_options');
-  await expect(layerUpstreamBody('volcengine-ark', split, 'doubao-seedream-5-0-flash-260915', source,
-    { ...settings, arkImageUrl: mock.paths.signedSourceUrl })).resolves.toMatchObject({
-    layer_decomposition: true, image: mock.paths.signedSourceUrl,
+  await expect(build('doubao-seedream-5-0-flash-260915')).resolves.toMatchObject({
+    layer_decomposition: true, image: mock.paths.poster,
   });
   const edge = await layerUpstreamBody('volcengine-ark', { ...split, operation: 'edit',
     selection: { kind: 'rect', x: 0.9999, y: 0.9999, width: 0.0001, height: 0.0001 },
@@ -498,14 +502,13 @@ test('allows hidden images only for the layer tasks they are explicitly assigned
 });
 
 test('uses an owned reference key for canvas layer input and deduplicates retries', async () => {
-  const { sourceKey: objectKey, signedSourceUrl: url } = mock.paths;
+  const { sourceKey: objectKey, alphaPoster } = mock.paths;
   const foreignKey = 'reference-images/foreign-layer-test-source.png';
-  const posterBytes = Buffer.from(mock.paths.poster.split(',')[1]!, 'base64');
+  const posterBytes = Buffer.from(alphaPoster.split(',')[1]!, 'base64');
   const head = vi.spyOn(storageService, 'headObject').mockResolvedValue({
     objectKey, contentLength: posterBytes.length, contentType: 'image/png', metadata: {}, headers: {},
   });
-  const downloadUrl = vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(url);
-  const resolveKey = vi.spyOn(storageService, 'tryResolveObjectKeyFromUrl').mockImplementation(value => value === url ? objectKey : null);
+  const downloadUrl = vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(`https://cos.internal.example.test/${objectKey}?signed=fixture-only`);
   const read = vi.spyOn(storageService, 'getObjectStream').mockImplementation(async () => ({
     stream: Readable.from([posterBytes]), statusCode: 200,
     headers: { 'content-type': 'image/png', 'content-length': String(posterBytes.length) },
@@ -529,7 +532,7 @@ test('uses an owned reference key for canvas layer input and deduplicates retrie
     expect(accepted.json()).toMatchObject({ status: 'success', chargedCredits: credits });
     expect(read).toHaveBeenCalledTimes(1);
     expect(read).toHaveBeenCalledWith(objectKey);
-    expect(mock.upstreamCalls().at(-1)?.body.image).toEqual(mock.paths.poster);
+    expect(mock.upstreamCalls().at(-1)?.body.image).toEqual(alphaPoster);
     expect((await submit(objectKey, 'owned-reference-001')).json()).toEqual(accepted.json());
     expect(read).toHaveBeenCalledTimes(1);
     expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 1);
@@ -546,20 +549,15 @@ test('uses an owned reference key for canvas layer input and deduplicates retrie
       expect((await submit(foreignKey, 'foreign-reference-ark-001')).statusCode).toBe(400);
       expect(head).not.toHaveBeenCalled();
       expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 1);
-      const beforeReads = mock.providerReferenceReads().length;
       const official = await submit(objectKey, 'owned-reference-ark-001');
       expect(official.json()).toMatchObject({ status: 'success', chargedCredits: credits,
         result: { operation: 'edit', image: { width: 320, height: 400 } } });
       expect(downloadUrl).not.toHaveBeenCalled();
       expect(read).toHaveBeenLastCalledWith(objectKey);
       const upstream = mock.upstreamCalls().at(-1);
-      const image = String(upstream?.body.image);
-      expect(new URL(image)).toMatchObject({ origin: mock.providerReferenceOrigin, pathname: expect.stringMatching(providerReferencePath), search: '' });
-      expect(upstream).toMatchObject({ arkClientRequestId: expect.any(String) });
-      expect(mock.providerReferenceReads().slice(beforeReads)).toEqual([
-        { url: image, type: 'image/png', hash: createHash('sha256').update(posterBytes).digest('hex') },
-      ]);
-      expect(official.body).not.toContain(image);
+      expect(upstream).toMatchObject({ arkClientRequestId: expect.any(String), body: { image: alphaPoster, background: 'transparent' } });
+      expect((await sharp(posterBytes).stats()).isOpaque).toBe(false);
+      expect(official.body).not.toContain(alphaPoster);
       expect((await submit(objectKey, 'owned-reference-ark-001')).json()).toEqual(official.json());
       expect(read).toHaveBeenCalledTimes(2);
       expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 2);
@@ -568,6 +566,6 @@ test('uses an owned reference key for canvas layer input and deduplicates retrie
       await save('/edit', 'canvas-json');
     }
   } finally {
-    for (const spy of [head, downloadUrl, resolveKey, read]) spy.mockRestore();
+    for (const spy of [head, downloadUrl, read]) spy.mockRestore();
   }
 });

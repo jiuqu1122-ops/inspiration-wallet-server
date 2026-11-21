@@ -39,6 +39,7 @@ const raster = z.union([
 ]);
 type Raster = z.infer<typeof raster>;
 const maximumRasterBytes = 20 * 1024 ** 2;
+const arkInlineJpegTargetBytes = 512 * 1024;
 
 type SourceImage = { width: number; height: number; alpha: boolean | undefined };
 type RasterSize = Pick<SourceImage, 'width' | 'height'>;
@@ -56,6 +57,17 @@ type DecodedResult = { operation: 'edit'; output: Raster }
 async function arkSplitReference(image: string) {
   if (!image.startsWith('data:image/webp;')) return image;
   return 'data:image/png;base64,' + (await canvasRaster(dataBytes(image)).png().toBuffer()).toString('base64');
+}
+
+export async function prepareArkInlineJpeg(image: string) {
+  const bytes = dataBytes(image);
+  if (bytes.length <= arkInlineJpegTargetBytes) return image;
+  const raster = canvasRaster(bytes).timeout({ seconds: 10 });
+  const { orientation } = await raster.metadata();
+  // Keep the placement of every pixel and respect orientation in older inputs.
+  if (orientation && orientation !== 1) return image;
+  const compact = await raster.jpeg({ quality: 85, mozjpeg: true }).toBuffer();
+  return compact.length < bytes.length ? 'data:image/jpeg;base64,' + compact.toString('base64') : image;
 }
 
 const arkCoordinate = (value: number) => Math.min(999, Math.max(0, Math.round(value * 1000)));
@@ -81,7 +93,7 @@ function isArkSeedream55(upstreamModel: string, canonicalModelKey: string) {
 
 export async function layerUpstreamBody(
   adapter: LayerRoute['adapter'], input: CanvasLayerInput, model: string, source: SourceImage,
-  { maxLayers, canonicalModelKey, arkImageUrl }: { maxLayers: number; canonicalModelKey: string; arkImageUrl?: string | undefined },
+  { maxLayers, canonicalModelKey }: { maxLayers: number; canonicalModelKey: string },
 ) {
   const { operation, image, prompt, selection } = input;
   const { width, height } = source;
@@ -90,12 +102,12 @@ export async function layerUpstreamBody(
     // URL responses keep a multi-layer result out of the single JSON body limit.
     const fields = { model, output_format: 'png', response_format: 'url', watermark: false };
     if (operation === 'split') return { ...fields, layer_decomposition: true, size: 'auto',
-      image: arkImageUrl ?? await arkSplitReference(image), ...(prompt ? { prompt } : {}),
+      image: await arkSplitReference(image), ...(prompt ? { prompt } : {}),
       ...(isArkSeedream55(model, canonicalModelKey) ? { layer_decomposition_options: { max_images: maxLayers + 1 } } : {}) };
     const exactSizeSupported = width * height >= 921_600 && width * height <= 4_624_220
       && width / height >= 1 / 16 && width / height <= 16;
     const transparent = source.alpha && !(await sharp(dataBytes(image), { limitInputPixels: 64_000_000 }).stats()).isOpaque;
-    return { ...fields, image: arkImageUrl ?? image, prompt: arkEditPrompt(prompt, selection),
+    return { ...fields, image, prompt: arkEditPrompt(prompt, selection),
       ...(exactSizeSupported ? { size: `${width}x${height}` } : {}),
       ...(transparent ? { background: 'transparent' } : {}) };
   }
