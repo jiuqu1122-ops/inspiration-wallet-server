@@ -4,6 +4,11 @@ import sharp from 'sharp';
 import { startLayerMock } from './fixtures/layer-canvas-mock.js';
 import { storageService } from '../src/modules/storage/service.js';
 
+vi.mock('node:dns/promises', async importOriginal => ({
+  ...await importOriginal<typeof import('node:dns/promises')>(),
+  lookup: vi.fn(async () => [{ address: '1.1.1.1', family: 4 }]),
+}));
+
 let mock: Awaited<ReturnType<typeof startLayerMock>>;
 beforeAll(async () => { mock = await startLayerMock(4147); }, 15000);
 afterAll(async () => { await mock?.close(); });
@@ -28,6 +33,7 @@ test('deduplicates an in-flight split and charges its fixed price across all lay
   expect(changed.statusCode).toBe(409);
   const stats = (await mock.app.inject('/fixture/receipt')).json();
   expect(stats.calls.filter((call: {action: string}) => call.action === 'split')).toHaveLength(1);
+  expect(mock.upstreamCalls().at(-1)?.customTransport).toBe(false);
   expect(stats.balance).toBe('88');
   expect(stats.reservations).toBe('0');
 });
@@ -167,6 +173,7 @@ test('routes Ark split and edit, downloads layers, and sends official point guid
   const ark = { ...common, endpoint: '/images/generations', adapter: 'volcengine-ark' };
   expect((await save('split', { ...ark, creditsPerRequest: '12' })).statusCode).toBe(200);
   expect((await save('edit', { ...ark, creditsPerRequest: '8' })).statusCode).toBe(200);
+  mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
   try {
     const split = (await run({ operation: 'split', clientRequestId: 'ark-split-001', expectedCredits: '12' })).json();
     expect(split).toMatchObject({ status: 'success', chargedCredits: '12.000000', result: { width: 320, height: 400,
@@ -175,6 +182,7 @@ test('routes Ark split and edit, downloads layers, and sends official point guid
         { name: '云朵', order: 1, x: 100, y: 175, width: 96, height: 56, alpha: true, transparent: true },
       ] } });
     expect(mock.upstreamCalls().at(-1)?.body).toMatchObject({ image: mock.paths.poster, layer_decomposition: true, response_format: 'url' });
+    expect(mock.upstreamCalls().at(-1)?.customTransport).toBe(true);
     expect(mock.upstreamCalls().at(-1)?.body).not.toHaveProperty('prompt');
     expect(mock.upstreamCalls().at(-1)?.body).not.toHaveProperty('layer_decomposition_options');
     const layer = await mock.app.inject(new URL(split.result.assets[2]).pathname);
@@ -188,7 +196,14 @@ test('routes Ark split and edit, downloads layers, and sends official point guid
     expect(sent?.prompt).toContain('图1<point>250 500</point>');
     expect(sent?.image).toBe(mock.paths.poster);
     expect(sent).not.toHaveProperty('n');
+
+    const beforeTimeout = mock.upstreamCalls().length;
+    const timedOut = await run({ operation: 'edit', clientRequestId: 'ark-timeout-001', expectedCredits: '8', prompt: 'ark-timeout-fixture' });
+    expect(timedOut.json()).toMatchObject({ status: 'failed', chargedCredits: '0.000000',
+      message: '等待上游渠道响应超时。预留积分已释放。' });
+    expect(mock.upstreamCalls()).toHaveLength(beforeTimeout + 1);
   } finally {
+    mock.useMockAProviderKind('NEW_API');
     await save('split', { ...common, endpoint: '/split', adapter: 'canvas-json', creditsPerRequest: '12' });
     await save('edit', { ...common, endpoint: '/edit', adapter: 'canvas-json', creditsPerRequest: '8' });
   }

@@ -54,7 +54,7 @@ export async function startLayerMock(port = 4137) {
   ]));
   const operations = new Map<string, { idempotencyKey: string; result: unknown }>();
   const usageBindings = new Map<string, { key: string; canonicalModelId: string }>();
-  const calls: { channel: string; body: Record<string, unknown> }[] = [];
+  const calls: { channel: string; body: Record<string, unknown>; customTransport: boolean }[] = [];
   const uselgReads: string[] = [];
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
@@ -74,7 +74,7 @@ export async function startLayerMock(port = 4137) {
       }
       return new Response(new Uint8Array(asset), { headers: { 'content-type': 'image/png' } });
     }
-    const route = routes.find(entry => entry.channel.baseUrl === target.origin);
+    const route = routes.find(entry => new URL(entry.channel.baseUrl).origin === target.origin);
     if (!route) {
       if (target.hostname === '127.0.0.1') return realFetch(url, init);
       throw new Error('Local fixture blocked a non-local fetch');
@@ -95,7 +95,7 @@ export async function startLayerMock(port = 4137) {
         assets: [{ download_url: '/v1/images/tasks/imgtask-layer-edit-fixture/assets/0' }] });
     }
     const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    calls.push({ channel: route.id, body });
+    calls.push({ channel: route.id, body, customTransport: Boolean((init as RequestInit & { dispatcher?: unknown })?.dispatcher) });
     await new Promise(resolve => setTimeout(resolve, 1200));
     const pixel = route.id === 'mock-b';
     if (target.pathname === '/v1/images/edits') {
@@ -104,7 +104,10 @@ export async function startLayerMock(port = 4137) {
       if (body.prompt === 'expired asset') return Response.json({ data: [{ url: '/v1/images/tasks/direct/expired' }] });
       return Response.json({ task_id: 'imgtask-layer-edit-fixture', status: 'queued', poll_after_ms: 1000 }, { status: 202 });
     }
-    if (target.pathname === '/images/generations') {
+    if (target.pathname === '/images/generations' || target.pathname === '/api/v3/images/generations') {
+      if (body.prompt === 'ark-timeout-fixture') {
+        throw Object.assign(new Error('Provider response exceeded the deadline'), { code: 'IMAGE_PROVIDER_RESPONSE_TIMEOUT' });
+      }
       if (body.layer_decomposition === true) {
         return Response.json({ data: [
           { url: 'https://9.9.9.9/ark-layers/cloud.png?signature=fixture', size: '120x70', z_index: 2, name: '云朵',
@@ -273,7 +276,9 @@ export async function startLayerMock(port = 4137) {
   });
   await app.listen({ port, host: '127.0.0.1' });
   return { app, paths: { base: data(base), poster: data(poster) }, upstreamCalls: () => [...calls],
-    useMockAProviderKind(kind: AiProviderChannel['kind']) { routes[0]!.channel.kind = kind; },
+    useMockAProviderKind(kind: AiProviderChannel['kind'], baseUrl = 'https://1.1.1.1') {
+      Object.assign(routes[0]!.channel, { kind, baseUrl });
+    },
     uselgReads: () => [...uselgReads],
     failureDiagnostic: (clientRequestId: string) => records.find(row => row.clientRequestId === clientRequestId)?.failureDiagnostic as unknown,
     close: async () => { globalThis.fetch = realFetch; await app.close(); } };

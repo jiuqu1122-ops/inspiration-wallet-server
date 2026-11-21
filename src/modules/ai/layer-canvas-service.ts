@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { AiModelRoute, AiProviderChannel, Prisma, PrismaClient } from '@prisma/client';
+import { Agent } from 'undici';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl } from '../providers/url.js';
 import { isStoredImageResultUrl } from './image-result-store.js';
@@ -19,6 +20,10 @@ import { prepareGenericImageDataUrlReference } from './seedream-references.js';
 
 const identity = (userId: string, clientRequestId: string) => ({ userId_clientRequestId: { userId, clientRequestId } });
 const unavailable = () => new CloudAiError('layer_route_unavailable', '该操作尚未配置可用的模型、渠道或价格', 409);
+// The deployed network has no IPv6 route to Ark. Its IPv4 handshake can also
+// outlast Node's default dual-stack connection attempt window.
+const beijingArkLayerDispatcher = new Agent({ connect: { family: 4, timeout: 30_000 } });
+const BEIJING_ARK_LAYER_SUBMIT_TIMEOUT_MS = 240_000;
 
 async function readLayerInputImage(prisma: PrismaClient, userId: string, image: string) {
   if (!image.startsWith('reference-images/')) return image;
@@ -133,14 +138,20 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
     if (replay) return replay;
     throw error;
   }
+  const processingStartedAt = performance.now();
+  let upstreamResponseStatus: number | undefined;
   try {
     await assertPublicProviderUrl(provider.baseUrl);
+    const officialBeijingArk = config.adapter === 'volcengine-ark' && provider.kind === 'VOLCENGINE_ARK'
+      && new URL(provider.baseUrl).hostname === 'ark.cn-beijing.volces.com';
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
     const body = await layerUpstreamBody(config.adapter, preparedInput, route.upstreamModelId, source, {
       maxLayers: config.maxLayers, canonicalModelKey: model.canonicalModelKey,
     });
-    const upstream = await providerRequest(provider, secrets, config.endpoint, body, 180_000,
-      { 'Idempotency-Key': requestId });
+    const upstream = await providerRequest(provider, secrets, config.endpoint, body,
+      officialBeijingArk ? BEIJING_ARK_LAYER_SUBMIT_TIMEOUT_MS : 180_000,
+      { 'Idempotency-Key': requestId }, status => { upstreamResponseStatus = status; }, undefined,
+      officialBeijingArk ? beijingArkLayerDispatcher : undefined);
     stage = 'canvas_layer_result';
     const reply = operation === 'edit' ? await resolveLayerEditTask(
       provider, secrets, route, config, upstream, image, async id => {
@@ -175,9 +186,12 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
   } catch (error) {
     const diagnostic = buildFailureDiagnostic(error, { stage });
     console.warn('[canvas_layer_failed]', { clientRequestId, routeId: route.id, adapter: config.adapter,
-      ...taskIdentity(), stage: diagnostic.stage, code: diagnostic.code, httpStatus: diagnostic.httpStatus });
+      ...taskIdentity(), stage: diagnostic.stage, code: diagnostic.code, httpStatus: diagnostic.httpStatus,
+      upstreamResponseStatus: upstreamResponseStatus ?? null, elapsedMs: Math.round(performance.now() - processingStartedAt) });
+    const message = stage === 'canvas_layer_submit' && diagnostic.code === 'PROVIDER_TIMEOUT'
+      ? '等待上游渠道响应超时。' : stageMessages[stage];
     await releaseCredits(prisma, userId, requestId, diagnostic, { ...journal, ...taskIdentity(),
-      message: stageMessages[stage] + '预留积分已释放。' });
+      message: message + '预留积分已释放。' });
   }
   return getCanvasLayerRequest(prisma, userId, clientRequestId);
 }

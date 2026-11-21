@@ -926,6 +926,7 @@ export async function providerRequest(
   extraHeaders?: Record<string, string>,
   onResponseStatus?: (status: number) => void,
   diagnosticScope?: ImageResponseDiagnosticScope,
+  dispatcher?: Agent,
 ) {
   const controller = new AbortController();
   const timeoutMs = timeoutOverrideMs ?? (/(?:video|workerTask)/i.test(path) ? 10 * 60_000 : 4 * 60_000);
@@ -960,6 +961,7 @@ export async function providerRequest(
       method: body === undefined ? 'GET' : 'POST',
       headers: upstreamHeaders(secrets, extraHeaders),
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(dispatcher ? { dispatcher } : {}),
       redirect: 'error',
       signal: controller.signal,
     }));
