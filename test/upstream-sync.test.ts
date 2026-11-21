@@ -5,6 +5,7 @@ import { effectiveDiscoveryModality } from '../src/modules/ai/discovery-modality
 import {
   inferSuggestedModality,
   syncUpstreamModels,
+  upstreamAdapterFor,
 } from '../src/modules/ai/upstream-sync.js';
 
 const provider = (
@@ -36,6 +37,42 @@ afterEach(() => {
 });
 
 describe('upstream model modality inference', () => {
+  it('discovers Ark model domains and an explicitly configured image endpoint', async () => {
+    const channel = { ...provider('VOLCENGINE_ARK', ['IMAGE']), baseUrl: 'https://8.8.8.8/api/v3',
+      defaultModel: 'ep-fixture' };
+    const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => Response.json({ object: 'list', data: [
+      { id: 'seedream-fixture', domain: 'ImageGeneration' },
+      { id: 'text-fixture', domain: 'VLM' },
+      { id: 'embedding-fixture', domain: 'Embedding' },
+    ] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const items = await upstreamAdapterFor(channel).listModels(channel);
+    expect(items.map(item => [item.upstreamModelId, item.modality])).toEqual([
+      ['seedream-fixture', 'image'], ['text-fixture', 'chat'], ['embedding-fixture', null], ['ep-fixture', 'image'],
+    ]);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://8.8.8.8/api/v3/models');
+    const headers = new Headers(fetchMock.mock.calls[0]?.[1].headers);
+    expect(headers.get('authorization')).toBe('Bearer sk-test');
+    expect(headers.has('x-goog-api-key')).toBe(false);
+  });
+
+  it('keeps the managed Ark layer route settings when its upstream model is synchronized again', async () => {
+    const channel = { ...provider('VOLCENGINE_ARK', ['IMAGE']), baseUrl: 'https://8.8.8.8/api/v3' };
+    const canvasLayers = { split: { enabled: true, adapter: 'volcengine-ark', endpoint: '/images/generations',
+      maxMegapixels: 16, maxLayers: 10, creditsPerRequest: '12' } };
+    const route = { id: 'ark-layer-route', canonicalModelId: 'seedream-model', upstreamAvailable: true,
+      healthStatus: 'HEALTHY', costProfile: null, metadata: { canvasLayers } };
+    const update = vi.fn();
+    const prisma = {
+      aiProviderChannel: { findUnique: vi.fn(async () => channel) },
+      aiModelRoute: { findFirst: vi.fn(async () => route), update },
+    } as unknown as PrismaClient;
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ data: [{ id: 'seedream-fixture', domain: 'ImageGeneration' }] })));
+    await expect(syncUpstreamModels(prisma, channel.id)).resolves.toMatchObject({ mapped: 1 });
+    expect(update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ metadata: expect.objectContaining({ canvasLayers }) }),
+    }));
+  });
   it.each([
     'sd2.0',
     'sd2.0-900-内置过脸',

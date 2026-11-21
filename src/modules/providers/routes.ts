@@ -13,7 +13,7 @@ import {
 
 const providerIdSchema = z.object({ providerId: z.string().min(1).max(64) });
 const operationKeySchema = z.string().min(16).max(128).regex(/^[a-zA-Z0-9_-]+$/);
-const kindSchema = z.enum(['NEW_API', 'OPENAI_COMPATIBLE', 'XAIS', 'MIKOTO', 'BIGMODEL', 'MINIMAX', 'USELG']);
+const kindSchema = z.enum(['NEW_API', 'OPENAI_COMPATIBLE', 'XAIS', 'MIKOTO', 'BIGMODEL', 'MINIMAX', 'USELG', 'VOLCENGINE_ARK']);
 const capabilitySchema = z.enum([
   'LLM',
   'VISION',

@@ -109,6 +109,7 @@ enum AiProviderKind {
   BIGMODEL
   MINIMAX
   USELG
+  VOLCENGINE_ARK
 }
 
 enum AiProviderStatus {

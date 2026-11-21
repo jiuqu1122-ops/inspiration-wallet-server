@@ -608,6 +608,8 @@ async function listVideoProviders(prisma: PrismaClient) {
 export function providerCanServeImageAlongsideAgent(
   provider: Pick<AiProviderChannel, 'kind' | 'capabilities'>,
 ) {
+  // Ark uses explicit managed routes with a data-plane API prefix.
+  if (provider.kind === 'VOLCENGINE_ARK') return false;
   const hasImageCapability = provider.capabilities.some((capability) => (
     IMAGE_PROVIDER_CAPABILITIES.includes(capability)
   ));

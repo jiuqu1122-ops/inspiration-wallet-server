@@ -3,6 +3,9 @@ import { z } from 'zod';
 import { executeWalletMusicGeneration, getWalletMusicGenerationByRequest } from './music-service.js';
 import { submitWalletImageOperation, getWalletImageOperation } from './image-operation-service.js';
 import { imageOperationInputSchema } from './image-operation-protocol.js';
+import { canvasLayerInput } from './layer-canvas-adapters.js';
+import { getCanvasLayerRequest, submitCanvasLayerRequest } from './layer-canvas-service.js';
+import { getLayerCatalog } from './layer-canvas-config.js';
 import { CloudAiError, listWalletAgentModels } from './service.js';
 import {
   executeWalletImageGeneration,
@@ -201,7 +204,8 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
     async (_request, reply) => {
       try {
         await ensureAiCatalogSeeded(app.prisma);
-        return await getPublicAiCatalog(app.prisma);
+        const catalog = await getPublicAiCatalog(app.prisma);
+        return { ...catalog, canvasLayers: await getLayerCatalog(app.prisma) };
       } catch (error) {
         return knownError(reply, error);
       }
@@ -681,6 +685,29 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
       const result = await submitWalletImageOperation(app.prisma, { ...parsed.data, userId: request.user.sub });
       return reply.code(['success', 'failed', 'canceled', 'client_disconnected'].includes(result.status) ? 200 : 202).send(result);
     } catch (error) { return knownError(reply, error); }
+  });
+
+  app.post('/canvas-layers', {
+    onRequest: app.authenticateAccessToken,
+    bodyLimit: 30 * 1024 * 1024,
+    config: { rateLimit: { max: 12, timeWindow: '1 minute' } },
+  }, async (request, reply) => {
+    const parsed = canvasLayerInput.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', message: '画布图层请求格式无效' });
+    try {
+      const result = await submitCanvasLayerRequest(app.prisma, request.user.sub, parsed.data);
+      return reply.code(result?.status === 'processing' ? 202 : 200).send(result);
+    } catch (error) { return knownError(reply, error); }
+  });
+
+  app.get('/canvas-layers/by-request/:clientRequestId', {
+    preHandler: app.authenticateAccessToken,
+    config: { rateLimit: { max: 120, timeWindow: '1 minute' } },
+  }, async (request, reply) => {
+    const parsed = imageGenerationRequestParamsSchema.safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', message: '请求 ID 无效' });
+    return await getCanvasLayerRequest(app.prisma, request.user.sub, parsed.data.clientRequestId)
+      ?? reply.code(404).send({ error: 'layer_request_not_found', message: '找不到画布图层请求' });
   });
 
   app.get('/images/operations/by-request/:clientRequestId', {

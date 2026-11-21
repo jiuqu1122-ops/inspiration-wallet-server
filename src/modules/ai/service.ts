@@ -1174,7 +1174,7 @@ export async function listWalletAgentModels(prisma: PrismaClient) {
   };
 }
 
-async function reserveCredits(
+export async function reserveCredits(
   prisma: PrismaClient,
   input: {
     userId: string;
@@ -1186,6 +1186,7 @@ async function reserveCredits(
     pricingSnapshot?: PricingSnapshot | undefined;
     canonicalModelId?: string | undefined;
     routeId?: string | null | undefined;
+    initialResult?: Prisma.InputJsonObject;
   },
 ) {
   const requestedCredits = creditDecimal(input.credits);
@@ -1244,6 +1245,7 @@ async function reserveCredits(
         } : {}),
         status: 'RESERVED',
         estimatedCredits: credits,
+        ...(input.initialResult ? { result: input.initialResult } : {}),
       },
     });
     await transaction.walletLedger.create({
@@ -1266,9 +1268,11 @@ type CreditSettlement = {
   billingResult?: ChargeBreakdown | undefined;
   actualRouteId?: string | null | undefined;
   description?: string | undefined;
+  result?: Prisma.InputJsonObject;
+  breakdown?: Prisma.InputJsonObject;
 };
 
-async function settleCredits(
+export async function settleCredits(
   prisma: PrismaClient,
   userId: string,
   requestId: string,
@@ -1305,13 +1309,15 @@ async function settleCredits(
       ...(billingResult
         ? { result: toInputJson(billingResult), chargeBreakdown: toInputJson(billingResult) }
         : {}),
+      ...(settlement?.result ? { result: settlement.result } : {}),
+      ...(settlement?.breakdown ? { chargeBreakdown: settlement.breakdown } : {}),
     };
     const claimed = await transaction.aiRequest.updateMany({
       where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
       data: requestUpdate,
     });
     if (claimed.count !== 1) return;
-    if (billingResult && catalogDelegateAvailable(prisma)) {
+    if ((billingResult || settlement?.breakdown) && catalogDelegateAvailable(prisma)) {
       await transaction.aiBillingSettlement.create({
         data: {
           requestId,
@@ -1319,7 +1325,7 @@ async function settleCredits(
           routeId: settlement?.actualRouteId ?? request.routeId,
           priceVersionId: request.priceVersionId,
           chargedCredits: charged,
-          breakdown: toInputJson(billingResult),
+          breakdown: settlement?.breakdown ?? toInputJson(billingResult),
         },
       });
     }
@@ -1377,7 +1383,7 @@ async function settleCredits(
   });
 }
 
-async function releaseCredits(prisma: PrismaClient, userId: string, requestId: string, failureDiagnostic?: FailureDiagnostic) {
+export async function releaseCredits(prisma: PrismaClient, userId: string, requestId: string, failureDiagnostic?: FailureDiagnostic, result?: Prisma.InputJsonObject) {
   await prisma.$transaction(async (transaction) => {
     const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
     if (!request || request.userId !== userId || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
@@ -1386,6 +1392,7 @@ async function releaseCredits(prisma: PrismaClient, userId: string, requestId: s
       where: { id: requestId, status: { in: ['RESERVED', 'PROCESSING'] } },
       data: { status: 'FAILED', completedAt: new Date(),
         ...(failureDiagnostic ? { failureDiagnostic: toInputJson(failureDiagnostic) } : {}),
+        ...(result ? { result } : {}),
       },
     });
     if (claimed.count !== 1) return;

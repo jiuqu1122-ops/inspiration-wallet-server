@@ -90,7 +90,7 @@ function serializeProvider(provider: AiProviderChannel) {
 
 export function defaultProviderCapabilities(kind: AiProviderKind): AiCapability[] {
   if (kind === 'MINIMAX') return ['VIDEO_MINIMAX'];
-  if (kind === 'USELG' || kind === 'BIGMODEL') return ['IMAGE'];
+  if (kind === 'USELG' || kind === 'BIGMODEL' || kind === 'VOLCENGINE_ARK') return ['IMAGE'];
   if (kind === 'OPENAI_COMPATIBLE') return ['LLM', 'IMAGE'];
   return ['LLM'];
 }
@@ -536,6 +536,9 @@ function newApiManagementAuth(secrets: ProviderSecrets) {
 export async function getProviderBalance(prisma: PrismaClient, providerId: string) {
   const provider = await prisma.aiProviderChannel.findUnique({ where: { id: providerId } });
   if (!provider) throw new ProviderServiceError('provider_not_found', 'Provider not found', 404);
+  if (provider.kind === 'VOLCENGINE_ARK') {
+    throw new ProviderServiceError('provider_balance_unsupported', '请在火山引擎控制台查询账户余额', 400);
+  }
   await normalizeAndValidate(provider.kind, provider.baseUrl, provider.allowInsecureHttp);
 
   let secrets: ProviderSecrets;
@@ -644,6 +647,7 @@ function providerModelProbeCandidates(
   apiKey: string,
 ) {
   if (provider.kind === 'MINIMAX') return [];
+  if (provider.kind === 'VOLCENGINE_ARK') return [{ name: '火山方舟 Models API', path: '/models' }];
   if (provider.kind !== 'BIGMODEL') return [
     { name: 'OpenAI /v1/models', path: '/v1/models' },
   ];
@@ -760,6 +764,9 @@ export async function testProvider(prisma: PrismaClient, providerId: string) {
         secrets,
         candidate.headers ? { headers: candidate.headers } : undefined,
       );
+      if (provider.kind === 'VOLCENGINE_ARK' && !Array.isArray(valueAt(value, ['/data']))) {
+        throw new Error('火山方舟返回的模型列表格式不正确');
+      }
       modelCatalogReachable = true;
       if (candidate.path === '/v1beta/models') nativeImageCatalogReachable = true;
       models = Array.from(new Set([...models, ...modelIds(value)]));
@@ -793,9 +800,9 @@ export async function testProvider(prisma: PrismaClient, providerId: string) {
   const configuredTextModel = provider.defaultModel?.trim() ?? '';
   const discoveredTextModel = models.find(isLikelyTextModel) ?? '';
   const needsVisionProbe = provider.capabilities.includes('VISION');
-  const needsTextProbe = needsVisionProbe
+  const needsTextProbe = provider.kind !== 'VOLCENGINE_ARK' && (needsVisionProbe
     || ((provider.capabilities.includes('LLM'))
-      && Boolean(isLikelyTextModel(configuredTextModel) ? configuredTextModel : discoveredTextModel));
+      && Boolean(isLikelyTextModel(configuredTextModel) ? configuredTextModel : discoveredTextModel)));
   const needsNativeImageProbe = provider.kind === 'BIGMODEL'
     && provider.capabilities.some(isNativeBigmodelImageCapability);
   if (needsNativeImageProbe && !nativeImageCatalogReachable) {
@@ -831,6 +838,8 @@ export async function testProvider(prisma: PrismaClient, providerId: string) {
   status = 'OK';
   if (provider.kind === 'MINIMAX') {
     message = '连接成功；MiniMax H3 视频接口可访问';
+  } else if (provider.kind === 'VOLCENGINE_ARK') {
+    message = `火山方舟连接成功，返回 ${models.length} 个基础模型`;
   } else {
     const details = [
       modelCatalogReachable

@@ -528,6 +528,7 @@ describe('dual-protocol image channels', () => {
       capabilities: ['LLM'],
     })).toBe(false);
     expect(providerCanServeImageAlongsideAgent({ kind: 'OPENAI_COMPATIBLE', capabilities: ['LLM', 'IMAGE'] } as never)).toBe(true);
+    expect(providerCanServeImageAlongsideAgent({ kind: 'VOLCENGINE_ARK', capabilities: ['IMAGE'] })).toBe(false);
   });
 });
 

@@ -99,6 +99,7 @@ export function providerSpecificModality(
   provider: Pick<AiProviderChannel, 'kind'>,
   upstreamModelId: string,
 ): AiModality | null {
+  if (provider.kind === 'VOLCENGINE_ARK' && /^doubao-seedream-/i.test(upstreamModelId)) return 'image';
   if (provider.kind.toUpperCase() !== 'USELG') return null;
   const id = upstreamModelId.trim().toLowerCase();
   if (/^sd[-_.]?2[._-][05](?:[-_.]|$)/.test(id) || /^sd-2-fast(?:[-_.]|$)/.test(id)) return 'video';
@@ -123,6 +124,13 @@ export function inferSuggestedModality(
   id: string,
   item?: unknown,
 ): AiModality | null {
+  if (provider.kind === 'VOLCENGINE_ARK') {
+    const domain = objectValue(item)?.domain;
+    if (domain === 'ImageGeneration') return 'image';
+    if (domain === 'VideoGeneration') return 'video';
+    if (domain === 'LLM' || domain === 'VLM') return 'chat';
+    if (typeof domain === 'string' && domain) return null;
+  }
   const hints = providerModalityHints(provider);
   return explicitUpstreamModality(item)
     ?? providerSpecificModality(provider, id)
@@ -136,11 +144,14 @@ function preservesConfiguredRouteCapabilities(metadata: unknown) {
 }
 
 function refreshedRouteMetadata(current: unknown, discovered: Prisma.InputJsonValue) {
-  if (!preservesConfiguredRouteCapabilities(current)) return discovered;
+  const existing = objectValue(current);
+  const preserveCapabilities = preservesConfiguredRouteCapabilities(current);
+  if (!preserveCapabilities && !existing?.canvasLayers) return discovered;
   return {
-    ...(objectValue(current) ?? {}),
+    ...(preserveCapabilities ? existing : {}),
     ...(objectValue(discovered) ?? {}),
-    capabilitiesOverrideSource: objectValue(current)?.capabilitiesOverrideSource,
+    ...(preserveCapabilities ? { capabilitiesOverrideSource: existing?.capabilitiesOverrideSource } : {}),
+    ...(existing?.canvasLayers ? { canvasLayers: existing.canvasLayers } : {}),
   } as Prisma.InputJsonValue;
 }
 
@@ -165,7 +176,7 @@ function normalizeModel(provider: AiProviderChannel, item: unknown): NormalizedU
     cost: jsonValue(record.cost ?? record.pricing ?? record.price),
     metadata: jsonValue({
       raw: record,
-      adapter: provider.kind === 'BIGMODEL' ? 'gemini' : 'openai',
+      adapter: provider.kind === 'BIGMODEL' ? 'gemini' : provider.kind === 'VOLCENGINE_ARK' ? 'volcengine-ark' : 'openai',
       inferredModality: modality,
     }) ?? {},
   };
@@ -179,7 +190,7 @@ async function fetchProviderJson(provider: AiProviderChannel, path: string) {
     authorization: `Bearer ${secrets.apiKey}`,
     'user-agent': 'Inspiration-Wallet-Server/1',
   });
-  headers.set('x-goog-api-key', secrets.apiKey);
+  if (provider.kind !== 'VOLCENGINE_ARK') headers.set('x-goog-api-key', secrets.apiKey);
   for (const [name, value] of Object.entries(secrets.headers)) headers.set(name, value);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 20_000);
@@ -202,11 +213,16 @@ class JsonModelAdapter implements UpstreamModelAdapter {
   async listModels(provider: AiProviderChannel) {
     const value = await fetchProviderJson(provider, this.path);
     const root = objectValue(value);
-    const candidates = Array.isArray(root?.data)
+    if (provider.kind === 'VOLCENGINE_ARK' && !Array.isArray(root?.data)) {
+      throw new Error('火山方舟返回的模型列表格式不正确');
+    }
+    const candidates: unknown[] = Array.isArray(root?.data)
       ? root.data
       : Array.isArray(root?.models) ? root.models
         : Array.isArray(value) ? value : [];
-    return candidates
+    const configured = provider.kind === 'VOLCENGINE_ARK' ? provider.defaultModel?.trim() : '';
+    const entries = configured ? [...candidates, { id: configured, domain: 'ImageGeneration' }] : candidates;
+    return entries
       .map(item => normalizeModel(provider, item))
       .filter((item): item is NormalizedUpstreamModel => item !== null)
       .filter((item, index, all) => all.findIndex(other => other.upstreamModelId === item.upstreamModelId) === index)
@@ -216,8 +232,10 @@ class JsonModelAdapter implements UpstreamModelAdapter {
 
 const openAiAdapter = new JsonModelAdapter('/v1/models');
 const geminiAdapter = new JsonModelAdapter('/v1beta/models');
+const arkAdapter = new JsonModelAdapter('/models');
 
 export function upstreamAdapterFor(provider: AiProviderChannel): UpstreamModelAdapter {
+  if (provider.kind === 'VOLCENGINE_ARK') return arkAdapter;
   return provider.kind === 'BIGMODEL' ? geminiAdapter : openAiAdapter;
 }
 

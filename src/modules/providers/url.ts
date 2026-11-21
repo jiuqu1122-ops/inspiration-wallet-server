@@ -74,8 +74,12 @@ export function normalizeProviderBaseUrl(
   }
 
   let pathname = url.pathname.replace(/\/+$/, '');
-  pathname = pathname.replace(endpointSuffix, '');
-  if (/\/v1$/i.test(pathname)) pathname = pathname.slice(0, -3);
+  if (kind === 'VOLCENGINE_ARK') {
+    pathname = pathname.replace(/(\/api\/v3)\/(?:models|images\/generations)$/i, '$1') || '/api/v3';
+  } else {
+    pathname = pathname.replace(endpointSuffix, '');
+    if (/\/v1$/i.test(pathname)) pathname = pathname.slice(0, -3);
+  }
   url.pathname = pathname || '/';
   const normalized = url.toString().replace(/\/$/, '');
   if (kind === 'XAIS' && /\/xais$/i.test(normalized)) {
