@@ -187,6 +187,7 @@ test('downloads official Ark layers from a persisted URL manifest and sends URL 
   mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
   const imageService = await import('../src/modules/ai/image-service.js');
   const providerRequests = vi.spyOn(imageService, 'providerRequest');
+  const resultDownloads = vi.spyOn(await import('../src/modules/ai/seedream-references.js'), 'downloadArkCanvasResultBytes');
   try {
     const invalid = await run({ operation: 'split', clientRequestId: 'ark-split-too-small', expectedCredits: '12' });
     expect(invalid.statusCode).toBe(400);
@@ -246,10 +247,16 @@ test('downloads official Ark layers from a persisted URL manifest and sends URL 
     expect(walletAfter.ledger.slice(walletBefore.ledger.length))
       .toEqual([{ type: 'RESERVE', amount: '-12' }, { type: 'CHARGE', amount: '12' }]);
 
+    resultDownloads.mockClear();
     const edit = (await run({ operation: 'edit', clientRequestId: 'ark-edit-001', expectedCredits: '8', prompt: '调整颜色',
       selection: { kind: 'point', x: 0.25, y: 0.5 } })).json();
     expect(edit).toMatchObject({ status: 'success', chargedCredits: '8.000000',
       result: { operation: 'edit', image: { width: 320, height: 400 } } });
+    expect(resultDownloads).toHaveBeenCalledTimes(1);
+    const [assetUrl, , transfer] = resultDownloads.mock.calls[0]!;
+    expect(new URL(assetUrl).pathname).toMatch(/^\/ark-edits\//);
+    expect(transfer).toMatchObject({ phase: 'reading_body', responseStatus: 200, timeout: null });
+    expect(transfer?.receivedBytes).toBeGreaterThan(0);
     const sent = mock.upstreamCalls().at(-1)?.body;
     expect(sent?.prompt).toContain('图1<point>250 500</point>');
     expect(sent?.image).toBe(mock.paths.poster);
@@ -275,6 +282,7 @@ test('downloads official Ark layers from a persisted URL manifest and sends URL 
     });
     expect(mock.upstreamCalls()).toHaveLength(beforeTimeout + 2);
   } finally {
+    resultDownloads.mockRestore();
     providerRequests.mockRestore();
     mock.useMockAProviderKind('NEW_API');
     await save('split', { ...common, endpoint: '/split', adapter: 'canvas-json', creditsPerRequest: '12' });

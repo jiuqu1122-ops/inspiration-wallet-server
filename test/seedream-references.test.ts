@@ -28,7 +28,7 @@ import { aiRoutes } from '../src/modules/ai/routes.js';
 import { prepareRouteImageAdapterRequest, generatePreparedImageAdapterImages } from '../src/modules/ai/image-service.js';
 import { imageAdapterConfig } from '../src/modules/ai/image-adapters/types.js';
 import {
-  downloadArkCanvasResultBytes, prepareSeedreamReference, stageMultipartImageReference, referenceSourceType,
+  createArkCanvasTransfer, downloadArkCanvasResultBytes, prepareSeedreamReference, stageMultipartImageReference, referenceSourceType,
 } from '../src/modules/ai/seedream-references.js';
 import { resolveReferenceImageSources } from '../src/modules/ai/reference-upload-service.js';
 import {
@@ -111,7 +111,7 @@ describe('Ark canvas result downloads', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it.each(['complete', 'idle', 'total'] as const)('tracks split bytes and enforces both limits (%s)', async outcome => {
+  it.each(['complete', 'complete without trace', 'idle', 'total'] as const)('tracks Ark result progress and enforces both limits (%s)', async outcome => {
     vi.useFakeTimers();
     try {
       dns.lookup.mockResolvedValue([ipv4]);
@@ -121,17 +121,19 @@ describe('Ark canvas result downloads', () => {
         init.signal?.addEventListener('abort', () => body.error(new Error('aborted')), { once: true });
         return Promise.resolve(new Response(stream, { headers: { 'content-type': 'image/png' } }));
       }));
-      const trace: import('../src/modules/ai/seedream-references.js').ArkSplitTransfer = {
-        phase: 'resolving', receivedBytes: 0, responseStatus: null, timeout: null,
-      };
-      const read = downloadArkCanvasResultBytes(url, undefined, trace);
-      const verify = outcome === 'complete' ? expect(read).resolves.toEqual(png)
+      const trace = createArkCanvasTransfer();
+      const tracked = outcome !== 'complete without trace';
+      const completed = outcome === 'complete' || !tracked;
+      const read = downloadArkCanvasResultBytes(url, undefined, tracked ? trace : undefined);
+      const verify = completed ? expect(read).resolves.toEqual(png)
         : expect(read).rejects.toMatchObject({ code: 'ark_result_timeout', statusCode: 504 });
+      // Consume rejections immediately while the virtual clock is advancing.
+      void verify.catch(() => {});
       await vi.advanceTimersByTimeAsync(35_000);
       body.enqueue(png.subarray(0, 8));
       await vi.advanceTimersByTimeAsync(30_000);
-      expect(trace).toMatchObject({ phase: 'reading_body', receivedBytes: 8, responseStatus: 200, timeout: null });
-      if (outcome === 'complete') {
+      if (tracked) expect(trace).toMatchObject({ phase: 'reading_body', receivedBytes: 8, responseStatus: 200, timeout: null });
+      if (completed) {
         body.enqueue(png.subarray(8));
         body.close();
       } else if (outcome === 'idle') {
@@ -143,7 +145,7 @@ describe('Ark canvas result downloads', () => {
         await vi.advanceTimersByTimeAsync(20_001);
       }
       await verify;
-      expect(trace.timeout).toBe(outcome === 'complete' ? null : outcome);
+      if (tracked) expect(trace.timeout).toBe(completed ? null : outcome);
     } finally {
       vi.useRealTimers();
     }

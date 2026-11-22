@@ -18,15 +18,18 @@ import { REFERENCE_UPLOAD_MAX_BYTES, ReferenceUploadError } from './reference-up
 export type ReferenceSourceType = 'local' | 'cos' | 'signed_url' | 'public_url' | 'data_url';
 export type ReferenceTransport = 'data_url' | 'public_https';
 const FETCH_TIMEOUT_MS = 30_000;
-const ARK_RESULT_FETCH_TIMEOUT_MS = 45_000;
-export const ARK_SPLIT_ASSET_MAX_MS = 120_000;
-export type ArkSplitTransfer = {
+const ARK_RESULT_IDLE_TIMEOUT_MS = 45_000;
+export const ARK_CANVAS_ASSET_MAX_MS = 120_000;
+type ArkCanvasTransfer = {
   phase: 'resolving' | 'waiting_headers' | 'reading_body';
   receivedBytes: number;
   responseStatus: number | null;
   timeout: 'idle' | 'total' | null;
 };
-type ArkProgress = (phase: ArkSplitTransfer['phase'], receivedBytes: number, responseStatus: number | null) => void;
+export function createArkCanvasTransfer(): ArkCanvasTransfer {
+  return { phase: 'resolving', receivedBytes: 0, responseStatus: null, timeout: null };
+}
+type ArkProgress = (phase: ArkCanvasTransfer['phase'], receivedBytes: number, responseStatus: number | null) => void;
 const ARK_RESULT_MAX_BYTES = 20 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const imageMime = { png: 'image/png', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' } as const;
@@ -200,7 +203,7 @@ async function fetchPublicReference(source: string, signal: AbortSignal, maximum
 }
 
 /** One safe GET attempt. The canvas task owns the shared deadline and retry allowance. */
-export async function downloadArkCanvasResultBytes(source: string, signal?: AbortSignal, split?: ArkSplitTransfer) {
+export async function downloadArkCanvasResultBytes(source: string, signal?: AbortSignal, transfer = createArkCanvasTransfer()) {
   const attempt = new AbortController();
   const combined = signal ? AbortSignal.any([signal, attempt.signal]) : attempt.signal;
   let rejectAbort: (reason: unknown) => void = () => {};
@@ -209,17 +212,17 @@ export async function downloadArkCanvasResultBytes(source: string, signal?: Abor
   combined.addEventListener('abort', onAbort, { once: true });
   const abort = (kind: 'idle' | 'total') => {
     if (attempt.signal.aborted) return;
-    if (split) split.timeout = kind;
+    transfer.timeout = kind;
     attempt.abort();
   };
-  if (split) split.timeout = null;
-  const timeout = setTimeout(() => abort('idle'), ARK_RESULT_FETCH_TIMEOUT_MS);
-  const hardLimit = split ? setTimeout(() => abort('total'), ARK_SPLIT_ASSET_MAX_MS) : undefined;
-  const onProgress: ArkProgress | undefined = split ? (phase, receivedBytes, responseStatus) => {
+  Object.assign(transfer, createArkCanvasTransfer());
+  const timeout = setTimeout(() => abort('idle'), ARK_RESULT_IDLE_TIMEOUT_MS);
+  const hardLimit = setTimeout(() => abort('total'), ARK_CANVAS_ASSET_MAX_MS);
+  const onProgress: ArkProgress = (phase, receivedBytes, responseStatus) => {
     if (combined.aborted) return;
-    Object.assign(split, { phase, receivedBytes, responseStatus });
+    Object.assign(transfer, { phase, receivedBytes, responseStatus });
     timeout.refresh();
-  } : undefined;
+  };
   try {
     combined.throwIfAborted();
     return (await Promise.race([fetchPublicReference(source, combined, ARK_RESULT_MAX_BYTES, true, onProgress), aborted])).bytes;

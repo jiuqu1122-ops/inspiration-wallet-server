@@ -82,6 +82,7 @@ export async function startLayerMock(port = 4137) {
   };
   const uselgReads: string[] = [];
   const arkLayerReads: string[] = [];
+  const arkEditAssets = new Map<string, Buffer>();
   const transientArkLayerFailures = new Set<string>();
   let arkRecoveryAssetsAvailable = false;
   const realFetch = globalThis.fetch;
@@ -94,6 +95,11 @@ export async function startLayerMock(port = 4137) {
       uselgReads.push(target.origin + target.pathname);
       if (new Headers(init.headers).has('authorization')) return new Response(null, { status: 403 });
       return new Response(new Uint8Array(poster), { headers: { 'content-type': 'image/png' } });
+    }
+    if (target.origin === 'https://9.9.9.9' && target.pathname.startsWith('/ark-edits/') && init?.method === 'GET') {
+      const bytes = arkEditAssets.get(target.href);
+      if (!bytes || new Headers(init.headers).has('authorization')) return new Response(null, { status: 403 });
+      return new Response(new Uint8Array(bytes), { headers: { 'content-type': 'image/png' } });
     }
     if (target.origin === 'https://9.9.9.9' && target.pathname.startsWith('/ark-layers/') && init?.method === 'GET') {
       const name = target.pathname.slice('/ark-layers/'.length, -'.png'.length);
@@ -189,6 +195,11 @@ export async function startLayerMock(port = 4137) {
         return Response.json(result);
       }
       const output = await sharp(bytes).tint('#8b95ed').png().toBuffer();
+      if (body.response_format === 'url') {
+        const url = `https://9.9.9.9/ark-edits/${fingerprint(output)}.png?signature=fixture`;
+        arkEditAssets.set(url, output);
+        return Response.json({ data: [{ url }] });
+      }
       return Response.json({ data: [{ b64_json: output.toString('base64') }] });
     }
     if (target.pathname === '/edit') {
