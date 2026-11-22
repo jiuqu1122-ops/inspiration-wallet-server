@@ -165,7 +165,7 @@ test('creates and checks an Ark channel with the authenticated, read-only model 
   expect(probed.json()).toMatchObject({ ok: true, models: ['doubao-seedream-fixture'], modelCount: 1 });
 });
 
-test('routes Ark split and edit, downloads layers, and sends official point guidance without painting the image', async () => {
+test('receives official Ark layers as inline PNGs and sends URL output and point guidance for edits', async () => {
   const common = { enabled: true, maxMegapixels: 2, maxLayers: 32 };
   const save = (mode: 'split' | 'edit', config: object) => mock.app.inject({
     method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/' + mode, payload: { config },
@@ -185,19 +185,47 @@ test('routes Ark split and edit, downloads layers, and sends official point guid
     expect(missing.statusCode).toBe(404);
     const largerPoster = await sharp(Buffer.from(mock.paths.poster.split(',')[1]!, 'base64')).resize(640, 800).png().toBuffer();
     const image = 'data:image/png;base64,' + largerPoster.toString('base64');
-    const split = (await run({ operation: 'split', image, clientRequestId: 'ark-split-001', expectedCredits: '12' })).json();
+    const splitPayload = { operation: 'split', image, clientRequestId: 'ark-split-001', expectedCredits: '12' };
+    const submissionsBefore = mock.upstreamCalls().length;
+    const readsBefore = mock.arkLayerReads();
+    const walletBefore = (await mock.app.inject('/fixture/receipt')).json();
+    const splitResponse = await run(splitPayload);
+    expect(splitResponse.statusCode).toBe(200);
+    const split = splitResponse.json();
     expect(split).toMatchObject({ status: 'success', chargedCredits: '12.000000', result: { width: 320, height: 400,
+      base: { asset: 0, width: 320, height: 400 },
       layers: [
-        { name: '标题', order: 0, x: 27, y: 37, width: 210, height: 76 },
-        { name: '云朵', order: 1, x: 100, y: 175, width: 96, height: 56, alpha: true, transparent: true },
+        { name: '标题', asset: 1, order: 0, x: 27, y: 37, width: 210, height: 76, alpha: true, transparent: true },
+        { name: '云朵', asset: 2, order: 1, x: 100, y: 175, width: 96, height: 56, alpha: true, transparent: true },
       ] } });
-    expect(mock.upstreamCalls().at(-1)?.body).toMatchObject({ image, layer_decomposition: true, response_format: 'url' });
-    expect(mock.upstreamCalls().at(-1)?.customTransport).toBe(true);
-    expect(mock.upstreamCalls().at(-1)?.arkClientRequestId).toMatch(/^[a-zA-Z0-9-]+$/);
-    expect(mock.upstreamCalls().at(-1)?.body).not.toHaveProperty('prompt');
-    expect(mock.upstreamCalls().at(-1)?.body).not.toHaveProperty('layer_decomposition_options');
-    const layer = await mock.app.inject(new URL(split.result.assets[2]).pathname);
-    expect(await sharp(layer.rawPayload).metadata()).toMatchObject({ width: 96, height: 56, hasAlpha: true });
+    expect(split.result.assets).toHaveLength(3);
+    const expectedAssets = [
+      { width: 320, height: 400, opaque: true },
+      { width: 210, height: 76, opaque: false },
+      { width: 96, height: 56, opaque: false },
+    ];
+    for (const [index, { width, height, opaque }] of expectedAssets.entries()) {
+      const asset = await mock.app.inject(new URL(split.result.assets[index]).pathname);
+      expect(asset.statusCode).toBe(200);
+      expect(asset.headers['content-type']).toBe('image/png');
+      const png = sharp(asset.rawPayload);
+      expect(await png.metadata()).toMatchObject({ format: 'png', width, height, ...(opaque ? {} : { hasAlpha: true }) });
+      expect((await png.stats()).isOpaque).toBe(opaque);
+    }
+    expect((await run(splitPayload)).json()).toEqual(split);
+    const [submission] = mock.upstreamCalls().slice(submissionsBefore);
+    expect(mock.upstreamCalls()).toHaveLength(submissionsBefore + 1);
+    expect(submission).toMatchObject({ method: 'POST', url: 'https://ark.cn-beijing.volces.com/api/v3/images/generations',
+      customTransport: true, arkClientRequestId: expect.stringMatching(/^[a-zA-Z0-9-]+$/),
+      body: { image, layer_decomposition: true, response_format: 'b64_json' },
+    });
+    expect(submission?.body).not.toHaveProperty('prompt');
+    expect(submission?.body).not.toHaveProperty('layer_decomposition_options');
+    expect(mock.arkLayerReads()).toEqual(readsBefore);
+    const walletAfter = (await mock.app.inject('/fixture/receipt')).json();
+    expect(walletAfter.reservations).toBe(walletBefore.reservations);
+    expect(walletAfter.ledger.slice(walletBefore.ledger.length))
+      .toEqual([{ type: 'RESERVE', amount: '-12' }, { type: 'CHARGE', amount: '12' }]);
 
     const edit = (await run({ operation: 'edit', clientRequestId: 'ark-edit-001', expectedCredits: '8', prompt: '调整颜色',
       selection: { kind: 'point', x: 0.25, y: 0.5 } })).json();
@@ -206,6 +234,7 @@ test('routes Ark split and edit, downloads layers, and sends official point guid
     const sent = mock.upstreamCalls().at(-1)?.body;
     expect(sent?.prompt).toContain('图1<point>250 500</point>');
     expect(sent?.image).toBe(mock.paths.poster);
+    expect(sent?.response_format).toBe('url');
     expect(sent).not.toHaveProperty('n');
 
     const beforeTimeout = mock.upstreamCalls().length;
@@ -226,6 +255,41 @@ test('routes Ark split and edit, downloads layers, and sends official point guid
     mock.useMockAProviderKind('NEW_API');
     await save('split', { ...common, endpoint: '/split', adapter: 'canvas-json', creditsPerRequest: '12' });
     await save('edit', { ...common, endpoint: '/edit', adapter: 'canvas-json', creditsPerRequest: '8' });
+  }
+}, 15_000);
+
+test('rejects an oversized inline Ark split response and releases its reservation', async () => {
+  const save = (endpoint: string, adapter: string, creditsPerRequest: string) => mock.app.inject({
+    method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/split',
+    payload: { config: { enabled: true, maxMegapixels: 2, maxLayers: 32, endpoint, adapter, creditsPerRequest } },
+  });
+  expect((await save('/images/generations', 'volcengine-ark', '1')).statusCode).toBe(200);
+  mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
+  try {
+    const clientRequestId = 'ark-split-oversized-inline';
+    const before = (await mock.app.inject('/fixture/receipt')).json();
+    const submissionsBefore = mock.upstreamCalls().length;
+    const readsBefore = mock.arkLayerReads();
+    const submit = () => mock.app.inject({ method: 'POST', url: '/v1/ai/canvas-layers', payload: {
+      operation: 'split', image: mock.paths.splitPoster, clientRequestId,
+      prompt: 'ark-oversized-inline-output-fixture', expectedCredits: '1',
+    } });
+    const response = await submit();
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ status: 'failed', chargedCredits: '0.000000',
+      message: '方舟返回的图层数据超过服务端接收上限。预留积分已释放。' });
+    expect(mock.failureDiagnostic(clientRequestId)).toMatchObject({ stage: 'canvas_layer_submit', code: 'IMAGE_SIZE_LIMIT' });
+    expect((await submit()).json()).toEqual(response.json());
+    expect(mock.upstreamCalls()).toHaveLength(submissionsBefore + 1);
+    expect(mock.upstreamCalls().at(-1)).toMatchObject({ method: 'POST', body: { response_format: 'b64_json' } });
+    expect(mock.arkLayerReads()).toEqual(readsBefore);
+    const after = (await mock.app.inject('/fixture/receipt')).json();
+    expect(after.balance).toBe(before.balance);
+    expect(after.reservations).toBe(before.reservations);
+    expect(after.ledger.slice(before.ledger.length)).toEqual([{ type: 'RESERVE', amount: '-1' }, { type: 'RELEASE', amount: '1' }]);
+  } finally {
+    mock.useMockAProviderKind('NEW_API');
+    await save('/split', 'canvas-json', '12');
   }
 }, 15_000);
 

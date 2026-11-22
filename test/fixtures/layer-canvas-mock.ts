@@ -68,7 +68,8 @@ export async function startLayerMock(port = 4137) {
   ]));
   const operations = new Map<string, { idempotencyKey: string; result: unknown }>();
   const usageBindings = new Map<string, { key: string; canonicalModelId: string }>();
-  const calls: { channel: string; body: Record<string, unknown>; customTransport: boolean; arkClientRequestId: string | null }[] = [];
+  const calls: { channel: string; method: string | undefined; url: string; body: Record<string, unknown>;
+    customTransport: boolean; arkClientRequestId: string | null }[] = [];
   const sourceKey = 'reference-images/layer-test-source.png';
   const splitSourceKey = 'reference-images/layer-test-split-source.png';
   const splitJpegKey = 'reference-images/layer-test-split-source.jpg';
@@ -133,7 +134,8 @@ export async function startLayerMock(port = 4137) {
         assets: [{ download_url: '/v1/images/tasks/imgtask-layer-edit-fixture/assets/0' }] });
     }
     const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    calls.push({ channel: route.id, body, customTransport: Boolean((init as RequestInit & { dispatcher?: unknown })?.dispatcher),
+    calls.push({ channel: route.id, method: init?.method, url: target.href, body,
+      customTransport: Boolean((init as RequestInit & { dispatcher?: unknown })?.dispatcher),
       arkClientRequestId: new Headers(init?.headers).get('x-client-request-id') });
     await new Promise(resolve => setTimeout(resolve, 1200));
     const pixel = route.id === 'mock-b';
@@ -171,13 +173,24 @@ export async function startLayerMock(port = 4137) {
         const cloudSignature = body.prompt === 'ark-expired-layer-asset-fixture' ? 'expired'
           : body.prompt === 'ark-retry-layer-asset-fixture' ? 'retry-once' : 'fixture';
         const titleSignature = exhaustDownloadRetry ? 'unavailable' : recoverable ? 'recoverable' : 'fixture';
-        return Response.json({ data: [
-          { url: `https://9.9.9.9/ark-layers/cloud.png?signature=${cloudSignature}`, size: '120x70', z_index: 2, name: '云朵',
+        const baseSignature = exhaustDownloadRetry ? 'retry-once' : 'fixture';
+        // Download failure scenarios return URLs even when inline output was requested.
+        const returnUrl = body.response_format !== 'b64_json'
+          || [baseSignature, titleSignature, cloudSignature].some(signature => signature !== 'fixture');
+        const arkLayerAsset = (name: string, bytes: Buffer, signature: string) => returnUrl
+          ? { url: `https://9.9.9.9/ark-layers/${name}.png?signature=${signature}` }
+          : { b64_json: bytes.toString('base64') };
+        const result = { data: [
+          { ...arkLayerAsset('cloud', cloud, cloudSignature), size: '120x70', z_index: 2, name: '云朵',
             bounding_box: { absolute: [100, 175, 196, 231] } },
-          { url: `https://9.9.9.9/ark-layers/base.png?signature=${exhaustDownloadRetry ? 'retry-once' : 'fixture'}`, size: '320x400', z_index: 0 },
-          { url: `https://9.9.9.9/ark-layers/title.png?signature=${titleSignature}`, size: '210x76', z_index: 1, name: '标题',
+          { ...arkLayerAsset('base', base, baseSignature), size: '320x400', z_index: 0 },
+          { ...arkLayerAsset('title', title, titleSignature), size: '210x76', z_index: 1, name: '标题',
             bounding_box: { absolute: [27, 37, 237, 113] } },
-        ] });
+        ] };
+        if (body.prompt === 'ark-oversized-inline-output-fixture') {
+          return Response.json(result, { headers: { 'content-length': String(64 * 1024 ** 2 + 1) } });
+        }
+        return Response.json(result);
       }
       const output = await sharp(bytes).tint('#8b95ed').png().toBuffer();
       return Response.json({ data: [{ b64_json: output.toString('base64') }] });

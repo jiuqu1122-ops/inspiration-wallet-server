@@ -885,23 +885,50 @@ class ProviderResponseTimeoutError extends Error {
   }
 }
 
+class ProviderResponseSizeLimitError extends Error {
+  readonly code = 'IMAGE_PROVIDER_RESPONSE_SIZE_LIMIT';
+
+  constructor() {
+    super('Provider response exceeds the byte limit');
+    this.name = 'ProviderResponseSizeLimitError';
+  }
+}
+
 async function readProviderResponseText(
   response: Response,
   waitForDeadline: <T>(operation: Promise<T>) => Promise<T>,
   setActiveReader: (
     reader: ReadableStreamDefaultReader<Uint8Array> | undefined,
   ) => void,
+  maxResponseBytes?: number,
 ) {
   if (!response.body) return '';
+  if (maxResponseBytes !== undefined && !response.headers.has('content-encoding')) {
+    const declaredLength = response.headers.get('content-length');
+    if (declaredLength && /^\d+$/.test(declaredLength) && Number(declaredLength) > maxResponseBytes) {
+      const error = new ProviderResponseSizeLimitError();
+      void response.body.cancel(error).catch(() => {});
+      throw error;
+    }
+  }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   const chunks: string[] = [];
+  let responseBytes = 0;
   setActiveReader(reader);
   try {
     while (true) {
       const { done, value } = await waitForDeadline(reader.read());
       if (done) break;
+      if (maxResponseBytes !== undefined) {
+        responseBytes += value.byteLength;
+        if (responseBytes > maxResponseBytes) {
+          const error = new ProviderResponseSizeLimitError();
+          void reader.cancel(error).catch(() => {});
+          throw error;
+        }
+      }
       chunks.push(decoder.decode(value, { stream: true }));
     }
     chunks.push(decoder.decode());
@@ -927,7 +954,12 @@ export async function providerRequest(
   onResponseStatus?: (status: number, headers: Headers) => void,
   diagnosticScope?: ImageResponseDiagnosticScope,
   dispatcher?: Agent,
+  options?: { maxResponseBytes?: number },
 ) {
+  const maxResponseBytes = options?.maxResponseBytes;
+  if (maxResponseBytes !== undefined && (!Number.isSafeInteger(maxResponseBytes) || maxResponseBytes < 0)) {
+    throw new RangeError('Provider response byte limit must be a nonnegative safe integer');
+  }
   const controller = new AbortController();
   const timeoutMs = timeoutOverrideMs ?? (/(?:video|workerTask)/i.test(path) ? 10 * 60_000 : 4 * 60_000);
   let activeReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -972,6 +1004,7 @@ export async function providerRequest(
       response,
       waitForDeadline,
       reader => { activeReader = reader; },
+      maxResponseBytes,
     );
     if (diagnosticScope) markImageResponseBodyComplete(diagnosticScope, text, bodyStartedAt);
     const parseStartedAt = performance.now();
@@ -987,6 +1020,7 @@ export async function providerRequest(
     return withImagePollHint(parsed.value, response.headers.get('retry-after'));
   } catch (error) {
     if (error instanceof UpstreamImageError) throw error;
+    if (error instanceof ProviderResponseSizeLimitError) controller.abort(error);
     throw new UpstreamImageError(
       0,
       error instanceof Error ? error.message : String(error),

@@ -39,6 +39,7 @@ const raster = z.union([
 ]);
 type Raster = z.infer<typeof raster>;
 const maximumRasterBytes = 20 * 1024 ** 2;
+const maximumRasterBase64Length = 4 * Math.ceil(maximumRasterBytes / 3);
 const arkInlineJpegTargetBytes = 512 * 1024;
 
 type SourceImage = { width: number; height: number; alpha: boolean | undefined };
@@ -93,22 +94,22 @@ function isArkSeedream55(upstreamModel: string, canonicalModelKey: string) {
 
 export async function layerUpstreamBody(
   adapter: LayerRoute['adapter'], input: CanvasLayerInput, model: string, source: SourceImage,
-  { maxLayers, canonicalModelKey, arkEditReferenceUrl }:
-  { maxLayers: number; canonicalModelKey: string; arkEditReferenceUrl?: string | undefined },
+  { maxLayers, canonicalModelKey, arkEditReferenceUrl, arkInlineSplitResult }:
+  { maxLayers: number; canonicalModelKey: string; arkEditReferenceUrl?: string | undefined; arkInlineSplitResult?: boolean },
 ) {
   const { operation, image, prompt, selection } = input;
   const { width, height } = source;
   if (adapter === 'canvas-json') return { operation, model, image, prompt, selection };
   if (adapter === 'volcengine-ark') {
-    // URL responses keep a multi-layer result out of the single JSON body limit.
-    const fields = { model, output_format: 'png', response_format: 'url', watermark: false };
-    if (operation === 'split') return { ...fields, layer_decomposition: true, size: 'auto',
+    const fields = { model, output_format: 'png', watermark: false };
+    if (operation === 'split') return { ...fields, response_format: arkInlineSplitResult ? 'b64_json' : 'url',
+      layer_decomposition: true, size: 'auto',
       image: await arkSplitReference(image), ...(prompt ? { prompt } : {}),
       ...(isArkSeedream55(model, canonicalModelKey) ? { layer_decomposition_options: { max_images: maxLayers + 1 } } : {}) };
     const exactSizeSupported = width * height >= 921_600 && width * height <= 4_624_220
       && width / height >= 1 / 16 && width / height <= 16;
     const transparent = source.alpha && !(await sharp(dataBytes(image), { limitInputPixels: 64_000_000 }).stats()).isOpaque;
-    return { ...fields, image: arkEditReferenceUrl ?? image, prompt: arkEditPrompt(prompt, selection),
+    return { ...fields, response_format: 'url', image: arkEditReferenceUrl ?? image, prompt: arkEditPrompt(prompt, selection),
       ...(exactSizeSupported ? { size: `${width}x${height}` } : {}),
       ...(transparent ? { background: 'transparent' } : {}) };
   }
@@ -184,6 +185,9 @@ function decodeResponse(adapter: LayerRoute['adapter'], operation: LayerMode, ra
 }
 
 const dataBytes = (source: string) => {
+  if (source.length > maximumRasterBase64Length + 'data:image/jpeg;base64,'.length) {
+    throw new Error('Image bytes exceed the size limit');
+  }
   const match = /^data:image\/(?:png|jpe?g|webp);base64,([a-zA-Z0-9+/]+={0,2})$/i.exec(source);
   if (!match) throw new Error('Invalid image encoding');
   const bytes = Buffer.from(match[1]!, 'base64');
