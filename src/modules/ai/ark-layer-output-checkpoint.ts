@@ -6,10 +6,10 @@ import { isPublicIp } from '../providers/url.js';
 import type { LayerRoute } from './layer-canvas-config.js';
 
 const version = 'v1';
-// Keep the original field within the window understood by already-running
-// v1 workers during a rolling update. New workers honor the sealed extension.
+// Older workers read their own authenticated deadline during rolling updates.
 const legacyLifetimeMs = 9 * 60_000;
-const lifetimeMs = 30 * 60_000;
+const previousLifetimeMs = 30 * 60_000;
+const lifetimeMs = 90 * 60_000;
 const maximumEncodedLength = 512 * 1024;
 const ownHost = new URL(env.APP_BASE_URL).hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '');
 
@@ -45,6 +45,7 @@ const layer = z.object({
 const payload = z.object({
   expiresAt: z.number().int().positive(),
   downloadUntil: z.number().int().positive().optional(),
+  recoveryUntil: z.number().int().positive().optional(),
   reply: z.object({ data: z.array(layer).min(2).max(65) }),
   limits: z.object({ maxLayers: z.number().int().min(1).max(64), maxMegapixels: z.number().int().min(1).max(64) }),
 }).refine(({ reply: { data }, limits }) =>
@@ -70,7 +71,8 @@ function decodeBase64Url(value: string) {
 /** Save only the Ark output needed to retry downloads, bound to the owning request. */
 export function sealArkLayerOutputCheckpoint(identity: Identity, reply: unknown, config: Limits, now = Date.now()) {
   if (!Number.isSafeInteger(now) || now < 0) return null;
-  const checked = payload.safeParse({ expiresAt: now + legacyLifetimeMs, downloadUntil: now + lifetimeMs, reply, limits: config });
+  const checked = payload.safeParse({ expiresAt: now + legacyLifetimeMs, downloadUntil: now + previousLifetimeMs,
+    recoveryUntil: now + lifetimeMs, reply, limits: config });
   const key = encryptionKey();
   if (!checked.success || !key) return null;
   const iv = randomBytes(12);
@@ -99,11 +101,12 @@ export function openArkLayerOutputCheckpoint(identity: Identity, encoded: string
     const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
     const checked = payload.safeParse(JSON.parse(plaintext));
     if (!checked.success) return null;
-    const { expiresAt: legacyEnd, downloadUntil, reply, limits } = checked.data;
-    if (downloadUntil !== undefined && downloadUntil - legacyEnd !== lifetimeMs - legacyLifetimeMs) return null;
-    const expiresAt = downloadUntil ?? legacyEnd;
-    const windowMs = downloadUntil === undefined ? legacyLifetimeMs : lifetimeMs;
-    if (expiresAt <= now || expiresAt > now + windowMs) return null;
+    const { expiresAt: legacyEnd, downloadUntil, recoveryUntil, reply, limits } = checked.data;
+    const issuedAt = legacyEnd - legacyLifetimeMs;
+    if (issuedAt > now || (downloadUntil !== undefined && downloadUntil !== issuedAt + previousLifetimeMs)
+      || (recoveryUntil !== undefined && (downloadUntil === undefined || recoveryUntil !== issuedAt + lifetimeMs))) return null;
+    const expiresAt = recoveryUntil ?? downloadUntil ?? legacyEnd;
+    if (expiresAt <= now) return null;
     return { expiresAt, reply, limits };
   } catch {
     return null;

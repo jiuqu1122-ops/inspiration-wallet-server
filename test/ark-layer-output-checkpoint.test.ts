@@ -1,3 +1,4 @@
+import { createCipheriv, randomBytes } from 'node:crypto';
 import { expect, it } from 'vitest';
 import {
   openArkLayerOutputCheckpoint,
@@ -21,7 +22,7 @@ it('stores only the encrypted layer metadata and the original limits needed for 
   expect(sealed).not.toContain('signature');
   expect(sealArkLayerOutputCheckpoint(identity, reply, limits, now)).not.toEqual(sealed);
   expect(openArkLayerOutputCheckpoint(identity, sealed!, now + 1_000)).toEqual({
-    expiresAt: now + 30 * 60_000,
+    expiresAt: now + 90 * 60_000,
     limits,
     reply: { data: [{ ...foreground, name: 'Foreground', bounding_box: { absolute: [10, 20, 250, 200] } }, base] },
   });
@@ -33,10 +34,22 @@ it('rejects another user or task, expired receipts, and changed ciphertext', () 
   const altered = (ciphertext!.startsWith('a') ? 'b' : 'a') + ciphertext!.slice(1);
   expect(openArkLayerOutputCheckpoint({ ...identity, requestId: 'different-request' }, sealed, now)).toBeNull();
   expect(openArkLayerOutputCheckpoint({ ...identity, userId: 'different-user' }, sealed, now)).toBeNull();
-  expect(openArkLayerOutputCheckpoint(identity, sealed, now + 30 * 60_000 - 1)).not.toBeNull();
-  expect(openArkLayerOutputCheckpoint(identity, sealed, now + 30 * 60_000)).toBeNull();
+  expect(openArkLayerOutputCheckpoint(identity, sealed, now + 90 * 60_000 - 1)).not.toBeNull();
+  expect(openArkLayerOutputCheckpoint(identity, sealed, now + 90 * 60_000)).toBeNull();
   expect(openArkLayerOutputCheckpoint(identity, [version, iv, tag, altered].join('.'), now)).toBeNull();
   expect(openArkLayerOutputCheckpoint(identity, sealed + '.extra', now)).toBeNull();
+});
+
+it.each([9, 30])('honors the original %i-minute expiry of a previously sealed receipt', minutes => {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', Buffer.from(process.env.PROVIDER_SECRETS_ENCRYPTION_KEY!, 'base64'), iv);
+  cipher.setAAD(Buffer.from(JSON.stringify(['ark-layer-output-checkpoint', 'v1', identity.userId, identity.requestId])));
+  const expiry = now + minutes * 60_000;
+  const payload = { expiresAt: now + 9 * 60_000, ...(minutes === 30 ? { downloadUntil: expiry } : {}), reply: { data: [base, foreground] }, limits };
+  const bytes = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()]);
+  const sealed = ['v1', ...[iv, cipher.getAuthTag(), bytes].map(buffer => buffer.toString('base64url'))].join('.');
+  expect(openArkLayerOutputCheckpoint(identity, sealed, expiry - 1)?.expiresAt).toBe(expiry);
+  expect(openArkLayerOutputCheckpoint(identity, sealed, expiry)).toBeNull();
 });
 
 it.each([

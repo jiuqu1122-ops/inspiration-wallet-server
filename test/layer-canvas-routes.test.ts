@@ -235,11 +235,11 @@ test('downloads official Ark layers from a persisted URL manifest and sends URL 
     expect(submission?.body).not.toHaveProperty('layer_decomposition_options');
     expect(providerRequests).toHaveBeenCalledTimes(1);
     const splitRequest = providerRequests.mock.calls[0]!;
-    expect(splitRequest[4]).toBe(240_000);
+    expect(splitRequest[4]).toBe(360_000);
     expect(splitRequest[9]).toMatchObject({
       maxResponseBytes: 64 * 1024 ** 2,
-      responseBodyTimeoutMs: expect.any(Number),
-      responseBodyIdleTimeoutMs: expect.any(Number),
+      responseBodyTimeoutMs: 480_000,
+      responseBodyIdleTimeoutMs: 240_000,
     });
     expect(mock.arkLayerReads()).toEqual([...readsBefore, 'base', 'title', 'cloud']);
     const walletAfter = (await mock.app.inject('/fixture/receipt')).json();
@@ -372,7 +372,7 @@ test.each([
     expect(head).toHaveBeenCalledWith(objectKey);
     expect(read).toHaveBeenCalledTimes(1);
     expect(read).toHaveBeenCalledWith(objectKey);
-    expect(downloadUrl).toHaveBeenCalledWith(objectKey, { expiresSeconds: 600 });
+    expect(downloadUrl).toHaveBeenCalledWith(objectKey, { expiresSeconds: 900 });
     const upstream = mock.upstreamCalls().at(-1);
     expect(upstream).toMatchObject({ method: 'POST', url: 'https://ark.cn-beijing.volces.com/api/v3/images/generations',
       body: { layer_decomposition: true, response_format: 'url' },
@@ -850,7 +850,7 @@ test('uses an owned reference key for canvas layer input and deduplicates retrie
       const official = await submit(objectKey, 'owned-reference-ark-001', 'Color', '1');
       expect(official.json()).toMatchObject({ status: 'success', chargedCredits: '1.000000',
         result: { operation: 'edit', image: { width: 320, height: 400 } } });
-      expect(downloadUrl).toHaveBeenCalledWith(objectKey, { expiresSeconds: 600 });
+      expect(downloadUrl).toHaveBeenCalledWith(objectKey, { expiresSeconds: 900 });
       expect(validateSigned).toHaveBeenCalledWith(objectKey, signedUrl);
       expect(read).toHaveBeenLastCalledWith(objectKey);
       const upstream = mock.upstreamCalls().at(-1);
@@ -875,7 +875,7 @@ test('uses an owned reference key for canvas layer input and deduplicates retrie
       read.mockResolvedValueOnce({ stream: Readable.from([splitJpeg]), statusCode: 200, headers: { 'content-type': 'image/jpeg' } });
       const fallback = await submit(splitJpegKey, 'owned-reference-ark-private', 'Color', '1');
       expect(fallback.json()).toMatchObject({ status: 'success', chargedCredits: '1.000000' });
-      expect(downloadUrl).toHaveBeenCalledWith(splitJpegKey, { expiresSeconds: 600 });
+      expect(downloadUrl).toHaveBeenCalledWith(splitJpegKey, { expiresSeconds: 900 });
       expect(validateSigned).toHaveBeenCalledTimes(2);
       expect(mock.upstreamCalls().at(-1)?.body.image).toBe('data:image/jpeg;base64,' + splitJpeg.toString('base64'));
       expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 4);

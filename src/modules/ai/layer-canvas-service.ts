@@ -16,7 +16,7 @@ import { CloudAiError, releaseCredits, reserveCredits, settleCredits } from './s
 import { serializeCredit } from '../wallets/credit-amount.js';
 import { toInputJson } from './pricing-center.js';
 import { authorizeReferenceObject, ReferenceUploadError } from './reference-upload-service.js';
-import { ARK_CANVAS_ASSET_MAX_MS, createArkCanvasTransfer, downloadArkCanvasResultBytes,
+import { ARK_CANVAS_ASSET_MAX_MS, ARK_CANVAS_CONNECT_TIMEOUT_MS, createArkCanvasTransfer, downloadArkCanvasResultBytes,
   isRetryableArkCanvasResultDownload, prepareStoredCanvasReference } from './seedream-references.js';
 import { createArkSubmitDiagnostics } from './ark-submit-diagnostics.js';
 import { openArkLayerOutputCheckpoint, sealArkLayerOutputCheckpoint } from './ark-layer-output-checkpoint.js';
@@ -25,15 +25,21 @@ const identity = (userId: string, clientRequestId: string) => ({ userId_clientRe
 const unavailable = () => new CloudAiError('layer_route_unavailable', '该操作尚未配置可用的模型、渠道或价格', 409);
 // The deployed network has no IPv6 route to Ark. Its IPv4 handshake can also
 // outlast Node's default dual-stack connection attempt window.
-const beijingArkLayerDispatcher = new Agent({ connect: { family: 4, timeout: 30_000 } });
-const BEIJING_ARK_LAYER_SUBMIT_TIMEOUT_MS = 240_000;
-const BEIJING_ARK_SPLIT_RESPONSE_BODY_TIMEOUT_MS = 360_000;
-const BEIJING_ARK_SPLIT_RESPONSE_BODY_IDLE_TIMEOUT_MS = 180_000;
+// Both synchronous paths fit the proxy's 16m header deadline: up to 6m for
+// submission plus either the split manifest or two 4m edit asset attempts.
+const BEIJING_ARK_LAYER_SUBMIT_TIMEOUT_MS = 6 * 60_000;
+const BEIJING_ARK_SPLIT_RESPONSE_BODY_TIMEOUT_MS = 8 * 60_000;
+const BEIJING_ARK_SPLIT_RESPONSE_BODY_IDLE_TIMEOUT_MS = 4 * 60_000;
+const beijingArkLayerDispatcher = new Agent({
+  connect: { family: 4, timeout: ARK_CANVAS_CONNECT_TIMEOUT_MS },
+  headersTimeout: BEIJING_ARK_LAYER_SUBMIT_TIMEOUT_MS + 5_000,
+  bodyTimeout: BEIJING_ARK_SPLIT_RESPONSE_BODY_TIMEOUT_MS + 5_000,
+});
 const BEIJING_ARK_SPLIT_RESPONSE_MAX_BYTES = 64 * 1024 * 1024;
-const ARK_REFERENCE_EXPIRY_SECONDS = 600;
-const BEIJING_ARK_LAYER_DOWNLOAD_TIMEOUT_MS = 360_000;
+const ARK_REFERENCE_EXPIRY_SECONDS = 15 * 60;
+const BEIJING_ARK_LAYER_DOWNLOAD_TIMEOUT_MS = 30 * 60_000;
 // One claim can make two bounded GET attempts before saving the next layer.
-const ARK_LAYER_DOWNLOAD_LEASE_MS = 2 * ARK_CANVAS_ASSET_MAX_MS + 30_000;
+const ARK_LAYER_DOWNLOAD_LEASE_MS = 2 * ARK_CANVAS_ASSET_MAX_MS + 60_000;
 const ARK_LAYER_MAX_FAILED_PASSES_PER_ASSET = 3;
 class ArkDownloadClaimLost extends Error {}
 const ARK_LAYER_DOWNLOAD_RETRY_DELAY_MS = 5_000;
@@ -115,10 +121,10 @@ async function resolveLayerEditTask(
   return { data: [{ url: output }] };
 }
 
-async function readLayerEditAsset(provider: AiProviderChannel, secrets: ProviderSecrets, source: string) {
+async function readLayerEditAsset(provider: AiProviderChannel, secrets: ProviderSecrets, source: string, timeoutMs: number) {
   const target = new URL(source, provider.baseUrl);
   if (target.origin !== new URL(provider.baseUrl).origin) return source;
-  const result = await imageTaskResultContent(provider, secrets, target.href, 45_000);
+  const result = await imageTaskResultContent(provider, secrets, target.href, timeoutMs);
   if (typeof result !== 'string' || !isStoredImageResultUrl(result)) throw new Error('Asset endpoint did not return image bytes');
   return result;
 }
@@ -391,7 +397,8 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
       const remote = operation === 'edit' ? /^(?:https?:\/\/|\/(?!\/))/i.test(assetSource) : /^https:\/\//i.test(assetSource);
       if (!remote || isStoredImageResultUrl(assetSource)) return canvasResultBytes(assetSource);
       stage = 'canvas_layer_download';
-      const asset = operation === 'edit' ? await readLayerEditAsset(provider, secrets, assetSource) : assetSource;
+      const asset = operation === 'edit'
+        ? await readLayerEditAsset(provider, secrets, assetSource, officialBeijingArk ? ARK_CANVAS_ASSET_MAX_MS : 45_000) : assetSource;
       const bytes = arkReader && /^https:\/\//i.test(asset) ? await arkReader.read(asset) : await canvasResultBytes(asset);
       stage = 'canvas_layer_decode';
       return bytes;

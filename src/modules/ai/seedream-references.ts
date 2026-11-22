@@ -19,8 +19,9 @@ import { ArkSplitRange } from './ark-split-range.js';
 export type ReferenceSourceType = 'local' | 'cos' | 'signed_url' | 'public_url' | 'data_url';
 export type ReferenceTransport = 'data_url' | 'public_https';
 const FETCH_TIMEOUT_MS = 30_000;
-const ARK_RESULT_IDLE_TIMEOUT_MS = 45_000;
-export const ARK_CANVAS_ASSET_MAX_MS = 120_000;
+export const ARK_CANVAS_CONNECT_TIMEOUT_MS = 60_000;
+const ARK_RESULT_IDLE_TIMEOUT_MS = 2 * 60_000;
+export const ARK_CANVAS_ASSET_MAX_MS = 4 * 60_000;
 type ArkCanvasTransfer = {
   phase: 'resolving' | 'waiting_headers' | 'reading_body';
   receivedBytes: number;
@@ -167,7 +168,7 @@ async function fetchPublicReference(source: string, signal: AbortSignal, maximum
       // Give the chosen public address the complete TLS handshake window.
       ...(arkResult ? { autoSelectFamily: false } : {}),
       connect: {
-        ...(arkResult ? { timeout: 30_000 } : {}),
+        ...(arkResult ? { timeout: ARK_CANVAS_CONNECT_TIMEOUT_MS } : {}),
         lookup: (_host, options, callback) => {
           if (options.all) callback(null, pinned);
           else callback(null, pinned[0]!.address, pinned[0]!.family);
@@ -316,8 +317,9 @@ async function readReference(source: string, signal: AbortSignal, maximumBytes =
 async function prepareReference(
   source: string,
   transport: ReferenceTransport,
-  { maximumBytes = REFERENCE_UPLOAD_MAX_BYTES, pngJpegOnly = false, load = readReference, includeSourceMime = false }:
-  { maximumBytes?: number; pngJpegOnly?: boolean; load?: typeof readReference; includeSourceMime?: boolean } = {},
+  { maximumBytes = REFERENCE_UPLOAD_MAX_BYTES, pngJpegOnly = false, load = readReference, includeSourceMime = false,
+    timeoutMs = FETCH_TIMEOUT_MS }:
+  { maximumBytes?: number; pngJpegOnly?: boolean; load?: typeof readReference; includeSourceMime?: boolean; timeoutMs?: number } = {},
 ) {
   const controller = new AbortController();
   let temporaryUrl: string | undefined;
@@ -354,7 +356,7 @@ async function prepareReference(
       timer = setTimeout(() => {
         controller.abort();
         reject(new ReferenceUploadError('Reference image preparation timed out', 'reference_image_timeout', 504));
-      }, FETCH_TIMEOUT_MS);
+      }, timeoutMs);
     })]);
   } catch (error) {
     if (temporaryUrl) await removeProviderReference(temporaryUrl);
@@ -379,7 +381,7 @@ export function prepareGenericImageDataUrlReference(source: string) {
 /** The caller must have already authorized this reference upload key. */
 export function prepareStoredCanvasReference(objectKey: string) {
   return prepareReference(objectKey, 'data_url', {
-    maximumBytes: 20 * 1024 * 1024, pngJpegOnly: true, load: readStoredReference, includeSourceMime: true,
+    maximumBytes: 20 * 1024 * 1024, pngJpegOnly: true, load: readStoredReference, includeSourceMime: true, timeoutMs: 60_000,
   });
 }
 

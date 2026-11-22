@@ -31,7 +31,7 @@ function makePrisma(claimCount = 1) {
 describe('stale AI request recovery', () => {
   it.each([false, true])('protects split downloads until their authenticated manifest expires (expired=%s)', async expired => {
     const { prisma, transaction } = makePrisma();
-    const issued = Date.now() - (expired ? 31 : 18) * 60_000;
+    const issued = Date.now() - (expired ? 91 : 75) * 60_000;
     const sealed = sealArkLayerOutputCheckpoint({ userId: 'user-1', requestId: 'request-1' }, { data: [
       { size: '800x600', z_index: 0, url: 'https://assets.example.test/base.png' },
       { size: '20x20', z_index: 1, url: 'https://assets.example.test/layer.png', bounding_box: { absolute: [1, 1, 21, 21] } },

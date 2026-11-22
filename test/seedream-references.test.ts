@@ -94,7 +94,7 @@ describe('Ark canvas result downloads', () => {
     expect(dns.lookup.mock.calls).toEqual([['ark-result.example', { all: true, verbatim: true }]]);
     expect(onAgentCreated).toHaveBeenCalledOnce();
     const options = onAgentCreated.mock.calls[0]![0];
-    expect(options).toMatchObject({ autoSelectFamily: false, connect: { timeout: 30_000 } });
+    expect(options).toMatchObject({ autoSelectFamily: false, connect: { timeout: 60_000 } });
     const lookup = options.connect.lookup;
     const callback = vi.fn();
     lookup('ark-result.example', { all: true }, callback);
@@ -129,20 +129,20 @@ describe('Ark canvas result downloads', () => {
         : expect(read).rejects.toMatchObject({ code: 'ark_result_timeout', statusCode: 504 });
       // Consume rejections immediately while the virtual clock is advancing.
       void verify.catch(() => {});
-      await vi.advanceTimersByTimeAsync(35_000);
+      await vi.advanceTimersByTimeAsync(85_000);
       body.enqueue(png.subarray(0, 8));
-      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.advanceTimersByTimeAsync(65_000);
       if (tracked) expect(trace).toMatchObject({ phase: 'reading_body', receivedBytes: 8, responseStatus: 200, timeout: null });
       if (completed) {
         body.enqueue(png.subarray(8));
         body.close();
       } else if (outcome === 'idle') {
-        await vi.advanceTimersByTimeAsync(20_000);
+        await vi.advanceTimersByTimeAsync(55_001);
       } else {
         body.enqueue(png.subarray(8, 16));
-        await vi.advanceTimersByTimeAsync(35_000);
+        await vi.advanceTimersByTimeAsync(65_000);
         body.enqueue(png.subarray(16, 24));
-        await vi.advanceTimersByTimeAsync(20_001);
+        await vi.advanceTimersByTimeAsync(25_001);
       }
       await verify;
       if (tracked) expect(trace.timeout).toBe(completed ? null : outcome);
@@ -185,12 +185,12 @@ describe('Ark canvas result downloads', () => {
     let offset = 8;
     if (kind === 'total') {
       for (const end of [16, 24, 32]) {
-        await vi.advanceTimersByTimeAsync(35_000);
+        await vi.advanceTimersByTimeAsync(65_000);
         body.enqueue(png.subarray(offset, end));
         offset = end;
       }
     }
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(120_000);
     await stopped;
     expect(trace).toMatchObject({ timeout: kind, receivedBytes: offset });
     fetch.mockImplementationOnce(async (_url, init) => {
