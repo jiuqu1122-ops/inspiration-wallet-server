@@ -876,10 +876,12 @@ function isAmbiguousImageTaskSubmitError(error: unknown): error is UpstreamImage
     && (error.status === 0 || [502, 503, 504].includes(error.status));
 }
 
+type ProviderResponseTimeoutPhase = 'response_body' | 'response_body_idle';
+
 class ProviderResponseTimeoutError extends Error {
   readonly code = 'IMAGE_PROVIDER_RESPONSE_TIMEOUT';
 
-  constructor(timeoutMs: number) {
+  constructor(timeoutMs: number, public readonly phase?: ProviderResponseTimeoutPhase) {
     super(`Provider response exceeded the ${timeoutMs}ms deadline`);
     this.name = 'ProviderResponseTimeoutError';
   }
@@ -901,6 +903,7 @@ async function readProviderResponseText(
     reader: ReadableStreamDefaultReader<Uint8Array> | undefined,
   ) => void,
   maxResponseBytes?: number,
+  onProgress?: (bytesReceived: number) => void,
 ) {
   if (!response.body) return '';
   if (maxResponseBytes !== undefined && !response.headers.has('content-encoding')) {
@@ -921,9 +924,10 @@ async function readProviderResponseText(
     while (true) {
       const { done, value } = await waitForDeadline(reader.read());
       if (done) break;
-      if (maxResponseBytes !== undefined) {
+      if (value.byteLength > 0 && (maxResponseBytes !== undefined || onProgress)) {
         responseBytes += value.byteLength;
-        if (responseBytes > maxResponseBytes) {
+        onProgress?.(responseBytes);
+        if (maxResponseBytes !== undefined && responseBytes > maxResponseBytes) {
           const error = new ProviderResponseSizeLimitError();
           void reader.cancel(error).catch(() => {});
           throw error;
@@ -944,6 +948,13 @@ async function readProviderResponseText(
   }
 }
 
+type ProviderRequestOptions = {
+  maxResponseBytes?: number;
+  responseBodyTimeoutMs?: number;
+  responseBodyIdleTimeoutMs?: number;
+  onResponseBodyProgress?: (bytesReceived: number) => void;
+};
+
 export async function providerRequest(
   provider: AiProviderChannel,
   secrets: ProviderSecrets,
@@ -954,11 +965,15 @@ export async function providerRequest(
   onResponseStatus?: (status: number, headers: Headers) => void,
   diagnosticScope?: ImageResponseDiagnosticScope,
   dispatcher?: Agent,
-  options?: { maxResponseBytes?: number },
+  options?: ProviderRequestOptions,
 ) {
-  const maxResponseBytes = options?.maxResponseBytes;
+  const { maxResponseBytes, responseBodyTimeoutMs, responseBodyIdleTimeoutMs, onResponseBodyProgress } = options ?? {};
   if (maxResponseBytes !== undefined && (!Number.isSafeInteger(maxResponseBytes) || maxResponseBytes < 0)) {
     throw new RangeError('Provider response byte limit must be a nonnegative safe integer');
+  }
+  if ([responseBodyTimeoutMs, responseBodyIdleTimeoutMs].some(value => value !== undefined
+    && (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647))) {
+    throw new RangeError('Provider response body timeouts must be positive timer durations');
   }
   const controller = new AbortController();
   const timeoutMs = timeoutOverrideMs ?? (/(?:video|workerTask)/i.test(path) ? 10 * 60_000 : 4 * 60_000);
@@ -968,9 +983,10 @@ export async function providerRequest(
     rejectDeadline = reject;
   });
   const waitForDeadline = <T>(operation: Promise<T>) => Promise.race([operation, deadline]);
-  const timeout = setTimeout(() => {
+  const expire = (duration: number, phase?: ProviderResponseTimeoutPhase) => {
+    if (controller.signal.aborted) return;
     if (diagnosticScope) diagnosticScope.timeoutTriggered = true;
-    const error = new ProviderResponseTimeoutError(timeoutMs);
+    const error = new ProviderResponseTimeoutError(duration, phase);
     rejectDeadline(error);
     controller.abort(error);
     if (activeReader) {
@@ -987,7 +1003,9 @@ export async function providerRequest(
         // path. The explicit deadline rejection must not wait on either one.
       });
     }
-  }, timeoutMs);
+  };
+  let timeout = setTimeout(() => expire(timeoutMs), timeoutMs);
+  let bodyIdleTimeout: ReturnType<typeof setTimeout> | undefined;
   try {
     const response = await waitForDeadline(fetch(providerRequestUrl(provider, path), {
       method: body === undefined ? 'GET' : 'POST',
@@ -999,13 +1017,29 @@ export async function providerRequest(
     }));
     if (diagnosticScope) markImageResponseHeaders(diagnosticScope, response);
     onResponseStatus?.(response.status, response.headers);
+    if (response.ok && responseBodyTimeoutMs !== undefined) {
+      clearTimeout(timeout);
+      timeout = setTimeout(() => expire(responseBodyTimeoutMs, 'response_body'), responseBodyTimeoutMs);
+    }
+    const resetBodyIdleTimeout = response.ok && responseBodyIdleTimeoutMs !== undefined ? () => {
+      clearTimeout(bodyIdleTimeout);
+      bodyIdleTimeout = setTimeout(() => expire(responseBodyIdleTimeoutMs, 'response_body_idle'), responseBodyIdleTimeoutMs);
+    } : undefined;
+    resetBodyIdleTimeout?.();
+    const bodyProgress = response.ok && (resetBodyIdleTimeout || onResponseBodyProgress) ? (bytesReceived: number) => {
+      resetBodyIdleTimeout?.();
+      try { onResponseBodyProgress?.(bytesReceived); }
+      catch { /* Diagnostic callbacks must not interrupt response delivery. */ }
+    } : undefined;
     const bodyStartedAt = performance.now();
     const text = await readProviderResponseText(
       response,
       waitForDeadline,
       reader => { activeReader = reader; },
       maxResponseBytes,
+      bodyProgress,
     );
+    clearTimeout(bodyIdleTimeout);
     if (diagnosticScope) markImageResponseBodyComplete(diagnosticScope, text, bodyStartedAt);
     const parseStartedAt = performance.now();
     const parsed = parseProviderResponse(text);
@@ -1029,6 +1063,7 @@ export async function providerRequest(
     );
   } finally {
     clearTimeout(timeout);
+    clearTimeout(bodyIdleTimeout);
   }
 }
 

@@ -177,6 +177,8 @@ test('receives official Ark layers as inline PNGs and sends URL output and point
   expect((await save('split', { ...ark, creditsPerRequest: '12' })).statusCode).toBe(200);
   expect((await save('edit', { ...ark, creditsPerRequest: '8' })).statusCode).toBe(200);
   mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
+  const imageService = await import('../src/modules/ai/image-service.js');
+  const providerRequests = vi.spyOn(imageService, 'providerRequest');
   try {
     const invalid = await run({ operation: 'split', clientRequestId: 'ark-split-too-small', expectedCredits: '12' });
     expect(invalid.statusCode).toBe(400);
@@ -221,6 +223,14 @@ test('receives official Ark layers as inline PNGs and sends URL output and point
     });
     expect(submission?.body).not.toHaveProperty('prompt');
     expect(submission?.body).not.toHaveProperty('layer_decomposition_options');
+    expect(providerRequests).toHaveBeenCalledTimes(1);
+    const splitRequest = providerRequests.mock.calls[0]!;
+    expect(splitRequest[4]).toBe(240_000);
+    expect(splitRequest[9]).toMatchObject({
+      maxResponseBytes: 64 * 1024 ** 2,
+      responseBodyTimeoutMs: expect.any(Number),
+      responseBodyIdleTimeoutMs: expect.any(Number),
+    });
     expect(mock.arkLayerReads()).toEqual(readsBefore);
     const walletAfter = (await mock.app.inject('/fixture/receipt')).json();
     expect(walletAfter.reservations).toBe(walletBefore.reservations);
@@ -236,6 +246,10 @@ test('receives official Ark layers as inline PNGs and sends URL output and point
     expect(sent?.image).toBe(mock.paths.poster);
     expect(sent?.response_format).toBe('url');
     expect(sent).not.toHaveProperty('n');
+    expect(providerRequests).toHaveBeenCalledTimes(2);
+    const editRequest = providerRequests.mock.calls[1]!;
+    expect(editRequest[4]).toBe(splitRequest[4]);
+    expect(editRequest[9]).toBeUndefined();
 
     const beforeTimeout = mock.upstreamCalls().length;
     const timedOut = await run({ operation: 'edit', clientRequestId: 'ark-timeout-001', expectedCredits: '8', prompt: 'ark-timeout-fixture' });
@@ -252,6 +266,7 @@ test('receives official Ark layers as inline PNGs and sends URL output and point
     });
     expect(mock.upstreamCalls()).toHaveLength(beforeTimeout + 2);
   } finally {
+    providerRequests.mockRestore();
     mock.useMockAProviderKind('NEW_API');
     await save('split', { ...common, endpoint: '/split', adapter: 'canvas-json', creditsPerRequest: '12' });
     await save('edit', { ...common, endpoint: '/edit', adapter: 'canvas-json', creditsPerRequest: '8' });

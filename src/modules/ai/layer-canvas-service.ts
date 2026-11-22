@@ -26,6 +26,8 @@ const unavailable = () => new CloudAiError('layer_route_unavailable', '该操作
 // outlast Node's default dual-stack connection attempt window.
 const beijingArkLayerDispatcher = new Agent({ connect: { family: 4, timeout: 30_000 } });
 const BEIJING_ARK_LAYER_SUBMIT_TIMEOUT_MS = 240_000;
+const BEIJING_ARK_SPLIT_RESPONSE_BODY_TIMEOUT_MS = 360_000;
+const BEIJING_ARK_SPLIT_RESPONSE_BODY_IDLE_TIMEOUT_MS = 180_000;
 const BEIJING_ARK_SPLIT_RESPONSE_MAX_BYTES = 64 * 1024 * 1024;
 const ARK_REFERENCE_EXPIRY_SECONDS = 600;
 const BEIJING_ARK_LAYER_DOWNLOAD_TIMEOUT_MS = 360_000;
@@ -269,6 +271,9 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
   let upstreamResponseStatus: number | undefined;
   let arkRequestId: string | undefined;
   let arkImageTransport: 'signed-url' | 'inline' | undefined;
+  let arkResponseBytes = 0;
+  let arkFirstResponseChunkMs: number | undefined;
+  let arkLastResponseChunkMs: number | undefined;
   let arkImagePayloadBytes: number | undefined;
   let arkSubmitDiagnostics: ReturnType<typeof createArkSubmitDiagnostics> | undefined;
   let arkReader: ReturnType<typeof arkLayerResultReader> | undefined;
@@ -298,7 +303,17 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
         if (id && /^[a-zA-Z0-9_.:-]{1,128}$/.test(id)) arkRequestId = id;
       }, undefined,
       officialBeijingArk ? beijingArkLayerDispatcher : undefined,
-      arkInlineSplitResult ? { maxResponseBytes: BEIJING_ARK_SPLIT_RESPONSE_MAX_BYTES } : undefined);
+      arkInlineSplitResult ? {
+        maxResponseBytes: BEIJING_ARK_SPLIT_RESPONSE_MAX_BYTES,
+        responseBodyTimeoutMs: BEIJING_ARK_SPLIT_RESPONSE_BODY_TIMEOUT_MS,
+        responseBodyIdleTimeoutMs: BEIJING_ARK_SPLIT_RESPONSE_BODY_IDLE_TIMEOUT_MS,
+        onResponseBodyProgress: bytesReceived => {
+          const elapsedMs = Math.round(performance.now() - processingStartedAt);
+          arkResponseBytes = bytesReceived;
+          arkFirstResponseChunkMs ??= elapsedMs;
+          arkLastResponseChunkMs = elapsedMs;
+        },
+      } : undefined);
     arkSubmitDiagnostics = officialBeijingArk ? createArkSubmitDiagnostics() : undefined;
     const upstream = await (arkSubmitDiagnostics ? arkSubmitDiagnostics.run(submit) : submit());
     stage = 'canvas_layer_result';
@@ -343,6 +358,7 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
     const diagnostic = buildFailureDiagnostic(error, { stage,
       ...(officialBeijingArk && stage === 'canvas_layer_submit' ? { provider: 'volcengine-ark' } : {}) });
     const arkSubmitTrace = arkSubmitDiagnostics?.snapshot();
+    const responseTimeoutPhase = error instanceof Error ? jsonRecord(error.cause).phase : undefined;
     const retryableDownload = diagnostic.stage === 'canvas_layer_download' && error instanceof ReferenceUploadError
       && (error.code === 'ark_result_deadline' || isRetryableArkCanvasResultDownload(error));
     console.warn(arkCheckpoint && retryableDownload ? '[canvas_layer_download_recovery_queued]' : '[canvas_layer_failed]', {
@@ -351,6 +367,12 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
       ...(officialBeijingArk ? { arkClientRequestId: requestId, arkRequestId: arkRequestId ?? null,
         arkImageTransport: arkImageTransport ?? null, arkImagePayloadBytes: arkImagePayloadBytes ?? null,
         arkRequestedResultFormat: arkInlineSplitResult ? 'b64_json' : 'url',
+        ...(arkInlineSplitResult ? {
+          arkResponseBytes, arkFirstResponseChunkMs: arkFirstResponseChunkMs ?? null,
+          arkLastResponseChunkMs: arkLastResponseChunkMs ?? null,
+          ...(responseTimeoutPhase === 'response_body' || responseTimeoutPhase === 'response_body_idle'
+            ? { arkResponseTimeoutPhase: responseTimeoutPhase } : {}),
+        } : {}),
         ...arkSubmitTrace, arkAssetsStarted: arkReader?.stats.assetsStarted ?? 0,
         arkDownloadRetried: arkReader?.stats.retried ?? false,
         arkDownloadErrorCode: diagnostic.stage === 'canvas_layer_download' && error instanceof ReferenceUploadError ? error.code : null,
@@ -369,7 +391,9 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
       message = '方舟返回的图层数据超过服务端接收上限。';
     }
     if (stage === 'canvas_layer_submit' && diagnostic.code === 'PROVIDER_TIMEOUT') {
-      if ((upstreamResponseStatus ?? 0) < 400) {
+      if (arkInlineSplitResult && upstreamResponseStatus === 200) {
+        message = '接收方舟返回的图层数据超时。';
+      } else if ((upstreamResponseStatus ?? 0) < 400) {
         message = arkSubmitTrace?.arkSubmitPhase === 'sending_request_body'
           ? '向方舟发送请求超时。' : '等待上游渠道响应超时。';
       }
