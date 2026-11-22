@@ -101,7 +101,8 @@ export async function startLayerMock(port = 4137) {
       if (!bytes || new Headers(init.headers).has('authorization')) return new Response(null, { status: 403 });
       return new Response(new Uint8Array(bytes), { headers: { 'content-type': 'image/png' } });
     }
-    if (target.origin === 'https://9.9.9.9' && target.pathname.startsWith('/ark-layers/') && init?.method === 'GET') {
+    if (['https://9.9.9.9', 'https://ark-layer.example.test'].includes(target.origin)
+      && target.pathname.startsWith('/ark-layers/') && init?.method === 'GET') {
       const name = target.pathname.slice('/ark-layers/'.length, -'.png'.length);
       const asset = { base, title, cloud }[name as 'base' | 'title' | 'cloud'];
       const signature = target.searchParams.get('signature');
@@ -191,7 +192,7 @@ export async function startLayerMock(port = 4137) {
         const titleSignature = exhaustDownloadRetry ? 'unavailable' : recoverable ? 'recoverable' : 'fixture';
         const baseSignature = exhaustDownloadRetry ? 'retry-once' : 'fixture';
         const arkLayerAsset = (name: string, bytes: Buffer, signature: string) => body.response_format === 'url'
-          ? { url: `https://9.9.9.9/ark-layers/${name}.png?signature=${signature}` }
+          ? { url: `https://${recoverable ? 'ark-layer.example.test' : '9.9.9.9'}/ark-layers/${name}.png?signature=${signature}` }
           : { b64_json: bytes.toString('base64') };
         const result = { data: [
           { ...arkLayerAsset('cloud', cloud, cloudSignature), size: '120x70', z_index: 2, name: '云朵',

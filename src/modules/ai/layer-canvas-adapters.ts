@@ -236,22 +236,40 @@ async function normalizeRaster(value: Raster, remainingPixels: number, expected?
   }
   const bytes = await image.png().toBuffer();
   const transparent = dimensions.alpha && !(await sharp(bytes).stats()).isOpaque;
-  return { width: output.width, height: output.height, alpha: dimensions.alpha, transparent, originalPixels, budgetPixels,
-    dataUrl: 'data:image/png;base64,' + bytes.toString('base64') };
+  return { width: output.width, height: output.height, alpha: dimensions.alpha, transparent, originalPixels, budgetPixels, bytes };
 }
 
+type NormalizedRaster = Awaited<ReturnType<typeof normalizeRaster>>;
+export type SavedCanvasRaster = Omit<NormalizedRaster, 'bytes'> & { asset: string };
+export type ResolveSplitRaster = (index: number, decode: () => Promise<NormalizedRaster>) => Promise<SavedCanvasRaster>;
+
 export async function decodeCanvasLayerResult(config: Pick<LayerRoute, 'adapter' | 'maxLayers' | 'maxMegapixels'>,
-  operation: LayerMode, reply: unknown, readAsset?: ReadLayerAsset) {
+  operation: LayerMode, reply: unknown, readAsset?: ReadLayerAsset, resolveSplitRaster?: ResolveSplitRaster) {
   const decoded = decodeResponse(config.adapter, operation, reply, config.maxLayers);
   let pixels = 0;
   let usedBudgetPixels = 0;
   const assets: string[] = [];
-  const read = async (raster: Raster, dimensions?: RasterSize, resize?: RasterSize) => {
-    const { dataUrl, originalPixels, budgetPixels, ...meta } = await normalizeRaster(raster,
-      config.maxMegapixels * 1_000_000 - usedBudgetPixels, dimensions, resize, readAsset);
+  const read = async (raster: Raster, dimensions?: RasterSize, resize?: RasterSize, requireAlpha = false) => {
+    const remaining = config.maxMegapixels * 1_000_000 - usedBudgetPixels;
+    const decode = async () => {
+      const result = await normalizeRaster(raster, remaining, dimensions, resize, readAsset);
+      if (requireAlpha && !result.alpha) throw new Error('A returned layer is missing its alpha channel');
+      return result;
+    };
+    let saved: SavedCanvasRaster;
+    if (resolveSplitRaster && operation === 'split') {
+      saved = await resolveSplitRaster(assets.length, decode);
+    } else {
+      const { bytes, ...meta } = await decode();
+      saved = { ...meta, asset: 'data:image/png;base64,' + bytes.toString('base64') };
+    }
+    const { asset, originalPixels, budgetPixels, ...meta } = saved;
+    const expected = resize ?? dimensions;
+    if (budgetPixels > remaining || (requireAlpha && !meta.alpha)
+      || (expected && (expected.width !== meta.width || expected.height !== meta.height))) throw new Error('Invalid stored layer raster');
     pixels += originalPixels;
     usedBudgetPixels += budgetPixels;
-    assets.push(dataUrl);
+    assets.push(asset);
     return meta;
   };
   if (decoded.operation === 'edit') {
@@ -265,8 +283,7 @@ export async function decodeCanvasLayerResult(config: Pick<LayerRoute, 'adapter'
       throw new Error('A returned layer falls outside the canvas');
     }
     // Ark sends cropped rasters whose resolutions may differ from their placement bounds.
-    const image = layer.rasterSize ? await read(layer.image, layer.rasterSize, layer) : await read(layer.image, layer);
-    if (!image.alpha) throw new Error('A returned layer is missing its alpha channel');
+    const image = await read(layer.image, layer.rasterSize ?? layer, layer.rasterSize ? layer : undefined, true);
     layers.push({ ...image, asset: index + 1, id: 'layer-' + index, name: layer.name,
       x: layer.x, y: layer.y, order: index, opacity: layer.opacity });
   }

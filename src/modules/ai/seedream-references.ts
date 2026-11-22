@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isIP } from 'node:net';
+import type { LookupAddress } from 'node:dns';
 import { Readable } from 'node:stream';
 import { Agent } from 'undici';
 import sharp from 'sharp';
@@ -14,7 +15,7 @@ import {
   createProviderReference, getProviderReference, providerReferenceKey, removeProviderReference,
 } from './provider-reference-store.js';
 import { REFERENCE_UPLOAD_MAX_BYTES, ReferenceUploadError } from './reference-upload-service.js';
-import { ArkSplitRange } from './ark-split-range.js';
+import { ArkResultRange } from './ark-result-range.js';
 
 export type ReferenceSourceType = 'local' | 'cos' | 'signed_url' | 'public_url' | 'data_url';
 export type ReferenceTransport = 'data_url' | 'public_https';
@@ -25,12 +26,13 @@ export const ARK_CANVAS_ASSET_MAX_MS = 4 * 60_000;
 type ArkCanvasTransfer = {
   phase: 'resolving' | 'waiting_headers' | 'reading_body';
   receivedBytes: number;
+  peerAddress: string | null;
   resumedFrom?: number;
   responseStatus: number | null;
   timeout: 'idle' | 'total' | null;
 };
 export function createArkCanvasTransfer(): ArkCanvasTransfer {
-  return { phase: 'resolving', receivedBytes: 0, responseStatus: null, timeout: null };
+  return { phase: 'resolving', receivedBytes: 0, peerAddress: null, responseStatus: null, timeout: null };
 }
 type ArkProgress = (phase: ArkCanvasTransfer['phase'], receivedBytes: number, responseStatus: number | null) => void;
 const ARK_RESULT_MAX_BYTES = 20 * 1024 * 1024;
@@ -148,7 +150,7 @@ async function readImageResponse(response: Response, maximumBytes = REFERENCE_UP
 }
 
 async function fetchPublicReference(source: string, signal: AbortSignal, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES, arkResult = false,
-  onProgress?: ArkProgress, range?: ArkSplitRange) {
+  onProgress?: ArkProgress, range?: ArkResultRange, selectPeer?: (addresses: LookupAddress[]) => LookupAddress) {
   let current = publicReferenceUrl(source);
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
     const hostname = current.hostname.replace(/^\[|\]$/g, '');
@@ -163,7 +165,8 @@ async function fetchPublicReference(source: string, signal: AbortSignal, maximum
     // Pin the already checked DNS answer for the socket; a second DNS lookup
     // must not allow rebinding between validation and connection.
     const ipv4 = arkResult ? addresses.filter(address => address.family === 4) : [];
-    const pinned = ipv4.length ? ipv4 : addresses;
+    const eligible = ipv4.length ? ipv4 : addresses;
+    const pinned = selectPeer ? [selectPeer(eligible)] : eligible;
     const dispatcher = new Agent({
       // Give the chosen public address the complete TLS handshake window.
       ...(arkResult ? { autoSelectFamily: false } : {}),
@@ -215,8 +218,8 @@ async function fetchPublicReference(source: string, signal: AbortSignal, maximum
 
 /** One safe GET attempt. The canvas task owns the shared deadline and retry allowance. */
 export async function downloadArkCanvasResultBytes(source: string, signal?: AbortSignal, transfer = createArkCanvasTransfer(),
-  split?: { requestId: string; expiresAt: number }) {
-  const range = split && new ArkSplitRange(split.requestId, source, split.expiresAt);
+  recovery?: { requestId: string; expiresAt: number } | ArkResultRange, triedAddresses: string[] = []) {
+  const range = recovery instanceof ArkResultRange ? recovery : recovery && new ArkResultRange(source, recovery);
   const attempt = new AbortController();
   const combined = signal ? AbortSignal.any([signal, attempt.signal]) : attempt.signal;
   let rejectAbort: (reason: unknown) => void = () => {};
@@ -233,12 +236,24 @@ export async function downloadArkCanvasResultBytes(source: string, signal?: Abor
   const hardLimit = setTimeout(() => abort('total'), ARK_CANVAS_ASSET_MAX_MS);
   const onProgress: ArkProgress = (phase, receivedBytes, responseStatus) => {
     if (combined.aborted) return;
+    if (phase === 'resolving') transfer.peerAddress = null;
     Object.assign(transfer, { phase, receivedBytes, responseStatus });
     timeout.refresh();
   };
   try {
     combined.throwIfAborted();
-    return (await Promise.race([fetchPublicReference(source, combined, ARK_RESULT_MAX_BYTES, true, onProgress, range), aborted])).bytes;
+    const fetchImage = fetchPublicReference(source, combined, ARK_RESULT_MAX_BYTES, true, onProgress, range, addresses => {
+      // Only choose among addresses validated for this hostname on this attempt.
+      const peer = addresses.reduce((oldest, next) =>
+        triedAddresses.indexOf(next.address) < triedAddresses.indexOf(oldest.address) ? next : oldest);
+      const index = triedAddresses.indexOf(peer.address);
+      if (index >= 0) triedAddresses.splice(index, 1);
+      triedAddresses.push(peer.address);
+      if (triedAddresses.length > 32) triedAddresses.shift();
+      transfer.peerAddress = peer.address;
+      return peer;
+    });
+    return (await Promise.race([fetchImage, aborted])).bytes;
   } catch (error) {
     if (combined.aborted || (error instanceof ReferenceUploadError ? isRetryableArkCanvasResultDownload(error) : isTransientImageTransferError(error))) {
       range?.park();

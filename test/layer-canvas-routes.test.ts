@@ -7,13 +7,16 @@ import { storageService } from '../src/modules/storage/service.js';
 
 vi.mock('node:dns/promises', async importOriginal => ({
   ...await importOriginal<typeof import('node:dns/promises')>(),
-  lookup: vi.fn(async (hostname: string) => [{
+  lookup: vi.fn(async (hostname: string) => hostname === 'ark-layer.example.test'
+    ? ['1.1.1.1', '8.8.8.8', '9.9.9.9'].map(address => ({ address, family: 4 })) : [{
     address: hostname === 'cos.internal.example.test' || hostname.endsWith('.myqcloud.com') ? '10.0.3.2' : '1.1.1.1', family: 4,
   }]),
 }));
 
 let mock: Awaited<ReturnType<typeof startLayerMock>>;
 beforeAll(async () => { mock = await startLayerMock(4147); }, 15000);
+const mockLayerUploads = () => vi.spyOn(storageService, 'uploadMedia')
+  .mockImplementation(async ({ namespace, filename }) => namespace + '/' + filename);
 afterAll(async () => { await mock?.close(); });
 
 test('deduplicates an in-flight split and charges its fixed price across all layers', async () => {
@@ -174,6 +177,7 @@ async function processArkSplit(clientRequestId: string) {
 }
 
 test('downloads official Ark layers from a persisted URL manifest and sends URL output and point guidance for edits', async () => {
+  mockLayerUploads();
   const common = { enabled: true, maxMegapixels: 2, maxLayers: 32 };
   const save = (mode: 'split' | 'edit', config: object) => mock.app.inject({
     method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/' + mode, payload: { config },
@@ -329,6 +333,7 @@ test.each([
   ['png', 'public signed URL'], ['jpeg', 'public signed URL'],
   ['png', 'inline fallback'], ['jpeg', 'inline fallback'],
 ] as const)('sends an owned Ark %s split reference with %s', async (format, transport) => {
+  mockLayerUploads();
   const { splitPoster, splitSourceKey, splitJpeg, splitJpegKey, arkSourceUrl } = mock.paths;
   const objectKey = format === 'png' ? splitSourceKey : splitJpegKey;
   const bytes = format === 'png' ? Buffer.from(splitPoster.split(',')[1]!, 'base64') : splitJpeg;
@@ -410,6 +415,7 @@ test.each([
 }, 15_000);
 
 test('retries one transient Ark layer download without resubmitting or charging twice', async () => {
+  mockLayerUploads();
   const save = (endpoint: string, adapter: string, creditsPerRequest: string) => mock.app.inject({
     method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/split',
     payload: { config: { enabled: true, maxMegapixels: 2, maxLayers: 32, endpoint, adapter, creditsPerRequest } },
@@ -453,6 +459,7 @@ test('retries one transient Ark layer download without resubmitting or charging 
 }, 15_000);
 
 test('resumes a partial Ark layer on the next worker pass with a single claim and no new submission', async () => {
+  const uploads = mockLayerUploads();
   const { recoverNextArkCanvasLayerOutput } = await import('../src/modules/ai/layer-canvas-service.js');
   const save = (endpoint: string, adapter: string, creditsPerRequest: string) => mock.app.inject({
     method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/split',
@@ -476,8 +483,20 @@ test('resumes a partial Ark layer on the next worker pass with a single claim an
     expect((await query()).json()).toEqual(deferred.json());
     expect((await post()).json()).toEqual(deferred.json());
     expect(mock.arkLayerReads().slice(readsBefore)).toEqual([]);
+    uploads.mockClear();
     expect((await processArkSplit(clientRequestId)).json()).toEqual(deferred.json());
     expect(mock.arkLayerReads().slice(readsBefore)).toEqual(['base', 'title', 'title']);
+    expect(uploads).toHaveBeenCalledTimes(1);
+    const baseUpload = uploads.mock.calls[0]![0];
+    expect(baseUpload).toMatchObject({ namespace: 'generated-images', mime: 'image/png' });
+    expect(await sharp(baseUpload.source).metadata()).toMatchObject({ format: 'png', width: 320, height: 400 });
+    const storedProgress = async () => (await mock.app.prisma.aiRequest.findUnique({
+      where: { userId_clientRequestId: { userId: 'local-test-user', clientRequestId } }, select: { result: true },
+    }))?.result;
+    expect(await storedProgress()).toMatchObject({
+      arkDownloadPeers: ['1.1.1.1', '8.8.8.8'],
+      arkSplitAssets: [{ uploaded: true, raster: { asset: expect.stringContaining(baseUpload.filename) } }],
+    });
     const pending = (await mock.app.inject('/fixture/receipt')).json();
     expect(pending.calls).toHaveLength(before.calls.length + 1);
     expect(pending.ledger.slice(before.ledger.length)).toEqual([{ type: 'RESERVE', amount: '-2' }]);
@@ -486,12 +505,22 @@ test('resumes a partial Ark layer on the next worker pass with a single claim an
     expect(dueAt).toBeInstanceOf(Date);
     await expect(recoverNextArkCanvasLayerOutput(mock.app.prisma, new Date(dueAt!.getTime() - 1))).resolves.toBe(false);
     mock.allowArkRecoveryAssets();
+    uploads.mockRejectedValueOnce(new Error('temporary COS failure'));
     const recovered = await Promise.all([
       recoverNextArkCanvasLayerOutput(mock.app.prisma, dueAt!),
       recoverNextArkCanvasLayerOutput(mock.app.prisma, dueAt!),
     ]);
     expect(recovered.sort()).toEqual([false, true]);
+    expect((await query()).json()).toEqual(deferred.json());
+    expect(mock.arkLayerReads().slice(readsBefore)).toEqual(['base', 'title', 'title', 'title']);
+    expect(await storedProgress()).toMatchObject({
+      arkDownloadPeers: ['1.1.1.1', '8.8.8.8', '9.9.9.9'], arkSplitAssets: [{ uploaded: true }, { uploaded: false }],
+    });
+    await processArkSplit(clientRequestId);
     const receipt = (await query()).json();
+    expect(uploads).toHaveBeenCalledTimes(4);
+    const [base, title, cloud] = receipt.result.assets.map((url: string) => new URL(url).pathname.split('/').pop());
+    expect(uploads.mock.calls.map(([file]) => file.filename)).toEqual([base, title, title, cloud]);
     expect(receipt).toMatchObject({ status: 'success', chargedCredits: '2.000000', result: {
       width: 320, height: 400,
       layers: [
@@ -512,6 +541,7 @@ test('resumes a partial Ark layer on the next worker pass with a single claim an
 }, 15_000);
 
 test('a replacement worker resumes the saved split and a late worker cannot settle it again', async () => {
+  mockLayerUploads();
   const { recoverNextArkCanvasLayerOutput } = await import('../src/modules/ai/layer-canvas-service.js');
   const downloads = await import('../src/modules/ai/seedream-references.js');
   const realDownload = downloads.downloadArkCanvasResultBytes;
@@ -572,6 +602,7 @@ test.each([
   { reason: 'persistent transient failures', prompt: 'ark-exhausted-layer-asset-retry-fixture', deferred: true,
     clientRequestId: 'ark-split-exhausted-layer-retry', reads: ['base', 'base', 'title', 'title'] },
 ])('refunds a failed Ark split when $reason prevents downloading a layer', async ({ prompt, clientRequestId, reads, deferred }) => {
+  const uploads = mockLayerUploads();
   const save = (endpoint: string, adapter: string) => mock.app.inject({
     method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/split',
     payload: { config: { enabled: true, maxMegapixels: 2, maxLayers: 32, endpoint, adapter, creditsPerRequest: '12' } },
@@ -596,6 +627,12 @@ test.each([
     expect(result.json()).toMatchObject({ status: 'failed', chargedCredits: '0.000000',
       message: '上游返回了图片地址，但下载失败。预留积分已释放。' });
     expect(mock.failureDiagnostic(clientRequestId)).toMatchObject({ stage: 'canvas_layer_download' });
+    const row = await mock.app.prisma.aiRequest.findUnique({ where: { userId_clientRequestId: {
+      userId: 'local-test-user', clientRequestId,
+    } } });
+    expect(row?.result).toMatchObject({ arkSplitAssets: uploads.mock.calls.map(([file]) => ({
+      uploaded: true, raster: { asset: expect.stringContaining('/v1/ai/image-results/' + file.filename) },
+    })) });
     expect((await post()).json()).toEqual(result.json());
     const after = (await mock.app.inject('/fixture/receipt')).json();
     expect(after.calls).toHaveLength(before.calls.length + 1);

@@ -31,6 +31,7 @@ import {
   createArkCanvasTransfer, downloadArkCanvasResultBytes, prepareSeedreamReference, stageMultipartImageReference, referenceSourceType,
 } from '../src/modules/ai/seedream-references.js';
 import { resolveReferenceImageSources } from '../src/modules/ai/reference-upload-service.js';
+import { ArkResultRange } from '../src/modules/ai/ark-result-range.js';
 import {
   createProviderReference, getProviderReference, providerReferenceKey, removeProviderReference, PROVIDER_REFERENCE_TTL_MS,
 } from '../src/modules/ai/provider-reference-store.js';
@@ -109,6 +110,36 @@ describe('Ark canvas result downloads', () => {
 
     await expect(downloadArkCanvasResultBytes(url)).rejects.toMatchObject({ code: 'reference_image_url_blocked' });
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('resumes an edit on a different freshly validated address without changing the signed URL', async () => {
+    const alternate = { address: '8.8.8.8', family: 4 };
+    const peers: string[] = [];
+    const range = new ArkResultRange(url);
+    const trace = createArkCanvasTransfer();
+    dns.lookup.mockResolvedValue([ipv4, alternate]);
+    const headers = { etag: '"edit-v1"', 'content-type': 'image/png' };
+    const fetch = vi.fn().mockResolvedValueOnce(new Response(png.subarray(0, 16), {
+      headers: { ...headers, 'content-length': String(png.length) },
+    })).mockResolvedValueOnce(new Response(png.subarray(16), {
+      status: 206, headers: { ...headers, 'content-range': `bytes 16-${png.length - 1}/${png.length}` },
+    }));
+    vi.stubGlobal('fetch', fetch);
+    const read = () => downloadArkCanvasResultBytes(url, undefined, trace, range, peers);
+    await expect(read()).rejects.toMatchObject({ code: 'ark_result_incomplete' });
+    expect(trace.peerAddress).toBe(ipv4.address);
+    await expect(read()).resolves.toEqual(png);
+    expect(trace).toMatchObject({ peerAddress: alternate.address, resumedFrom: 16 });
+    const socketLookup = onAgentCreated.mock.calls[1]![0].connect.lookup;
+    const result = vi.fn();
+    socketLookup('ark-result.example', { all: true }, result);
+    expect(result).toHaveBeenCalledWith(null, [alternate]);
+    expect(fetch.mock.calls.map(([source]) => String(source))).toEqual([url, url]);
+    expect(new Headers(fetch.mock.calls[1]![1].headers).get('if-range')).toBe(headers.etag);
+    expect(new Headers(fetch.mock.calls[1]![1].headers).get('range')).toBe('bytes=16-');
+    dns.lookup.mockResolvedValue([alternate, { family: 4, address: '127.0.0.1' }]);
+    await expect(read()).rejects.toMatchObject({ code: 'reference_image_url_blocked' });
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it.each(['complete', 'complete without trace', 'idle', 'total'] as const)('tracks Ark result progress and enforces both limits (%s)', async outcome => {

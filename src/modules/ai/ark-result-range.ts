@@ -20,28 +20,32 @@ function take(key: string) {
   return entry.asset;
 }
 
-export class ArkSplitRange {
-  private readonly key: string;
+export class ArkResultRange {
+  private readonly key?: string;
   private asset: PartialAsset | undefined;
   resumedFrom = 0;
 
-  constructor(requestId: string, source: string, private readonly expiresAt: number) {
-    this.key = createHash('sha256').update(JSON.stringify([requestId, source])).digest('hex');
-    this.asset = take(this.key);
+  constructor(source: string, private readonly checkpoint?: { requestId: string; expiresAt: number }) {
+    if (checkpoint) {
+      this.key = createHash('sha256').update(JSON.stringify([checkpoint.requestId, source])).digest('hex');
+      this.asset = take(this.key);
+    }
   }
 
   park() {
     const asset = this.asset;
-    const ttl = this.expiresAt - Date.now();
+    const key = this.key;
+    if (!this.checkpoint || !key) return;
+    const ttl = this.checkpoint.expiresAt - Date.now();
     if (!asset || !asset.filled || asset.filled >= asset.bytes.length || ttl <= 0) return;
-    take(this.key);
+    take(key);
     while (parked.size >= maxParkedAssets || parkedBytes + asset.bytes.length > maxParkedBytes) {
       const oldest = parked.keys().next().value;
       if (oldest === undefined) return;
       take(oldest);
     }
-    const timer = setTimeout(() => take(this.key), ttl).unref();
-    parked.set(this.key, { asset, timer });
+    const timer = setTimeout(() => take(key), ttl).unref();
+    parked.set(key, { asset, timer });
     parkedBytes += asset.bytes.length;
     this.asset = undefined;
   }

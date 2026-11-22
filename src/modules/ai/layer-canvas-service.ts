@@ -4,7 +4,7 @@ import { Agent } from 'undici';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl } from '../providers/url.js';
 import { storageService } from '../storage/service.js';
-import { createImageResultFromResponse, isStoredImageResultUrl } from './image-result-store.js';
+import { isStoredImageResultUrl } from './image-result-store.js';
 import { configuredImageTaskEnvelope, imageTaskResultContent, providerRequest, resolveImageAdapterResponse,
   persistGeneratedImageResultsAndScheduleMirrors } from './image-service.js';
 import { normalizeImageTaskExecutionConfig } from './image-execution.js';
@@ -20,6 +20,8 @@ import { ARK_CANVAS_ASSET_MAX_MS, ARK_CANVAS_CONNECT_TIMEOUT_MS, createArkCanvas
   isRetryableArkCanvasResultDownload, prepareStoredCanvasReference } from './seedream-references.js';
 import { createArkSubmitDiagnostics } from './ark-submit-diagnostics.js';
 import { openArkLayerOutputCheckpoint, sealArkLayerOutputCheckpoint } from './ark-layer-output-checkpoint.js';
+import { ArkResultRange } from './ark-result-range.js';
+import { ArkSplitAssets } from './ark-split-assets.js';
 
 const identity = (userId: string, clientRequestId: string) => ({ userId_clientRequestId: { userId, clientRequestId } });
 const unavailable = () => new CloudAiError('layer_route_unavailable', '该操作尚未配置可用的模型、渠道或价格', 409);
@@ -134,20 +136,23 @@ function arkLayerResultReader(clientRequestId: string, arkRequestId?: string,
   const transfer = recovery?.transfer ?? createArkCanvasTransfer();
   const stats = { assetsStarted: 0, retried: false };
   let signal: AbortSignal | undefined;
-  return { stats, transfer, async read(source: string, assetNumber = stats.assetsStarted + 1) {
+  return { stats, transfer, async read(source: string, assetNumber = stats.assetsStarted + 1, peers: string[] = []) {
     if (isStoredImageResultUrl(source)) return canvasResultBytes(source);
     const remaining = recovery ? recovery.expiresAt - Date.now() : BEIJING_ARK_LAYER_DOWNLOAD_TIMEOUT_MS;
     signal ??= AbortSignal.timeout(Math.max(1, Math.min(BEIJING_ARK_LAYER_DOWNLOAD_TIMEOUT_MS, remaining)));
     stats.assetsStarted += 1;
+    const range = recovery ?? new ArkResultRange(source);
     try {
-      return await downloadArkCanvasResultBytes(source, signal, transfer, recovery);
+      return await downloadArkCanvasResultBytes(source, signal, transfer, range, peers);
     } catch (error) {
       if ((!recovery && stats.retried) || signal.aborted || !(error instanceof ReferenceUploadError)
         || !isRetryableArkCanvasResultDownload(error)) throw error;
       stats.retried = true;
       console.warn('[canvas_layer_download_retry]', { clientRequestId, arkRequestId: arkRequestId ?? null,
         assetNumber, code: error.code, httpStatus: error.statusCode, ...transfer });
-      return downloadArkCanvasResultBytes(source, signal, transfer, recovery);
+      const bytes = await downloadArkCanvasResultBytes(source, signal, transfer, range, peers);
+      console.info('[canvas_layer_download_recovered]', { clientRequestId, assetNumber, ...transfer });
+      return bytes;
     }
   } };
 }
@@ -158,7 +163,8 @@ async function saveCanvasLayerResult(
   providerName: string, trace: Parameters<typeof persistGeneratedImageResultsAndScheduleMirrors>[2],
   downloadDueAt?: string,
 ) {
-  const assets = await persistGeneratedImageResultsAndScheduleMirrors(decoded.assets, providerName, trace);
+  // The split worker already stored the validated PNGs under these final keys.
+  const assets = downloadDueAt ? decoded.assets : await persistGeneratedImageResultsAndScheduleMirrors(decoded.assets, providerName, trace);
   if (decoded.assets.length !== assets.length || assets.some(asset => !isStoredImageResultUrl(asset))) {
     throw new Error('Result assets failed persistence');
   }
@@ -182,15 +188,19 @@ export async function recoverNextArkCanvasLayerOutput(prisma: PrismaClient, now 
       estimatedCredits: true, result: true },
   });
   if (!row) return false;
-  const { arkDownloadCheckpoint, arkDownloadDueAt, arkDownloadAttempt, arkDownloadRetryAsset, arkDownloadedAssets, ...journal } = jsonRecord(row.result);
+  const { arkDownloadCheckpoint, arkDownloadDueAt, arkDownloadAttempt, arkDownloadRetryAsset, arkDownloadedAssets,
+    arkSplitAssets, arkDownloadPeers, arkDownloadRetryStage, ...journal } = jsonRecord(row.result);
   if (typeof arkDownloadCheckpoint !== 'string' || typeof arkDownloadDueAt !== 'string' || journal.operation !== 'split') return false;
   const previousAssets: unknown[] = Array.isArray(arkDownloadedAssets) ? arkDownloadedAssets : [];
   const savedAssets = previousAssets.every((asset): asset is string => typeof asset === 'string' && isStoredImageResultUrl(asset))
     ? [...previousAssets] : [];
+  const splitAssets = new ArkSplitAssets(arkSplitAssets);
+  let peers: string[] = Array.isArray(arkDownloadPeers) ? arkDownloadPeers.filter((ip): ip is string => typeof ip === 'string').slice(-32) : [];
   // Earlier receipts counted passes across the entire task. Without an asset
   // number that count cannot be attributed to the next missing layer.
   let retryAsset = typeof arkDownloadRetryAsset === 'number' ? arkDownloadRetryAsset : 0;
   let failedPasses = retryAsset && typeof arkDownloadAttempt === 'number' ? arkDownloadAttempt : 0;
+  let retryStage: keyof typeof stageMessages = arkDownloadRetryStage === 'result_persistence' ? 'result_persistence' : 'canvas_layer_download';
   const startedAt = Date.now();
   const clock = () => now.getTime() + Date.now() - startedAt;
   let claim = arkDownloadDueAt;
@@ -199,7 +209,8 @@ export async function recoverNextArkCanvasLayerOutput(prisma: PrismaClient, now 
     const updated = await prisma.aiRequest.updateMany({
       where: { id: row.id, status: 'PROCESSING', result: arkDownloadClaim(claim) },
       data: { result: toInputJson({ ...journal, arkDownloadCheckpoint, arkDownloadRetryAsset: retryAsset, arkDownloadAttempt: failedPasses,
-        arkDownloadDueAt: dueAt, arkDownloadedAssets: savedAssets }) },
+        arkDownloadRetryStage: retryStage, arkDownloadDueAt: dueAt, arkDownloadedAssets: savedAssets,
+        arkSplitAssets: splitAssets.entries, arkDownloadPeers: peers }) },
     });
     if (updated.count === 1) claim = dueAt;
     return updated.count === 1;
@@ -209,6 +220,7 @@ export async function recoverNextArkCanvasLayerOutput(prisma: PrismaClient, now 
   let stage: keyof typeof stageMessages = 'canvas_layer_download';
   const checkpoint = openArkLayerOutputCheckpoint({ requestId: row.id, userId: row.userId }, arkDownloadCheckpoint, now.getTime());
   let assetNumber = 0;
+  let savingAsset = false;
   const transfer = createArkCanvasTransfer();
   try {
     if (!checkpoint) throw new Error('Ark layer download checkpoint unavailable or expired');
@@ -216,24 +228,33 @@ export async function recoverNextArkCanvasLayerOutput(prisma: PrismaClient, now 
       typeof journal.arkRequestId === 'string' ? journal.arkRequestId : undefined, { requestId: row.id, expiresAt: checkpoint.expiresAt, transfer });
     const decoded = await decodeCanvasLayerResult({ adapter: 'volcengine-ark', ...checkpoint.limits }, 'split', checkpoint.reply,
       async source => {
-        const index = assetNumber++;
         stage = 'canvas_layer_decode';
-        const local = savedAssets[index];
+        // Receipts from older workers contain the original, unnormalized rasters.
+        const local = savedAssets[assetNumber - 1];
         if (local) {
           try { return await canvasResultBytes(local); }
           catch { /* The result cache can expire or evict a file. Re-fetch this layer. */ }
         }
         stage = 'canvas_layer_download';
-        const bytes = await reader.read(source, assetNumber);
-        stage = 'result_persistence';
-        savedAssets[index] = await createImageResultFromResponse(new Response(new Uint8Array(bytes)));
-        if (assetNumber === retryAsset) {
-          retryAsset = 0;
-          failedPasses = 0;
-        }
-        if (!await recordProgress(clock() + ARK_LAYER_DOWNLOAD_LEASE_MS)) throw new ArkDownloadClaimLost();
+        const bytes = await reader.read(source, assetNumber, peers);
         stage = 'canvas_layer_decode';
         return bytes;
+      }, async (index, decode) => {
+        assetNumber = index + 1;
+        if (assetNumber !== retryAsset && !splitAssets.entries[index]?.uploaded) peers = [];
+        stage = 'result_persistence';
+        savingAsset = true;
+        const raster = await splitAssets.resolve(index, async () => {
+          stage = 'canvas_layer_decode';
+          const normalized = await decode();
+          stage = 'result_persistence';
+          return normalized;
+        }, async () => {
+          if (!await recordProgress(clock() + ARK_LAYER_DOWNLOAD_LEASE_MS)) throw new ArkDownloadClaimLost();
+        });
+        savingAsset = false;
+        stage = 'canvas_layer_decode';
+        return raster;
       });
     stage = 'result_persistence';
     await saveCanvasLayerResult(prisma, row.userId, row.id, journal, serializeCredit(row.estimatedCredits),
@@ -241,21 +262,25 @@ export async function recoverNextArkCanvasLayerOutput(prisma: PrismaClient, now 
         routeId: row.routeId, providerId: row.route?.channelId ?? 'volcengine-ark', adapterKey: 'volcengine-ark' }, claim);
   } catch (error) {
     if (error instanceof ArkDownloadClaimLost) return false;
-    failedPasses = retryAsset === assetNumber ? failedPasses + 1 : 1;
+    failedPasses = retryAsset === assetNumber && retryStage === stage ? failedPasses + 1 : 1;
     retryAsset = assetNumber;
+    retryStage = stage;
     const retryAt = clock() + ARK_LAYER_DOWNLOAD_RETRY_DELAY_MS * failedPasses;
-    const retry = stage === 'canvas_layer_download' && error instanceof ReferenceUploadError
-      && (error.code === 'ark_result_deadline' || isRetryableArkCanvasResultDownload(error))
+    const retryable = (stage === 'canvas_layer_download' && error instanceof ReferenceUploadError
+      && (error.code === 'ark_result_deadline' || isRetryableArkCanvasResultDownload(error)))
+      || (stage === 'result_persistence' && savingAsset);
+    const retry = retryable
       && failedPasses < ARK_LAYER_MAX_FAILED_PASSES_PER_ASSET && checkpoint && retryAt < checkpoint.expiresAt;
     const diagnostic = buildFailureDiagnostic(error, { stage });
     console.warn(retry ? '[canvas_layer_download_recovery_queued]' : '[canvas_layer_download_recovery_failed]', {
       clientRequestId: row.clientRequestId, arkRequestId: journal.arkRequestId ?? null,
-      assetNumber, savedCount: savedAssets.length, assetPass: failedPasses, ...(assetNumber ? transfer : {}),
+      assetNumber, savedCount: splitAssets.entries.filter(asset => asset.uploaded).length, assetPass: failedPasses, ...(assetNumber ? transfer : {}),
       causeCode: error instanceof ReferenceUploadError ? error.code : null,
       stage: diagnostic.stage, code: diagnostic.code, httpStatus: diagnostic.httpStatus });
     if (retry) return recordProgress(retryAt);
     await releaseCredits(prisma, row.userId, row.id, diagnostic, {
-      ...toInputJson(journal) as Prisma.InputJsonObject, message: stageMessages[stage] + '预留积分已释放。',
+      ...toInputJson(journal) as Prisma.InputJsonObject, arkSplitAssets: splitAssets.entries,
+      message: stageMessages[stage] + '预留积分已释放。',
     }, arkDownloadClaim(claim));
   }
   return true;
