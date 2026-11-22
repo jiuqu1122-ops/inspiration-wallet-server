@@ -4,7 +4,7 @@ import { Agent } from 'undici';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
 import { assertPublicProviderUrl } from '../providers/url.js';
 import { storageService } from '../storage/service.js';
-import { isStoredImageResultUrl } from './image-result-store.js';
+import { createImageResultFromResponse, isStoredImageResultUrl } from './image-result-store.js';
 import { configuredImageTaskEnvelope, imageTaskResultContent, providerRequest, resolveImageAdapterResponse,
   persistGeneratedImageResultsAndScheduleMirrors } from './image-service.js';
 import { normalizeImageTaskExecutionConfig } from './image-execution.js';
@@ -31,7 +31,10 @@ const BEIJING_ARK_SPLIT_RESPONSE_BODY_IDLE_TIMEOUT_MS = 180_000;
 const BEIJING_ARK_SPLIT_RESPONSE_MAX_BYTES = 64 * 1024 * 1024;
 const ARK_REFERENCE_EXPIRY_SECONDS = 600;
 const BEIJING_ARK_LAYER_DOWNLOAD_TIMEOUT_MS = 360_000;
-const ARK_LAYER_DOWNLOAD_LEASE_MS = BEIJING_ARK_LAYER_DOWNLOAD_TIMEOUT_MS + 45_000;
+// Covers two 45-second GET attempts on a single layer. Renew after each saved layer.
+const ARK_LAYER_DOWNLOAD_LEASE_MS = 120_000;
+const ARK_LAYER_DOWNLOAD_MAX_PASSES = 3;
+class ArkDownloadClaimLost extends Error {}
 const ARK_LAYER_DOWNLOAD_RETRY_DELAY_MS = 5_000;
 const ARK_LAYER_DOWNLOAD_DUE_PATH = ['arkDownloadDueAt'];
 const arkDownloadClaim = (dueAt: string) => ({ path: ARK_LAYER_DOWNLOAD_DUE_PATH, equals: dueAt });
@@ -169,40 +172,70 @@ export async function recoverNextArkCanvasLayerOutput(prisma: PrismaClient, now 
       estimatedCredits: true, result: true },
   });
   if (!row) return false;
-  const { arkDownloadCheckpoint, arkDownloadDueAt, arkDownloadAttempt, ...journal } = jsonRecord(row.result);
+  const { arkDownloadCheckpoint, arkDownloadDueAt, arkDownloadAttempt, arkDownloadedAssets, ...journal } = jsonRecord(row.result);
   if (typeof arkDownloadCheckpoint !== 'string' || typeof arkDownloadDueAt !== 'string' || journal.operation !== 'split') return false;
-  const claimedUntil = new Date(now.getTime() + ARK_LAYER_DOWNLOAD_LEASE_MS).toISOString();
-  const claimed = await prisma.aiRequest.updateMany({
-    where: { id: row.id, status: 'PROCESSING', result: arkDownloadClaim(arkDownloadDueAt) },
-    data: { result: toInputJson({ ...journal, arkDownloadCheckpoint, arkDownloadAttempt: 1,
-      arkDownloadDueAt: claimedUntil }) },
-  });
-  if (claimed.count !== 1) return false;
+  const previousAssets: unknown[] = Array.isArray(arkDownloadedAssets) ? arkDownloadedAssets : [];
+  const savedAssets = previousAssets.every((asset): asset is string => typeof asset === 'string' && isStoredImageResultUrl(asset))
+    ? [...previousAssets] : [];
+  const pass = (typeof arkDownloadAttempt === 'number' ? arkDownloadAttempt : 0) + 1;
+  const startedAt = Date.now();
+  const clock = () => now.getTime() + Date.now() - startedAt;
+  let claim = arkDownloadDueAt;
+  const recordProgress = async (due: number) => {
+    const dueAt = new Date(due).toISOString();
+    const updated = await prisma.aiRequest.updateMany({
+      where: { id: row.id, status: 'PROCESSING', result: arkDownloadClaim(claim) },
+      data: { result: toInputJson({ ...journal, arkDownloadCheckpoint, arkDownloadAttempt: pass,
+        arkDownloadDueAt: dueAt, arkDownloadedAssets: savedAssets }) },
+    });
+    if (updated.count === 1) claim = dueAt;
+    return updated.count === 1;
+  };
+  if (!await recordProgress(clock() + ARK_LAYER_DOWNLOAD_LEASE_MS)) return false;
 
   let stage: keyof typeof stageMessages = 'canvas_layer_download';
+  const checkpoint = openArkLayerOutputCheckpoint({ requestId: row.id, userId: row.userId }, arkDownloadCheckpoint, now.getTime());
+  let assetNumber = 0;
   try {
-    if (arkDownloadAttempt === 1) throw new Error('Ark layer download recovery exceeded its lease');
-    const checkpoint = openArkLayerOutputCheckpoint({ requestId: row.id, userId: row.userId }, arkDownloadCheckpoint, now.getTime());
     if (!checkpoint) throw new Error('Ark layer download checkpoint unavailable or expired');
-    const reader = arkLayerResultReader(row.clientRequestId, undefined, checkpoint.expiresAt);
+    const reader = arkLayerResultReader(row.clientRequestId,
+      typeof journal.arkRequestId === 'string' ? journal.arkRequestId : undefined, checkpoint.expiresAt);
     const decoded = await decodeCanvasLayerResult({ adapter: 'volcengine-ark', ...checkpoint.limits }, 'split', checkpoint.reply,
       async source => {
+        const index = assetNumber++;
+        stage = 'canvas_layer_decode';
+        const local = savedAssets[index];
+        if (local) {
+          try { return await canvasResultBytes(local); }
+          catch { /* The result cache can expire or evict a file. Re-fetch this layer. */ }
+        }
         stage = 'canvas_layer_download';
         const bytes = await reader.read(source);
+        stage = 'result_persistence';
+        savedAssets[index] = await createImageResultFromResponse(new Response(new Uint8Array(bytes)));
+        if (!await recordProgress(clock() + ARK_LAYER_DOWNLOAD_LEASE_MS)) throw new ArkDownloadClaimLost();
         stage = 'canvas_layer_decode';
         return bytes;
       });
     stage = 'result_persistence';
     await saveCanvasLayerResult(prisma, row.userId, row.id, journal, serializeCredit(row.estimatedCredits),
       decoded, row.route?.channel?.name ?? 'volcengine-ark', { clientRequestId: row.clientRequestId, canonicalModel: row.logicalModel,
-        routeId: row.routeId, providerId: row.route?.channelId ?? 'volcengine-ark', adapterKey: 'volcengine-ark' }, claimedUntil);
+        routeId: row.routeId, providerId: row.route?.channelId ?? 'volcengine-ark', adapterKey: 'volcengine-ark' }, claim);
   } catch (error) {
+    if (error instanceof ArkDownloadClaimLost) return false;
+    const retryAt = clock() + ARK_LAYER_DOWNLOAD_RETRY_DELAY_MS * pass;
+    const retry = stage === 'canvas_layer_download' && error instanceof ReferenceUploadError
+      && (error.code === 'ark_result_deadline' || isRetryableArkCanvasResultDownload(error))
+      && pass < ARK_LAYER_DOWNLOAD_MAX_PASSES && checkpoint && retryAt < checkpoint.expiresAt;
     const diagnostic = buildFailureDiagnostic(error, { stage });
-    console.warn('[canvas_layer_download_recovery_failed]', { clientRequestId: row.clientRequestId,
+    console.warn(retry ? '[canvas_layer_download_recovery_queued]' : '[canvas_layer_download_recovery_failed]', {
+      clientRequestId: row.clientRequestId, arkRequestId: journal.arkRequestId ?? null,
+      assetNumber, savedCount: savedAssets.length, pass, causeCode: error instanceof ReferenceUploadError ? error.code : null,
       stage: diagnostic.stage, code: diagnostic.code, httpStatus: diagnostic.httpStatus });
+    if (retry) return recordProgress(retryAt);
     await releaseCredits(prisma, row.userId, row.id, diagnostic, {
       ...toInputJson(journal) as Prisma.InputJsonObject, message: stageMessages[stage] + '预留积分已释放。',
-    }, arkDownloadClaim(claimedUntil));
+    }, arkDownloadClaim(claim));
   }
   return true;
 }
@@ -239,12 +272,12 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
   }
   const officialBeijingArk = config.adapter === 'volcengine-ark' && provider.kind === 'VOLCENGINE_ARK'
     && new URL(provider.baseUrl).origin === 'https://ark.cn-beijing.volces.com';
-  const arkInlineSplitResult = officialBeijingArk && operation === 'split';
+  const officialArkSplit = officialBeijingArk && operation === 'split';
   const { image, storedMime, objectKey } = await readLayerInputImage(prisma, userId, input.image);
   let source;
   try { source = await canvasSourceDimensions(image); }
   catch { throw new CloudAiError('invalid_source_image', '输入图片损坏、格式不受支持或尺寸超限', 400); }
-  if (arkInlineSplitResult) {
+  if (officialArkSplit) {
     const pixels = source.width * source.height;
     const ratio = source.width / source.height;
     if (pixels < 512 * 512 || pixels > 6000 * 6000 || ratio < 1 / 16 || ratio > 16) {
@@ -277,7 +310,6 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
   let arkImagePayloadBytes: number | undefined;
   let arkSubmitDiagnostics: ReturnType<typeof createArkSubmitDiagnostics> | undefined;
   let arkReader: ReturnType<typeof arkLayerResultReader> | undefined;
-  let arkCheckpoint: { sealed: string; dueAt: string } | undefined;
   try {
     await assertPublicProviderUrl(provider.baseUrl);
     const secrets = decryptProviderSecrets(provider.encryptedSecrets);
@@ -285,10 +317,10 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
     // Pick the transport before submitting. A trusted signed URL keeps the
     // request body small without resizing or recompressing the reference.
     const arkReferenceUrl = officialBeijingArk ? signedArkReference(objectKey, storedMime) : undefined;
-    const upstreamImage = arkInlineSplitResult && !arkReferenceUrl && storedMime === 'image/jpeg'
+    const upstreamImage = officialArkSplit && !arkReferenceUrl && storedMime === 'image/jpeg'
       ? await prepareArkInlineJpeg(image) : image;
     const body = await layerUpstreamBody(config.adapter, { ...input, image: upstreamImage }, route.upstreamModelId, source, {
-      maxLayers: config.maxLayers, canonicalModelKey: model.canonicalModelKey, arkReferenceUrl, arkInlineSplitResult,
+      maxLayers: config.maxLayers, canonicalModelKey: model.canonicalModelKey, arkReferenceUrl,
     });
     if (officialBeijingArk && 'image' in body && typeof body.image === 'string') {
       arkImageTransport = arkReferenceUrl ? 'signed-url' : 'inline';
@@ -303,7 +335,7 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
         if (id && /^[a-zA-Z0-9_.:-]{1,128}$/.test(id)) arkRequestId = id;
       }, undefined,
       officialBeijingArk ? beijingArkLayerDispatcher : undefined,
-      arkInlineSplitResult ? {
+      officialArkSplit ? {
         maxResponseBytes: BEIJING_ARK_SPLIT_RESPONSE_MAX_BYTES,
         responseBodyTimeoutMs: BEIJING_ARK_SPLIT_RESPONSE_BODY_TIMEOUT_MS,
         responseBodyIdleTimeoutMs: BEIJING_ARK_SPLIT_RESPONSE_BODY_IDLE_TIMEOUT_MS,
@@ -326,18 +358,17 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
         });
       },
     ) : upstream;
-    if (arkInlineSplitResult) {
+    if (officialArkSplit) {
+      stage = 'canvas_layer_decode';
       const sealed = sealArkLayerOutputCheckpoint({ requestId, userId }, reply, config);
-      if (sealed) {
-        const dueAt = new Date(Date.now() + ARK_LAYER_DOWNLOAD_LEASE_MS).toISOString();
-        const saved = await prisma.aiRequest.updateMany({
-          where: { id: requestId, userId, status: 'RESERVED' },
-          data: { status: 'PROCESSING', result: { ...journal,
-            arkDownloadCheckpoint: sealed, arkDownloadDueAt: dueAt } },
-        });
-        if (saved.count !== 1) return getCanvasLayerRequest(prisma, userId, clientRequestId);
-        arkCheckpoint = { sealed, dueAt };
-      }
+      if (!sealed) throw new Error('Could not validate and seal Ark layer output manifest');
+      stage = 'result_persistence';
+      await prisma.aiRequest.updateMany({
+        where: { id: requestId, userId, status: 'RESERVED' },
+        data: { status: 'PROCESSING', result: { ...journal, ...(arkRequestId ? { arkRequestId } : {}),
+          arkDownloadCheckpoint: sealed, arkDownloadDueAt: new Date().toISOString() } },
+      });
+      return getCanvasLayerRequest(prisma, userId, clientRequestId);
     }
     arkReader = officialBeijingArk ? arkLayerResultReader(clientRequestId, arkRequestId) : undefined;
     stage = 'canvas_layer_decode';
@@ -353,21 +384,19 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
     stage = 'result_persistence';
     await saveCanvasLayerResult(prisma, userId, requestId, { ...journal, ...taskIdentity() }, chargedCredits, decoded, provider.name, {
       clientRequestId, canonicalModel: model.canonicalModelKey, routeId: route.id, providerId: provider.id, adapterKey: config.adapter,
-    }, arkCheckpoint?.dueAt);
+    });
   } catch (error) {
     const diagnostic = buildFailureDiagnostic(error, { stage,
       ...(officialBeijingArk && stage === 'canvas_layer_submit' ? { provider: 'volcengine-ark' } : {}) });
     const arkSubmitTrace = arkSubmitDiagnostics?.snapshot();
     const responseTimeoutPhase = error instanceof Error ? jsonRecord(error.cause).phase : undefined;
-    const retryableDownload = diagnostic.stage === 'canvas_layer_download' && error instanceof ReferenceUploadError
-      && (error.code === 'ark_result_deadline' || isRetryableArkCanvasResultDownload(error));
-    console.warn(arkCheckpoint && retryableDownload ? '[canvas_layer_download_recovery_queued]' : '[canvas_layer_failed]', {
+    console.warn('[canvas_layer_failed]', {
       clientRequestId, routeId: route.id, adapter: config.adapter,
       ...taskIdentity(), stage: diagnostic.stage, code: diagnostic.code, httpStatus: diagnostic.httpStatus, causeCode: diagnostic.causeCode,
       ...(officialBeijingArk ? { arkClientRequestId: requestId, arkRequestId: arkRequestId ?? null,
         arkImageTransport: arkImageTransport ?? null, arkImagePayloadBytes: arkImagePayloadBytes ?? null,
-        arkRequestedResultFormat: arkInlineSplitResult ? 'b64_json' : 'url',
-        ...(arkInlineSplitResult ? {
+        arkRequestedResultFormat: 'url',
+        ...(officialArkSplit ? {
           arkResponseBytes, arkFirstResponseChunkMs: arkFirstResponseChunkMs ?? null,
           arkLastResponseChunkMs: arkLastResponseChunkMs ?? null,
           ...(responseTimeoutPhase === 'response_body' || responseTimeoutPhase === 'response_body_idle'
@@ -378,20 +407,12 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
         arkDownloadErrorCode: diagnostic.stage === 'canvas_layer_download' && error instanceof ReferenceUploadError ? error.code : null,
         arkErrorCode: diagnostic.ark?.code ?? null, arkErrorParameter: diagnostic.ark?.parameter ?? null } : {}),
       upstreamResponseStatus: upstreamResponseStatus ?? null, elapsedMs: Math.round(performance.now() - processingStartedAt) });
-    if (arkCheckpoint && retryableDownload) {
-      await prisma.aiRequest.updateMany({
-        where: { id: requestId, userId, status: 'PROCESSING', result: arkDownloadClaim(arkCheckpoint.dueAt) },
-        data: { result: { ...journal, arkDownloadCheckpoint: arkCheckpoint.sealed,
-          arkDownloadDueAt: new Date(Date.now() + ARK_LAYER_DOWNLOAD_RETRY_DELAY_MS).toISOString() } },
-      });
-      return getCanvasLayerRequest(prisma, userId, clientRequestId);
-    }
     let message: string = stageMessages[stage];
-    if (arkInlineSplitResult && stage === 'canvas_layer_submit' && diagnostic.code === 'IMAGE_SIZE_LIMIT') {
+    if (officialArkSplit && stage === 'canvas_layer_submit' && diagnostic.code === 'IMAGE_SIZE_LIMIT') {
       message = '方舟返回的图层数据超过服务端接收上限。';
     }
     if (stage === 'canvas_layer_submit' && diagnostic.code === 'PROVIDER_TIMEOUT') {
-      if (arkInlineSplitResult && upstreamResponseStatus === 200) {
+      if (officialArkSplit && upstreamResponseStatus === 200) {
         message = '接收方舟返回的图层数据超时。';
       } else if ((upstreamResponseStatus ?? 0) < 400) {
         message = arkSubmitTrace?.arkSubmitPhase === 'sending_request_body'
@@ -400,7 +421,7 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
       if (upstreamResponseStatus === 400 && diagnostic.ark?.parameter === 'image') message = '方舟处理参考图超时（HTTP 400）。';
     }
     await releaseCredits(prisma, userId, requestId, diagnostic, { ...journal, ...taskIdentity(),
-      message: message + '预留积分已释放。' }, arkCheckpoint ? arkDownloadClaim(arkCheckpoint.dueAt) : undefined);
+      message: message + '预留积分已释放。' });
   }
   return getCanvasLayerRequest(prisma, userId, clientRequestId);
 }

@@ -94,15 +94,15 @@ function isArkSeedream55(upstreamModel: string, canonicalModelKey: string) {
 
 export async function layerUpstreamBody(
   adapter: LayerRoute['adapter'], input: CanvasLayerInput, model: string, source: SourceImage,
-  { maxLayers, canonicalModelKey, arkReferenceUrl, arkInlineSplitResult }:
-  { maxLayers: number; canonicalModelKey: string; arkReferenceUrl?: string | undefined; arkInlineSplitResult?: boolean },
+  { maxLayers, canonicalModelKey, arkReferenceUrl }:
+  { maxLayers: number; canonicalModelKey: string; arkReferenceUrl?: string | undefined },
 ) {
   const { operation, image, prompt, selection } = input;
   const { width, height } = source;
   if (adapter === 'canvas-json') return { operation, model, image, prompt, selection };
   if (adapter === 'volcengine-ark') {
     const fields = { model, output_format: 'png', watermark: false };
-    if (operation === 'split') return { ...fields, response_format: arkInlineSplitResult ? 'b64_json' : 'url',
+    if (operation === 'split') return { ...fields, response_format: 'url',
       layer_decomposition: true, size: 'auto',
       image: arkReferenceUrl ?? await arkSplitReference(image), ...(prompt ? { prompt } : {}),
       ...(isArkSeedream55(model, canonicalModelKey) ? { layer_decomposition_options: { max_images: maxLayers + 1 } } : {}) };

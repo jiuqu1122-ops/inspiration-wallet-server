@@ -173,10 +173,7 @@ export async function startLayerMock(port = 4137) {
           : body.prompt === 'ark-retry-layer-asset-fixture' ? 'retry-once' : 'fixture';
         const titleSignature = exhaustDownloadRetry ? 'unavailable' : recoverable ? 'recoverable' : 'fixture';
         const baseSignature = exhaustDownloadRetry ? 'retry-once' : 'fixture';
-        // Download failure scenarios return URLs even when inline output was requested.
-        const returnUrl = body.response_format !== 'b64_json'
-          || [baseSignature, titleSignature, cloudSignature].some(signature => signature !== 'fixture');
-        const arkLayerAsset = (name: string, bytes: Buffer, signature: string) => returnUrl
+        const arkLayerAsset = (name: string, bytes: Buffer, signature: string) => body.response_format === 'url'
           ? { url: `https://9.9.9.9/ark-layers/${name}.png?signature=${signature}` }
           : { b64_json: bytes.toString('base64') };
         const result = { data: [
@@ -186,7 +183,7 @@ export async function startLayerMock(port = 4137) {
           { ...arkLayerAsset('title', title, titleSignature), size: '210x76', z_index: 1, name: '标题',
             bounding_box: { absolute: [27, 37, 237, 113] } },
         ] };
-        if (body.prompt === 'ark-oversized-inline-output-fixture') {
+        if (body.prompt === 'ark-oversized-output-fixture') {
           return Response.json(result, { headers: { 'content-length': String(64 * 1024 ** 2 + 1) } });
         }
         return Response.json(result);

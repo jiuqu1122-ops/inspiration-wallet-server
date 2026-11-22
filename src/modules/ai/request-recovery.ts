@@ -89,6 +89,7 @@ export async function recoverStaleAiRequests(
     const now = new Date();
     const { arkDownloadCheckpoint, arkDownloadDueAt, ...journal } = jsonRecord(candidate.result);
     delete journal.arkDownloadAttempt;
+    delete journal.arkDownloadedAssets;
     try {
       const released = await prisma.$transaction(async transaction => {
         const claimed = await transaction.aiRequest.updateMany({
