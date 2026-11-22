@@ -293,16 +293,22 @@ test('rejects an oversized inline Ark split response and releases its reservatio
   }
 }, 15_000);
 
-test.each(['png', 'jpeg'] as const)('sends an owned Ark %s split source inline without requesting a private COS URL', async format => {
-  const { splitPoster, splitSourceKey, splitJpeg, splitJpegKey } = mock.paths;
+test.each([
+  ['png', 'public signed URL'], ['jpeg', 'public signed URL'],
+  ['png', 'inline fallback'], ['jpeg', 'inline fallback'],
+] as const)('sends an owned Ark %s split reference with %s', async (format, transport) => {
+  const { splitPoster, splitSourceKey, splitJpeg, splitJpegKey, arkSourceUrl } = mock.paths;
   const objectKey = format === 'png' ? splitSourceKey : splitJpegKey;
   const bytes = format === 'png' ? Buffer.from(splitPoster.split(',')[1]!, 'base64') : splitJpeg;
   const contentType = `image/${format}`;
   const head = vi.spyOn(storageService, 'headObject').mockResolvedValue({
     objectKey, contentLength: bytes.length, contentType, metadata: {}, headers: {},
   });
-  const privateUrl = `https://cos.internal.example.test/${objectKey}?signed=fixture-only`;
-  const downloadUrl = vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(privateUrl);
+  const canUseSignedReference = transport === 'public signed URL';
+  const signedUrl = canUseSignedReference ? arkSourceUrl(objectKey)
+    : `https://canvas-reference-fixture.oss-cn-beijing-internal.aliyuncs.com/${objectKey}?signed=fixture-only`;
+  const downloadUrl = vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(signedUrl);
+  const validateSigned = vi.spyOn(storageService, 'validateSignedUrl').mockReturnValue(signedUrl);
   const read = vi.spyOn(storageService, 'getObjectStream').mockImplementation(async () => ({
     stream: Readable.from([bytes]), statusCode: 200,
     headers: { 'content-type': contentType, 'content-length': String(bytes.length) },
@@ -319,33 +325,52 @@ test.each(['png', 'jpeg'] as const)('sends an owned Ark %s split source inline w
     expect((await save('/images/generations', 'volcengine-ark', '1')).statusCode).toBe(200);
     mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
     const beforeCalls = mock.upstreamCalls().length;
-    const requestId = `ark-split-inline-${format}`;
+    const readsBefore = mock.arkLayerReads();
+    const requestId = `ark-split-${canUseSignedReference ? 'signed' : 'inline'}-${format}`;
     const accepted = await submit(requestId);
     expect(accepted.statusCode).toBe(200);
-    expect(accepted.json()).toMatchObject({ status: 'success', chargedCredits: '1.000000' });
+    expect(accepted.json()).toMatchObject({ status: 'success', chargedCredits: '1.000000', result: {
+      width: 320, height: 400, base: { width: 320, height: 400 },
+      layers: [
+        { name: '标题', order: 0, width: 210, height: 76, alpha: true, transparent: true },
+        { name: '云朵', order: 1, width: 96, height: 56, alpha: true, transparent: true },
+      ],
+    } });
     expect(head).toHaveBeenCalledWith(objectKey);
     expect(read).toHaveBeenCalledTimes(1);
     expect(read).toHaveBeenCalledWith(objectKey);
-    expect(downloadUrl).not.toHaveBeenCalled();
-    const image = String(mock.upstreamCalls().at(-1)?.body.image);
-    expect(mock.upstreamCalls().at(-1)?.body).toMatchObject({ layer_decomposition: true });
-    expect(image.startsWith(`data:${contentType};base64,`)).toBe(true);
-    const sentBytes = Buffer.from(image.split(',')[1]!, 'base64');
-    if (format === 'jpeg') {
-      expect(bytes.length).toBeGreaterThan(512 * 1024);
-      expect(sentBytes.length).toBeLessThan(bytes.length);
-      const { width, height, orientation } = await sharp(bytes).metadata();
-      expect(await sharp(sentBytes).metadata()).toMatchObject({ format, width, height });
-      expect((await sharp(sentBytes).metadata()).orientation).toBe(orientation);
+    expect(downloadUrl).toHaveBeenCalledWith(objectKey, { expiresSeconds: 600 });
+    const upstream = mock.upstreamCalls().at(-1);
+    expect(upstream).toMatchObject({ method: 'POST', url: 'https://ark.cn-beijing.volces.com/api/v3/images/generations',
+      body: { layer_decomposition: true, response_format: 'b64_json' },
+    });
+    const image = String(upstream?.body.image);
+    if (canUseSignedReference) {
+      expect(validateSigned).toHaveBeenCalledExactlyOnceWith(objectKey, signedUrl);
+      expect(image).toBe(signedUrl);
     } else {
-      expect(sentBytes.equals(bytes)).toBe(true);
+      expect(validateSigned).not.toHaveBeenCalled();
+      expect(image.startsWith(`data:${contentType};base64,`)).toBe(true);
+      const sentBytes = Buffer.from(image.split(',')[1]!, 'base64');
+      if (format === 'jpeg') {
+        expect(bytes.length).toBeGreaterThan(512 * 1024);
+        expect(sentBytes.length).toBeLessThan(bytes.length);
+        const { width, height, orientation } = await sharp(bytes).metadata();
+        expect(await sharp(sentBytes).metadata()).toMatchObject({ format, width, height });
+        expect((await sharp(sentBytes).metadata()).orientation).toBe(orientation);
+      } else {
+        expect(sentBytes.equals(bytes)).toBe(true);
+      }
     }
     expect(accepted.body).not.toContain(image);
+    expect(accepted.body).not.toContain(signedUrl);
     expect((await submit(requestId)).json()).toEqual(accepted.json());
     expect(mock.upstreamCalls()).toHaveLength(beforeCalls + 1);
+    expect(mock.arkLayerReads()).toEqual(readsBefore);
     expect(read).toHaveBeenCalledTimes(1);
+    expect(downloadUrl).toHaveBeenCalledTimes(1);
   } finally {
-    for (const spy of [head, downloadUrl, read]) spy.mockRestore();
+    for (const spy of [head, downloadUrl, validateSigned, read]) spy.mockRestore();
     mock.useMockAProviderKind('NEW_API');
     await save('/split', 'canvas-json', '12');
   }
@@ -684,13 +709,13 @@ test('allows hidden images only for the layer tasks they are explicitly assigned
 });
 
 test('uses an owned reference key for canvas layer input and deduplicates retries', async () => {
-  const { sourceKey: objectKey, alphaPoster, arkEditSourceUrl, splitJpegKey, splitJpeg } = mock.paths;
+  const { sourceKey: objectKey, alphaPoster, arkSourceUrl, splitJpegKey, splitJpeg } = mock.paths;
   const foreignKey = 'reference-images/foreign-layer-test-source.png';
   const posterBytes = Buffer.from(alphaPoster.split(',')[1]!, 'base64');
   const head = vi.spyOn(storageService, 'headObject').mockResolvedValue({
     objectKey, contentLength: posterBytes.length, contentType: 'image/png', metadata: {}, headers: {},
   });
-  const signedUrl = arkEditSourceUrl(objectKey);
+  const signedUrl = arkSourceUrl(objectKey);
   const downloadUrl = vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(signedUrl);
   const validateSigned = vi.spyOn(storageService, 'validateSignedUrl').mockReturnValue(signedUrl);
   const read = vi.spyOn(storageService, 'getObjectStream').mockImplementation(async () => ({

@@ -73,7 +73,7 @@ export async function startLayerMock(port = 4137) {
   const sourceKey = 'reference-images/layer-test-source.png';
   const splitSourceKey = 'reference-images/layer-test-split-source.png';
   const splitJpegKey = 'reference-images/layer-test-split-source.jpg';
-  const arkEditSourceUrl = (objectKey: string) => `https://canvas-reference-fixture-1250000000.cos.ap-beijing.myqcloud.com/${objectKey}?signed=fixture-only`;
+  const arkSourceUrl = (objectKey: string) => `https://canvas-reference-fixture-1250000000.cos.ap-beijing.myqcloud.com/${objectKey}?signed=fixture-only`;
   const referenceFixtures: Record<string, { bytes: Buffer; contentType: string; owner: string }> = {
     [sourceKey]: { bytes: alphaPoster, contentType: 'image/png', owner: 'local-test-user' },
     [splitSourceKey]: { bytes: splitPoster, contentType: 'image/png', owner: 'local-test-user' },
@@ -161,12 +161,11 @@ export async function startLayerMock(port = 4137) {
       }
       const source = String(body.image);
       const inline = /^data:image\/(?:png|jpeg|webp);base64,/.test(source);
-      const signedEdit = body.layer_decomposition !== true
-        ? Object.entries(referenceFixtures).find(([key]) => source === arkEditSourceUrl(key))?.[1] : undefined;
-      if (!inline && !signedEdit) {
+      const signedReference = Object.entries(referenceFixtures).find(([key]) => source === arkSourceUrl(key))?.[1];
+      if (!inline && !signedReference) {
         return Response.json({ error: { code: 'InvalidParameter', param: 'image', message: 'Image download timeout' } }, { status: 400 });
       }
-      const bytes = signedEdit?.bytes ?? Buffer.from(source.split(',')[1] ?? '', 'base64');
+      const bytes = signedReference?.bytes ?? Buffer.from(source.split(',')[1] ?? '', 'base64');
       if (body.layer_decomposition === true) {
         const exhaustDownloadRetry = body.prompt === 'ark-exhausted-layer-asset-retry-fixture';
         const recoverable = body.prompt === 'ark-recover-layer-asset-fixture';
@@ -365,7 +364,7 @@ export async function startLayerMock(port = 4137) {
   });
   await app.listen({ port, host: '127.0.0.1' });
   return { app, paths: { base: data(base), poster: data(poster), sourceKey, alphaPoster: data(alphaPoster),
-    splitPoster: data(splitPoster), splitSourceKey, splitJpegKey, splitJpeg, arkEditSourceUrl }, upstreamCalls: () => [...calls],
+    splitPoster: data(splitPoster), splitSourceKey, splitJpegKey, splitJpeg, arkSourceUrl }, upstreamCalls: () => [...calls],
     useMockAProviderKind(kind: AiProviderChannel['kind'], baseUrl = 'https://1.1.1.1') {
       Object.assign(routes[0]!.channel, { kind, baseUrl });
     },
