@@ -174,7 +174,8 @@ export async function startLayerMock(port = 4137) {
       if (body.prompt === 'ark-timeout-fixture') {
         throw Object.assign(new Error('Provider response exceeded the deadline'), { code: 'IMAGE_PROVIDER_RESPONSE_TIMEOUT' });
       }
-      if (body.prompt === 'ark-image-download-timeout-fixture') {
+      if (body.prompt === 'ark-image-download-timeout-fixture'
+        || (body.prompt === 'ark-signed-image-timeout-fixture' && String(body.image).startsWith('https://'))) {
         return Response.json({ error: { code: 'InvalidParameter', param: 'image', message: 'Image download timeout' } }, { status: 400 });
       }
       const source = String(body.image);

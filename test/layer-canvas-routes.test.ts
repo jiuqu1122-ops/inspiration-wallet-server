@@ -901,9 +901,29 @@ test('uses an owned reference key for canvas layer input and deduplicates retrie
       const rejected = () => submit(objectKey, 'owned-reference-ark-rejected', 'ark-image-download-timeout-fixture', '1');
       const rejectedReceipt = (await rejected()).json();
       expect(rejectedReceipt).toMatchObject({ status: 'failed', chargedCredits: '0.000000' });
-      expect(mock.upstreamCalls().at(-1)?.body.image).toBe(signedUrl);
+      expect(mock.upstreamCalls().slice(-2).map(call => call.body.image)).toEqual([signedUrl, alphaPoster]);
       expect((await rejected()).json()).toEqual(rejectedReceipt);
-      expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 3);
+      expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 4);
+
+      const walletBefore = (await mock.app.inject('/fixture/receipt')).json();
+      const retryEdit = () => submit(objectKey, 'owned-reference-ark-recovered', 'ark-signed-image-timeout-fixture', '1');
+      const recovered = (await retryEdit()).json();
+      expect(recovered).toMatchObject({ status: 'success', chargedCredits: '1.000000', result: { operation: 'edit' } });
+      const [first, second] = mock.upstreamCalls().slice(-2);
+      expect(first?.body.image).toBe(signedUrl);
+      expect(second?.body).toEqual({ ...first!.body, image: alphaPoster });
+      expect(second?.arkClientRequestId).toBe(first!.arkClientRequestId + '-inline');
+      expect((await retryEdit()).json()).toEqual(recovered);
+      expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 6);
+      const walletAfter = (await mock.app.inject('/fixture/receipt')).json();
+      expect(walletAfter.ledger.slice(walletBefore.ledger.length)).toEqual([
+        { type: 'RESERVE', amount: '-1' }, { type: 'CHARGE', amount: '1' },
+      ]);
+
+      const uncertain = await submit(objectKey, 'owned-reference-ark-uncertain', 'ark-timeout-fixture', '1');
+      expect(uncertain.json()).toMatchObject({ status: 'failed', chargedCredits: '0.000000' });
+      expect(mock.upstreamCalls().at(-1)?.body.image).toBe(signedUrl);
+      expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 7);
 
       downloadUrl.mockReturnValueOnce(`https://canvas-reference-fixture.oss-cn-beijing-internal.aliyuncs.com/${splitJpegKey}?signed=fixture-only`);
       head.mockResolvedValueOnce({
@@ -913,9 +933,9 @@ test('uses an owned reference key for canvas layer input and deduplicates retrie
       const fallback = await submit(splitJpegKey, 'owned-reference-ark-private', 'Color', '1');
       expect(fallback.json()).toMatchObject({ status: 'success', chargedCredits: '1.000000' });
       expect(downloadUrl).toHaveBeenCalledWith(splitJpegKey, { expiresSeconds: 900 });
-      expect(validateSigned).toHaveBeenCalledTimes(2);
+      expect(validateSigned).toHaveBeenCalledTimes(4);
       expect(mock.upstreamCalls().at(-1)?.body.image).toBe('data:image/jpeg;base64,' + splitJpeg.toString('base64'));
-      expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 4);
+      expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 8);
     } finally {
       mock.useMockAProviderKind('NEW_API');
       await save('/edit', 'canvas-json');
@@ -923,4 +943,4 @@ test('uses an owned reference key for canvas layer input and deduplicates retrie
   } finally {
     for (const spy of [head, downloadUrl, validateSigned, read]) spy.mockRestore();
   }
-}, 15_000);
+}, 25_000);

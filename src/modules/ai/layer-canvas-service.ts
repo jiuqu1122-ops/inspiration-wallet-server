@@ -349,6 +349,7 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
   const processingStartedAt = performance.now();
   let upstreamResponseStatus: number | undefined;
   let arkRequestId: string | undefined;
+  let arkClientRequestId = requestId;
   let arkImageTransport: 'signed-url' | 'inline' | undefined;
   let arkResponseBytes = 0;
   let arkFirstResponseChunkMs: number | undefined;
@@ -373,9 +374,8 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
       arkImagePayloadBytes = Buffer.byteLength(body.image);
     }
     stage = 'canvas_layer_submit';
-    const submit = () => providerRequest(provider, secrets, config.endpoint, body,
-      officialBeijingArk ? BEIJING_ARK_LAYER_SUBMIT_TIMEOUT_MS : 180_000,
-      { 'Idempotency-Key': requestId, ...(officialBeijingArk ? { 'X-Client-Request-Id': requestId } : {}) }, (status, headers) => {
+    const submit = (payload: typeof body, timeoutMs: number) => providerRequest(provider, secrets, config.endpoint, payload,
+      timeoutMs, { 'Idempotency-Key': arkClientRequestId, ...(officialBeijingArk ? { 'X-Client-Request-Id': arkClientRequestId } : {}) }, (status, headers) => {
         upstreamResponseStatus = status;
         const id = officialBeijingArk ? headers.get('x-request-id') : null;
         if (id && /^[a-zA-Z0-9_.:-]{1,128}$/.test(id)) arkRequestId = id;
@@ -392,8 +392,32 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
           arkLastResponseChunkMs = elapsedMs;
         },
       } : undefined);
-    arkSubmitDiagnostics = officialBeijingArk ? createArkSubmitDiagnostics() : undefined;
-    const upstream = await (arkSubmitDiagnostics ? arkSubmitDiagnostics.run(submit) : submit());
+    const send = (payload: typeof body, timeoutMs: number) => {
+      arkSubmitDiagnostics = officialBeijingArk ? createArkSubmitDiagnostics() : undefined;
+      return arkSubmitDiagnostics ? arkSubmitDiagnostics.run(() => submit(payload, timeoutMs)) : submit(payload, timeoutMs);
+    };
+    const submitTimeoutMs = officialBeijingArk ? BEIJING_ARK_LAYER_SUBMIT_TIMEOUT_MS : 180_000;
+    const submitDeadline = performance.now() + submitTimeoutMs;
+    const upstream = await send(body, submitTimeoutMs).catch((error: unknown) => {
+      if (operation !== 'edit' || !arkReferenceUrl || !('image' in body) || body.image !== arkReferenceUrl
+        || upstreamResponseStatus !== 400) throw error;
+      const rejection = buildFailureDiagnostic(error, { stage: 'canvas_layer_submit', provider: 'volcengine-ark' });
+      if (rejection.code !== 'PROVIDER_TIMEOUT' || rejection.ark?.code !== 'InvalidParameter'
+        || rejection.ark.parameter !== 'image') throw error;
+      const remainingMs = Math.floor(submitDeadline - performance.now());
+      if (remainingMs < 1) throw error;
+
+      // Ark explicitly rejected this input. Keep the reservation and submission deadline,
+      // and give the changed provider payload its own idempotency key.
+      console.warn('[canvas_layer_edit_reference_retry]', { clientRequestId, arkRequestId: arkRequestId ?? null,
+        from: 'signed-url', to: 'inline', httpStatus: upstreamResponseStatus });
+      arkClientRequestId = requestId + '-inline';
+      upstreamResponseStatus = undefined;
+      arkRequestId = undefined;
+      arkImageTransport = 'inline';
+      arkImagePayloadBytes = Buffer.byteLength(image);
+      return send({ ...body, image }, remainingMs);
+    });
     stage = 'canvas_layer_result';
     const reply = operation === 'edit' ? await resolveLayerEditTask(
       provider, secrets, route, config, upstream, image, async id => {
@@ -440,7 +464,7 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
     console.warn('[canvas_layer_failed]', {
       clientRequestId, routeId: route.id, adapter: config.adapter,
       ...taskIdentity(), stage: diagnostic.stage, code: diagnostic.code, httpStatus: diagnostic.httpStatus, causeCode: diagnostic.causeCode,
-      ...(officialBeijingArk ? { arkClientRequestId: requestId, arkRequestId: arkRequestId ?? null,
+      ...(officialBeijingArk ? { arkClientRequestId, arkRequestId: arkRequestId ?? null,
         arkImageTransport: arkImageTransport ?? null, arkImagePayloadBytes: arkImagePayloadBytes ?? null,
         arkRequestedResultFormat: 'url',
         ...(officialArkSplit ? {
