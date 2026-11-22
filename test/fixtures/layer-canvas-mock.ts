@@ -202,6 +202,9 @@ export async function startLayerMock(port = 4137) {
           { ...arkLayerAsset('title', title, titleSignature), size: '210x76', z_index: 1, name: '标题',
             bounding_box: { absolute: [27, 37, 237, 113] } },
         ] };
+        if (body.prompt === 'fourteen foreground layers') {
+          for (let z_index = 3; z_index <= 14; z_index++) result.data.push({ ...result.data[0]!, z_index });
+        }
         if (body.prompt === 'ark-oversized-output-fixture') {
           return Response.json(result, { headers: { 'content-length': String(64 * 1024 ** 2 + 1) } });
         }

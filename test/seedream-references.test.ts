@@ -82,6 +82,62 @@ describe('Ark canvas result downloads', () => {
   const url = 'https://ark-result.example/layer.png?signature=fixture';
   const ipv6 = { address: '2606:4700:4700::1111', family: 6 };
   const ipv4 = { address: '1.1.1.1', family: 4 };
+  const fast = { address: '36.144.112.108', family: 4 };
+  const arkHost = 'ark-acg-cn-beijing.tos-cn-beijing.volces.com';
+
+  it('starts split layers on the measured Beijing edge, resumes on a fallback, and reuses it during cooldown', async () => {
+    vi.useFakeTimers();
+    const split = { requestId: 'split-peer-recovery', expiresAt: Date.now() + 30 * 60_000 };
+    const source = 'https://' + arkHost + '/base.png?signature=fixture';
+    const trace = createArkCanvasTransfer();
+    const expectedHeaders = { 'content-type': 'image/png', etag: '"base"' };
+    const calls = vi.fn().mockResolvedValueOnce(new Response(png.subarray(0, 16), {
+      headers: { ...expectedHeaders, 'content-length': String(png.length) },
+    })).mockResolvedValueOnce(new Response(png.subarray(16), {
+      status: 206, headers: { ...expectedHeaders, 'content-range': `bytes 16-${png.length - 1}/${png.length}` },
+    })).mockImplementation(async () => pngResponse());
+    vi.stubGlobal('fetch', calls);
+    dns.lookup.mockResolvedValue([ipv4, fast]);
+    const tried: string[] = [];
+    await expect(downloadArkCanvasResultBytes(source, undefined, trace, split, tried)).rejects.toMatchObject({ code: 'ark_result_incomplete' });
+    const pinned = vi.fn();
+    onAgentCreated.mock.calls[0]![0].connect.lookup(arkHost, { all: true }, pinned);
+    expect(pinned).toHaveBeenCalledWith(null, [fast]);
+    expect(String(calls.mock.calls[0]![0])).toBe(source);
+    await expect(downloadArkCanvasResultBytes(source, undefined, trace, split, tried)).resolves.toEqual(png);
+    expect(trace).toMatchObject({ peerAddress: ipv4.address, resumedFrom: 16 });
+    expect(new Headers(calls.mock.calls[1]![1].headers).get('range')).toBe('bytes=16-');
+    const third = { address: '8.8.8.8', family: 4 };
+    dns.lookup.mockResolvedValue([fast, third, ipv4]);
+    const layer = 'https://' + arkHost + '/layer.png';
+    await downloadArkCanvasResultBytes(layer, undefined, trace, split);
+    expect(trace.peerAddress).toBe(ipv4.address);
+    await vi.advanceTimersByTimeAsync(10 * 60_000 + 1);
+    dns.lookup.mockResolvedValue([third, ipv4, fast]);
+    await downloadArkCanvasResultBytes(layer, undefined, trace, split);
+    expect(trace.peerAddress).toBe(fast.address);
+    dns.lookup.mockResolvedValue([third]);
+    await downloadArkCanvasResultBytes(layer, undefined, trace, split);
+    expect(trace.peerAddress).toBe(third.address);
+  });
+
+  it('keeps the preferred address scoped to split downloads and the current redirect hostname', async () => {
+    const trace = createArkCanvasTransfer();
+    const source = 'https://' + arkHost + '/layer.png';
+    dns.lookup.mockResolvedValue([ipv4, fast]);
+    const fetch = vi.fn().mockImplementation(async () => pngResponse());
+    vi.stubGlobal('fetch', fetch);
+    await downloadArkCanvasResultBytes(source, undefined, trace, new ArkResultRange(source));
+    expect(trace.peerAddress).toBe(ipv4.address);
+    fetch.mockResolvedValueOnce(new Response(null, { status: 302, headers: { location: url } }));
+    dns.lookup.mockResolvedValueOnce([{ address: '9.9.9.9', family: 4 }]);
+    const split = { requestId: 'split-redirect-peer', expiresAt: Date.now() + 60_000 };
+    await downloadArkCanvasResultBytes(source, undefined, trace, split);
+    expect(trace.peerAddress).toBe(ipv4.address);
+    dns.lookup.mockResolvedValue([fast, { address: '127.0.0.1', family: 4 }]);
+    await expect(downloadArkCanvasResultBytes(source, undefined, trace, split)).rejects.toMatchObject({ code: 'reference_image_url_blocked' });
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
 
   it.each([
     { answers: [ipv6, ipv4], pinned: [ipv4] },

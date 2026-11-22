@@ -16,7 +16,8 @@ export const canvasLayerInput = z.strictObject({
   operation: z.enum(['split', 'edit']),
   // Older clients can still send a canonical model. New clients use server routing.
   model: z.string().trim().min(1).max(128).optional(),
-  expectedCredits: layerCreditsSchema.optional(),
+  expectedCredits: z.string().trim().regex(/^\d{1,10}(?:\.\d{1,6})?$/).optional(),
+  expectedCreditsPerOutputImage: layerCreditsSchema.optional(),
   image: z.union([
     z.string().max(28_000_080).regex(/^data:image\/(png|jpeg|webp);base64,[a-zA-Z0-9+/]+=*$/),
     z.string().max(256).startsWith('reference-images/'),

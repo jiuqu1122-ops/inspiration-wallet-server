@@ -1,6 +1,6 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { z } from 'zod';
-import { serializeCredit } from '../wallets/credit-amount.js';
+import { creditDecimal, serializeCredit } from '../wallets/credit-amount.js';
 
 export const layerModes = ['split', 'edit'] as const;
 export type LayerMode = typeof layerModes[number];
@@ -17,6 +17,7 @@ const layerRouteFields = {
 };
 export const layerRouteSchema = z.union([
   z.strictObject({ ...layerRouteFields, creditsPerRequest: layerCreditsSchema }),
+  z.strictObject({ ...layerRouteFields, creditsPerOutputImage: layerCreditsSchema }),
   z.strictObject({ ...layerRouteFields, baseCredits: layerCreditsSchema, perMegapixelCredits: layerCreditsSchema })
     .transform(({ baseCredits, enabled, endpoint, adapter, maxMegapixels, maxLayers }) =>
       ({ enabled, endpoint, adapter, maxMegapixels, maxLayers, creditsPerRequest: baseCredits })),
@@ -26,7 +27,18 @@ export const jsonRecord = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 export function layerRouteConfig(metadata: unknown, mode: LayerMode) {
   const parsed = layerRouteSchema.safeParse(jsonRecord(jsonRecord(metadata).canvasLayers)[mode]);
-  return parsed.success ? parsed.data : null;
+  return parsed.success && (mode === 'split' || 'creditsPerRequest' in parsed.data) ? parsed.data : null;
+}
+
+function layerQuote(config: LayerRoute, upstreamModel: string, canonicalModel: string) {
+  if ('creditsPerRequest' in config) return { maxCredits: serializeCredit(config.creditsPerRequest) };
+  const model = upstreamModel.startsWith('ep-') ? canonicalModel : upstreamModel;
+  const arkFlashOrPro = config.adapter === 'volcengine-ark' && /^doubao-seedream-5-0-(flash|pro)(?:-\d+)?$/i.test(model);
+  const maxOutputImages = (arkFlashOrPro ? Math.min(config.maxLayers, 16) : config.maxLayers) + 1;
+  return {
+    creditsPerOutputImage: serializeCredit(config.creditsPerOutputImage), maxOutputImages,
+    maxCredits: serializeCredit(creditDecimal(config.creditsPerOutputImage).times(maxOutputImages)),
+  };
 }
 
 const layerTaskPreferred = (metadata: unknown, mode: LayerMode) =>
@@ -72,7 +84,8 @@ async function findLayerCandidates(
     const config = layerRouteConfig(route.metadata, mode);
     return config?.enabled && route.channel && route.canonicalModel
       && (mode !== 'split' || config.adapter !== 'images-api-edit')
-      ? [{ route, provider: route.channel, model: route.canonicalModel, config }] : [];
+      ? [{ route, provider: route.channel, model: route.canonicalModel, config,
+        quote: layerQuote(config, route.upstreamModelId, route.canonicalModel.canonicalModelKey) }] : [];
   });
   const rank = ({ route, model }: typeof candidates[number]) => {
     if (binding && layerTaskPreferred(route.metadata, mode)) return 2;
@@ -107,7 +120,8 @@ export async function getAdminLayerTasks(prisma: PrismaClient) {
         modelName: binding?.canonicalModel.displayName ?? current?.model.displayName ?? null,
         currentRoute: current ? {
           id: current.route.id, channelName: current.provider.name, upstreamModelId: current.route.upstreamModelId,
-          creditsPerRequest: serializeCredit(current.config.creditsPerRequest),
+          creditsPerRequest: current.quote.maxCredits,
+          ...('creditsPerOutputImage' in current.config ? { creditsPerOutputImage: current.quote.creditsPerOutputImage } : {}),
         } : null,
       }] as const;
     })),
@@ -131,14 +145,15 @@ export async function getLayerCatalog(prisma: PrismaClient) {
     const models = new Map<string, {
       id: string; name: string; creditsPerRequest: string;
       baseCredits: string; perMegapixelCredits: string; maxCredits: string;
+      creditsPerOutputImage?: string; maxOutputImages?: number;
     }>();
-    for (const { config, model } of candidates) {
+    for (const { quote, model } of candidates) {
       if (models.has(model.canonicalModelKey)) continue;
-      const creditsPerRequest = serializeCredit(config.creditsPerRequest);
+      const creditsPerRequest = quote.maxCredits;
       models.set(model.canonicalModelKey, {
         id: model.canonicalModelKey, name: model.displayName, creditsPerRequest,
         // Older clients still read these keys from the catalog.
-        baseCredits: creditsPerRequest, perMegapixelCredits: '0', maxCredits: creditsPerRequest,
+        baseCredits: creditsPerRequest, perMegapixelCredits: '0', ...quote,
       });
     }
     return [mode, [...models.values()]] as const;
@@ -151,6 +166,7 @@ export async function updateLayerRoute(
   selectForTask = false,
 ) {
   if (mode === 'split' && config?.adapter === 'images-api-edit') throw new Error('Images API edit only supports interactive edit');
+  if (mode === 'edit' && config && 'creditsPerOutputImage' in config) throw new Error('按输出张数计费仅适用于图层拆分');
   await prisma.$transaction(async tx => {
     const route = await tx.aiModelRoute.findFirst({
       where: { id: routeId, canonicalModel: { canonicalModelKey: modelKey, modality: 'image' } },

@@ -16,6 +16,7 @@ import {
 } from './provider-reference-store.js';
 import { REFERENCE_UPLOAD_MAX_BYTES, ReferenceUploadError } from './reference-upload-service.js';
 import { ArkResultRange } from './ark-result-range.js';
+import { arkSplitDownloadHost, orderArkSplitPeers, recordArkSplitPeerFailure, recordArkSplitPeerSuccess } from './ark-split-download-peers.js';
 
 export type ReferenceSourceType = 'local' | 'cos' | 'signed_url' | 'public_url' | 'data_url';
 export type ReferenceTransport = 'data_url' | 'public_https';
@@ -27,6 +28,7 @@ type ArkCanvasTransfer = {
   phase: 'resolving' | 'waiting_headers' | 'reading_body';
   receivedBytes: number;
   peerAddress: string | null;
+  elapsedMs?: number;
   resumedFrom?: number;
   responseStatus: number | null;
   timeout: 'idle' | 'total' | null;
@@ -150,7 +152,7 @@ async function readImageResponse(response: Response, maximumBytes = REFERENCE_UP
 }
 
 async function fetchPublicReference(source: string, signal: AbortSignal, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES, arkResult = false,
-  onProgress?: ArkProgress, range?: ArkResultRange, selectPeer?: (addresses: LookupAddress[]) => LookupAddress) {
+  onProgress?: ArkProgress, range?: ArkResultRange, selectPeer?: (addresses: LookupAddress[], hostname: string) => LookupAddress) {
   let current = publicReferenceUrl(source);
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
     const hostname = current.hostname.replace(/^\[|\]$/g, '');
@@ -166,7 +168,7 @@ async function fetchPublicReference(source: string, signal: AbortSignal, maximum
     // must not allow rebinding between validation and connection.
     const ipv4 = arkResult ? addresses.filter(address => address.family === 4) : [];
     const eligible = ipv4.length ? ipv4 : addresses;
-    const pinned = selectPeer ? [selectPeer(eligible)] : eligible;
+    const pinned = selectPeer ? [selectPeer(eligible, hostname)] : eligible;
     const dispatcher = new Agent({
       // Give the chosen public address the complete TLS handshake window.
       ...(arkResult ? { autoSelectFamily: false } : {}),
@@ -219,6 +221,9 @@ async function fetchPublicReference(source: string, signal: AbortSignal, maximum
 /** One safe GET attempt. The canvas task owns the shared deadline and retry allowance. */
 export async function downloadArkCanvasResultBytes(source: string, signal?: AbortSignal, transfer = createArkCanvasTransfer(),
   recovery?: { requestId: string; expiresAt: number } | ArkResultRange, triedAddresses: string[] = []) {
+  const split = recovery !== undefined && !(recovery instanceof ArkResultRange);
+  let splitPeer: string | undefined;
+  const startedAt = performance.now();
   const range = recovery instanceof ArkResultRange ? recovery : recovery && new ArkResultRange(source, recovery);
   const attempt = new AbortController();
   const combined = signal ? AbortSignal.any([signal, attempt.signal]) : attempt.signal;
@@ -236,16 +241,22 @@ export async function downloadArkCanvasResultBytes(source: string, signal?: Abor
   const hardLimit = setTimeout(() => abort('total'), ARK_CANVAS_ASSET_MAX_MS);
   const onProgress: ArkProgress = (phase, receivedBytes, responseStatus) => {
     if (combined.aborted) return;
-    if (phase === 'resolving') transfer.peerAddress = null;
+    if (phase === 'resolving') {
+      transfer.peerAddress = null;
+      splitPeer = undefined;
+    }
     Object.assign(transfer, { phase, receivedBytes, responseStatus });
     timeout.refresh();
   };
   try {
     combined.throwIfAborted();
-    const fetchImage = fetchPublicReference(source, combined, ARK_RESULT_MAX_BYTES, true, onProgress, range, addresses => {
+    const fetchImage = fetchPublicReference(source, combined, ARK_RESULT_MAX_BYTES, true, onProgress, range, (addresses, hostname) => {
       // Only choose among addresses validated for this hostname on this attempt.
-      const peer = addresses.reduce((oldest, next) =>
+      const preferArkPeer = split && hostname === arkSplitDownloadHost;
+      const candidates = preferArkPeer ? orderArkSplitPeers(addresses) : addresses;
+      const peer = candidates.reduce((oldest, next) =>
         triedAddresses.indexOf(next.address) < triedAddresses.indexOf(oldest.address) ? next : oldest);
+      if (preferArkPeer) splitPeer = peer.address;
       const index = triedAddresses.indexOf(peer.address);
       if (index >= 0) triedAddresses.splice(index, 1);
       triedAddresses.push(peer.address);
@@ -253,11 +264,13 @@ export async function downloadArkCanvasResultBytes(source: string, signal?: Abor
       transfer.peerAddress = peer.address;
       return peer;
     });
-    return (await Promise.race([fetchImage, aborted])).bytes;
+    const { bytes } = await Promise.race([fetchImage, aborted]);
+    if (splitPeer) recordArkSplitPeerSuccess(splitPeer);
+    return bytes;
   } catch (error) {
-    if (combined.aborted || (error instanceof ReferenceUploadError ? isRetryableArkCanvasResultDownload(error) : isTransientImageTransferError(error))) {
-      range?.park();
-    }
+    const retryable = error instanceof ReferenceUploadError ? isRetryableArkCanvasResultDownload(error) : isTransientImageTransferError(error);
+    if (combined.aborted || retryable) range?.park();
+    if (splitPeer && !signal?.aborted && (attempt.signal.aborted || retryable)) recordArkSplitPeerFailure(splitPeer);
     if (signal?.aborted) throw new ReferenceUploadError('Ark result download deadline exceeded', 'ark_result_deadline', 504);
     if (attempt.signal.aborted) throw new ReferenceUploadError('Ark result download timed out', 'ark_result_timeout', 504);
     if (error instanceof ReferenceUploadError) throw error;
@@ -267,6 +280,7 @@ export async function downloadArkCanvasResultBytes(source: string, signal?: Abor
     }
     throw new ReferenceUploadError('Ark result download failed', 'ark_result_download_failed', 502);
   } finally {
+    transfer.elapsedMs = Math.round(performance.now() - startedAt);
     if (range) transfer.resumedFrom = range.resumedFrom;
     clearTimeout(timeout);
     clearTimeout(hardLimit);

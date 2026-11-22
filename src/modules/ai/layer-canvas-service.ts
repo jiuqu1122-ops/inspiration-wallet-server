@@ -13,7 +13,7 @@ import { jsonRecord, layerCandidates, type LayerRoute } from './layer-canvas-con
 import { canvasLayerEditOutput, canvasResultBytes, canvasSourceDimensions, decodeCanvasLayerResult, layerUpstreamBody,
   prepareArkInlineJpeg, type CanvasLayerInput } from './layer-canvas-adapters.js';
 import { CloudAiError, releaseCredits, reserveCredits, settleCredits } from './service.js';
-import { serializeCredit } from '../wallets/credit-amount.js';
+import { creditDecimal, serializeCredit } from '../wallets/credit-amount.js';
 import { toInputJson } from './pricing-center.js';
 import { authorizeReferenceObject, ReferenceUploadError } from './reference-upload-service.js';
 import { ARK_CANVAS_ASSET_MAX_MS, ARK_CANVAS_CONNECT_TIMEOUT_MS, createArkCanvasTransfer, downloadArkCanvasResultBytes,
@@ -159,7 +159,7 @@ function arkLayerResultReader(clientRequestId: string, arkRequestId?: string,
 
 async function saveCanvasLayerResult(
   prisma: PrismaClient, userId: string, requestId: string, journal: Record<string, unknown>,
-  chargedCredits: string, decoded: Awaited<ReturnType<typeof decodeCanvasLayerResult>>,
+  reservedCredits: string, decoded: Awaited<ReturnType<typeof decodeCanvasLayerResult>>,
   providerName: string, trace: Parameters<typeof persistGeneratedImageResultsAndScheduleMirrors>[2],
   downloadDueAt?: string,
 ) {
@@ -168,12 +168,21 @@ async function saveCanvasLayerResult(
   if (decoded.assets.length !== assets.length || assets.some(asset => !isStoredImageResultUrl(asset))) {
     throw new Error('Result assets failed persistence');
   }
+  const unit = decoded.structure.operation === 'split' && typeof journal.creditsPerOutputImage === 'string'
+    ? journal.creditsPerOutputImage : undefined;
+  const chargedCredits = unit === undefined ? reservedCredits : serializeCredit(creditDecimal(unit).times(assets.length));
+  if (unit !== undefined && (typeof journal.maxOutputImages !== 'number' || assets.length < 1
+    || assets.length > journal.maxOutputImages || creditDecimal(chargedCredits).gt(reservedCredits))) {
+    throw new Error('Layer delivery exceeds reserved quote');
+  }
   await settleCredits(prisma, userId, requestId, {
     chargedCredits, description: '画布图层操作结算',
+    ...(unit !== undefined ? { releaseDescription: '图层拆分按交付张数结算，退回多预留的积分' } : {}),
     ...(downloadDueAt ? { resultCondition: arkDownloadClaim(downloadDueAt) } : {}),
     result: toInputJson({ ...journal, result: { ...decoded.structure, assets } }) as Prisma.InputJsonObject,
     breakdown: { operation: decoded.structure.operation, imageCount: assets.length, outputPixels: decoded.pixels,
-      creditsPerRequest: chargedCredits, totalCredits: chargedCredits },
+      ...(unit !== undefined ? { creditsPerOutputImage: unit, baseImageCount: 1, layerCount: assets.length - 1, reservedCredits }
+        : { creditsPerRequest: chargedCredits }), totalCredits: chargedCredits },
   });
 }
 
@@ -237,6 +246,9 @@ export async function recoverNextArkCanvasLayerOutput(prisma: PrismaClient, now 
         }
         stage = 'canvas_layer_download';
         const bytes = await reader.read(source, assetNumber, peers);
+        console.info('[canvas_layer_asset_downloaded]', { clientRequestId: row.clientRequestId, assetNumber,
+          peerAddress: transfer.peerAddress, attemptMs: transfer.elapsedMs, resumedFrom: transfer.resumedFrom ?? 0,
+          attemptBytes: bytes.length - (transfer.resumedFrom ?? 0), assetBytes: bytes.length });
         stage = 'canvas_layer_decode';
         return bytes;
       }, async (index, decode) => {
@@ -294,11 +306,16 @@ export async function getCanvasLayerRequest(prisma: PrismaClient, userId: string
     if (fingerprint) throw new CloudAiError('duplicate_request', '请求 ID 已被其他操作使用', 409);
     return null;
   }
+  const breakdown = jsonRecord(row.chargeBreakdown);
+  const imageBilling = row.status === 'SUCCEEDED' && typeof breakdown.creditsPerOutputImage === 'string'
+    && typeof breakdown.imageCount === 'number'
+    ? { creditsPerOutputImage: breakdown.creditsPerOutputImage, imageCount: breakdown.imageCount } : undefined;
   return {
     clientRequestId,
     status: row.status === 'SUCCEEDED' ? 'success' : row.status === 'FAILED' || row.status === 'REFUNDED' ? 'failed' : 'processing',
     model: row.logicalModel,
     chargedCredits: serializeCredit(row.chargedCredits),
+    ...(imageBilling ? { imageBilling } : {}),
     ...(row.status === 'SUCCEEDED' ? { result: result.result } : {}),
     ...(row.status === 'FAILED' || row.status === 'REFUNDED' ? { message: result.message ?? '请求已结束，积分已释放' } : {}),
   };
@@ -311,9 +328,12 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
   if (existing) return existing;
   const [selected] = await layerCandidates(prisma, operation, input.model);
   if (!selected) throw unavailable();
-  const { route, provider, model, config } = selected;
-  const chargedCredits = serializeCredit(config.creditsPerRequest);
-  if (input.expectedCredits !== undefined && serializeCredit(input.expectedCredits) !== chargedCredits) {
+  const { route, provider, model, quote } = selected;
+  const config = quote.maxOutputImages === undefined ? selected.config : { ...selected.config, maxLayers: quote.maxOutputImages - 1 };
+  const reservedCredits = quote.maxCredits;
+  if ((quote.creditsPerOutputImage !== undefined && input.expectedCredits === undefined)
+    || (input.expectedCredits !== undefined && serializeCredit(input.expectedCredits) !== reservedCredits)
+    || (input.expectedCreditsPerOutputImage !== undefined && serializeCredit(input.expectedCreditsPerOutputImage) !== quote.creditsPerOutputImage)) {
     throw new CloudAiError('layer_price_changed', '积分价格已调整，请核对后重新运行', 409);
   }
   const officialBeijingArk = config.adapter === 'volcengine-ark' && provider.kind === 'VOLCENGINE_ARK'
@@ -330,7 +350,9 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
       throw new CloudAiError('invalid_source_image', '火山方舟图层拆分要求图片总像素在 262,144 至 36,000,000 之间，宽高比在 1:16 至 16:1 之间', 400);
     }
   }
-  const journal = { canvasLayersVersion: 1, fingerprint, operation, adapter: config.adapter, creditsPerRequest: chargedCredits };
+  const journal = { canvasLayersVersion: 1, fingerprint, operation, adapter: config.adapter,
+    ...(quote.creditsPerOutputImage === undefined ? { creditsPerRequest: reservedCredits }
+      : { creditsPerOutputImage: quote.creditsPerOutputImage, maxOutputImages: quote.maxOutputImages }) };
   let requestId;
   let stage: keyof typeof stageMessages = 'canvas_layer_submit';
   let upstreamTaskId = '';
@@ -339,7 +361,7 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
     requestId = await reserveCredits(prisma, {
       userId, clientRequestId, capability: 'IMAGE', logicalModel: model.canonicalModelKey,
       canonicalModelId: model.id, routeId: route.id, description: '画布图层操作预留',
-      credits: chargedCredits, initialResult: journal,
+      credits: reservedCredits, initialResult: journal,
     });
   } catch (error) {
     const replay = await getCanvasLayerRequest(prisma, userId, clientRequestId, fingerprint);
@@ -453,7 +475,7 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
       return bytes;
     });
     stage = 'result_persistence';
-    await saveCanvasLayerResult(prisma, userId, requestId, { ...journal, ...taskIdentity() }, chargedCredits, decoded, provider.name, {
+    await saveCanvasLayerResult(prisma, userId, requestId, { ...journal, ...taskIdentity() }, reservedCredits, decoded, provider.name, {
       clientRequestId, canonicalModel: model.canonicalModelKey, routeId: route.id, providerId: provider.id, adapterKey: config.adapter,
     });
   } catch (error) {

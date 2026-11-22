@@ -1264,6 +1264,7 @@ export async function reserveCredits(
 
 type CreditSettlement = {
   chargedCredits: string;
+  releaseDescription?: string;
   logicalModel?: string | undefined;
   billingResult?: ChargeBreakdown | undefined;
   actualRouteId?: string | null | undefined;
@@ -1377,7 +1378,7 @@ export async function settleCredits(
           type: 'RELEASE',
           amount: release,
           balanceAfter: wallet.availableCredits,
-          description: 'Chat Token 结算，释放多余预扣额度',
+          description: settlement?.releaseDescription ?? 'Chat Token 结算，释放多余预扣额度',
         },
       });
     }
