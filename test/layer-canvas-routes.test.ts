@@ -332,6 +332,7 @@ test('rejects an oversized Ark split response and releases its reservation', asy
 test.each([
   ['png', 'public signed URL'], ['jpeg', 'public signed URL'],
   ['png', 'inline fallback'], ['jpeg', 'inline fallback'],
+  ['png', 'rejected signed URL'], ['jpeg', 'rejected signed URL'],
 ] as const)('sends an owned Ark %s split reference with %s', async (format, transport) => {
   mockLayerUploads();
   const { splitPoster, splitSourceKey, splitJpeg, splitJpegKey, arkSourceUrl } = mock.paths;
@@ -341,7 +342,8 @@ test.each([
   const head = vi.spyOn(storageService, 'headObject').mockResolvedValue({
     objectKey, contentLength: bytes.length, contentType, metadata: {}, headers: {},
   });
-  const canUseSignedReference = transport === 'public signed URL';
+  const canUseSignedReference = transport !== 'inline fallback';
+  const retryWithInline = transport === 'rejected signed URL';
   const signedUrl = canUseSignedReference ? arkSourceUrl(objectKey)
     : `https://canvas-reference-fixture.oss-cn-beijing-internal.aliyuncs.com/${objectKey}?signed=fixture-only`;
   const downloadUrl = vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(signedUrl);
@@ -356,14 +358,16 @@ test.each([
   });
   const submit = (clientRequestId: string) => mock.app.inject({
     method: 'POST', url: '/v1/ai/canvas-layers',
-    payload: { operation: 'split', image: objectKey, clientRequestId, expectedCredits: '1' },
+    payload: { operation: 'split', image: objectKey, clientRequestId, expectedCredits: '1',
+      ...(retryWithInline ? { prompt: 'ark-signed-image-timeout-fixture' } : {}) },
   });
   try {
     expect((await save('/images/generations', 'volcengine-ark', '1')).statusCode).toBe(200);
     mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
     const beforeCalls = mock.upstreamCalls().length;
     const readsBefore = mock.arkLayerReads();
-    const requestId = `ark-split-${canUseSignedReference ? 'signed' : 'inline'}-${format}`;
+    const beforeLedger = (await mock.app.inject('/fixture/receipt')).json().ledger.length;
+    const requestId = `ark-split-${transport.replaceAll(' ', '-')}-${format}`;
     expect((await submit(requestId)).statusCode).toBe(202);
     const accepted = await processArkSplit(requestId);
     expect(accepted.statusCode).toBe(200);
@@ -385,9 +389,16 @@ test.each([
     const image = String(upstream?.body.image);
     if (canUseSignedReference) {
       expect(validateSigned).toHaveBeenCalledExactlyOnceWith(objectKey, signedUrl);
-      expect(image).toBe(signedUrl);
+      const first = mock.upstreamCalls()[beforeCalls]!;
+      expect(first.body.image).toBe(signedUrl);
+      if (retryWithInline) {
+        expect(upstream?.arkClientRequestId).toBe(first.arkClientRequestId + '-inline');
+        expect(upstream?.body).toEqual({ ...first.body, image });
+      }
     } else {
       expect(validateSigned).not.toHaveBeenCalled();
+    }
+    if (transport !== 'public signed URL') {
       expect(image.startsWith(`data:${contentType};base64,`)).toBe(true);
       const sentBytes = Buffer.from(image.split(',')[1]!, 'base64');
       if (format === 'jpeg') {
@@ -403,7 +414,10 @@ test.each([
     expect(accepted.body).not.toContain(image);
     expect(accepted.body).not.toContain(signedUrl);
     expect((await submit(requestId)).json()).toEqual(accepted.json());
-    expect(mock.upstreamCalls()).toHaveLength(beforeCalls + 1);
+    expect(mock.upstreamCalls()).toHaveLength(beforeCalls + (retryWithInline ? 2 : 1));
+    expect((await mock.app.inject('/fixture/receipt')).json().ledger.slice(beforeLedger)).toEqual([
+      { type: 'RESERVE', amount: '-1' }, { type: 'CHARGE', amount: '1' },
+    ]);
     expect(mock.arkLayerReads()).toEqual([...readsBefore, 'base', 'title', 'cloud']);
     expect(read).toHaveBeenCalledTimes(1);
     expect(downloadUrl).toHaveBeenCalledTimes(1);

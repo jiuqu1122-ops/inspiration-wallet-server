@@ -386,8 +386,8 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
     // Pick the transport before submitting. A trusted signed URL keeps the
     // request body small without resizing or recompressing the reference.
     const arkReferenceUrl = officialBeijingArk ? signedArkReference(objectKey, storedMime) : undefined;
-    const upstreamImage = officialArkSplit && !arkReferenceUrl && storedMime === 'image/jpeg'
-      ? await prepareArkInlineJpeg(image) : image;
+    const inlineReference = () => officialArkSplit && storedMime === 'image/jpeg' ? prepareArkInlineJpeg(image) : image;
+    const upstreamImage = arkReferenceUrl ? image : await inlineReference();
     const body = await layerUpstreamBody(config.adapter, { ...input, image: upstreamImage }, route.upstreamModelId, source, {
       maxLayers: config.maxLayers, canonicalModelKey: model.canonicalModelKey, arkReferenceUrl,
     });
@@ -420,25 +420,26 @@ export async function submitCanvasLayerRequest(prisma: PrismaClient, userId: str
     };
     const submitTimeoutMs = officialBeijingArk ? BEIJING_ARK_LAYER_SUBMIT_TIMEOUT_MS : 180_000;
     const submitDeadline = performance.now() + submitTimeoutMs;
-    const upstream = await send(body, submitTimeoutMs).catch((error: unknown) => {
-      if (operation !== 'edit' || !arkReferenceUrl || !('image' in body) || body.image !== arkReferenceUrl
+    const upstream = await send(body, submitTimeoutMs).catch(async (error: unknown) => {
+      if (!arkReferenceUrl || !('image' in body) || body.image !== arkReferenceUrl
         || upstreamResponseStatus !== 400) throw error;
       const rejection = buildFailureDiagnostic(error, { stage: 'canvas_layer_submit', provider: 'volcengine-ark' });
       if (rejection.code !== 'PROVIDER_TIMEOUT' || rejection.ark?.code !== 'InvalidParameter'
         || rejection.ark.parameter !== 'image') throw error;
+      const inlineImage = await inlineReference();
       const remainingMs = Math.floor(submitDeadline - performance.now());
       if (remainingMs < 1) throw error;
 
       // Ark explicitly rejected this input. Keep the reservation and submission deadline,
       // and give the changed provider payload its own idempotency key.
-      console.warn('[canvas_layer_edit_reference_retry]', { clientRequestId, arkRequestId: arkRequestId ?? null,
+      console.warn(`[canvas_layer_${operation}_reference_retry]`, { clientRequestId, arkRequestId: arkRequestId ?? null,
         from: 'signed-url', to: 'inline', httpStatus: upstreamResponseStatus });
       arkClientRequestId = requestId + '-inline';
       upstreamResponseStatus = undefined;
       arkRequestId = undefined;
       arkImageTransport = 'inline';
-      arkImagePayloadBytes = Buffer.byteLength(image);
-      return send({ ...body, image }, remainingMs);
+      arkImagePayloadBytes = Buffer.byteLength(inlineImage);
+      return send({ ...body, image: inlineImage }, remainingMs);
     });
     stage = 'canvas_layer_result';
     const reply = operation === 'edit' ? await resolveLayerEditTask(
