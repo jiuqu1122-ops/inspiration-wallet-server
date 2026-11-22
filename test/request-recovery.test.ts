@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Prisma } from '@prisma/client';
 import { recoverStaleAiRequests } from '../src/modules/ai/request-recovery.js';
+import { sealArkLayerOutputCheckpoint } from '../src/modules/ai/ark-layer-output-checkpoint.js';
 
 function makePrisma(claimCount = 1) {
   const transaction = {
@@ -28,6 +29,31 @@ function makePrisma(claimCount = 1) {
 }
 
 describe('stale AI request recovery', () => {
+  it.each([false, true])('protects split downloads until their authenticated manifest expires (expired=%s)', async expired => {
+    const { prisma, transaction } = makePrisma();
+    const issued = Date.now() - (expired ? 31 : 18) * 60_000;
+    const sealed = sealArkLayerOutputCheckpoint({ userId: 'user-1', requestId: 'request-1' }, { data: [
+      { size: '800x600', z_index: 0, url: 'https://assets.example.test/base.png' },
+      { size: '20x20', z_index: 1, url: 'https://assets.example.test/layer.png', bounding_box: { absolute: [1, 1, 21, 21] } },
+    ] }, { maxMegapixels: 16, maxLayers: 4 }, issued);
+    expect(sealed).toBeTruthy();
+    const dueAt = new Date(issued).toISOString();
+    prisma.aiRequest.findMany.mockResolvedValue([{ id: 'request-1', userId: 'user-1', capability: 'IMAGE',
+      status: 'PROCESSING', estimatedCredits: new Prisma.Decimal('12'), pricingSnapshot: null, clientRequestId: 'canvas-1',
+      result: { canvasLayersVersion: 1, adapter: 'volcengine-ark', operation: 'split', arkDownloadCheckpoint: sealed,
+        arkDownloadDueAt: dueAt, arkDownloadRetryAsset: 2, arkDownloadAttempt: 1 },
+    } as never]);
+    const result = await recoverStaleAiRequests(prisma as never, new Date(Date.now() - 15 * 60_000));
+    expect(result.recovered).toBe(expired ? 1 : 0);
+    if (expired) {
+      expect(transaction.aiRequest.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ status: 'PROCESSING', result: { path: ['arkDownloadDueAt'], equals: dueAt } }),
+      }));
+    } else {
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    }
+  });
+
   it('claims stale requests, fails active video tasks, and releases the reservation once', async () => {
     const { prisma, transaction } = makePrisma();
     const result = await recoverStaleAiRequests(

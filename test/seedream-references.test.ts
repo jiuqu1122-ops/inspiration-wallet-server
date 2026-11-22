@@ -111,6 +111,44 @@ describe('Ark canvas result downloads', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it.each(['complete', 'idle', 'total'] as const)('tracks split bytes and enforces both limits (%s)', async outcome => {
+    vi.useFakeTimers();
+    try {
+      dns.lookup.mockResolvedValue([ipv4]);
+      let body!: ReadableStreamDefaultController<Uint8Array>;
+      const stream = new ReadableStream<Uint8Array>({ start(controller) { body = controller; } });
+      vi.stubGlobal('fetch', vi.fn((_url, init: RequestInit) => {
+        init.signal?.addEventListener('abort', () => body.error(new Error('aborted')), { once: true });
+        return Promise.resolve(new Response(stream, { headers: { 'content-type': 'image/png' } }));
+      }));
+      const trace: import('../src/modules/ai/seedream-references.js').ArkSplitTransfer = {
+        phase: 'resolving', receivedBytes: 0, responseStatus: null, timeout: null,
+      };
+      const read = downloadArkCanvasResultBytes(url, undefined, trace);
+      const verify = outcome === 'complete' ? expect(read).resolves.toEqual(png)
+        : expect(read).rejects.toMatchObject({ code: 'ark_result_timeout', statusCode: 504 });
+      await vi.advanceTimersByTimeAsync(35_000);
+      body.enqueue(png.subarray(0, 8));
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(trace).toMatchObject({ phase: 'reading_body', receivedBytes: 8, responseStatus: 200, timeout: null });
+      if (outcome === 'complete') {
+        body.enqueue(png.subarray(8));
+        body.close();
+      } else if (outcome === 'idle') {
+        await vi.advanceTimersByTimeAsync(20_000);
+      } else {
+        body.enqueue(png.subarray(8, 16));
+        await vi.advanceTimersByTimeAsync(35_000);
+        body.enqueue(png.subarray(16, 24));
+        await vi.advanceTimersByTimeAsync(20_001);
+      }
+      await verify;
+      expect(trace.timeout).toBe(outcome === 'complete' ? null : outcome);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('ends a stalled DNS lookup at the shared deadline without starting a GET', async () => {
     let finishLookup: (addresses: typeof ipv4[]) => void = () => {};
     dns.lookup.mockImplementation(() => new Promise(resolve => { finishLookup = resolve; }));

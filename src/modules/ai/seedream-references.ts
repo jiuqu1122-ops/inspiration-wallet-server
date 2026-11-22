@@ -19,6 +19,14 @@ export type ReferenceSourceType = 'local' | 'cos' | 'signed_url' | 'public_url' 
 export type ReferenceTransport = 'data_url' | 'public_https';
 const FETCH_TIMEOUT_MS = 30_000;
 const ARK_RESULT_FETCH_TIMEOUT_MS = 45_000;
+export const ARK_SPLIT_ASSET_MAX_MS = 120_000;
+export type ArkSplitTransfer = {
+  phase: 'resolving' | 'waiting_headers' | 'reading_body';
+  receivedBytes: number;
+  responseStatus: number | null;
+  timeout: 'idle' | 'total' | null;
+};
+type ArkProgress = (phase: ArkSplitTransfer['phase'], receivedBytes: number, responseStatus: number | null) => void;
 const ARK_RESULT_MAX_BYTES = 20 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const imageMime = { png: 'image/png', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' } as const;
@@ -95,7 +103,8 @@ function validatedArkResultBytes(bytes: Buffer, header: string) {
   return { bytes, mime };
 }
 
-async function readImageResponse(response: Response, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES, arkResult = false) {
+async function readImageResponse(response: Response, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES, arkResult = false,
+  onProgress?: ArkProgress) {
   const length = Number(response.headers.get('content-length') || 0);
   const tooLarge = () => arkResult
     ? new ReferenceUploadError('Ark result exceeds the size limit', 'ark_result_too_large', 413)
@@ -114,6 +123,7 @@ async function readImageResponse(response: Response, maximumBytes = REFERENCE_UP
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
+      if (value.byteLength) onProgress?.('reading_body', size, response.status);
       if (size > maximumBytes) throw tooLarge();
       chunks.push(Buffer.from(value));
     }
@@ -131,10 +141,12 @@ async function readImageResponse(response: Response, maximumBytes = REFERENCE_UP
   }
 }
 
-async function fetchPublicReference(source: string, signal: AbortSignal, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES, arkResult = false) {
+async function fetchPublicReference(source: string, signal: AbortSignal, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES, arkResult = false,
+  onProgress?: ArkProgress) {
   let current = publicReferenceUrl(source);
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
     const hostname = current.hostname.replace(/^\[|\]$/g, '');
+    onProgress?.('resolving', 0, null);
     const addresses = isIP(hostname)
       ? [{ address: hostname, family: isIP(hostname) }]
       : await lookup(hostname, { all: true, verbatim: true });
@@ -158,10 +170,12 @@ async function fetchPublicReference(source: string, signal: AbortSignal, maximum
       },
     });
     try {
+      onProgress?.('waiting_headers', 0, null);
       const response = await fetch(current, {
         method: 'GET', headers: { accept: 'image/png,image/jpeg,image/webp,image/gif' },
         redirect: 'manual', signal, dispatcher,
       } as RequestInit);
+      onProgress?.('reading_body', 0, response.status);
       if (response.status >= 300 && response.status < 400) {
         await response.body?.cancel().catch(() => {});
         const location = response.headers.get('location');
@@ -177,7 +191,7 @@ async function fetchPublicReference(source: string, signal: AbortSignal, maximum
         }
         throw new ReferenceUploadError(`Reference image download returned HTTP ${response.status}`);
       }
-      return await readImageResponse(response, maximumBytes, arkResult);
+      return await readImageResponse(response, maximumBytes, arkResult, onProgress);
     } finally {
       await dispatcher.destroy();
     }
@@ -186,17 +200,29 @@ async function fetchPublicReference(source: string, signal: AbortSignal, maximum
 }
 
 /** One safe GET attempt. The canvas task owns the shared deadline and retry allowance. */
-export async function downloadArkCanvasResultBytes(source: string, signal?: AbortSignal) {
+export async function downloadArkCanvasResultBytes(source: string, signal?: AbortSignal, split?: ArkSplitTransfer) {
   const attempt = new AbortController();
   const combined = signal ? AbortSignal.any([signal, attempt.signal]) : attempt.signal;
   let rejectAbort: (reason: unknown) => void = () => {};
   const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
   const onAbort = () => rejectAbort(combined.reason);
   combined.addEventListener('abort', onAbort, { once: true });
-  const timeout = setTimeout(() => attempt.abort(), ARK_RESULT_FETCH_TIMEOUT_MS);
+  const abort = (kind: 'idle' | 'total') => {
+    if (attempt.signal.aborted) return;
+    if (split) split.timeout = kind;
+    attempt.abort();
+  };
+  if (split) split.timeout = null;
+  const timeout = setTimeout(() => abort('idle'), ARK_RESULT_FETCH_TIMEOUT_MS);
+  const hardLimit = split ? setTimeout(() => abort('total'), ARK_SPLIT_ASSET_MAX_MS) : undefined;
+  const onProgress: ArkProgress | undefined = split ? (phase, receivedBytes, responseStatus) => {
+    if (combined.aborted) return;
+    Object.assign(split, { phase, receivedBytes, responseStatus });
+    timeout.refresh();
+  } : undefined;
   try {
     combined.throwIfAborted();
-    return (await Promise.race([fetchPublicReference(source, combined, ARK_RESULT_MAX_BYTES, true), aborted])).bytes;
+    return (await Promise.race([fetchPublicReference(source, combined, ARK_RESULT_MAX_BYTES, true, onProgress), aborted])).bytes;
   } catch (error) {
     if (signal?.aborted) throw new ReferenceUploadError('Ark result download deadline exceeded', 'ark_result_deadline', 504);
     if (attempt.signal.aborted) throw new ReferenceUploadError('Ark result download timed out', 'ark_result_timeout', 504);
@@ -208,6 +234,7 @@ export async function downloadArkCanvasResultBytes(source: string, signal?: Abor
     throw new ReferenceUploadError('Ark result download failed', 'ark_result_download_failed', 502);
   } finally {
     clearTimeout(timeout);
+    clearTimeout(hardLimit);
     combined.removeEventListener('abort', onAbort);
   }
 }

@@ -16,7 +16,8 @@ import { CloudAiError, releaseCredits, reserveCredits, settleCredits } from './s
 import { serializeCredit } from '../wallets/credit-amount.js';
 import { toInputJson } from './pricing-center.js';
 import { authorizeReferenceObject, ReferenceUploadError } from './reference-upload-service.js';
-import { downloadArkCanvasResultBytes, isRetryableArkCanvasResultDownload, prepareStoredCanvasReference } from './seedream-references.js';
+import { ARK_SPLIT_ASSET_MAX_MS, type ArkSplitTransfer, downloadArkCanvasResultBytes,
+  isRetryableArkCanvasResultDownload, prepareStoredCanvasReference } from './seedream-references.js';
 import { createArkSubmitDiagnostics } from './ark-submit-diagnostics.js';
 import { openArkLayerOutputCheckpoint, sealArkLayerOutputCheckpoint } from './ark-layer-output-checkpoint.js';
 
@@ -31,9 +32,9 @@ const BEIJING_ARK_SPLIT_RESPONSE_BODY_IDLE_TIMEOUT_MS = 180_000;
 const BEIJING_ARK_SPLIT_RESPONSE_MAX_BYTES = 64 * 1024 * 1024;
 const ARK_REFERENCE_EXPIRY_SECONDS = 600;
 const BEIJING_ARK_LAYER_DOWNLOAD_TIMEOUT_MS = 360_000;
-// Covers two 45-second GET attempts on a single layer. Renew after each saved layer.
-const ARK_LAYER_DOWNLOAD_LEASE_MS = 120_000;
-const ARK_LAYER_DOWNLOAD_MAX_PASSES = 3;
+// One claim can make two bounded GET attempts before saving the next layer.
+const ARK_LAYER_DOWNLOAD_LEASE_MS = 2 * ARK_SPLIT_ASSET_MAX_MS + 30_000;
+const ARK_LAYER_MAX_FAILED_PASSES_PER_ASSET = 3;
 class ArkDownloadClaimLost extends Error {}
 const ARK_LAYER_DOWNLOAD_RETRY_DELAY_MS = 5_000;
 const ARK_LAYER_DOWNLOAD_DUE_PATH = ['arkDownloadDueAt'];
@@ -122,22 +123,22 @@ async function readLayerEditAsset(provider: AiProviderChannel, secrets: Provider
   return result;
 }
 
-function arkLayerResultReader(clientRequestId: string, arkRequestId?: string, expiresAt = Infinity) {
+function arkLayerResultReader(clientRequestId: string, arkRequestId?: string, expiresAt = Infinity, split?: ArkSplitTransfer) {
   const stats = { assetsStarted: 0, retried: false };
   let signal: AbortSignal | undefined;
-  return { stats, async read(source: string) {
+  return { stats, async read(source: string, assetNumber = stats.assetsStarted + 1) {
     if (isStoredImageResultUrl(source)) return canvasResultBytes(source);
     signal ??= AbortSignal.timeout(Math.max(1, Math.min(BEIJING_ARK_LAYER_DOWNLOAD_TIMEOUT_MS, expiresAt - Date.now())));
     stats.assetsStarted += 1;
     try {
-      return await downloadArkCanvasResultBytes(source, signal);
+      return await downloadArkCanvasResultBytes(source, signal, split);
     } catch (error) {
-      if (stats.retried || signal.aborted || !(error instanceof ReferenceUploadError)
+      if ((!split && stats.retried) || signal.aborted || !(error instanceof ReferenceUploadError)
         || !isRetryableArkCanvasResultDownload(error)) throw error;
       stats.retried = true;
       console.warn('[canvas_layer_download_retry]', { clientRequestId, arkRequestId: arkRequestId ?? null,
-        assetNumber: stats.assetsStarted, code: error.code, httpStatus: error.statusCode });
-      return downloadArkCanvasResultBytes(source, signal);
+        assetNumber, code: error.code, httpStatus: error.statusCode, ...split });
+      return downloadArkCanvasResultBytes(source, signal, split);
     }
   } };
 }
@@ -172,12 +173,15 @@ export async function recoverNextArkCanvasLayerOutput(prisma: PrismaClient, now 
       estimatedCredits: true, result: true },
   });
   if (!row) return false;
-  const { arkDownloadCheckpoint, arkDownloadDueAt, arkDownloadAttempt, arkDownloadedAssets, ...journal } = jsonRecord(row.result);
+  const { arkDownloadCheckpoint, arkDownloadDueAt, arkDownloadAttempt, arkDownloadRetryAsset, arkDownloadedAssets, ...journal } = jsonRecord(row.result);
   if (typeof arkDownloadCheckpoint !== 'string' || typeof arkDownloadDueAt !== 'string' || journal.operation !== 'split') return false;
   const previousAssets: unknown[] = Array.isArray(arkDownloadedAssets) ? arkDownloadedAssets : [];
   const savedAssets = previousAssets.every((asset): asset is string => typeof asset === 'string' && isStoredImageResultUrl(asset))
     ? [...previousAssets] : [];
-  const pass = (typeof arkDownloadAttempt === 'number' ? arkDownloadAttempt : 0) + 1;
+  // Earlier receipts counted passes across the entire task. Without an asset
+  // number that count cannot be attributed to the next missing layer.
+  let retryAsset = typeof arkDownloadRetryAsset === 'number' ? arkDownloadRetryAsset : 0;
+  let failedPasses = retryAsset && typeof arkDownloadAttempt === 'number' ? arkDownloadAttempt : 0;
   const startedAt = Date.now();
   const clock = () => now.getTime() + Date.now() - startedAt;
   let claim = arkDownloadDueAt;
@@ -185,7 +189,7 @@ export async function recoverNextArkCanvasLayerOutput(prisma: PrismaClient, now 
     const dueAt = new Date(due).toISOString();
     const updated = await prisma.aiRequest.updateMany({
       where: { id: row.id, status: 'PROCESSING', result: arkDownloadClaim(claim) },
-      data: { result: toInputJson({ ...journal, arkDownloadCheckpoint, arkDownloadAttempt: pass,
+      data: { result: toInputJson({ ...journal, arkDownloadCheckpoint, arkDownloadRetryAsset: retryAsset, arkDownloadAttempt: failedPasses,
         arkDownloadDueAt: dueAt, arkDownloadedAssets: savedAssets }) },
     });
     if (updated.count === 1) claim = dueAt;
@@ -196,10 +200,11 @@ export async function recoverNextArkCanvasLayerOutput(prisma: PrismaClient, now 
   let stage: keyof typeof stageMessages = 'canvas_layer_download';
   const checkpoint = openArkLayerOutputCheckpoint({ requestId: row.id, userId: row.userId }, arkDownloadCheckpoint, now.getTime());
   let assetNumber = 0;
+  const transfer: ArkSplitTransfer = { phase: 'resolving', receivedBytes: 0, responseStatus: null, timeout: null };
   try {
     if (!checkpoint) throw new Error('Ark layer download checkpoint unavailable or expired');
     const reader = arkLayerResultReader(row.clientRequestId,
-      typeof journal.arkRequestId === 'string' ? journal.arkRequestId : undefined, checkpoint.expiresAt);
+      typeof journal.arkRequestId === 'string' ? journal.arkRequestId : undefined, checkpoint.expiresAt, transfer);
     const decoded = await decodeCanvasLayerResult({ adapter: 'volcengine-ark', ...checkpoint.limits }, 'split', checkpoint.reply,
       async source => {
         const index = assetNumber++;
@@ -210,9 +215,13 @@ export async function recoverNextArkCanvasLayerOutput(prisma: PrismaClient, now 
           catch { /* The result cache can expire or evict a file. Re-fetch this layer. */ }
         }
         stage = 'canvas_layer_download';
-        const bytes = await reader.read(source);
+        const bytes = await reader.read(source, assetNumber);
         stage = 'result_persistence';
         savedAssets[index] = await createImageResultFromResponse(new Response(new Uint8Array(bytes)));
+        if (assetNumber === retryAsset) {
+          retryAsset = 0;
+          failedPasses = 0;
+        }
         if (!await recordProgress(clock() + ARK_LAYER_DOWNLOAD_LEASE_MS)) throw new ArkDownloadClaimLost();
         stage = 'canvas_layer_decode';
         return bytes;
@@ -223,14 +232,17 @@ export async function recoverNextArkCanvasLayerOutput(prisma: PrismaClient, now 
         routeId: row.routeId, providerId: row.route?.channelId ?? 'volcengine-ark', adapterKey: 'volcengine-ark' }, claim);
   } catch (error) {
     if (error instanceof ArkDownloadClaimLost) return false;
-    const retryAt = clock() + ARK_LAYER_DOWNLOAD_RETRY_DELAY_MS * pass;
+    failedPasses = retryAsset === assetNumber ? failedPasses + 1 : 1;
+    retryAsset = assetNumber;
+    const retryAt = clock() + ARK_LAYER_DOWNLOAD_RETRY_DELAY_MS * failedPasses;
     const retry = stage === 'canvas_layer_download' && error instanceof ReferenceUploadError
       && (error.code === 'ark_result_deadline' || isRetryableArkCanvasResultDownload(error))
-      && pass < ARK_LAYER_DOWNLOAD_MAX_PASSES && checkpoint && retryAt < checkpoint.expiresAt;
+      && failedPasses < ARK_LAYER_MAX_FAILED_PASSES_PER_ASSET && checkpoint && retryAt < checkpoint.expiresAt;
     const diagnostic = buildFailureDiagnostic(error, { stage });
     console.warn(retry ? '[canvas_layer_download_recovery_queued]' : '[canvas_layer_download_recovery_failed]', {
       clientRequestId: row.clientRequestId, arkRequestId: journal.arkRequestId ?? null,
-      assetNumber, savedCount: savedAssets.length, pass, causeCode: error instanceof ReferenceUploadError ? error.code : null,
+      assetNumber, savedCount: savedAssets.length, assetPass: failedPasses, ...(assetNumber ? transfer : {}),
+      causeCode: error instanceof ReferenceUploadError ? error.code : null,
       stage: diagnostic.stage, code: diagnostic.code, httpStatus: diagnostic.httpStatus });
     if (retry) return recordProgress(retryAt);
     await releaseCredits(prisma, row.userId, row.id, diagnostic, {

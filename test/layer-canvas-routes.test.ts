@@ -562,7 +562,7 @@ test.each([
   { reason: 'a permanent 403', prompt: 'ark-expired-layer-asset-fixture', deferred: false,
     clientRequestId: 'ark-split-expired-layer', reads: ['base', 'title', 'cloud'] },
   { reason: 'persistent transient failures', prompt: 'ark-exhausted-layer-asset-retry-fixture', deferred: true,
-    clientRequestId: 'ark-split-exhausted-layer-retry', reads: ['base', 'base', 'title'] },
+    clientRequestId: 'ark-split-exhausted-layer-retry', reads: ['base', 'base', 'title', 'title'] },
 ])('refunds a failed Ark split when $reason prevents downloading a layer', async ({ prompt, clientRequestId, reads, deferred }) => {
   const save = (endpoint: string, adapter: string) => mock.app.inject({
     method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/split',

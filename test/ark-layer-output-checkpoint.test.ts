@@ -21,7 +21,7 @@ it('stores only the encrypted layer metadata and the original limits needed for 
   expect(sealed).not.toContain('signature');
   expect(sealArkLayerOutputCheckpoint(identity, reply, limits, now)).not.toEqual(sealed);
   expect(openArkLayerOutputCheckpoint(identity, sealed!, now + 1_000)).toEqual({
-    expiresAt: now + 9 * 60_000,
+    expiresAt: now + 30 * 60_000,
     limits,
     reply: { data: [{ ...foreground, name: 'Foreground', bounding_box: { absolute: [10, 20, 250, 200] } }, base] },
   });
@@ -33,8 +33,8 @@ it('rejects another user or task, expired receipts, and changed ciphertext', () 
   const altered = (ciphertext!.startsWith('a') ? 'b' : 'a') + ciphertext!.slice(1);
   expect(openArkLayerOutputCheckpoint({ ...identity, requestId: 'different-request' }, sealed, now)).toBeNull();
   expect(openArkLayerOutputCheckpoint({ ...identity, userId: 'different-user' }, sealed, now)).toBeNull();
-  expect(openArkLayerOutputCheckpoint(identity, sealed, now + 9 * 60_000 - 1)).not.toBeNull();
-  expect(openArkLayerOutputCheckpoint(identity, sealed, now + 9 * 60_000)).toBeNull();
+  expect(openArkLayerOutputCheckpoint(identity, sealed, now + 30 * 60_000 - 1)).not.toBeNull();
+  expect(openArkLayerOutputCheckpoint(identity, sealed, now + 30 * 60_000)).toBeNull();
   expect(openArkLayerOutputCheckpoint(identity, [version, iv, tag, altered].join('.'), now)).toBeNull();
   expect(openArkLayerOutputCheckpoint(identity, sealed + '.extra', now)).toBeNull();
 });

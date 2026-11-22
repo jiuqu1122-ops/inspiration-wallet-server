@@ -1,6 +1,7 @@
 import type { PrismaClient } from '@prisma/client';
 import { toInputJson } from './pricing-center.js';
 import { jsonRecord } from './layer-canvas-config.js';
+import { openArkLayerOutputCheckpoint } from './ark-layer-output-checkpoint.js';
 import { releaseMembershipQuota } from '../membership/quota-billing.js';
 
 const ACTIVE_REQUEST_STATUSES = ['RESERVED', 'PROCESSING'] as const;
@@ -57,6 +58,7 @@ export async function recoverStaleAiRequests(
       id: true,
       userId: true,
       capability: true,
+      status: true,
       estimatedCredits: true,
       pricingSnapshot: true,
       clientRequestId: true,
@@ -85,10 +87,14 @@ export async function recoverStaleAiRequests(
     // An operation may have been accepted upstream even before its task receipt
     // reached us. Only its explicit terminal state can release this hold.
     if (requiresConfirmedImageOutcome(candidate.pricingSnapshot)) continue;
-    eligible += 1;
     const now = new Date();
     const { arkDownloadCheckpoint, arkDownloadDueAt, ...journal } = jsonRecord(candidate.result);
+    const arkSplit = journal.canvasLayersVersion === 1 && journal.operation === 'split' && journal.adapter === 'volcengine-ark';
+    if (arkSplit && candidate.status === 'PROCESSING' && typeof arkDownloadCheckpoint === 'string' && typeof arkDownloadDueAt === 'string'
+      && openArkLayerOutputCheckpoint({ userId: candidate.userId, requestId: candidate.id }, arkDownloadCheckpoint, now.getTime())) continue;
+    eligible += 1;
     delete journal.arkDownloadAttempt;
+    delete journal.arkDownloadRetryAsset;
     delete journal.arkDownloadedAssets;
     try {
       const released = await prisma.$transaction(async transaction => {
@@ -96,7 +102,8 @@ export async function recoverStaleAiRequests(
           where: {
             id: candidate.id,
             capability: { in: ['IMAGE', 'VIDEO'] },
-            status: { in: [...ACTIVE_REQUEST_STATUSES] },
+            status: arkSplit ? candidate.status : { in: [...ACTIVE_REQUEST_STATUSES] },
+            ...(arkSplit && typeof arkDownloadDueAt === 'string' ? { result: { path: ['arkDownloadDueAt'], equals: arkDownloadDueAt } } : {}),
             createdAt: { lt: staleBefore },
             completedAt: null,
             estimatedCredits: candidate.estimatedCredits,
