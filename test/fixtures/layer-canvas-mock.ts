@@ -109,14 +109,25 @@ export async function startLayerMock(port = 4137) {
       if (!asset || !signature || new Headers(init.headers).has('authorization')) {
         return new Response(null, { status: 403 });
       }
-      if (signature === 'unavailable' || (signature === 'recoverable' && !arkRecoveryAssetsAvailable)) {
-        return new Response(null, { status: 503 });
+      if (signature === 'unavailable') return new Response(null, { status: 503 });
+      if (signature === 'recoverable') {
+        const headers = new Headers(init.headers);
+        const etag = '"fixture-title"';
+        const end = asset.length;
+        if (!headers.has('range')) {
+          return new Response(new Uint8Array(asset.subarray(0, 32)), { headers: { etag, 'content-length': String(end) } });
+        }
+        if (!arkRecoveryAssetsAvailable) return new Response(null, { status: 503 });
+        if (headers.get('range') !== 'bytes=32-' || headers.get('if-range') !== etag) return new Response(null, { status: 416 });
+        return new Response(new Uint8Array(asset.subarray(32)), { status: 206, headers: {
+          etag, 'content-range': `bytes 32-${end - 1}/${end}`, 'content-type': 'image/png',
+        } });
       }
       if (signature === 'retry-once' && !transientArkLayerFailures.has(target.pathname)) {
         transientArkLayerFailures.add(target.pathname);
         return new Response(null, { status: 503 });
       }
-      if (!['fixture', 'retry-once', 'recoverable'].includes(signature)) return new Response(null, { status: 403 });
+      if (!['fixture', 'retry-once'].includes(signature)) return new Response(null, { status: 403 });
       return new Response(new Uint8Array(asset), { headers: { 'content-type': 'image/png' } });
     }
     const route = routes.find(entry => new URL(entry.channel.baseUrl).origin === target.origin);

@@ -14,6 +14,7 @@ import {
   createProviderReference, getProviderReference, providerReferenceKey, removeProviderReference,
 } from './provider-reference-store.js';
 import { REFERENCE_UPLOAD_MAX_BYTES, ReferenceUploadError } from './reference-upload-service.js';
+import { ArkSplitRange } from './ark-split-range.js';
 
 export type ReferenceSourceType = 'local' | 'cos' | 'signed_url' | 'public_url' | 'data_url';
 export type ReferenceTransport = 'data_url' | 'public_https';
@@ -23,6 +24,7 @@ export const ARK_CANVAS_ASSET_MAX_MS = 120_000;
 type ArkCanvasTransfer = {
   phase: 'resolving' | 'waiting_headers' | 'reading_body';
   receivedBytes: number;
+  resumedFrom?: number;
   responseStatus: number | null;
   timeout: 'idle' | 'total' | null;
 };
@@ -145,7 +147,7 @@ async function readImageResponse(response: Response, maximumBytes = REFERENCE_UP
 }
 
 async function fetchPublicReference(source: string, signal: AbortSignal, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES, arkResult = false,
-  onProgress?: ArkProgress) {
+  onProgress?: ArkProgress, range?: ArkSplitRange) {
   let current = publicReferenceUrl(source);
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
     const hostname = current.hostname.replace(/^\[|\]$/g, '');
@@ -174,8 +176,9 @@ async function fetchPublicReference(source: string, signal: AbortSignal, maximum
     });
     try {
       onProgress?.('waiting_headers', 0, null);
+      const rangeHeaders = range?.headers(current.href);
       const response = await fetch(current, {
-        method: 'GET', headers: { accept: 'image/png,image/jpeg,image/webp,image/gif' },
+        method: 'GET', headers: { accept: 'image/png,image/jpeg,image/webp,image/gif', ...rangeHeaders },
         redirect: 'manual', signal, dispatcher,
       } as RequestInit);
       onProgress?.('reading_body', 0, response.status);
@@ -188,11 +191,18 @@ async function fetchPublicReference(source: string, signal: AbortSignal, maximum
         continue;
       }
       if (!response.ok) {
+        const invalidRange = response.status === 416 && rangeHeaders?.range ? range?.invalidRange() : undefined;
         await response.body?.cancel().catch(() => {});
+        if (invalidRange) throw invalidRange;
         if (arkResult) {
           throw new ReferenceUploadError(`Ark result download returned HTTP ${response.status}`, 'ark_result_http', response.status);
         }
         throw new ReferenceUploadError(`Reference image download returned HTTP ${response.status}`);
+      }
+      if (range) {
+        const bytes = await range.read(response, current.href, maximumBytes, signal,
+          size => onProgress?.('reading_body', size, response.status));
+        if (bytes) return validatedArkResultBytes(bytes, response.headers.get('content-type') ?? '');
       }
       return await readImageResponse(response, maximumBytes, arkResult, onProgress);
     } finally {
@@ -203,7 +213,9 @@ async function fetchPublicReference(source: string, signal: AbortSignal, maximum
 }
 
 /** One safe GET attempt. The canvas task owns the shared deadline and retry allowance. */
-export async function downloadArkCanvasResultBytes(source: string, signal?: AbortSignal, transfer = createArkCanvasTransfer()) {
+export async function downloadArkCanvasResultBytes(source: string, signal?: AbortSignal, transfer = createArkCanvasTransfer(),
+  split?: { requestId: string; expiresAt: number }) {
+  const range = split && new ArkSplitRange(split.requestId, source, split.expiresAt);
   const attempt = new AbortController();
   const combined = signal ? AbortSignal.any([signal, attempt.signal]) : attempt.signal;
   let rejectAbort: (reason: unknown) => void = () => {};
@@ -225,8 +237,11 @@ export async function downloadArkCanvasResultBytes(source: string, signal?: Abor
   };
   try {
     combined.throwIfAborted();
-    return (await Promise.race([fetchPublicReference(source, combined, ARK_RESULT_MAX_BYTES, true, onProgress), aborted])).bytes;
+    return (await Promise.race([fetchPublicReference(source, combined, ARK_RESULT_MAX_BYTES, true, onProgress, range), aborted])).bytes;
   } catch (error) {
+    if (combined.aborted || (error instanceof ReferenceUploadError ? isRetryableArkCanvasResultDownload(error) : isTransientImageTransferError(error))) {
+      range?.park();
+    }
     if (signal?.aborted) throw new ReferenceUploadError('Ark result download deadline exceeded', 'ark_result_deadline', 504);
     if (attempt.signal.aborted) throw new ReferenceUploadError('Ark result download timed out', 'ark_result_timeout', 504);
     if (error instanceof ReferenceUploadError) throw error;
@@ -236,6 +251,7 @@ export async function downloadArkCanvasResultBytes(source: string, signal?: Abor
     }
     throw new ReferenceUploadError('Ark result download failed', 'ark_result_download_failed', 502);
   } finally {
+    if (range) transfer.resumedFrom = range.resumedFrom;
     clearTimeout(timeout);
     clearTimeout(hardLimit);
     combined.removeEventListener('abort', onAbort);

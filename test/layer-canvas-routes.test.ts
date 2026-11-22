@@ -452,7 +452,7 @@ test('retries one transient Ark layer download without resubmitting or charging 
   }
 }, 15_000);
 
-test('recovers a deferred Ark split with a single worker claim and no new submission', async () => {
+test('resumes a partial Ark layer on the next worker pass with a single claim and no new submission', async () => {
   const { recoverNextArkCanvasLayerOutput } = await import('../src/modules/ai/layer-canvas-service.js');
   const save = (endpoint: string, adapter: string, creditsPerRequest: string) => mock.app.inject({
     method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/split',

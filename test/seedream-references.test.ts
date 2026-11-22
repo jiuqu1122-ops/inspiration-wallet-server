@@ -166,6 +166,69 @@ describe('Ark canvas result downloads', () => {
     await Promise.resolve();
     expect(fetch).not.toHaveBeenCalled();
   });
+
+  it.each(['idle', 'total'] as const)('continues the same split asset after a %s timeout', async kind => {
+    vi.useFakeTimers();
+    const split = { requestId: 'split-timeout-' + kind, expiresAt: Date.now() + 30 * 60_000 };
+    const headers = { etag: '"original"', 'content-type': 'image/png', 'content-length': String(png.length) };
+    let body!: ReadableStreamDefaultController<Uint8Array>;
+    const fetch = vi.fn((_url: URL, init: RequestInit) => {
+      const responseBody = new ReadableStream<Uint8Array>({ start(controller) { body = controller; } });
+      init.signal?.addEventListener('abort', () => body.error(new Error('aborted')), { once: true });
+      return Promise.resolve(new Response(responseBody, { headers }));
+    });
+    vi.stubGlobal('fetch', fetch);
+    const trace = createArkCanvasTransfer();
+    const stopped = expect(downloadArkCanvasResultBytes(url, undefined, trace, split)).rejects.toMatchObject({ code: 'ark_result_timeout' });
+    await vi.advanceTimersByTimeAsync(1);
+    body.enqueue(png.subarray(0, 8));
+    let offset = 8;
+    if (kind === 'total') {
+      for (const end of [16, 24, 32]) {
+        await vi.advanceTimersByTimeAsync(35_000);
+        body.enqueue(png.subarray(offset, end));
+        offset = end;
+      }
+    }
+    await vi.advanceTimersByTimeAsync(45_000);
+    await stopped;
+    expect(trace).toMatchObject({ timeout: kind, receivedBytes: offset });
+    fetch.mockImplementationOnce(async (_url, init) => {
+      expect(new Headers(init.headers).get('range')).toBe(`bytes=${offset}-`);
+      expect(new Headers(init.headers).get('if-range')).toBe(headers.etag);
+      return new Response(png.subarray(offset), { status: 206, headers: { ...headers,
+        'content-length': String(png.length - offset), 'content-range': `bytes ${offset}-${png.length - 1}/${png.length}` } });
+    });
+    await expect(downloadArkCanvasResultBytes(url, undefined, trace, split)).resolves.toEqual(png);
+    expect(trace).toMatchObject({ timeout: null, resumedFrom: offset, receivedBytes: png.length, responseStatus: 206 });
+  });
+
+  it.each(['new full response', 'wrong offset', 'changed etag', 'unsatisfiable'] as const)(
+    'handles a different response to a split range request (%s)', async outcome => {
+      const split = { requestId: 'split-range-' + outcome, expiresAt: Date.now() + 60_000 };
+      const headers = { etag: '"asset-v1"', 'content-type': 'image/png' };
+      const fetch = vi.fn().mockResolvedValueOnce(new Response(png.subarray(0, 16), {
+        headers: { ...headers, 'content-length': String(png.length) },
+      }));
+      vi.stubGlobal('fetch', fetch);
+      const read = () => downloadArkCanvasResultBytes(url, undefined, undefined, split);
+      await expect(read()).rejects.toMatchObject({ code: 'ark_result_incomplete' });
+      if (outcome === 'new full response') {
+        const replacement = await sharp({ create: { width: 3, height: 2, channels: 3, background: 'blue' } }).png().toBuffer();
+        fetch.mockResolvedValueOnce(new Response(replacement, { headers: { etag: '"asset-v2"', 'content-length': String(replacement.length) } }));
+        await expect(read()).resolves.toEqual(replacement);
+      } else {
+        const start = outcome === 'wrong offset' ? 0 : 16;
+        fetch.mockResolvedValueOnce(outcome === 'unsatisfiable' ? new Response(null, { status: 416 })
+          : new Response(png.subarray(start), { status: 206, headers: { ...headers,
+            etag: outcome === 'changed etag' ? '"v2"' : headers.etag, 'content-range': `bytes ${start}-${png.length - 1}/${png.length}` } }));
+        await expect(read()).rejects.toMatchObject({ code: 'ark_result_incomplete' });
+        fetch.mockResolvedValueOnce(pngResponse());
+        await expect(read()).resolves.toEqual(png);
+        expect(new Headers(fetch.mock.calls[2]![1].headers).has('range')).toBe(false);
+      }
+      expect(new Headers(fetch.mock.calls[1]![1].headers).get('range')).toBe('bytes=16-');
+    });
 });
 
 describe('Seedream reference preparation and edit serialization', () => {

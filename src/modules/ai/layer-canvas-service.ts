@@ -124,7 +124,7 @@ async function readLayerEditAsset(provider: AiProviderChannel, secrets: Provider
 }
 
 function arkLayerResultReader(clientRequestId: string, arkRequestId?: string,
-  recovery?: { expiresAt: number; transfer: ReturnType<typeof createArkCanvasTransfer> }) {
+  recovery?: { requestId: string; expiresAt: number; transfer: ReturnType<typeof createArkCanvasTransfer> }) {
   const transfer = recovery?.transfer ?? createArkCanvasTransfer();
   const stats = { assetsStarted: 0, retried: false };
   let signal: AbortSignal | undefined;
@@ -134,14 +134,14 @@ function arkLayerResultReader(clientRequestId: string, arkRequestId?: string,
     signal ??= AbortSignal.timeout(Math.max(1, Math.min(BEIJING_ARK_LAYER_DOWNLOAD_TIMEOUT_MS, remaining)));
     stats.assetsStarted += 1;
     try {
-      return await downloadArkCanvasResultBytes(source, signal, transfer);
+      return await downloadArkCanvasResultBytes(source, signal, transfer, recovery);
     } catch (error) {
       if ((!recovery && stats.retried) || signal.aborted || !(error instanceof ReferenceUploadError)
         || !isRetryableArkCanvasResultDownload(error)) throw error;
       stats.retried = true;
       console.warn('[canvas_layer_download_retry]', { clientRequestId, arkRequestId: arkRequestId ?? null,
         assetNumber, code: error.code, httpStatus: error.statusCode, ...transfer });
-      return downloadArkCanvasResultBytes(source, signal, transfer);
+      return downloadArkCanvasResultBytes(source, signal, transfer, recovery);
     }
   } };
 }
@@ -207,7 +207,7 @@ export async function recoverNextArkCanvasLayerOutput(prisma: PrismaClient, now 
   try {
     if (!checkpoint) throw new Error('Ark layer download checkpoint unavailable or expired');
     const reader = arkLayerResultReader(row.clientRequestId,
-      typeof journal.arkRequestId === 'string' ? journal.arkRequestId : undefined, { expiresAt: checkpoint.expiresAt, transfer });
+      typeof journal.arkRequestId === 'string' ? journal.arkRequestId : undefined, { requestId: row.id, expiresAt: checkpoint.expiresAt, transfer });
     const decoded = await decodeCanvasLayerResult({ adapter: 'volcengine-ark', ...checkpoint.limits }, 'split', checkpoint.reply,
       async source => {
         const index = assetNumber++;
