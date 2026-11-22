@@ -9,6 +9,7 @@ import sharp from 'sharp';
 import { isPublicIp } from '../providers/url.js';
 import { storageService } from '../storage/service.js';
 import { getImageResult, isStoredImageResultUrl } from './image-result-store.js';
+import { isTransientImageTransferError } from './image-task-retry.js';
 import {
   createProviderReference, getProviderReference, providerReferenceKey, removeProviderReference,
 } from './provider-reference-store.js';
@@ -17,8 +18,11 @@ import { REFERENCE_UPLOAD_MAX_BYTES, ReferenceUploadError } from './reference-up
 export type ReferenceSourceType = 'local' | 'cos' | 'signed_url' | 'public_url' | 'data_url';
 export type ReferenceTransport = 'data_url' | 'public_https';
 const FETCH_TIMEOUT_MS = 30_000;
+const ARK_RESULT_FETCH_TIMEOUT_MS = 45_000;
+const ARK_RESULT_MAX_BYTES = 20 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const imageMime = { png: 'image/png', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' } as const;
+const pngSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
 export function referenceSourceType(source: string): ReferenceSourceType {
   const value = source.trim();
@@ -77,34 +81,57 @@ async function validatedImage(bytes: Buffer, declaredMime = '', maximumBytes = R
   return { bytes, mime };
 }
 
-async function readImageResponse(response: Response, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES) {
+function validatedArkResultBytes(bytes: Buffer, header: string) {
+  let mime = '';
+  if (bytes.subarray(0, 8).equals(pngSignature)) mime = imageMime.png;
+  else if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) mime = imageMime.jpeg;
+  else if (bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') mime = imageMime.webp;
+  const declared = header.split(';')[0]!.trim().toLowerCase();
+  if (!mime || (declared && declared !== 'application/octet-stream'
+    && declared !== mime && !(declared === 'image/jpg' && mime === imageMime.jpeg))) {
+    throw new ReferenceUploadError('Ark result did not contain valid image bytes for its content type', 'ark_result_invalid_image', 502);
+  }
+  // The canvas decoder validates the full raster and its layout.
+  return { bytes, mime };
+}
+
+async function readImageResponse(response: Response, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES, arkResult = false) {
   const length = Number(response.headers.get('content-length') || 0);
-  if (!response.body) throw new ReferenceUploadError('Reference image response is empty');
+  const tooLarge = () => arkResult
+    ? new ReferenceUploadError('Ark result exceeds the size limit', 'ark_result_too_large', 413)
+    : new ReferenceUploadError(`Reference image exceeds ${maximumBytes / 1024 / 1024} MiB`);
+  const incomplete = () => arkResult
+    ? new ReferenceUploadError('Ark result download was incomplete', 'ark_result_incomplete', 502)
+    : new ReferenceUploadError('Reference image download was incomplete');
+  if (!response.body) throw arkResult ? incomplete() : new ReferenceUploadError('Reference image response is empty');
   const reader = response.body.getReader();
   let complete = false;
   try {
-    if (length > maximumBytes) throw new ReferenceUploadError(`Reference image exceeds ${maximumBytes / 1024 / 1024} MiB`);
+    if (length > maximumBytes) throw tooLarge();
     const chunks: Buffer[] = [];
     let size = 0;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > maximumBytes) throw new ReferenceUploadError(`Reference image exceeds ${maximumBytes / 1024 / 1024} MiB`);
+      if (size > maximumBytes) throw tooLarge();
       chunks.push(Buffer.from(value));
     }
     complete = true;
-    if (length > 0 && !response.headers.get('content-encoding') && length !== size) {
-      throw new ReferenceUploadError('Reference image download was incomplete');
+    if ((arkResult && (size === 0 || response.status === 206))
+      || (length > 0 && !response.headers.get('content-encoding') && length !== size)) {
+      throw incomplete();
     }
-    return validatedImage(Buffer.concat(chunks), response.headers.get('content-type') || '', maximumBytes);
+    const bytes = Buffer.concat(chunks);
+    const mime = response.headers.get('content-type') || '';
+    return arkResult ? validatedArkResultBytes(bytes, mime) : validatedImage(bytes, mime, maximumBytes);
   } finally {
     if (!complete) await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }
 
-async function fetchPublicReference(source: string, signal: AbortSignal, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES) {
+async function fetchPublicReference(source: string, signal: AbortSignal, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES, arkResult = false) {
   let current = publicReferenceUrl(source);
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
     const hostname = current.hostname.replace(/^\[|\]$/g, '');
@@ -117,10 +144,19 @@ async function fetchPublicReference(source: string, signal: AbortSignal, maximum
     }
     // Pin the already checked DNS answer for the socket; a second DNS lookup
     // must not allow rebinding between validation and connection.
-    const dispatcher = new Agent({ connect: { lookup: (_host, options, callback) => {
-      if (options.all) callback(null, addresses);
-      else callback(null, addresses[0]!.address, addresses[0]!.family);
-    } } });
+    const ipv4 = arkResult ? addresses.filter(address => address.family === 4) : [];
+    const pinned = ipv4.length ? ipv4 : addresses;
+    const dispatcher = new Agent({
+      // Give the chosen public address the complete TLS handshake window.
+      ...(arkResult ? { autoSelectFamily: false } : {}),
+      connect: {
+        ...(arkResult ? { timeout: 30_000 } : {}),
+        lookup: (_host, options, callback) => {
+          if (options.all) callback(null, pinned);
+          else callback(null, pinned[0]!.address, pinned[0]!.family);
+        },
+      },
+    });
     try {
       const response = await fetch(current, {
         method: 'GET', headers: { accept: 'image/png,image/jpeg,image/webp,image/gif' },
@@ -136,14 +172,49 @@ async function fetchPublicReference(source: string, signal: AbortSignal, maximum
       }
       if (!response.ok) {
         await response.body?.cancel().catch(() => {});
+        if (arkResult) {
+          throw new ReferenceUploadError(`Ark result download returned HTTP ${response.status}`, 'ark_result_http', response.status);
+        }
         throw new ReferenceUploadError(`Reference image download returned HTTP ${response.status}`);
       }
-      return await readImageResponse(response, maximumBytes);
+      return await readImageResponse(response, maximumBytes, arkResult);
     } finally {
       await dispatcher.destroy();
     }
   }
   throw new ReferenceUploadError('Reference image redirect limit exceeded');
+}
+
+/** One safe GET attempt. The canvas task owns the shared deadline and retry allowance. */
+export async function downloadArkCanvasResultBytes(source: string, signal?: AbortSignal) {
+  const attempt = new AbortController();
+  const combined = signal ? AbortSignal.any([signal, attempt.signal]) : attempt.signal;
+  let rejectAbort: (reason: unknown) => void = () => {};
+  const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+  const onAbort = () => rejectAbort(combined.reason);
+  combined.addEventListener('abort', onAbort, { once: true });
+  const timeout = setTimeout(() => attempt.abort(), ARK_RESULT_FETCH_TIMEOUT_MS);
+  try {
+    combined.throwIfAborted();
+    return (await Promise.race([fetchPublicReference(source, combined, ARK_RESULT_MAX_BYTES, true), aborted])).bytes;
+  } catch (error) {
+    if (signal?.aborted) throw new ReferenceUploadError('Ark result download deadline exceeded', 'ark_result_deadline', 504);
+    if (attempt.signal.aborted) throw new ReferenceUploadError('Ark result download timed out', 'ark_result_timeout', 504);
+    if (error instanceof ReferenceUploadError) throw error;
+    // DNS and fetch errors can embed full signed URLs. Preserve retryability without the raw cause.
+    if (isTransientImageTransferError(error)) {
+      throw new ReferenceUploadError('Ark result download had a temporary network error', 'ark_result_transport', 502);
+    }
+    throw new ReferenceUploadError('Ark result download failed', 'ark_result_download_failed', 502);
+  } finally {
+    clearTimeout(timeout);
+    combined.removeEventListener('abort', onAbort);
+  }
+}
+
+export function isRetryableArkCanvasResultDownload(error: ReferenceUploadError) {
+  return ['ark_result_timeout', 'ark_result_incomplete', 'ark_result_transport'].includes(error.code)
+    || (error.code === 'ark_result_http' && isTransientImageTransferError(error));
 }
 
 async function readStoredReference(objectKey: string, signal: AbortSignal, maximumBytes = REFERENCE_UPLOAD_MAX_BYTES) {
@@ -199,14 +270,15 @@ async function readReference(source: string, signal: AbortSignal, maximumBytes =
 async function prepareReference(
   source: string,
   transport: ReferenceTransport,
-  { maximumBytes = REFERENCE_UPLOAD_MAX_BYTES, pngJpegOnly = false, load = readReference }:
-  { maximumBytes?: number; pngJpegOnly?: boolean; load?: typeof readReference } = {},
+  { maximumBytes = REFERENCE_UPLOAD_MAX_BYTES, pngJpegOnly = false, load = readReference, includeSourceMime = false }:
+  { maximumBytes?: number; pngJpegOnly?: boolean; load?: typeof readReference; includeSourceMime?: boolean } = {},
 ) {
   const controller = new AbortController();
   let temporaryUrl: string | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const work = async () => {
     let image = await load(source, controller.signal, maximumBytes);
+    const sourceMime = image.mime;
     if (pngJpegOnly && image.mime === 'image/webp') {
       const png = await sharp(image.bytes, { failOn: 'warning', limitInputPixels: 8192 * 8192 })
         .timeout({ seconds: 10 }).png().toBuffer();
@@ -217,7 +289,8 @@ async function prepareReference(
     }
     controller.signal.throwIfAborted();
     if (transport === 'data_url') {
-      return { value: `data:${image.mime};base64,${image.bytes.toString('base64')}`, mime: image.mime, sizeBytes: image.bytes.length };
+      return { value: `data:${image.mime};base64,${image.bytes.toString('base64')}`, mime: image.mime, sizeBytes: image.bytes.length,
+        ...(includeSourceMime ? { sourceMime } : {}) };
     }
     temporaryUrl = await createProviderReference(image.bytes, image.mime);
     try {
@@ -259,7 +332,9 @@ export function prepareGenericImageDataUrlReference(source: string) {
 
 /** The caller must have already authorized this reference upload key. */
 export function prepareStoredCanvasReference(objectKey: string) {
-  return prepareReference(objectKey, 'data_url', { maximumBytes: 20 * 1024 * 1024, pngJpegOnly: true, load: readStoredReference });
+  return prepareReference(objectKey, 'data_url', {
+    maximumBytes: 20 * 1024 * 1024, pngJpegOnly: true, load: readStoredReference, includeSourceMime: true,
+  });
 }
 
 /** Ordered, bounded staging for explicit multipart routes. Uses the same verified

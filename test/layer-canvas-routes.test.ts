@@ -7,7 +7,9 @@ import { storageService } from '../src/modules/storage/service.js';
 
 vi.mock('node:dns/promises', async importOriginal => ({
   ...await importOriginal<typeof import('node:dns/promises')>(),
-  lookup: vi.fn(async (hostname: string) => [{ address: hostname === 'cos.internal.example.test' ? '10.0.3.2' : '1.1.1.1', family: 4 }]),
+  lookup: vi.fn(async (hostname: string) => [{
+    address: hostname === 'cos.internal.example.test' || hostname.endsWith('.myqcloud.com') ? '10.0.3.2' : '1.1.1.1', family: 4,
+  }]),
 }));
 
 let mock: Awaited<ReturnType<typeof startLayerMock>>;
@@ -285,7 +287,111 @@ test.each(['png', 'jpeg'] as const)('sends an owned Ark %s split source inline w
   }
 }, 15_000);
 
-test('reports a rejected Ark output-layer download separately from image decoding', async () => {
+test('retries one transient Ark layer download without resubmitting or charging twice', async () => {
+  const save = (endpoint: string, adapter: string, creditsPerRequest: string) => mock.app.inject({
+    method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/split',
+    payload: { config: { enabled: true, maxMegapixels: 2, maxLayers: 32, endpoint, adapter, creditsPerRequest } },
+  });
+  expect((await save('/images/generations', 'volcengine-ark', '1')).statusCode).toBe(200);
+  mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
+  try {
+    const before = (await mock.app.inject('/fixture/receipt')).json();
+    const readsBefore = mock.arkLayerReads().length;
+    const post = () => mock.app.inject({ method: 'POST', url: '/v1/ai/canvas-layers', payload: {
+      operation: 'split', clientRequestId: 'ark-split-retry-layer', image: mock.paths.splitPoster,
+      prompt: 'ark-retry-layer-asset-fixture', expectedCredits: '1',
+    } });
+    const result = await post();
+    expect(result.statusCode).toBe(200);
+    const receipt = result.json();
+    expect(receipt).toMatchObject({ status: 'success', chargedCredits: '1.000000', result: {
+      width: 320, height: 400, base: { asset: 0, width: 320, height: 400 },
+      layers: [
+        { name: '标题', asset: 1, order: 0, x: 27, y: 37, width: 210, height: 76, alpha: true },
+        { name: '云朵', asset: 2, order: 1, x: 100, y: 175, width: 96, height: 56, alpha: true },
+      ],
+    } });
+    expect(receipt.result.assets).toHaveLength(3);
+    for (const url of receipt.result.assets) {
+      const asset = await mock.app.inject(new URL(url).pathname);
+      expect(asset.statusCode).toBe(200);
+      expect(asset.headers['content-type']).toBe('image/png');
+    }
+    expect((await post()).json()).toEqual(receipt);
+    expect(mock.arkLayerReads().slice(readsBefore)).toEqual(['base', 'title', 'cloud', 'cloud']);
+    const after = (await mock.app.inject('/fixture/receipt')).json();
+    expect(after.calls).toHaveLength(before.calls.length + 1);
+    expect(after.reservations).toBe(before.reservations);
+    expect(after.ledger.slice(before.ledger.length)).toEqual([{ type: 'RESERVE', amount: '-1' }, { type: 'CHARGE', amount: '1' }]);
+  } finally {
+    mock.useMockAProviderKind('NEW_API');
+    await save('/split', 'canvas-json', '12');
+  }
+}, 15_000);
+
+test('recovers a deferred Ark split with a single worker claim and no new submission', async () => {
+  const { recoverNextArkCanvasLayerOutput } = await import('../src/modules/ai/layer-canvas-service.js');
+  const save = (endpoint: string, adapter: string, creditsPerRequest: string) => mock.app.inject({
+    method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/split',
+    payload: { config: { enabled: true, maxMegapixels: 2, maxLayers: 32, endpoint, adapter, creditsPerRequest } },
+  });
+  expect((await save('/images/generations', 'volcengine-ark', '2')).statusCode).toBe(200);
+  mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
+  try {
+    const clientRequestId = 'ark-split-recovery-layer';
+    const before = (await mock.app.inject('/fixture/receipt')).json();
+    const readsBefore = mock.arkLayerReads().length;
+    const post = () => mock.app.inject({ method: 'POST', url: '/v1/ai/canvas-layers', payload: {
+      operation: 'split', clientRequestId, image: mock.paths.splitPoster,
+      prompt: 'ark-recover-layer-asset-fixture', expectedCredits: '2',
+    } });
+    const query = () => mock.app.inject('/v1/ai/canvas-layers/by-request/' + clientRequestId);
+    const deferred = await post();
+    expect(deferred.statusCode).toBe(202);
+    expect(deferred.json()).toMatchObject({ status: 'processing', chargedCredits: '0.000000' });
+    expect(deferred.body).not.toContain('signature=');
+    expect((await query()).json()).toEqual(deferred.json());
+    expect((await post()).json()).toEqual(deferred.json());
+    expect(mock.arkLayerReads().slice(readsBefore)).toEqual(['base', 'title', 'title']);
+    const pending = (await mock.app.inject('/fixture/receipt')).json();
+    expect(pending.calls).toHaveLength(before.calls.length + 1);
+    expect(pending.ledger.slice(before.ledger.length)).toEqual([{ type: 'RESERVE', amount: '-2' }]);
+
+    const dueAt = mock.arkDownloadDueAt(clientRequestId);
+    expect(dueAt).toBeInstanceOf(Date);
+    await expect(recoverNextArkCanvasLayerOutput(mock.app.prisma, new Date(dueAt!.getTime() - 1))).resolves.toBe(false);
+    mock.allowArkRecoveryAssets();
+    const recovered = await Promise.all([
+      recoverNextArkCanvasLayerOutput(mock.app.prisma, dueAt!),
+      recoverNextArkCanvasLayerOutput(mock.app.prisma, dueAt!),
+    ]);
+    expect(recovered.sort()).toEqual([false, true]);
+    const receipt = (await query()).json();
+    expect(receipt).toMatchObject({ status: 'success', chargedCredits: '2.000000', result: {
+      width: 320, height: 400,
+      layers: [
+        { name: '标题', asset: 1, order: 0, x: 27, y: 37, width: 210, height: 76, alpha: true },
+        { name: '云朵', asset: 2, order: 1, x: 100, y: 175, width: 96, height: 56, alpha: true },
+      ],
+    } });
+    expect(receipt.result.assets).toHaveLength(3);
+    expect(mock.arkLayerReads().slice(readsBefore)).toEqual(['base', 'title', 'title', 'base', 'title', 'cloud']);
+    const after = (await mock.app.inject('/fixture/receipt')).json();
+    expect(after.calls).toHaveLength(before.calls.length + 1);
+    expect(after.reservations).toBe(before.reservations);
+    expect(after.ledger.slice(before.ledger.length)).toEqual([{ type: 'RESERVE', amount: '-2' }, { type: 'CHARGE', amount: '2' }]);
+  } finally {
+    mock.useMockAProviderKind('NEW_API');
+    await save('/split', 'canvas-json', '12');
+  }
+}, 15_000);
+
+test.each([
+  { reason: 'a permanent 403', prompt: 'ark-expired-layer-asset-fixture', deferred: false,
+    clientRequestId: 'ark-split-expired-layer', reads: ['base', 'title', 'cloud'] },
+  { reason: 'persistent transient failures', prompt: 'ark-exhausted-layer-asset-retry-fixture', deferred: true,
+    clientRequestId: 'ark-split-exhausted-layer-retry', reads: ['base', 'base', 'title'] },
+])('refunds a failed Ark split when $reason prevents downloading a layer', async ({ prompt, clientRequestId, reads, deferred }) => {
   const save = (endpoint: string, adapter: string) => mock.app.inject({
     method: 'PUT', url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/split',
     payload: { config: { enabled: true, maxMegapixels: 2, maxLayers: 32, endpoint, adapter, creditsPerRequest: '12' } },
@@ -294,14 +400,26 @@ test('reports a rejected Ark output-layer download separately from image decodin
   mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
   try {
     const before = (await mock.app.inject('/fixture/receipt')).json();
-    const clientRequestId = 'ark-split-expired-layer';
-    const result = await mock.app.inject({ method: 'POST', url: '/v1/ai/canvas-layers', payload: {
-      operation: 'split', clientRequestId, image: mock.paths.splitPoster, prompt: 'ark-expired-layer-asset-fixture', expectedCredits: '12',
+    const readsBefore = mock.arkLayerReads().length;
+    const post = () => mock.app.inject({ method: 'POST', url: '/v1/ai/canvas-layers', payload: {
+      operation: 'split', clientRequestId, image: mock.paths.splitPoster, prompt, expectedCredits: '12',
     } });
-    expect(result.statusCode).toBe(200);
+    let result = await post();
+    expect(result.statusCode).toBe(deferred ? 202 : 200);
+    expect(mock.arkLayerReads().slice(readsBefore)).toEqual(reads);
+    if (deferred) {
+      const { recoverNextArkCanvasLayerOutput } = await import('../src/modules/ai/layer-canvas-service.js');
+      expect(result.json()).toMatchObject({ status: 'processing' });
+      const dueAt = mock.arkDownloadDueAt(clientRequestId);
+      expect(dueAt).toBeInstanceOf(Date);
+      await expect(recoverNextArkCanvasLayerOutput(mock.app.prisma, dueAt!)).resolves.toBe(true);
+      result = await mock.app.inject('/v1/ai/canvas-layers/by-request/' + clientRequestId);
+      expect(mock.arkLayerReads().slice(readsBefore)).toEqual([...reads, 'base', 'title', 'title']);
+    }
     expect(result.json()).toMatchObject({ status: 'failed', chargedCredits: '0.000000',
       message: '上游返回了图片地址，但下载失败。预留积分已释放。' });
     expect(mock.failureDiagnostic(clientRequestId)).toMatchObject({ stage: 'canvas_layer_download' });
+    expect((await post()).json()).toEqual(result.json());
     const after = (await mock.app.inject('/fixture/receipt')).json();
     expect(after.calls).toHaveLength(before.calls.length + 1);
     expect(after.balance).toBe(before.balance);
@@ -502,13 +620,15 @@ test('allows hidden images only for the layer tasks they are explicitly assigned
 });
 
 test('uses an owned reference key for canvas layer input and deduplicates retries', async () => {
-  const { sourceKey: objectKey, alphaPoster } = mock.paths;
+  const { sourceKey: objectKey, alphaPoster, arkEditSourceUrl, splitJpegKey, splitJpeg } = mock.paths;
   const foreignKey = 'reference-images/foreign-layer-test-source.png';
   const posterBytes = Buffer.from(alphaPoster.split(',')[1]!, 'base64');
   const head = vi.spyOn(storageService, 'headObject').mockResolvedValue({
     objectKey, contentLength: posterBytes.length, contentType: 'image/png', metadata: {}, headers: {},
   });
-  const downloadUrl = vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(`https://cos.internal.example.test/${objectKey}?signed=fixture-only`);
+  const signedUrl = arkEditSourceUrl(objectKey);
+  const downloadUrl = vi.spyOn(storageService, 'getDownloadUrl').mockReturnValue(signedUrl);
+  const validateSigned = vi.spyOn(storageService, 'validateSignedUrl').mockReturnValue(signedUrl);
   const read = vi.spyOn(storageService, 'getObjectStream').mockImplementation(async () => ({
     stream: Readable.from([posterBytes]), statusCode: 200,
     headers: { 'content-type': 'image/png', 'content-length': String(posterBytes.length) },
@@ -517,9 +637,9 @@ test('uses an owned reference key for canvas layer input and deduplicates retrie
     const catalog = (await mock.app.inject('/v1/ai/catalog')).json().canvasLayers;
     expect(catalog.referenceUpload).toBe(true);
     const credits = catalog.edit[0].creditsPerRequest;
-    const submit = (image: string, clientRequestId: string) => mock.app.inject({
+    const submit = (image: string, clientRequestId: string, prompt = 'Color', expectedCredits = credits) => mock.app.inject({
       method: 'POST', url: '/v1/ai/canvas-layers', payload: { operation: 'edit', clientRequestId,
-        prompt: 'Color', image, expectedCredits: credits },
+        prompt, image, expectedCredits },
     });
     const upstreamCalls = mock.upstreamCalls().length;
     const denied = await submit(foreignKey, 'foreign-reference-001');
@@ -533,39 +653,60 @@ test('uses an owned reference key for canvas layer input and deduplicates retrie
     expect(read).toHaveBeenCalledTimes(1);
     expect(read).toHaveBeenCalledWith(objectKey);
     expect(mock.upstreamCalls().at(-1)?.body.image).toEqual(alphaPoster);
+    expect(downloadUrl).not.toHaveBeenCalled();
     expect((await submit(objectKey, 'owned-reference-001')).json()).toEqual(accepted.json());
     expect(read).toHaveBeenCalledTimes(1);
     expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 1);
 
     const common = { enabled: true, maxMegapixels: 2, maxLayers: 32, creditsPerRequest: credits };
-    const save = (endpoint: string, adapter: string) => mock.app.inject({ method: 'PUT',
-      url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/edit', payload: { config: { ...common, endpoint, adapter } },
+    const save = (endpoint: string, adapter: string, creditsPerRequest = credits) => mock.app.inject({ method: 'PUT',
+      url: '/v1/admin/ai-models/local-layer-model/layer-routes/mock-a/edit', payload: { config: { ...common, endpoint, adapter, creditsPerRequest } },
     });
-    expect((await save('/images/generations', 'volcengine-ark')).statusCode).toBe(200);
+    expect((await save('/images/generations', 'volcengine-ark', '1')).statusCode).toBe(200);
     mock.useMockAProviderKind('VOLCENGINE_ARK', 'https://ark.cn-beijing.volces.com/api/v3');
     try {
-      downloadUrl.mockClear();
       head.mockClear();
-      expect((await submit(foreignKey, 'foreign-reference-ark-001')).statusCode).toBe(400);
+      expect((await submit(foreignKey, 'foreign-reference-ark-001', 'Color', '1')).statusCode).toBe(400);
       expect(head).not.toHaveBeenCalled();
-      expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 1);
-      const official = await submit(objectKey, 'owned-reference-ark-001');
-      expect(official.json()).toMatchObject({ status: 'success', chargedCredits: credits,
-        result: { operation: 'edit', image: { width: 320, height: 400 } } });
       expect(downloadUrl).not.toHaveBeenCalled();
+      expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 1);
+      const official = await submit(objectKey, 'owned-reference-ark-001', 'Color', '1');
+      expect(official.json()).toMatchObject({ status: 'success', chargedCredits: '1.000000',
+        result: { operation: 'edit', image: { width: 320, height: 400 } } });
+      expect(downloadUrl).toHaveBeenCalledWith(objectKey, { expiresSeconds: 600 });
+      expect(validateSigned).toHaveBeenCalledWith(objectKey, signedUrl);
       expect(read).toHaveBeenLastCalledWith(objectKey);
       const upstream = mock.upstreamCalls().at(-1);
-      expect(upstream).toMatchObject({ arkClientRequestId: expect.any(String), body: { image: alphaPoster, background: 'transparent' } });
+      expect(upstream).toMatchObject({ arkClientRequestId: expect.any(String), body: { image: signedUrl, background: 'transparent' } });
       expect((await sharp(posterBytes).stats()).isOpaque).toBe(false);
-      expect(official.body).not.toContain(alphaPoster);
-      expect((await submit(objectKey, 'owned-reference-ark-001')).json()).toEqual(official.json());
+      expect(official.body).not.toContain(signedUrl);
+      expect((await submit(objectKey, 'owned-reference-ark-001', 'Color', '1')).json()).toEqual(official.json());
       expect(read).toHaveBeenCalledTimes(2);
       expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 2);
+
+      const rejected = () => submit(objectKey, 'owned-reference-ark-rejected', 'ark-image-download-timeout-fixture', '1');
+      const rejectedReceipt = (await rejected()).json();
+      expect(rejectedReceipt).toMatchObject({ status: 'failed', chargedCredits: '0.000000' });
+      expect(mock.upstreamCalls().at(-1)?.body.image).toBe(signedUrl);
+      expect((await rejected()).json()).toEqual(rejectedReceipt);
+      expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 3);
+
+      downloadUrl.mockReturnValueOnce(`https://canvas-reference-fixture.oss-cn-beijing-internal.aliyuncs.com/${splitJpegKey}?signed=fixture-only`);
+      head.mockResolvedValueOnce({
+        objectKey: splitJpegKey, contentLength: splitJpeg.length, contentType: 'image/jpeg', metadata: {}, headers: {},
+      });
+      read.mockResolvedValueOnce({ stream: Readable.from([splitJpeg]), statusCode: 200, headers: { 'content-type': 'image/jpeg' } });
+      const fallback = await submit(splitJpegKey, 'owned-reference-ark-private', 'Color', '1');
+      expect(fallback.json()).toMatchObject({ status: 'success', chargedCredits: '1.000000' });
+      expect(downloadUrl).toHaveBeenCalledWith(splitJpegKey, { expiresSeconds: 600 });
+      expect(validateSigned).toHaveBeenCalledTimes(2);
+      expect(mock.upstreamCalls().at(-1)?.body.image).toBe('data:image/jpeg;base64,' + splitJpeg.toString('base64'));
+      expect(mock.upstreamCalls()).toHaveLength(upstreamCalls + 4);
     } finally {
       mock.useMockAProviderKind('NEW_API');
       await save('/edit', 'canvas-json');
     }
   } finally {
-    for (const spy of [head, downloadUrl, read]) spy.mockRestore();
+    for (const spy of [head, downloadUrl, validateSigned, read]) spy.mockRestore();
   }
-});
+}, 15_000);

@@ -18,6 +18,7 @@ import {
   markStaleAiTaskFailed,
 } from './modules/ai/task-service.js';
 import { recoverStaleAiRequests } from './modules/ai/request-recovery.js';
+import { recoverNextArkCanvasLayerOutput } from './modules/ai/layer-canvas-service.js';
 
 const prisma = new PrismaClient();
 const workerId = `${hostname()}:${process.pid}`;
@@ -196,6 +197,8 @@ async function main() {
   let lastCleanupAt = 0;
   let lastRecoveryAt = Date.now();
   let lastRequestRecoveryAt = Date.now();
+  let nextLayerRecoveryAt = 0;
+  let layerRecoveryActive = false;
   const requestRecoveryIntervalMs = Math.max(
     30_000,
     Math.min(5 * 60_000, Math.floor(env.AI_REQUEST_STALE_AFTER_MS / 4)),
@@ -228,6 +231,19 @@ async function main() {
       if (!task) break;
       const promise = executeTask(task).finally(() => active.delete(promise));
       active.add(promise);
+    }
+    if (!shuttingDown && !layerRecoveryActive && active.size < env.AI_WORKER_CONCURRENCY
+      && Date.now() >= nextLayerRecoveryAt) {
+      layerRecoveryActive = true;
+      nextLayerRecoveryAt = Date.now() + 10_000;
+      const recovery = recoverNextArkCanvasLayerOutput(prisma)
+        .then(() => {})
+        .catch(() => { log('ark_canvas_layer_recovery_error'); })
+        .finally(() => {
+          layerRecoveryActive = false;
+          active.delete(recovery);
+        });
+      active.add(recovery);
     }
     await new Promise(resolve => setTimeout(resolve, env.AI_TASK_POLL_INTERVAL_MS));
   }

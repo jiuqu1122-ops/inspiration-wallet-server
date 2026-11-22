@@ -5,16 +5,31 @@ import Fastify from 'fastify';
 import sharp from 'sharp';
 
 const dns = vi.hoisted(() => ({ lookup: vi.fn() }));
+const onAgentCreated = vi.hoisted(() => vi.fn());
 const storage = vi.hoisted(() => ({
   tryResolveObjectKeyFromUrl: vi.fn(), getObjectStream: vi.fn(), headObject: vi.fn(), getDownloadUrl: vi.fn(),
 }));
 vi.mock('node:dns/promises', () => ({ lookup: dns.lookup }));
 vi.mock('../src/modules/storage/service.js', () => ({ storageService: storage }));
+vi.mock('undici', async importOriginal => {
+  const undici = await importOriginal<typeof import('undici')>();
+  return {
+    ...undici,
+    Agent: class extends undici.Agent {
+      constructor(options?: ConstructorParameters<typeof undici.Agent>[0]) {
+        super(options);
+        onAgentCreated(options);
+      }
+    },
+  };
+});
 
 import { aiRoutes } from '../src/modules/ai/routes.js';
 import { prepareRouteImageAdapterRequest, generatePreparedImageAdapterImages } from '../src/modules/ai/image-service.js';
 import { imageAdapterConfig } from '../src/modules/ai/image-adapters/types.js';
-import { prepareSeedreamReference, stageMultipartImageReference, referenceSourceType } from '../src/modules/ai/seedream-references.js';
+import {
+  downloadArkCanvasResultBytes, prepareSeedreamReference, stageMultipartImageReference, referenceSourceType,
+} from '../src/modules/ai/seedream-references.js';
 import { resolveReferenceImageSources } from '../src/modules/ai/reference-upload-service.js';
 import {
   createProviderReference, getProviderReference, providerReferenceKey, removeProviderReference, PROVIDER_REFERENCE_TTL_MS,
@@ -46,6 +61,7 @@ beforeAll(async () => {
 });
 beforeEach(() => {
   dns.lookup.mockReset().mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+  onAgentCreated.mockClear();
   storage.tryResolveObjectKeyFromUrl.mockReset().mockReturnValue(null);
   storage.getObjectStream.mockReset().mockImplementation(async () => ({
     statusCode: 200, stream: Readable.from([png]),
@@ -59,6 +75,57 @@ beforeEach(() => {
 afterEach(async () => {
   for (const url of createdUrls.splice(0)) await removeProviderReference(url);
   vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals();
+});
+
+describe('Ark canvas result downloads', () => {
+  const url = 'https://ark-result.example/layer.png?signature=fixture';
+  const ipv6 = { address: '2606:4700:4700::1111', family: 6 };
+  const ipv4 = { address: '1.1.1.1', family: 4 };
+
+  it.each([
+    { answers: [ipv6, ipv4], pinned: [ipv4] },
+    { answers: [ipv6], pinned: [ipv6] },
+  ])('pins only validated addresses and favors IPv4 when present', async ({ answers, pinned }) => {
+    dns.lookup.mockResolvedValue(answers);
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => pngResponse()));
+
+    await expect(downloadArkCanvasResultBytes(url)).resolves.toEqual(png);
+
+    expect(dns.lookup.mock.calls).toEqual([['ark-result.example', { all: true, verbatim: true }]]);
+    expect(onAgentCreated).toHaveBeenCalledOnce();
+    const options = onAgentCreated.mock.calls[0]![0];
+    expect(options).toMatchObject({ autoSelectFamily: false, connect: { timeout: 30_000 } });
+    const lookup = options.connect.lookup;
+    const callback = vi.fn();
+    lookup('ark-result.example', { all: true }, callback);
+    lookup('ark-result.example', { all: false }, callback);
+    expect(callback.mock.calls).toEqual([[null, pinned], [null, pinned[0]!.address, pinned[0]!.family]]);
+  });
+
+  it('rejects a private IPv6 answer alongside an otherwise usable public IPv4 answer', async () => {
+    dns.lookup.mockResolvedValue([ipv4, { address: 'fd00::1', family: 6 }]);
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+
+    await expect(downloadArkCanvasResultBytes(url)).rejects.toMatchObject({ code: 'reference_image_url_blocked' });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('ends a stalled DNS lookup at the shared deadline without starting a GET', async () => {
+    let finishLookup: (addresses: typeof ipv4[]) => void = () => {};
+    dns.lookup.mockImplementation(() => new Promise(resolve => { finishLookup = resolve; }));
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+    const controller = new AbortController();
+    const download = downloadArkCanvasResultBytes(url, controller.signal);
+    const failure = expect(download).rejects.toMatchObject({ code: 'ark_result_deadline', statusCode: 504 });
+
+    controller.abort();
+    await failure;
+    finishLookup([ipv4]);
+    await Promise.resolve();
+    expect(fetch).not.toHaveBeenCalled();
+  });
 });
 
 describe('Seedream reference preparation and edit serialization', () => {

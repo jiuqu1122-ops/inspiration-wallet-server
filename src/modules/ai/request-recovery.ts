@@ -1,5 +1,6 @@
 import type { PrismaClient } from '@prisma/client';
 import { toInputJson } from './pricing-center.js';
+import { jsonRecord } from './layer-canvas-config.js';
 import { releaseMembershipQuota } from '../membership/quota-billing.js';
 
 const ACTIVE_REQUEST_STATUSES = ['RESERVED', 'PROCESSING'] as const;
@@ -59,6 +60,7 @@ export async function recoverStaleAiRequests(
       estimatedCredits: true,
       pricingSnapshot: true,
       clientRequestId: true,
+      result: true,
     },
   });
 
@@ -85,6 +87,8 @@ export async function recoverStaleAiRequests(
     if (requiresConfirmedImageOutcome(candidate.pricingSnapshot)) continue;
     eligible += 1;
     const now = new Date();
+    const { arkDownloadCheckpoint, arkDownloadDueAt, ...journal } = jsonRecord(candidate.result);
+    delete journal.arkDownloadAttempt;
     try {
       const released = await prisma.$transaction(async transaction => {
         const claimed = await transaction.aiRequest.updateMany({
@@ -100,6 +104,8 @@ export async function recoverStaleAiRequests(
             status: 'FAILED',
             completedAt: now,
             failureDiagnostic: toInputJson(staleFailureDiagnostic(now)),
+            ...(typeof arkDownloadCheckpoint === 'string' && typeof arkDownloadDueAt === 'string'
+              ? { result: toInputJson({ ...journal, message: STALE_REQUEST_MESSAGE }) } : {}),
           },
         });
         if (claimed.count !== 1) return false;

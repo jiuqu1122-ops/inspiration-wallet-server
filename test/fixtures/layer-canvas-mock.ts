@@ -72,6 +72,7 @@ export async function startLayerMock(port = 4137) {
   const sourceKey = 'reference-images/layer-test-source.png';
   const splitSourceKey = 'reference-images/layer-test-split-source.png';
   const splitJpegKey = 'reference-images/layer-test-split-source.jpg';
+  const arkEditSourceUrl = (objectKey: string) => `https://canvas-reference-fixture-1250000000.cos.ap-beijing.myqcloud.com/${objectKey}?signed=fixture-only`;
   const referenceFixtures: Record<string, { bytes: Buffer; contentType: string; owner: string }> = {
     [sourceKey]: { bytes: alphaPoster, contentType: 'image/png', owner: 'local-test-user' },
     [splitSourceKey]: { bytes: splitPoster, contentType: 'image/png', owner: 'local-test-user' },
@@ -79,6 +80,9 @@ export async function startLayerMock(port = 4137) {
     'reference-images/foreign-layer-test-source.png': { bytes: poster, contentType: 'image/png', owner: 'different-test-user' },
   };
   const uselgReads: string[] = [];
+  const arkLayerReads: string[] = [];
+  const transientArkLayerFailures = new Set<string>();
+  let arkRecoveryAssetsAvailable = false;
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     const target = new URL(String(url));
@@ -91,10 +95,21 @@ export async function startLayerMock(port = 4137) {
       return new Response(new Uint8Array(poster), { headers: { 'content-type': 'image/png' } });
     }
     if (target.origin === 'https://9.9.9.9' && target.pathname.startsWith('/ark-layers/') && init?.method === 'GET') {
-      const asset = { base, title, cloud }[target.pathname.slice('/ark-layers/'.length, -'.png'.length) as 'base' | 'title' | 'cloud'];
-      if (!asset || target.searchParams.get('signature') !== 'fixture' || new Headers(init.headers).has('authorization')) {
+      const name = target.pathname.slice('/ark-layers/'.length, -'.png'.length);
+      const asset = { base, title, cloud }[name as 'base' | 'title' | 'cloud'];
+      const signature = target.searchParams.get('signature');
+      arkLayerReads.push(name);
+      if (!asset || !signature || new Headers(init.headers).has('authorization')) {
         return new Response(null, { status: 403 });
       }
+      if (signature === 'unavailable' || (signature === 'recoverable' && !arkRecoveryAssetsAvailable)) {
+        return new Response(null, { status: 503 });
+      }
+      if (signature === 'retry-once' && !transientArkLayerFailures.has(target.pathname)) {
+        transientArkLayerFailures.add(target.pathname);
+        return new Response(null, { status: 503 });
+      }
+      if (!['fixture', 'retry-once', 'recoverable'].includes(signature)) return new Response(null, { status: 403 });
       return new Response(new Uint8Array(asset), { headers: { 'content-type': 'image/png' } });
     }
     const route = routes.find(entry => new URL(entry.channel.baseUrl).origin === target.origin);
@@ -143,17 +158,24 @@ export async function startLayerMock(port = 4137) {
         return Response.json({ error: { code: 'InvalidParameter', param: 'image', message: 'Image download timeout' } }, { status: 400 });
       }
       const source = String(body.image);
-      if (!/^data:image\/(?:png|jpeg|webp);base64,/.test(source)) {
+      const inline = /^data:image\/(?:png|jpeg|webp);base64,/.test(source);
+      const signedEdit = body.layer_decomposition !== true
+        ? Object.entries(referenceFixtures).find(([key]) => source === arkEditSourceUrl(key))?.[1] : undefined;
+      if (!inline && !signedEdit) {
         return Response.json({ error: { code: 'InvalidParameter', param: 'image', message: 'Image download timeout' } }, { status: 400 });
       }
-      const bytes = Buffer.from(source.split(',')[1] ?? '', 'base64');
+      const bytes = signedEdit?.bytes ?? Buffer.from(source.split(',')[1] ?? '', 'base64');
       if (body.layer_decomposition === true) {
-        const cloudSignature = body.prompt === 'ark-expired-layer-asset-fixture' ? 'expired' : 'fixture';
+        const exhaustDownloadRetry = body.prompt === 'ark-exhausted-layer-asset-retry-fixture';
+        const recoverable = body.prompt === 'ark-recover-layer-asset-fixture';
+        const cloudSignature = body.prompt === 'ark-expired-layer-asset-fixture' ? 'expired'
+          : body.prompt === 'ark-retry-layer-asset-fixture' ? 'retry-once' : 'fixture';
+        const titleSignature = exhaustDownloadRetry ? 'unavailable' : recoverable ? 'recoverable' : 'fixture';
         return Response.json({ data: [
           { url: `https://9.9.9.9/ark-layers/cloud.png?signature=${cloudSignature}`, size: '120x70', z_index: 2, name: '云朵',
             bounding_box: { absolute: [100, 175, 196, 231] } },
-          { url: 'https://9.9.9.9/ark-layers/base.png?signature=fixture', size: '320x400', z_index: 0 },
-          { url: 'https://9.9.9.9/ark-layers/title.png?signature=fixture', size: '210x76', z_index: 1, name: '标题',
+          { url: `https://9.9.9.9/ark-layers/base.png?signature=${exhaustDownloadRetry ? 'retry-once' : 'fixture'}`, size: '320x400', z_index: 0 },
+          { url: `https://9.9.9.9/ark-layers/title.png?signature=${titleSignature}`, size: '210x76', z_index: 1, name: '标题',
             bounding_box: { absolute: [27, 37, 237, 113] } },
         ] });
       }
@@ -178,9 +200,23 @@ export async function startLayerMock(port = 4137) {
   let availableCredits = creditDecimal(100);
   let reservedCredits = creditDecimal(0);
   let queue: Promise<unknown> = Promise.resolve();
-  const find = ({ where }: { where: any }) => records.find(row => where.userId_clientRequestId
-    ? row.userId === where.userId_clientRequestId.userId && row.clientRequestId === where.userId_clientRequestId.clientRequestId
-    : row.id === where.id && (!where.userId || row.userId === where.userId) && (!where.status?.in || where.status.in.includes(row.status))) ?? null;
+  const matchesRequest = (row: Record<string, any>, where: any): boolean => {
+    if (where.userId_clientRequestId) {
+      return row.userId === where.userId_clientRequestId.userId
+        && row.clientRequestId === where.userId_clientRequestId.clientRequestId;
+    }
+    if ((where.id && row.id !== where.id) || (where.userId && row.userId !== where.userId)
+      || (where.capability && row.capability !== where.capability)) return false;
+    if (typeof where.status === 'string' && row.status !== where.status) return false;
+    if (where.status?.in && !where.status.in.includes(row.status)) return false;
+    if (where.result?.path) {
+      const value = where.result.path.reduce((item: any, key: string) => item?.[key], row.result);
+      if ('equals' in where.result && value !== where.result.equals) return false;
+      if ('lte' in where.result && (typeof value !== 'string' || value > where.result.lte)) return false;
+    }
+    return !where.AND || where.AND.every((condition: any) => matchesRequest(row, condition));
+  };
+  const find = ({ where }: { where: any }) => records.find(row => matchesRequest(row, where)) ?? null;
   const updateWallet = ({ data }: { data: any }) => {
     availableCredits = availableCredits.plus(data.availableCredits?.increment ?? 0).minus(data.availableCredits?.decrement ?? 0);
     reservedCredits = reservedCredits.plus(data.reservedCredits?.increment ?? 0).minus(data.reservedCredits?.decrement ?? 0);
@@ -239,6 +275,7 @@ export async function startLayerMock(port = 4137) {
         return routes.filter(route => route.metadata.canvasLayers[operation]?.enabled);
       },
       findFirst: async ({ where }: any) => routes.find(route => route.id === where.id) ?? null,
+      findUnique: async ({ where }: any) => routes.find(route => route.id === where.id) ?? null,
       update: async ({ where, data }: any) => Object.assign(routes.find(route => route.id === where.id)!, data),
     },
     aiUpstreamDiscovery: { findMany: async () => [] },
@@ -264,6 +301,8 @@ export async function startLayerMock(port = 4137) {
     },
     aiBillingSettlement: { create: async () => ({}) },
     aiRequest: { findUnique: async (query: any) => find(query), findFirst: async (query: any) => find(query),
+      findMany: async ({ where, take }: any) => records.filter(row => matchesRequest(row, where))
+        .slice(0, take).map(row => ({ ...row })),
       create: async ({ data }: any) => { const row = { id: randomUUID(), chargedCredits: 0, ...data }; records.push(row); return row; },
       updateMany: async ({ where, data }: any) => { const row = find({ where }); if (!row) return { count: 0 }; Object.assign(row, data); return { count: 1 }; } },
     wallet: { updateMany: async ({ where, data }: any) => {
@@ -313,11 +352,17 @@ export async function startLayerMock(port = 4137) {
   });
   await app.listen({ port, host: '127.0.0.1' });
   return { app, paths: { base: data(base), poster: data(poster), sourceKey, alphaPoster: data(alphaPoster),
-    splitPoster: data(splitPoster), splitSourceKey, splitJpegKey, splitJpeg }, upstreamCalls: () => [...calls],
+    splitPoster: data(splitPoster), splitSourceKey, splitJpegKey, splitJpeg, arkEditSourceUrl }, upstreamCalls: () => [...calls],
     useMockAProviderKind(kind: AiProviderChannel['kind'], baseUrl = 'https://1.1.1.1') {
       Object.assign(routes[0]!.channel, { kind, baseUrl });
     },
     uselgReads: () => [...uselgReads],
+    arkLayerReads: () => [...arkLayerReads],
+    allowArkRecoveryAssets: () => { arkRecoveryAssetsAvailable = true; },
+    arkDownloadDueAt: (clientRequestId: string) => {
+      const dueAt = records.find(row => row.clientRequestId === clientRequestId)?.result?.arkDownloadDueAt;
+      return typeof dueAt === 'string' ? new Date(dueAt) : null;
+    },
     failureDiagnostic: (clientRequestId: string) => records.find(row => row.clientRequestId === clientRequestId)?.failureDiagnostic as unknown,
     close: async () => {
       try {

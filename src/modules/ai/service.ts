@@ -1270,6 +1270,7 @@ type CreditSettlement = {
   description?: string | undefined;
   result?: Prisma.InputJsonObject;
   breakdown?: Prisma.InputJsonObject;
+  resultCondition?: Prisma.AiRequestWhereInput['result'];
 };
 
 export async function settleCredits(
@@ -1279,9 +1280,9 @@ export async function settleCredits(
   settlement?: CreditSettlement,
 ) {
   await prisma.$transaction(async (transaction) => {
-    const request = await transaction.aiRequest.findFirst({
-      where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
-    });
+    const where: Prisma.AiRequestWhereInput = { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] },
+      ...(settlement?.resultCondition ? { result: settlement.resultCondition } : {}) };
+    const request = await transaction.aiRequest.findFirst({ where });
     if (!request) return;
     const reserved = creditDecimal(request.estimatedCredits);
     const quota = membershipQuotaFromPricingSnapshot(request.pricingSnapshot);
@@ -1313,7 +1314,7 @@ export async function settleCredits(
       ...(settlement?.breakdown ? { chargeBreakdown: settlement.breakdown } : {}),
     };
     const claimed = await transaction.aiRequest.updateMany({
-      where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
+      where,
       data: requestUpdate,
     });
     if (claimed.count !== 1) return;
@@ -1383,13 +1384,14 @@ export async function settleCredits(
   });
 }
 
-export async function releaseCredits(prisma: PrismaClient, userId: string, requestId: string, failureDiagnostic?: FailureDiagnostic, result?: Prisma.InputJsonObject) {
+export async function releaseCredits(prisma: PrismaClient, userId: string, requestId: string, failureDiagnostic?: FailureDiagnostic,
+  result?: Prisma.InputJsonObject, resultCondition?: Prisma.AiRequestWhereInput['result']) {
   await prisma.$transaction(async (transaction) => {
     const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
     if (!request || request.userId !== userId || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
     await releaseMembershipQuota(transaction, request.pricingSnapshot);
     const claimed = await transaction.aiRequest.updateMany({
-      where: { id: requestId, status: { in: ['RESERVED', 'PROCESSING'] } },
+      where: { id: requestId, status: { in: ['RESERVED', 'PROCESSING'] }, ...(resultCondition ? { result: resultCondition } : {}) },
       data: { status: 'FAILED', completedAt: new Date(),
         ...(failureDiagnostic ? { failureDiagnostic: toInputJson(failureDiagnostic) } : {}),
         ...(result ? { result } : {}),

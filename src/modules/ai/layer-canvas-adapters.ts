@@ -93,7 +93,8 @@ function isArkSeedream55(upstreamModel: string, canonicalModelKey: string) {
 
 export async function layerUpstreamBody(
   adapter: LayerRoute['adapter'], input: CanvasLayerInput, model: string, source: SourceImage,
-  { maxLayers, canonicalModelKey }: { maxLayers: number; canonicalModelKey: string },
+  { maxLayers, canonicalModelKey, arkEditReferenceUrl }:
+  { maxLayers: number; canonicalModelKey: string; arkEditReferenceUrl?: string | undefined },
 ) {
   const { operation, image, prompt, selection } = input;
   const { width, height } = source;
@@ -107,7 +108,7 @@ export async function layerUpstreamBody(
     const exactSizeSupported = width * height >= 921_600 && width * height <= 4_624_220
       && width / height >= 1 / 16 && width / height <= 16;
     const transparent = source.alpha && !(await sharp(dataBytes(image), { limitInputPixels: 64_000_000 }).stats()).isOpaque;
-    return { ...fields, image, prompt: arkEditPrompt(prompt, selection),
+    return { ...fields, image: arkEditReferenceUrl ?? image, prompt: arkEditPrompt(prompt, selection),
       ...(exactSizeSupported ? { size: `${width}x${height}` } : {}),
       ...(transparent ? { background: 'transparent' } : {}) };
   }
@@ -235,7 +236,8 @@ async function normalizeRaster(value: Raster, remainingPixels: number, expected?
     dataUrl: 'data:image/png;base64,' + bytes.toString('base64') };
 }
 
-export async function decodeCanvasLayerResult(config: LayerRoute, operation: LayerMode, reply: unknown, readAsset?: ReadLayerAsset) {
+export async function decodeCanvasLayerResult(config: Pick<LayerRoute, 'adapter' | 'maxLayers' | 'maxMegapixels'>,
+  operation: LayerMode, reply: unknown, readAsset?: ReadLayerAsset) {
   const decoded = decodeResponse(config.adapter, operation, reply, config.maxLayers);
   let pixels = 0;
   let usedBudgetPixels = 0;
