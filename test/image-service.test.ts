@@ -22,6 +22,7 @@ import {
   confirmXaisReferenceAttachment,
   convertGptImage2ChromaKeyToTransparentPng,
   executeWalletImageGeneration,
+  executeWalletVideoGeneration,
   filterProviderImageModels,
   findVideoTaskEnvelope,
   generateBigmodelBananaImages,
@@ -45,6 +46,7 @@ import {
   mirrorGeneratedVideoResponse,
   mergeLegacyVideoStatusResult,
   minimaxVideoBody,
+  providerRequest,
   mirrorXaisImageResults,
   newApiImageRequestParams,
   parseWalletImageGenerationResult,
@@ -89,6 +91,7 @@ import { createImageResultFromResponse, getImageResult } from '../src/modules/ai
 import { imageResultFallbackStore } from '../src/modules/ai/image-result-fallback.js';
 import { storageService } from '../src/modules/storage/service.js';
 import { encryptProviderSecrets } from '../src/lib/provider-secrets.js';
+import { metasoMiniMaxDispatcher } from '../src/modules/providers/metaso-transport.js';
 import { imageRouteExecutionMode } from '../src/modules/ai/image-execution.js';
 
 describe('Mikoto Seedance model mapping', () => {
@@ -134,10 +137,14 @@ describe('Mikoto Seedance model mapping', () => {
       ratio: '16:9',
     });
     expect(body.resolution).toBe('2K');
-    expect(minimaxVideoBody({ model: 'MiniMax-H3', prompt: 'camera orbit', inputImages: [], inputVideos: [], inputAudios: [], resolution: '720p' } as never).resolution)
-      .toBe('768P');
+    expect(minimaxVideoBody({ model: 'MiniMax-H3', prompt: 'camera orbit', inputImages: [], inputVideos: [], inputAudios: [], resolution: '720p' } as never))
+      .toMatchObject({ resolution: '768P', ratio: '16:9' });
     expect(minimaxVideoBody({ model: 'MiniMax-H3', prompt: 'camera orbit', inputImages: [], inputVideos: [], inputAudios: [], resolution: '480p' } as never).resolution)
       .toBe('768P');
+    expect(minimaxVideoBody({ model: 'MiniMax-H3', prompt: 'camera orbit', inputImages: [], inputVideos: [], inputAudios: [], aspectRatio: 'adaptive' } as never).ratio)
+      .toBe('16:9');
+    expect(minimaxVideoBody({ model: 'MiniMax-H3', prompt: 'camera orbit', inputImages: [], inputVideos: [], inputAudios: [], aspectRatio: '9:16' } as never).ratio)
+      .toBe('9:16');
     expect(minimaxVideoBody({
       model: 'MiniMax-H3',
       prompt: 'transition',
@@ -146,11 +153,85 @@ describe('Mikoto Seedance model mapping', () => {
       inputAudios: [],
       inputMode: 'FLF',
       resolution: '768P',
-    } as never).content).toEqual([
-      { type: 'text', text: 'transition' },
-      { type: 'image_url', image_url: { url: 'https://media.example/start.jpg' }, role: 'first_frame' },
-      { type: 'image_url', image_url: { url: 'https://media.example/end.jpg' }, role: 'last_frame' },
-    ]);
+      aspectRatio: '16:9',
+    } as never)).toMatchObject({
+      ratio: 'adaptive',
+      content: [
+        { type: 'text', text: 'transition' },
+        { type: 'image_url', image_url: { url: 'https://media.example/start.jpg' }, role: 'first_frame' },
+        { type: 'image_url', image_url: { url: 'https://media.example/end.jpg' }, role: 'last_frame' },
+      ],
+    });
+  });
+
+  it('releases a failed H3 submission once and keeps its connection error in the admin record', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError('fetch failed', {
+      cause: Object.assign(new Error('connection reset'), { code: 'ECONNRESET' }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const updateRequest = vi.fn().mockResolvedValue({ count: 1 });
+    const writeLedger = vi.fn();
+    const wallet = { availableCredits: '800' };
+    const transaction = {
+      aiRequest: {
+        findUnique: vi.fn().mockResolvedValueOnce(null)
+          .mockResolvedValueOnce({ id: 'h3-request', userId: 'h3-user', status: 'RESERVED' }),
+        create: vi.fn().mockResolvedValue({ id: 'h3-request' }),
+        updateMany: updateRequest,
+      },
+      wallet: {
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+        findUniqueOrThrow: vi.fn().mockResolvedValue(wallet),
+        update: vi.fn().mockResolvedValue(wallet),
+      },
+      walletLedger: { create: writeLedger },
+    };
+    const prisma = {
+      $transaction: (callback: (tx: typeof transaction) => unknown) => callback(transaction),
+      aiProviderChannel: {
+        findMany: vi.fn().mockResolvedValue([{
+          id: 'h3-channel',
+          kind: 'MINIMAX',
+          baseUrl: 'https://8.8.4.4/api/minimax',
+          capabilities: ['VIDEO_MINIMAX'],
+          encryptedSecrets: encryptProviderSecrets({ apiKey: 'test-key', headers: {} }),
+        }]),
+      },
+    };
+
+    await expect(executeWalletVideoGeneration(prisma as never, {
+      userId: 'h3-user', clientRequestId: 'h3-client-request', model: 'minimax-h3', provider: 'minimax',
+      prompt: 'camera orbit', count: 1, duration: 5, resolution: '2K',
+      inputImages: [], inputVideos: [], inputAudios: [],
+    })).rejects.toMatchObject({ code: 'video_generation_failed' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://8.8.4.4/api/minimax/v2/video_generation');
+    expect(updateRequest).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        status: 'FAILED',
+        failureDiagnostic: expect.objectContaining({
+          stage: 'video_submit', code: 'NETWORK_ERROR', causeCode: 'ECONNRESET', httpStatus: null,
+        }),
+      }),
+    }));
+    expect(writeLedger).toHaveBeenCalledTimes(2);
+    expect(writeLedger).toHaveBeenLastCalledWith({ data: expect.objectContaining({ type: 'RELEASE' }) });
+  });
+
+  it('uses the same IPv4 transport for Metaso submission and task polling', async () => {
+    const fetchMock = vi.fn(async () => new Response('{}'));
+    vi.stubGlobal('fetch', fetchMock);
+    const provider = { kind: 'MINIMAX', baseUrl: 'https://metaso.cn' } as never;
+    const secrets = { apiKey: 'test-key', headers: {} };
+    const base = 'https://metaso.cn/api/minimax/v2';
+
+    await providerRequest(provider, secrets, '/api/minimax/v2/video_generation', {});
+    await providerRequest(provider, secrets, '/api/minimax/v2/query/video_generation/h3-task');
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, `${base}/video_generation`,
+      expect.objectContaining({ method: 'POST', dispatcher: metasoMiniMaxDispatcher }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, `${base}/query/video_generation/h3-task`,
+      expect.objectContaining({ method: 'GET', dispatcher: metasoMiniMaxDispatcher }));
   });
 
   it('maps the two client models to Mikoto resolution-specific model ids', () => {
@@ -327,6 +408,24 @@ describe('Mikoto Seedance model mapping', () => {
       'https://video-product.cdn.minimax.io/inference_output/current',
     ]);
     expect(envelope).toEqual(selected);
+  });
+
+  it('reads the video URL directly from the Metaso task query response', () => {
+    const videoUrl = 'https://media.example/h3-generated-2k-output.mp4';
+    const response = { task: {
+      id: '424010985738629',
+      model: 'MiniMax-H3',
+      status: 'succeeded',
+      content: { url: videoUrl },
+      resolution: '2K',
+      duration: 5,
+      usage: { total_seconds: 5, output_seconds: 5 },
+    } };
+    const task = findVideoTaskEnvelope(response, response.task.id);
+    expect(task).toEqual(response.task);
+    expect(collectMiniMaxH3VideoSources(task)).toEqual([videoUrl]);
+    expect(collectMiniMaxH3FileIds(task)).toEqual([]);
+    expect(isMiniMaxVideoTaskReadyForSettlement(task)).toBe(true);
   });
 
   it('keeps polling safely while a newly accepted H3 task is not listed yet', () => {

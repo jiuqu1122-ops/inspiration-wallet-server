@@ -23,7 +23,8 @@ import sharp from 'sharp';
 import { Agent } from 'undici';
 import { env } from '../../config/env.js';
 import { decryptProviderSecrets, type ProviderSecrets } from '../../lib/provider-secrets.js';
-import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
+import { metasoMiniMaxDispatcher } from '../providers/metaso-transport.js';
+import { assertPublicProviderUrl, isMetasoMiniMax, minimaxH3EndpointPath, minimaxH3StatusPath, providerEndpoint } from '../providers/url.js';
 import { CloudAiError } from './service.js';
 import {
   aiPricingModelToken as imageModelToken,
@@ -1007,11 +1008,15 @@ export async function providerRequest(
   let timeout = setTimeout(() => expire(timeoutMs), timeoutMs);
   let bodyIdleTimeout: ReturnType<typeof setTimeout> | undefined;
   try {
-    const response = await waitForDeadline(fetch(providerRequestUrl(provider, path), {
+    const url = providerRequestUrl(provider, path);
+    const requestDispatcher = dispatcher ?? (
+      provider.kind === 'MINIMAX' && isMetasoMiniMax(url) ? metasoMiniMaxDispatcher : undefined
+    );
+    const response = await waitForDeadline(fetch(url, {
       method: body === undefined ? 'GET' : 'POST',
       headers: upstreamHeaders(secrets, extraHeaders),
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      ...(dispatcher ? { dispatcher } : {}),
+      ...(requestDispatcher ? { dispatcher: requestDispatcher } : {}),
       redirect: 'error',
       signal: controller.signal,
     }));
@@ -8225,7 +8230,13 @@ export function minimaxVideoBody(input: VideoInput) {
   const resolution = requestedResolution === '1080p' || requestedResolution === '2k'
     ? '2K'
     : '768P';
-  const ratio = String(input.aspectRatio || 'adaptive').trim() || 'adaptive';
+  const requestedRatio = input.aspectRatio?.trim() || 'adaptive';
+  let ratio = requestedRatio;
+  if (content.length === 1 && requestedRatio === 'adaptive') {
+    ratio = '16:9';
+  } else if (isFirstLastFrame && input.inputImages.length > 0) {
+    ratio = 'adaptive';
+  }
   const duration = Math.max(4, Math.min(15, Math.round(Number(input.duration) || 5)));
   return {
     model: 'MiniMax-H3',
@@ -8295,6 +8306,7 @@ async function reserveVideo(
         chargedCredits: creditDecimal(0),
         result: Prisma.DbNull,
         chargeBreakdown: Prisma.DbNull,
+        failureDiagnostic: Prisma.DbNull,
         completedAt: null,
       } })
       : await transaction.aiRequest.create({ data: {
@@ -8360,14 +8372,24 @@ async function settleVideo(
   });
 }
 
-async function releaseVideo(prisma: PrismaClient, userId: string, requestId: string, released: string) {
+async function releaseVideo(
+  prisma: PrismaClient,
+  userId: string,
+  requestId: string,
+  released: string,
+  failureDiagnostic?: FailureDiagnostic,
+) {
   const releasedCredits = creditDecimal(released);
   await prisma.$transaction(async (transaction) => {
     const request = await transaction.aiRequest.findUnique({ where: { id: requestId } });
     if (!request || request.userId !== userId || (request.status !== 'RESERVED' && request.status !== 'PROCESSING')) return;
     const claimed = await transaction.aiRequest.updateMany({
       where: { id: requestId, userId, status: { in: ['RESERVED', 'PROCESSING'] } },
-      data: { status: 'FAILED', completedAt: new Date() },
+      data: {
+        status: 'FAILED',
+        completedAt: new Date(),
+        ...(failureDiagnostic ? { failureDiagnostic: toInputJson(failureDiagnostic) } : {}),
+      },
     });
     if (claimed.count !== 1) return;
     const wallet = await transaction.wallet.update({ where: { userId }, data: { availableCredits: { increment: releasedCredits }, reservedCredits: { decrement: releasedCredits } } });
@@ -8743,7 +8765,7 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
       const path = provider.kind === 'XAIS'
         ? '/xais/workerTaskStart'
         : provider.kind === 'MIKOTO' ? '/v1/videos'
-          : provider.kind === 'MINIMAX' ? '/api/minimax/v2/video_generation'
+          : provider.kind === 'MINIMAX' ? minimaxH3EndpointPath(provider.baseUrl, '/v2/video_generation')
           : '/v1/video/generations';
       const mikotoModels = provider.kind === 'MIKOTO'
           ? isSeedance20VideoModel(upstreamInput.model)
@@ -8867,7 +8889,20 @@ export async function executeWalletVideoGeneration(prisma: PrismaClient, input: 
     // Once any legacy provider has returned a task id the upstream job exists.
     // Never release and allow a client retry to submit a second generation.
     if (!acceptedLegacyTask) {
-      await releaseVideo(prisma, input.userId, reservation.requestId, reservation.estimated);
+      const diagnostic = provider.kind === 'MINIMAX'
+        ? buildFailureDiagnostic(error, { stage: 'video_submit', resolution: input.resolution })
+        : undefined;
+      if (diagnostic) {
+        console.warn('[minimax_h3_submit_failed]', {
+          requestId: reservation.requestId,
+          clientRequestId: input.clientRequestId,
+          providerChannelId: provider.id,
+          code: diagnostic.code,
+          httpStatus: diagnostic.httpStatus,
+          causeCode: diagnostic.causeCode,
+        });
+      }
+      await releaseVideo(prisma, input.userId, reservation.requestId, reservation.estimated, diagnostic);
     }
     if (error instanceof CloudAiError) throw error;
     throw new CloudAiError('video_generation_failed', error instanceof Error ? error.message : '视频生成失败', 502);
@@ -9185,7 +9220,7 @@ export async function executeWalletVideoStatus(
     : provider.kind === 'MIKOTO'
       ? `/v1/videos/${encodeURIComponent(upstreamTaskId)}`
       : provider.kind === 'MINIMAX'
-        ? `/api/minimax/v2/query/video_generation?task_id=${encodeURIComponent(upstreamTaskId)}`
+        ? minimaxH3StatusPath(provider.baseUrl, upstreamTaskId)
       : `/v1/video/generations/${encodeURIComponent(upstreamTaskId)}`;
   let upstreamStatus: unknown;
   try {
@@ -9266,11 +9301,11 @@ export async function executeWalletVideoStatus(
       const fileIds = collectMiniMaxH3FileIds(deliveryPayload);
       for (const fileId of fileIds) {
         const retrievePaths = [
-          `/api/minimax/v2/files/retrieve?file_id=${encodeURIComponent(fileId)}`,
-          `/api/minimax/v1/files/retrieve?file_id=${encodeURIComponent(fileId)}`,
+          minimaxH3EndpointPath(provider.baseUrl, `/v2/files/retrieve?file_id=${encodeURIComponent(fileId)}`),
+          minimaxH3EndpointPath(provider.baseUrl, `/v1/files/retrieve?file_id=${encodeURIComponent(fileId)}`),
           `/v1/files/retrieve?file_id=${encodeURIComponent(fileId)}`,
         ];
-        for (const retrievePath of retrievePaths) {
+        for (const retrievePath of new Set(retrievePaths)) {
           try {
             const filePayload = await providerRequest(provider, secrets, retrievePath);
             const retrievedSources = collectMiniMaxH3VideoSources(filePayload);

@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { isPublicIp, normalizeProviderBaseUrl, providerEndpoint } from '../src/modules/providers/url.js';
+import { isPublicIp, minimaxH3EndpointPath, minimaxH3StatusPath, normalizeProviderBaseUrl, providerEndpoint } from '../src/modules/providers/url.js';
+
+it('constructs H3 submit and status URLs with exactly one Metaso prefix', () => {
+  for (const base of ['https://metaso.cn', 'https://metaso.cn/api/minimax/']) {
+    expect(providerEndpoint(base, minimaxH3EndpointPath(base, '/v2/video_generation')))
+      .toBe('https://metaso.cn/api/minimax/v2/video_generation');
+    expect(providerEndpoint(base, minimaxH3StatusPath(base, 'h3/task')))
+      .toBe('https://metaso.cn/api/minimax/v2/query/video_generation/h3%2Ftask');
+  }
+});
 
 describe('provider URL safety and normalization', () => {
   it('normalizes NewAPI and XAIS endpoints using the main application rules', () => {

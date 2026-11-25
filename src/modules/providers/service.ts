@@ -10,8 +10,13 @@ import {
   ProviderSecretsConfigurationError,
   type ProviderSecrets,
 } from '../../lib/provider-secrets.js';
+import { buildFailureDiagnostic } from '../ai/failure-diagnostic.js';
+import { metasoMiniMaxDispatcher } from './metaso-transport.js';
 import {
   assertPublicProviderUrl,
+  isMetasoMiniMax,
+  minimaxH3EndpointPath,
+  minimaxH3StatusPath,
   normalizeProviderBaseUrl,
   providerEndpoint,
 } from './url.js';
@@ -310,7 +315,11 @@ function responsePreview(value: string, secrets: ProviderSecrets) {
 async function providerGet(
   url: string,
   secrets: ProviderSecrets,
-  options?: { bearerToken?: string | undefined; headers?: Record<string, string> | undefined },
+  options?: {
+    bearerToken?: string | undefined;
+    headers?: Record<string, string> | undefined;
+    dispatcher?: typeof metasoMiniMaxDispatcher | undefined;
+  },
 ) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15_000);
@@ -327,12 +336,19 @@ async function providerGet(
       headers,
       redirect: 'error',
       signal: controller.signal,
+      ...(options?.dispatcher ? { dispatcher: options.dispatcher } : {}),
     });
     const body = await readLimitedBody(response);
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${responsePreview(body, secrets) || 'empty response'}`);
     }
     return JSON.parse(body) as unknown;
+  } catch (error) {
+    if (options?.dispatcher && error instanceof Error) {
+      const { causeCode } = buildFailureDiagnostic(error, { stage: 'video_task' });
+      if (causeCode) throw new Error(`${error.message} (${causeCode})`, { cause: error });
+    }
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
@@ -548,6 +564,7 @@ export async function getProviderBalance(prisma: PrismaClient, providerId: strin
     configurationError(error);
   }
 
+  const metaso = provider.kind === 'MINIMAX' && isMetasoMiniMax(provider.baseUrl);
   const candidates = provider.kind === 'XAIS'
     ? [{ name: 'XAIS /xais/userProfile', path: '/xais/userProfile' }]
     : provider.kind === 'USELG'
@@ -555,7 +572,9 @@ export async function getProviderBalance(prisma: PrismaClient, providerId: strin
     : provider.kind === 'MIKOTO'
       ? [{ name: 'Mikoto /v1/models', path: '/v1/models' }]
     : provider.kind === 'MINIMAX'
-      ? [{ name: 'MiniMax video endpoint', path: '/api/minimax/v2/query/video_generation?task_id=probe' }]
+      ? metaso
+        ? [{ name: 'Metaso /v2/credits/balance', path: minimaxH3EndpointPath(provider.baseUrl, '/v2/credits/balance') }]
+        : [{ name: 'MiniMax video endpoint', path: minimaxH3StatusPath(provider.baseUrl, 'probe') }]
     : provider.kind === 'BIGMODEL'
       ? [{ name: 'Bigmodel /v1beta/models', path: '/v1beta/models', headers: { 'x-goog-api-key': secrets.apiKey } }]
     : provider.kind === 'OPENAI_COMPATIBLE'
@@ -579,13 +598,13 @@ export async function getProviderBalance(prisma: PrismaClient, providerId: strin
         secrets,
         useManagementAuth
           ? { bearerToken: managementAuth.token, headers: { 'New-Api-User': managementAuth.user, ...(candidateHeaders ?? {}) } }
-          : candidateHeaders ? { headers: candidateHeaders } : undefined,
+          : { headers: candidateHeaders, dispatcher: metaso ? metasoMiniMaxDispatcher : undefined },
       );
       const result = normalizeProviderBalance(provider.kind, candidate.name, value);
       if (result.available) return result;
       reachableResult = result;
     } catch (error) {
-      if (provider.kind === 'MINIMAX'
+      if (provider.kind === 'MINIMAX' && !metaso
         && /HTTP (?:400|404|422):/i.test(error instanceof Error ? error.message : '')) {
         reachableResult = normalizeProviderBalance(provider.kind, candidate.name, {});
         continue;
@@ -775,15 +794,20 @@ export async function testProvider(prisma: PrismaClient, providerId: string) {
     }
   }
   if (provider.kind === 'MINIMAX') {
+    const metaso = isMetasoMiniMax(provider.baseUrl);
+    const path = metaso
+      ? minimaxH3EndpointPath(provider.baseUrl, '/v2/credits/balance')
+      : minimaxH3StatusPath(provider.baseUrl, 'probe');
     try {
       await providerGet(
-        providerEndpoint(provider.baseUrl, '/api/minimax/v2/query/video_generation?task_id=probe'),
+        providerEndpoint(provider.baseUrl, path),
         secrets,
+        metaso ? { dispatcher: metasoMiniMaxDispatcher } : undefined,
       );
       modelCatalogReachable = true;
     } catch (error) {
       const message = error instanceof Error ? error.message : '';
-      if (/HTTP (?:400|404|422):/i.test(message)) modelCatalogReachable = true;
+      if (!metaso && /HTTP (?:400|404|422):/i.test(message)) modelCatalogReachable = true;
       else modelErrors.push(`MiniMax video endpoint: ${message || 'request failed'}`);
     }
   }

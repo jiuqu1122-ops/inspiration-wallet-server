@@ -79,6 +79,37 @@ test('circular causes and throwing error getters cannot break failure handling',
   assert.equal(buildFailureDiagnostic(cyclic, { stage: 'text_request' }, now).code, 'NETWORK_ERROR');
   assert.doesNotThrow(() => buildFailureDiagnostic({ get message() { throw new Error('bad getter'); } }, { stage: 'text_request' }, now));
 });
+test('retains safe MiniMax submission diagnostics for network and TLS errors', () => {
+  for (const code of ['ECONNRESET', 'ERR_TLS_CERT_ALTNAME_INVALID']) {
+    const connection = Object.assign(new Error('private network details'), { code });
+    const socketErrors = new AggregateError([connection]);
+    const fetchError = new TypeError('fetch failed', { cause: socketErrors });
+    const error = new Error('fetch failed', { cause: fetchError });
+    const diagnostic = buildFailureDiagnostic(error, { stage: 'video_submit', resolution: '2K' }, now);
+    assert.equal(diagnostic.code, 'NETWORK_ERROR');
+    assert.equal(diagnostic.httpStatus, null);
+    assert.equal(diagnostic.causeCode, code);
+    assert.equal(diagnostic.stage, 'video_submit');
+    assert.deepEqual(readFailureDiagnostic(diagnostic), diagnostic);
+    assert.doesNotMatch(JSON.stringify(diagnostic), /private network details/);
+  }
+});
+test('classifies the documented Metaso HTTP error responses', () => {
+  const cases = [
+    [400, 'invalid params, prompt is required (2013)', 'PROVIDER_INVALID_REQUEST'],
+    [401, 'login fail (1004)', 'PROVIDER_AUTH_FAILED'],
+    [402, 'insufficient balance (1008)', 'PROVIDER_QUOTA_EXCEEDED'],
+    [422, 'video description contains sensitive content (1026)', 'PROVIDER_CONTENT_REJECTED'],
+    [429, 'rate limit, please retry later (1002)', 'PROVIDER_RATE_LIMITED'],
+    [500, 'internal error (1000)', 'PROVIDER_SERVER_ERROR'],
+  ] as const;
+  for (const [status, message, code] of cases) {
+    const diagnostic = buildFailureDiagnostic({ status, message }, { stage: 'video_submit' }, now);
+    assert.equal(diagnostic.code, code);
+    assert.equal(diagnostic.httpStatus, status);
+    assert.equal(diagnostic.causeCode, null);
+  }
+});
 test('preserves a redacted concrete prompt-limit detail without storing prompt content', () => {
   const result = buildFailureDiagnostic({
     status: 400,

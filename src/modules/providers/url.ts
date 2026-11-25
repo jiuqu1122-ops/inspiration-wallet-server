@@ -103,3 +103,16 @@ export async function assertPublicProviderUrl(baseUrl: string) {
 export function providerEndpoint(baseUrl: string, path: string) {
   return `${baseUrl.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
 }
+
+export function minimaxH3EndpointPath(baseUrl: string, path: string) {
+  const basePath = new URL(baseUrl).pathname.replace(/\/+$/, '');
+  return /\/api\/minimax$/i.test(basePath) ? path : `/api/minimax${path}`;
+}
+
+export function minimaxH3StatusPath(baseUrl: string, taskId: string) {
+  return minimaxH3EndpointPath(baseUrl, `/v2/query/video_generation/${encodeURIComponent(taskId)}`);
+}
+
+export function isMetasoMiniMax(baseUrl: string) {
+  return new URL(baseUrl).hostname === 'metaso.cn';
+}

@@ -19,11 +19,15 @@ const KNOWN_MESSAGES: Record<string, string> = {
   REQUEST_STALE: '任务长时间未完成，已自动释放预留积分',
   GENERATION_FAILED: '请求执行失败，未记录可安全展示的详细原因',
 };
-const SAFE_STAGES = new Set(['image_generation', 'text_request', 'video_task', 'result_persistence', 'request_recovery',
+const SAFE_STAGES = new Set(['image_generation', 'text_request', 'video_submit', 'video_task', 'result_persistence', 'request_recovery',
   'canvas_layer_source', 'canvas_layer_submit', 'canvas_layer_result', 'canvas_layer_download', 'canvas_layer_decode']);
 const SAFE_CAUSE_CODES = new Set([
   'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'ECONNREFUSED', 'ENOSPC', 'EACCES', 'ENOENT',
+  'EHOSTUNREACH', 'ENETUNREACH',
   'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
+  'CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'ERR_TLS_CERT_ALTNAME_INVALID', 'ERR_SSL_WRONG_VERSION_NUMBER',
   'IMAGE_PROVIDER_RESPONSE_TIMEOUT', 'IMAGE_RESULT_PERSISTENCE_FAILED',
 ]);
 
@@ -143,7 +147,11 @@ export function buildFailureDiagnostic(
       if (value.code === 'IMAGE_RESULT_PERSISTENCE_FAILED') persistence = true;
       const status = Number(value.status ?? value.statusCode);
       if (Number.isInteger(status) && status >= 400 && status <= 599) httpStatus = status;
-      current = value.cause;
+      // Node can aggregate connection errors when trying several addresses.
+      current = value.cause ?? (Array.isArray(value.errors) ? value.errors.slice(0, 6).find((candidate: unknown) => (
+        candidate !== null && typeof candidate === 'object' && 'code' in candidate
+        && typeof candidate.code === 'string' && SAFE_CAUSE_CODES.has(candidate.code)
+      )) : undefined);
     }
   } catch { /* A hostile getter must not break the original release/settlement path. */ }
   const text = texts.join('\n');
@@ -156,8 +164,9 @@ export function buildFailureDiagnostic(
     httpStatus = 400;
   }
   else if (/(?:prompt|\u63d0\u793a\u8bcd).{0,60}(?:too long|exceeds?|is over.{0,20}limit)|(?:prompt|\u63d0\u793a\u8bcd).{0,60}(?:length|characters?|tokens?|size).{0,40}(?:limit|maximum|exceeds?|too long|\u8d85\u51fa|\u4e0a\u9650)|(?:maximum|limit).{0,60}(?:prompt|\u63d0\u793a\u8bcd).{0,60}(?:length|characters?|tokens?|size)|(?:\u63d0\u793a\u8bcd).{0,20}(?:\u8d85\u957f|\u8d85\u51fa.{0,12}\u9650\u5236|\u957f\u5ea6\u4e0a\u9650|\u5b57\u6570\u4e0a\u9650)/i.test(text)) code = 'PROVIDER_PROMPT_TOO_LONG';
-  else if (/\b(?:quota_not_enough|insufficient_quota|insufficient_balance)\b/i.test(text)) code = 'PROVIDER_QUOTA_EXCEEDED';
-  else if (/\b(?:content_policy_violation|content_policy_rejected|moderation_blocked|safety_system)\b/i.test(text)) code = 'PROVIDER_CONTENT_REJECTED';
+  else if (httpStatus === 402 || /\b(?:quota_not_enough|insufficient_quota|insufficient_balance)\b/i.test(text)) code = 'PROVIDER_QUOTA_EXCEEDED';
+  else if (/\b(?:content_policy_violation|content_policy_rejected|moderation_blocked|safety_system)\b/i.test(text)
+    || (httpStatus === 422 && /\bvideo description contains sensitive content\b/i.test(text))) code = 'PROVIDER_CONTENT_REJECTED';
   else if (/too large|size is invalid|exceeds? (?:the )?(?:size|byte)|大小超|超出.{0,8}限制/i.test(text)) code = 'IMAGE_SIZE_LIMIT';
   else if (/valid image bytes|empty image bytes|content-length mismatch|no bytes|没有返回图片数据/i.test(text)) code = 'IMAGE_INVALID_CONTENT';
   else if (/cancelled|canceled|已取消/i.test(text)) code = 'REQUEST_CANCELLED';

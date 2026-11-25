@@ -1,21 +1,28 @@
 import { describe, expect, it, vi } from 'vitest';
 import { encryptProviderSecrets } from '../src/lib/provider-secrets.js';
+import { metasoMiniMaxDispatcher } from '../src/modules/providers/metaso-transport.js';
 import {
   buildProviderProbeBody,
   defaultProviderCapabilities,
+  getProviderBalance,
   testProvider,
 } from '../src/modules/providers/service.js';
+
+vi.mock('node:dns/promises', () => ({
+  lookup: vi.fn(async () => [{ address: '1.1.1.1', family: 4 }]),
+}));
 
 function provider(
   kind: 'MIKOTO' | 'BIGMODEL' | 'MINIMAX' | 'USELG' | 'OPENAI_COMPATIBLE',
   capabilities: string[],
   defaultModel = 'gpt-5.4',
+  baseUrl = 'https://example.com',
 ) {
   return {
     id: 'provider-test-1',
     kind,
     name: kind,
-    baseUrl: 'https://example.com',
+    baseUrl,
     allowInsecureHttp: false,
     defaultModel,
     capabilities,
@@ -115,8 +122,26 @@ describe('provider connection probes', () => {
     expect(result.ok).toBe(true);
     expect(result.message).toBe('连接成功；MiniMax H3 视频接口可访问');
     expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
-      'https://example.com/api/minimax/v2/query/video_generation?task_id=probe',
+      'https://example.com/api/minimax/v2/query/video_generation/probe',
     );
+  });
+
+  it('uses the Metaso credits endpoint and IPv4 transport for balance and connection checks', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ balance: 12.34 })));
+    vi.stubGlobal('fetch', fetchMock);
+    const prisma = prismaFor(provider('MINIMAX', ['VIDEO_MINIMAX'], 'MiniMax-H3', 'https://metaso.cn/api/minimax'));
+
+    await expect(getProviderBalance(prisma, 'provider-test-1'))
+      .resolves.toMatchObject({ available: true, totalAvailable: '12.34' });
+    await expect(testProvider(prisma, 'provider-test-1')).resolves.toMatchObject({ ok: true });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    for (const call of [1, 2]) {
+      expect(fetchMock).toHaveBeenNthCalledWith(
+        call,
+        'https://metaso.cn/api/minimax/v2/credits/balance',
+        expect.objectContaining({ method: 'GET', dispatcher: metasoMiniMaxDispatcher }),
+      );
+    }
   });
 
   it('checks the JSON and image contract for a Vision channel', async () => {
