@@ -24,23 +24,17 @@ function encryptionKey(value = env.PROVIDER_SECRETS_ENCRYPTION_KEY) {
   return key;
 }
 
-export function encryptProviderSecrets(
-  secrets: ProviderSecrets,
-  keyValue?: string,
-) {
+export function sealProviderData(value: unknown, context: Buffer, keyValue?: string) {
   const iv = randomBytes(12);
   const cipher = createCipheriv(algorithm, encryptionKey(keyValue), iv);
-  cipher.setAAD(aad);
-  const plaintext = Buffer.from(JSON.stringify(secrets), 'utf8');
+  cipher.setAAD(context);
+  const plaintext = Buffer.from(JSON.stringify(value), 'utf8');
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
   return [version, iv.toString('base64url'), tag.toString('base64url'), ciphertext.toString('base64url')].join('.');
 }
 
-export function decryptProviderSecrets(
-  encoded: string,
-  keyValue?: string,
-): ProviderSecrets {
+export function openProviderData(encoded: string, context: Buffer, keyValue?: string): unknown {
   const [encodedVersion, ivValue, tagValue, ciphertextValue, extra] = encoded.split('.');
   if (
     encodedVersion !== version || !ivValue || !tagValue || !ciphertextValue || extra !== undefined
@@ -52,13 +46,21 @@ export function decryptProviderSecrets(
     encryptionKey(keyValue),
     Buffer.from(ivValue, 'base64url'),
   );
-  decipher.setAAD(aad);
+  decipher.setAAD(context);
   decipher.setAuthTag(Buffer.from(tagValue, 'base64url'));
   const plaintext = Buffer.concat([
     decipher.update(Buffer.from(ciphertextValue, 'base64url')),
     decipher.final(),
   ]);
-  const parsed = JSON.parse(plaintext.toString('utf8')) as Partial<ProviderSecrets>;
+  return JSON.parse(plaintext.toString('utf8')) as unknown;
+}
+
+export function encryptProviderSecrets(secrets: ProviderSecrets, keyValue?: string) {
+  return sealProviderData(secrets, aad, keyValue);
+}
+
+export function decryptProviderSecrets(encoded: string, keyValue?: string): ProviderSecrets {
+  const parsed = openProviderData(encoded, aad, keyValue) as Partial<ProviderSecrets>;
   if (typeof parsed.apiKey !== 'string' || !parsed.headers || typeof parsed.headers !== 'object') {
     throw new Error('Encrypted provider credential payload is invalid');
   }

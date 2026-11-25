@@ -461,6 +461,7 @@ model AiRequest {
   result            Json?
   /// Safe failure classification; no response bodies, prompts, secrets or image URLs.
   failureDiagnostic Json?
+  videoDispatch     String?
   createdAt         DateTime             @default(now())
   completedAt       DateTime?
   user              User                 @relation(fields: [userId], references: [id], onDelete: Restrict)
@@ -732,6 +733,12 @@ model AiVideoTask {
   videoAvailable    Boolean?
   pollAfterMs       Int?
   lastPolledAt      DateTime?
+  nextPollAt        DateTime?
+  leaseUntil        DateTime?
+  leaseToken        String?
+  retryCount        Int          @default(0)
+  deliverySource    String?
+  failureDiagnostic Json?
   resultObjectKey   String?
   resultUrl         String?
   upstreamPayload   Json?
@@ -747,6 +754,7 @@ model AiVideoTask {
   @@index([requestId, status])
   @@index([routeId, status])
   @@index([status, lastPolledAt])
+  @@index([status, nextPollAt, leaseUntil])
 }
 
 model ChatPricingConfig {

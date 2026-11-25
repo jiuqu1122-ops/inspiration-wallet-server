@@ -12,6 +12,7 @@ vi.mock('../src/modules/storage/service.js', () => ({
 }));
 
 import { mirrorGeneratedVideoResultToOss } from '../src/modules/ai/video-result-store.js';
+import { videoLogHost } from '../src/modules/ai/video-log.js';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -21,6 +22,12 @@ afterEach(() => {
 });
 
 describe('generated video OSS mirroring', () => {
+  it('retains only the hostname in video logs, including for URLs with credentials', () => {
+    expect(videoLogHost('https://secret-user:secret-pass@cdn.example.test:444/secret-token?signature=private#fragment'))
+      .toBe('cdn.example.test');
+    expect(videoLogHost('data:video/mp4;base64,private')).toBeNull();
+    expect(videoLogHost('malformed secret-token')).toBeNull();
+  });
   it('streams a public MP4 into OSS and returns a stable API URL', async () => {
     const mp4 = Buffer.from('000000186674797069736f6d0000020069736f6d69736f32', 'hex');
     const fetchMock = vi.fn(async () => new Response(mp4, {

@@ -48,6 +48,8 @@ export interface VideoAdapter {
     outputIndex: number,
     idempotencyKey: string,
   ): Promise<VideoAdapterSubmission>;
+  canRecoverSubmission?(context: VideoAdapterContext): boolean;
+  recoverSubmission?(context: VideoAdapterContext, idempotencyKey: string): Promise<VideoAdapterSubmission | null>;
   poll(context: VideoAdapterContext, upstreamTaskId: string): Promise<VideoAdapterPollResult>;
   fetchContent(context: VideoAdapterContext, upstreamTaskId: string, status: VideoAdapterPollResult): Promise<{
     source: string;

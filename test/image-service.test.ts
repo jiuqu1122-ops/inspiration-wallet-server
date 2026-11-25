@@ -22,7 +22,6 @@ import {
   confirmXaisReferenceAttachment,
   convertGptImage2ChromaKeyToTransparentPng,
   executeWalletImageGeneration,
-  executeWalletVideoGeneration,
   filterProviderImageModels,
   findVideoTaskEnvelope,
   generateBigmodelBananaImages,
@@ -164,60 +163,6 @@ describe('Mikoto Seedance model mapping', () => {
     });
   });
 
-  it('releases a failed H3 submission once and keeps its connection error in the admin record', async () => {
-    const fetchMock = vi.fn().mockRejectedValue(new TypeError('fetch failed', {
-      cause: Object.assign(new Error('connection reset'), { code: 'ECONNRESET' }),
-    }));
-    vi.stubGlobal('fetch', fetchMock);
-    const updateRequest = vi.fn().mockResolvedValue({ count: 1 });
-    const writeLedger = vi.fn();
-    const wallet = { availableCredits: '800' };
-    const transaction = {
-      aiRequest: {
-        findUnique: vi.fn().mockResolvedValueOnce(null)
-          .mockResolvedValueOnce({ id: 'h3-request', userId: 'h3-user', status: 'RESERVED' }),
-        create: vi.fn().mockResolvedValue({ id: 'h3-request' }),
-        updateMany: updateRequest,
-      },
-      wallet: {
-        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
-        findUniqueOrThrow: vi.fn().mockResolvedValue(wallet),
-        update: vi.fn().mockResolvedValue(wallet),
-      },
-      walletLedger: { create: writeLedger },
-    };
-    const prisma = {
-      $transaction: (callback: (tx: typeof transaction) => unknown) => callback(transaction),
-      aiProviderChannel: {
-        findMany: vi.fn().mockResolvedValue([{
-          id: 'h3-channel',
-          kind: 'MINIMAX',
-          baseUrl: 'https://8.8.4.4/api/minimax',
-          capabilities: ['VIDEO_MINIMAX'],
-          encryptedSecrets: encryptProviderSecrets({ apiKey: 'test-key', headers: {} }),
-        }]),
-      },
-    };
-
-    await expect(executeWalletVideoGeneration(prisma as never, {
-      userId: 'h3-user', clientRequestId: 'h3-client-request', model: 'minimax-h3', provider: 'minimax',
-      prompt: 'camera orbit', count: 1, duration: 5, resolution: '2K',
-      inputImages: [], inputVideos: [], inputAudios: [],
-    })).rejects.toMatchObject({ code: 'video_generation_failed' });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://8.8.4.4/api/minimax/v2/video_generation');
-    expect(updateRequest).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({
-        status: 'FAILED',
-        failureDiagnostic: expect.objectContaining({
-          stage: 'video_submit', code: 'NETWORK_ERROR', causeCode: 'ECONNRESET', httpStatus: null,
-        }),
-      }),
-    }));
-    expect(writeLedger).toHaveBeenCalledTimes(2);
-    expect(writeLedger).toHaveBeenLastCalledWith({ data: expect.objectContaining({ type: 'RELEASE' }) });
-  });
-
   it('uses the same IPv4 transport for Metaso submission and task polling', async () => {
     const fetchMock = vi.fn(async () => new Response('{}'));
     vi.stubGlobal('fetch', fetchMock);
@@ -326,12 +271,11 @@ describe('Mikoto Seedance model mapping', () => {
     })).toEqual(['https://media.example/output.mp4?token=1']);
   });
 
-  it('places mirrored video URLs before the upstream response', async () => {
+  it('returns only mirrored URLs from an upstream video response', async () => {
     const upstream = { data: { status: 'succeeded', video_url: 'https://media.example/output.mp4' } };
     const mirror = vi.fn(async () => 'https://api.unmind.art/v1/ai/video-results/stable.mp4');
     await expect(mirrorGeneratedVideoResponse(upstream, 'Mikoto', mirror)).resolves.toEqual({
       walletVideoResults: ['https://api.unmind.art/v1/ai/video-results/stable.mp4'],
-      upstream,
     });
     expect(mirror).toHaveBeenCalledWith('https://media.example/output.mp4');
   });

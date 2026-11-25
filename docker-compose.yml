@@ -68,6 +68,7 @@ services:
     image: ${BACKEND_IMAGE:-ghcr.io/jiuqu1122-ops/inspiration-wallet-server:latest}
     restart: unless-stopped
     init: true
+    stop_grace_period: 2m
     command: ["node", "dist/worker.js"]
     env_file:
       - .env

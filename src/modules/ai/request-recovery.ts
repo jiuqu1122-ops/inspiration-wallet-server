@@ -45,8 +45,9 @@ export async function recoverStaleAiRequests(
   const fetchCandidates = (cursor?: string) => prisma.aiRequest.findMany({
     where: {
       // Agent/chat and inspiration-analysis requests have their own AiTask
-      // heartbeat/recovery lifecycle. This sweeper owns image/video credits.
-      capability: { in: ['IMAGE', 'VIDEO'] },
+      // heartbeat/recovery lifecycle. Video reservations are reconciled by
+      // their Worker only after all outputs have a confirmed outcome.
+      capability: 'IMAGE',
       status: { in: [...ACTIVE_REQUEST_STATUSES] },
       createdAt: { lt: staleBefore },
       completedAt: null,
@@ -101,7 +102,7 @@ export async function recoverStaleAiRequests(
         const claimed = await transaction.aiRequest.updateMany({
           where: {
             id: candidate.id,
-            capability: { in: ['IMAGE', 'VIDEO'] },
+            capability: 'IMAGE',
             status: arkSplit ? candidate.status : { in: [...ACTIVE_REQUEST_STATUSES] },
             ...(arkSplit && typeof arkDownloadDueAt === 'string' ? { result: { path: ['arkDownloadDueAt'], equals: arkDownloadDueAt } } : {}),
             createdAt: { lt: staleBefore },
@@ -117,22 +118,6 @@ export async function recoverStaleAiRequests(
           },
         });
         if (claimed.count !== 1) return false;
-
-        // A late video status poll must not leave a task looking successful
-        // after its request reservation has already been released.
-        await transaction.aiVideoTask.updateMany({
-          where: {
-            requestId: candidate.id,
-            status: { notIn: ['SUCCEEDED', 'FAILED'] },
-          },
-          data: {
-            status: 'FAILED',
-            assetState: 'expired',
-            videoAvailable: false,
-            lastError: STALE_REQUEST_MESSAGE,
-            completedAt: now,
-          },
-        });
 
         await releaseMembershipQuota(transaction, candidate.pricingSnapshot);
         const wallet = await transaction.wallet.update({

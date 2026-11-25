@@ -19,10 +19,12 @@ import {
 } from './modules/ai/task-service.js';
 import { recoverStaleAiRequests } from './modules/ai/request-recovery.js';
 import { recoverNextArkCanvasLayerOutput } from './modules/ai/layer-canvas-service.js';
+import { claimVideoTask, processVideoTask, recoverVideoSettlement } from './modules/ai/video-worker.js';
 
 const prisma = new PrismaClient();
 const workerId = `${hostname()}:${process.pid}`;
 const active = new Set<Promise<void>>();
+const activeVideoTasks = new Set<Promise<void>>();
 let shuttingDown = false;
 
 function log(event: string, fields: Record<string, unknown> = {}) {
@@ -198,6 +200,7 @@ async function main() {
   let lastRecoveryAt = Date.now();
   let lastRequestRecoveryAt = Date.now();
   let nextLayerRecoveryAt = 0;
+  let nextVideoSettlementAt = 0;
   let layerRecoveryActive = false;
   const requestRecoveryIntervalMs = Math.max(
     30_000,
@@ -205,12 +208,27 @@ async function main() {
   );
   log('worker_started', {
     concurrency: env.AI_WORKER_CONCURRENCY,
+    videoConcurrency: env.AI_VIDEO_WORKER_CONCURRENCY,
     aiRequestStaleAfterMs: env.AI_REQUEST_STALE_AFTER_MS,
     aiRequestRecoveryIntervalMs: requestRecoveryIntervalMs,
   });
 
   while (!shuttingDown) {
     await updateHealthFile();
+    try {
+      if (Date.now() >= nextVideoSettlementAt) {
+        nextVideoSettlementAt = Date.now() + 5_000;
+        await recoverVideoSettlement(prisma);
+      }
+      while (!shuttingDown && activeVideoTasks.size < env.AI_VIDEO_WORKER_CONCURRENCY) {
+        const task = await claimVideoTask(prisma);
+        if (!task) break;
+        const promise = processVideoTask(prisma, task).finally(() => activeVideoTasks.delete(promise));
+        activeVideoTasks.add(promise);
+      }
+    } catch {
+      log('video_worker_dispatch_failed');
+    }
     if (Date.now() - lastRecoveryAt > env.AI_TASK_STALE_AFTER_MS / 2) {
       await recoverStaleTasks();
       lastRecoveryAt = Date.now();
@@ -247,7 +265,7 @@ async function main() {
     }
     await new Promise(resolve => setTimeout(resolve, env.AI_TASK_POLL_INTERVAL_MS));
   }
-  await Promise.allSettled(active);
+  await Promise.allSettled([...active, ...activeVideoTasks]);
 }
 
 async function shutdown(signal: string) {

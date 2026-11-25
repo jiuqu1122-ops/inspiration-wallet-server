@@ -16,6 +16,21 @@ export const REFERENCE_UPLOAD_TTL_SECONDS = 5 * 60;
 // queues and long-running generations, just like legacy reference uploads.
 const REFERENCE_IMAGE_TTL_SECONDS = Math.max(60 * 60, env.STORAGE_SIGNED_URL_EXPIRES_SECONDS);
 const REFERENCE_IMAGE_FILENAME_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?:-\d+)?\.(?:png|jpe?g|webp|gif)$/i;
+const videoReferenceNamespace = 'reference-video-inputs/';
+const mediaReferenceExtensions: Readonly<Record<string, string>> = {
+  'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm',
+  'video/x-m4v': 'm4v', 'video/x-msvideo': 'avi',
+  'audio/mpeg': 'mp3', 'audio/wav': 'wav', 'audio/x-wav': 'wav',
+  'audio/mp4': 'm4a', 'audio/aac': 'aac', 'audio/ogg': 'ogg', 'audio/flac': 'flac',
+};
+const VIDEO_REFERENCE_MAX_BYTES = 128 * 1024 * 1024;
+const maxMediaReferenceBytes = (mime: string) => mime.startsWith('video/') ? VIDEO_REFERENCE_MAX_BYTES : 32 * 1024 * 1024;
+
+export const videoReferenceUploadInputSchema = z.object({
+  filename: z.string().trim().min(1).max(255),
+  mime: z.string().refine(mime => Object.hasOwn(mediaReferenceExtensions, mime)),
+  sizeBytes: z.number().int().positive().max(VIDEO_REFERENCE_MAX_BYTES),
+}).strict();
 
 export const referenceUploadInputSchema = z.object({
   filename: z.string().trim().min(1).max(255),
@@ -106,6 +121,57 @@ export async function issueReferenceUploadTicket(
     headers: Record<string, string>;
     expiresAt: string;
   };
+}
+
+export async function issueVideoReferenceUploadTicket(
+  prisma: PrismaClient,
+  userId: string,
+  input: z.infer<typeof videoReferenceUploadInputSchema>,
+) {
+  if (!Object.hasOwn(mediaReferenceExtensions, input.mime) || input.sizeBytes > maxMediaReferenceBytes(input.mime)) {
+    throw new ReferenceUploadError('Video input is not supported or exceeds the size limit', 'video_reference_invalid', 413);
+  }
+  const objectKey = `${videoReferenceNamespace}${randomUUID()}.${mediaReferenceExtensions[input.mime]}`;
+  const expiresAt = new Date(Date.now() + REFERENCE_UPLOAD_TTL_SECONDS * 1_000);
+  const upload = storageService.createUploadUrl(objectKey, {
+    expiresSeconds: REFERENCE_UPLOAD_TTL_SECONDS, contentType: input.mime,
+  });
+  await delegate(prisma).create({ data: {
+    userId, objectKey, sizeBytes: input.sizeBytes, contentType: input.mime, status: 'ISSUED',
+    expiresAt: new Date(Date.now() + 24 * 60 * 60_000),
+  } });
+  return { objectKey, uploadUrl: upload.url, method: upload.method, headers: upload.headers, expiresAt: expiresAt.toISOString() };
+}
+
+export async function resolveVideoReferenceSources(
+  prisma: PrismaClient, userId: string, sources: string[], type: 'video' | 'audio',
+) {
+  return Promise.all(sources.map(async source => {
+    const trimmed = source.trim();
+    if (isHttpUrl(trimmed) || trimmed.startsWith(`data:${type}/`)) return trimmed;
+    if (!trimmed.startsWith(videoReferenceNamespace)) {
+      // Preserve opaque reference identifiers understood by existing providers.
+      return trimmed;
+    }
+    const objectKey = validateObjectKey(trimmed);
+    const record = await delegate(prisma).findFirst({
+      where: { userId, objectKey, status: { in: ['ISSUED', 'UPLOADED'] }, expiresAt: { gt: new Date() } },
+    });
+    const mime = record?.contentType.toLowerCase();
+    if (!record || !mime?.startsWith(`${type}/`) || !Object.hasOwn(mediaReferenceExtensions, mime)) {
+      throw new ReferenceUploadError('Video input does not belong to this user or has expired', 'video_reference_invalid', 422);
+    }
+    const metadata = await storageService.headObject(objectKey);
+    if (!metadata || metadata.contentLength !== Number(record.sizeBytes)
+      || metadata.contentLength <= 0 || metadata.contentLength > maxMediaReferenceBytes(mime)
+      || metadata.contentType?.split(';')[0]?.trim().toLowerCase() !== mime) {
+      throw new ReferenceUploadError('Video input upload is missing or invalid', 'video_reference_invalid', 422);
+    }
+    if (record.status !== 'UPLOADED') {
+      await delegate(prisma).update({ where: { id: record.id }, data: { status: 'UPLOADED', uploadedAt: new Date() } });
+    }
+    return storageService.getDownloadUrl(objectKey);
+  }));
 }
 
 export async function recordLegacyReferenceUpload(

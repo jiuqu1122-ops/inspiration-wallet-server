@@ -1,8 +1,29 @@
-import { buildFailureDiagnostic } from './failure-diagnostic.js';
-import { Prisma, type PrismaClient } from '@prisma/client';
+import { buildFailureDiagnostic, readFailureDiagnostic } from './failure-diagnostic.js';
+import { Prisma, type AiRequest, type PrismaClient } from '@prisma/client';
 import { createHash } from 'node:crypto';
+import { sealProviderData, openProviderData } from '../../lib/provider-secrets.js';
 import { creditDecimal } from '../wallets/credit-amount.js';
 import { calculateSnapshotCharge, toInputJson, type PricingSnapshot } from './pricing-center.js';
+
+import type { VideoInput } from './image-service.js';
+import type { NormalizedVideoRequest } from './video-request.js';
+import { isStoredVideoResultUrl } from './video-result-store.js';
+
+export type VideoDispatch = {
+  providerChannelId: string;
+  genericRouteIds: string[];
+  input: VideoInput;
+  normalizedInput?: NormalizedVideoRequest;
+};
+
+const dispatchContext = (request: Pick<VideoInput, 'userId' | 'clientRequestId'>) =>
+  Buffer.from(JSON.stringify(['video-dispatch', request.userId, request.clientRequestId]));
+
+export const sealVideoDispatch = (request: VideoInput, dispatch: VideoDispatch) =>
+  sealProviderData(dispatch, dispatchContext(request));
+
+export const openVideoDispatch = (request: Pick<AiRequest, 'videoDispatch' | 'userId' | 'clientRequestId'>) =>
+  request.videoDispatch ? openProviderData(request.videoDispatch, dispatchContext(request)) as VideoDispatch : null;
 
 export const VIDEO_TASK_TERMINAL_STATUSES = new Set(['SUCCEEDED', 'FAILED']);
 
@@ -11,81 +32,12 @@ export const videoOutputIdempotencyKey = (clientRequestId: string, outputIndex: 
 );
 
 export const clampVideoPollAfterMs = (value: unknown, fallback = 2_500) => {
-  const number = Number(value);
+  const number = value == null ? NaN : Number(value);
   // Providers commonly ask for 120s or more.  Keep a safety ceiling for
   // malformed responses, but never truncate a valid Retry-After/poll_after_ms
   // to the old 30s client cadence.
   return Number.isFinite(number) ? Math.max(1_000, Math.min(24 * 60 * 60_000, Math.round(number))) : fallback;
 };
-
-export async function createVideoTasks(
-  prisma: PrismaClient,
-  requestId: string,
-  routeId: string,
-  count: number,
-) {
-  await prisma.$transaction([
-    prisma.aiVideoTask.deleteMany({ where: { requestId, outputIndex: { gte: count } } }),
-    ...Array.from({ length: count }, (_, outputIndex) => prisma.aiVideoTask.upsert({
-      where: { requestId_outputIndex: { requestId, outputIndex } },
-      create: { requestId, routeId, outputIndex, status: 'RESERVED' },
-      update: {
-        routeId,
-        upstreamTaskId: null,
-        status: 'RESERVED',
-        assetState: null,
-        videoAvailable: null,
-        pollAfterMs: null,
-        lastPolledAt: null,
-        resultObjectKey: null,
-        resultUrl: null,
-        upstreamPayload: Prisma.DbNull,
-        lastError: null,
-        completedAt: null,
-      },
-    })),
-  ]);
-  return prisma.aiVideoTask.findMany({ where: { requestId }, orderBy: { outputIndex: 'asc' } });
-}
-
-export async function recordVideoTaskSubmission(
-  prisma: PrismaClient,
-  taskId: string,
-  submission: { upstreamTaskId: string; upstreamPayload: unknown; pollAfterMs?: number },
-) {
-  return prisma.$transaction(async transaction => {
-    const task = await transaction.aiVideoTask.update({
-      where: { id: taskId },
-      data: {
-        upstreamTaskId: submission.upstreamTaskId,
-        upstreamPayload: toInputJson(submission.upstreamPayload),
-        pollAfterMs: submission.pollAfterMs === undefined ? null : clampVideoPollAfterMs(submission.pollAfterMs),
-        status: 'PROCESSING',
-        lastError: null,
-      },
-    });
-    await transaction.aiRequest.updateMany({
-      where: { id: task.requestId, status: 'RESERVED' },
-      data: { status: 'PROCESSING' },
-    });
-    return task;
-  });
-}
-
-export async function recordVideoTaskFailure(
-  prisma: PrismaClient,
-  taskId: string,
-  error: unknown,
-) {
-  return prisma.aiVideoTask.update({
-    where: { id: taskId },
-    data: {
-      status: 'FAILED',
-      lastError: error instanceof Error ? error.message : String(error),
-      completedAt: new Date(),
-    },
-  });
-}
 
 export async function settleVideoRequestIfTerminal(prisma: PrismaClient, requestId: string) {
   return prisma.$transaction(async transaction => {
@@ -93,23 +45,48 @@ export async function settleVideoRequestIfTerminal(prisma: PrismaClient, request
       where: { id: requestId },
       include: { videoTasks: { orderBy: { outputIndex: 'asc' } } },
     });
-    if (!request || !['RESERVED', 'PROCESSING'].includes(request.status)) return null;
+    if (!request || !['RESERVED', 'PROCESSING', 'SUCCEEDED'].includes(request.status)) return null;
     if (request.videoTasks.length === 0
       || request.videoTasks.some(task => !VIDEO_TASK_TERMINAL_STATUSES.has(task.status))) return null;
 
     const succeeded = request.videoTasks.filter(task => task.status === 'SUCCEEDED' && task.resultUrl);
+    if (request.status === 'SUCCEEDED') {
+      // Migration adopts already-charged receipts only when they were never
+      // mirrored. Repair delivery without charging again.
+      if (succeeded.length || request.videoDispatch || !request.chargedCredits.gt(0)) return null;
+      const refunded = await transaction.aiRequest.updateMany({
+        where: { id: request.id, status: 'SUCCEEDED' },
+        data: { status: 'REFUNDED', completedAt: new Date() },
+      });
+      if (refunded.count !== 1) return null;
+      const wallet = await transaction.wallet.update({
+        where: { userId: request.userId },
+        data: {
+          availableCredits: { increment: request.chargedCredits },
+          lifetimeConsumed: { decrement: request.chargedCredits },
+        },
+      });
+      await transaction.walletLedger.create({
+        data: {
+          userId: request.userId, requestId: request.id, type: 'REFUND',
+          amount: request.chargedCredits, balanceAfter: wallet.availableCredits,
+          description: 'Previously charged video failed upstream',
+        },
+      });
+      return { status: 'failed' as const, generatedCount: 0 };
+    }
+
     if (succeeded.length === 0) {
       const claimed = await transaction.aiRequest.updateMany({
         where: { id: request.id, status: { in: ['RESERVED', 'PROCESSING'] } },
         data: {
           status: 'FAILED',
-          failureDiagnostic: toInputJson(buildFailureDiagnostic(
-            request.videoTasks.find(task => task.status === 'FAILED')?.lastError,
-            { stage: 'video_task' },
-          )),
-          result: toInputJson({
-            tasks: request.videoTasks.map(task => ({ id: task.id, status: task.status, error: task.lastError })),
-          }),
+          videoDispatch: null,
+          failureDiagnostic: toInputJson(
+            readFailureDiagnostic(request.videoTasks.find(task => task.status === 'FAILED')?.failureDiagnostic)
+            ?? buildFailureDiagnostic(undefined, { stage: 'video_task' }),
+          ),
+          result: toInputJson({ tasks: request.videoTasks.map(publicVideoTask) }),
           completedAt: new Date(),
         },
       });
@@ -142,7 +119,7 @@ export async function settleVideoRequestIfTerminal(prisma: PrismaClient, request
       : null;
     const chargedCredits = breakdown
       ? creditDecimal(breakdown.totalCredits)
-      : request.estimatedCredits;
+      : creditDecimal(request.estimatedCredits.mul(succeeded.length).div(request.videoTasks.length).toFixed(6));
     if (chargedCredits.gt(request.estimatedCredits)) {
       throw new Error('Final video charge exceeds the reserved estimate');
     }
@@ -161,26 +138,13 @@ export async function settleVideoRequestIfTerminal(prisma: PrismaClient, request
         cos_url: primaryResultUrl,
         cosUrl: primaryResultUrl,
       } : {}),
-      tasks: request.videoTasks.map(task => ({
-        id: task.id,
-        outputIndex: task.outputIndex,
-        status: task.status,
-        resultUrl: task.resultUrl,
-        ...(task.resultUrl ? {
-          video_url: task.resultUrl,
-          videoUrl: task.resultUrl,
-          result_url: task.resultUrl,
-          resultUrl: task.resultUrl,
-          cos_url: task.resultUrl,
-          cosUrl: task.resultUrl,
-        } : {}),
-        error: task.lastError,
-      })),
+      tasks: request.videoTasks.map(publicVideoTask),
     };
     const claimed = await transaction.aiRequest.updateMany({
       where: { id: request.id, status: { in: ['RESERVED', 'PROCESSING'] } },
       data: {
         status: 'SUCCEEDED',
+        videoDispatch: null,
         chargedCredits,
         ...(breakdown ? { chargeBreakdown: toInputJson(breakdown) } : {}),
         result: toInputJson(result),
@@ -236,46 +200,142 @@ export async function settleVideoRequestIfTerminal(prisma: PrismaClient, request
   }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
 }
 
-export function publicVideoTask(task: {
+const safeAssetStates = new Set(['available', 'ready', 'saved', 'saving', 'failed', 'expired']);
+
+type PublicVideoTaskInput = {
   id: string;
   upstreamTaskId: string | null;
+  outputIndex?: number;
   status: string;
   assetState: string | null;
   videoAvailable: boolean | null;
   pollAfterMs: number | null;
   resultUrl: string | null;
+  nextPollAt?: Date | null;
+  failureDiagnostic?: unknown;
+  // Legacy database fields may still arrive during a rolling upgrade.
   upstreamPayload?: unknown;
-  lastError: string | null;
-}) {
-  const status = task.status === 'SUCCEEDED'
-    ? 'succeeded'
+  lastError?: string | null;
+};
+
+export function publicVideoTask(task: PublicVideoTaskInput) {
+  const isRecovering = ['SUBMISSION_PENDING', 'CONFIRMATION_REQUIRED', 'PERSISTENCE_PENDING'].includes(task.status);
+  const status = task.status === 'SUCCEEDED' ? 'succeeded'
     : task.status === 'FAILED' ? 'failed' : 'processing';
-  const confirmationRequired = task.status === 'SUBMISSION_PENDING'
-    || task.status === 'PERSISTENCE_PENDING';
-  const upstreamTaskIds = task.upstreamTaskId ? [task.upstreamTaskId] : [];
+  const isTerminal = status !== 'processing';
+  const resultUrl = status === 'succeeded' && task.resultUrl && isStoredVideoResultUrl(task.resultUrl)
+    ? task.resultUrl : null;
+  const diagnostic = readFailureDiagnostic(task.failureDiagnostic);
+  const errorCode = isRecovering ? 'VIDEO_RECOVERY_PENDING' : status === 'failed'
+    ? diagnostic?.code ?? 'GENERATION_FAILED' : null;
+  const error = isRecovering ? '视频任务正在恢复或等待上游确认' : status === 'failed'
+    ? diagnostic?.message ?? '视频生成失败' : null;
+  const pollAfterMs = task.nextPollAt
+    ? Math.max(1_000, task.nextPollAt.getTime() - Date.now())
+    : task.pollAfterMs;
+  const assetState = task.assetState && safeAssetStates.has(task.assetState) ? task.assetState : null;
   return {
     task_id: task.id,
     taskId: task.id,
-    upstreamTaskId: task.upstreamTaskId,
-    upstreamTaskIds,
+    upstreamTaskIds: [task.id],
+    outputIndex: task.outputIndex ?? 0,
     status,
-    ...(confirmationRequired ? { confirmationRequired: true, recoveryStatus: 'pending_confirmation' } : {}),
-    video_available: task.videoAvailable ?? Boolean(task.resultUrl),
-    videoAvailable: task.videoAvailable ?? Boolean(task.resultUrl),
-    asset_state: task.assetState,
-    assetState: task.assetState,
-    poll_after_ms: task.pollAfterMs,
-    pollAfterMs: task.pollAfterMs,
-    ...(task.upstreamPayload ? { upstream: task.upstreamPayload } : {}),
-    ...(task.resultUrl ? {
-      video_url: task.resultUrl,
-      videoUrl: task.resultUrl,
-      result_url: task.resultUrl,
-      resultUrl: task.resultUrl,
-      cos_url: task.resultUrl,
-      cosUrl: task.resultUrl,
-      walletVideoResults: [task.resultUrl],
+    phase: task.status.toLowerCase(),
+    progress: isTerminal ? 100 : task.status === 'QUEUED' ? 0 : task.status === 'SUBMITTING' ? 5
+      : task.status === 'PERSISTENCE_PENDING' ? 90 : null,
+    isTerminal, isRecovering,
+    retryable: status === 'failed' && !['PROVIDER_AUTH_FAILED', 'PROVIDER_QUOTA_EXCEEDED',
+      'PROVIDER_INVALID_REQUEST', 'PROVIDER_CONTENT_REJECTED'].includes(errorCode ?? ''),
+    ...(isRecovering ? { confirmationRequired: true, recoveryStatus: 'pending_confirmation' } : {}),
+    video_available: Boolean(resultUrl),
+    videoAvailable: Boolean(resultUrl),
+    asset_state: assetState,
+    assetState,
+    poll_after_ms: pollAfterMs,
+    pollAfterMs,
+    resultUrl,
+    ...(resultUrl ? {
+      video_url: resultUrl, videoUrl: resultUrl, result_url: resultUrl,
+      cos_url: resultUrl, cosUrl: resultUrl, walletVideoResults: [resultUrl],
     } : {}),
-    ...(task.lastError ? { error: task.lastError } : {}),
+    ...(errorCode ? { errorCode, error } : {}),
   };
+}
+
+export function storedHistoricalVideoUrls(value: unknown, depth = 0): string[] {
+  if (depth > 6) return [];
+  if (typeof value === 'string') return isStoredVideoResultUrl(value) ? [value] : [];
+  if (Array.isArray(value)) return [...new Set(value.flatMap(item => storedHistoricalVideoUrls(item, depth + 1)))];
+  if (!value || typeof value !== 'object') return [];
+  const row = value as Record<string, unknown>;
+  return [...new Set(
+    ['results', 'tasks', 'walletVideoResults', 'video_url', 'videoUrl', 'result_url', 'resultUrl', 'cos_url', 'cosUrl']
+      .flatMap(key => storedHistoricalVideoUrls(row[key], depth + 1)),
+  )];
+}
+
+type VideoRequestRecord = Pick<AiRequest, 'id' | 'clientRequestId' | 'logicalModel' | 'status' | 'chargedCredits' | 'result' | 'failureDiagnostic'>
+  & { videoTasks: PublicVideoTaskInput[] };
+
+export function publicVideoRequest(request: VideoRequestRecord) {
+  const failed = request.status === 'FAILED' || request.status === 'REFUNDED';
+  const recovering = !failed && request.videoTasks.some(task => !VIDEO_TASK_TERMINAL_STATUSES.has(task.status));
+  const status = failed ? 'failed' : request.status === 'SUCCEEDED' && !recovering ? 'succeeded' : 'processing';
+  const historical = request.videoTasks.length === 0 && status === 'succeeded'
+    ? storedHistoricalVideoUrls(request.result) : [];
+  const tasks = request.videoTasks.map(task => publicVideoTask(failed
+    ? { ...task, status: 'FAILED', failureDiagnostic: task.failureDiagnostic ?? request.failureDiagnostic } : task));
+  const diagnostic = failed ? readFailureDiagnostic(request.failureDiagnostic) : null;
+  return {
+    requestId: request.id,
+    clientRequestId: request.clientRequestId,
+    status,
+    provider: 'managed',
+    model: request.logicalModel,
+    chargedCredits: request.chargedCredits.toString(),
+    tasks,
+    results: tasks.length ? tasks : historical,
+    isTerminal: status !== 'processing',
+    isRecovering: tasks.some(task => task.isRecovering),
+    completedCount: tasks.length ? tasks.filter(task => task.isTerminal).length : historical.length,
+    totalCount: tasks.length || historical.length,
+    ...(failed ? { errorCode: diagnostic?.code ?? 'GENERATION_FAILED', error: diagnostic?.message ?? 'Video generation failed' } : {}),
+  };
+}
+
+export async function getVideoRequestByClientId(prisma: PrismaClient, userId: string, clientRequestId: string) {
+  const row = await prisma.aiRequest.findFirst({
+    where: { userId, clientRequestId, capability: 'VIDEO' },
+    include: { videoTasks: { orderBy: { outputIndex: 'asc' } } },
+  });
+  return row ? publicVideoRequest(row) : null;
+}
+
+export async function getVideoTaskForUser(
+  prisma: PrismaClient,
+  input: { userId: string; taskId: string; clientRequestId?: string | undefined },
+) {
+  const { userId, taskId, clientRequestId } = input;
+  const task = await prisma.aiVideoTask.findFirst({
+    where: {
+      request: { userId, capability: 'VIDEO', ...(clientRequestId ? { clientRequestId } : {}) },
+      OR: [{ id: taskId }, ...(clientRequestId ? [{ upstreamTaskId: taskId }] : [])],
+    },
+    include: { request: { select: { status: true, failureDiagnostic: true } } },
+  });
+  if (task) {
+    const view = publicVideoTask(['FAILED', 'REFUNDED'].includes(task.request.status)
+      ? { ...task, status: 'FAILED', failureDiagnostic: task.failureDiagnostic ?? task.request.failureDiagnostic } : task);
+    // Echo only the already-known alias supplied by the owner of an old
+    // receipt. New requests never disclose IDs assigned by the upstream.
+    return view.taskId === taskId ? view : { ...view, task_id: taskId, taskId, upstreamTaskIds: [taskId] };
+  }
+  if (!clientRequestId) return null;
+  // Older desktop clients used the original request ID as the task ID.
+  const request = await getVideoRequestByClientId(prisma, userId, clientRequestId);
+  if (!request) return null;
+  if (taskId !== clientRequestId && request.tasks.length) return null;
+  if (request.tasks.length === 1) return request.tasks[0];
+  const historical = request.results.filter((result): result is string => typeof result === 'string');
+  return { ...request, task_id: taskId, taskId, walletVideoResults: historical };
 }

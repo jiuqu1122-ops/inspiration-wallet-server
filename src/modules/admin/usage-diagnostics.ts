@@ -152,8 +152,9 @@ export async function listAdminUsageErrors(prisma: PrismaClient, input: UsageErr
         route: { select: { upstreamModelId: true, channel: { select: { name: true } } } },
         user: { select: { id: true, email: true, displayName: true } },
         videoTasks: {
-          where: { status: 'FAILED' }, take: 16, orderBy: [{ completedAt: 'desc' }, { id: 'desc' }],
-          select: { id: true, lastError: true, completedAt: true },
+          where: { status: { in: ['FAILED', 'SUBMISSION_PENDING', 'CONFIRMATION_REQUIRED', 'PERSISTENCE_PENDING'] } },
+          take: 16, orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+          select: { id: true, failureDiagnostic: true, lastError: true, completedAt: true },
         },
       },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: input.limit + 1,
@@ -173,10 +174,9 @@ export async function listAdminUsageErrors(prisma: PrismaClient, input: UsageErr
     nextCursor: rows.length > input.limit && page.length ? encodeUsageCursor(page[page.length - 1]!) : null,
     items: page.map(row => {
       const pendingRecovery = recoveries.get(row.id);
-      const taskWithError = row.videoTasks.find(task => Boolean(task.lastError));
-      const outputDiagnostic = taskWithError
-        ? buildFailureDiagnostic(taskWithError.lastError, { stage: 'video_task' }, taskWithError.completedAt ?? snapshot)
-        : null;
+      const outputDiagnostic = row.videoTasks.map(task => readFailureDiagnostic(task.failureDiagnostic)
+        ?? (task.lastError ? buildFailureDiagnostic(task.lastError, { stage: 'video_task' }, task.completedAt ?? snapshot) : null))
+        .find(Boolean) ?? null;
       // A request can be reused after a prior failure. For a currently partial
       // success, use the current failed output, not stale request metadata.
       const diagnostic = ['FAILED', 'REFUNDED'].includes(row.status)

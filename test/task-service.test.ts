@@ -65,7 +65,7 @@ function taskPrisma(initial?: AiTask) {
 }
 
 describe('PostgreSQL-backed AI tasks', () => {
-  it('returns a root video envelope while preserving the upstream payload', () => {
+  it('returns a safe root video envelope without its upstream payload', () => {
     expect(publicVideoTask({
       id: 'client-request-1',
       upstreamTaskId: 'upstream-1',
@@ -73,19 +73,18 @@ describe('PostgreSQL-backed AI tasks', () => {
       assetState: 'ready',
       videoAvailable: true,
       pollAfterMs: null,
-      resultUrl: 'https://api.unmind.art/v1/ai/video-results/stable.mp4',
+      resultUrl: `https://api.example.test/v1/ai/video-results/${'a'.repeat(64)}.mp4`,
       upstreamPayload: { status: 'completed' },
       lastError: null,
     })).toMatchObject({
       task_id: 'client-request-1',
       taskId: 'client-request-1',
-      upstreamTaskIds: ['upstream-1'],
+      upstreamTaskIds: ['client-request-1'],
       status: 'succeeded',
-      walletVideoResults: ['https://api.unmind.art/v1/ai/video-results/stable.mp4'],
-      video_url: 'https://api.unmind.art/v1/ai/video-results/stable.mp4',
-      result_url: 'https://api.unmind.art/v1/ai/video-results/stable.mp4',
-      cos_url: 'https://api.unmind.art/v1/ai/video-results/stable.mp4',
-      upstream: { status: 'completed' },
+      walletVideoResults: [`https://api.example.test/v1/ai/video-results/${'a'.repeat(64)}.mp4`],
+      video_url: `https://api.example.test/v1/ai/video-results/${'a'.repeat(64)}.mp4`,
+      result_url: `https://api.example.test/v1/ai/video-results/${'a'.repeat(64)}.mp4`,
+      cos_url: `https://api.example.test/v1/ai/video-results/${'a'.repeat(64)}.mp4`,
     });
   });
 

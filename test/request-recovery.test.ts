@@ -17,7 +17,7 @@ function makePrisma(claimCount = 1) {
       findMany: vi.fn().mockResolvedValue([{
         id: 'request-1',
         userId: 'user-1',
-        capability: 'VIDEO',
+        capability: 'IMAGE',
         estimatedCredits: new Prisma.Decimal('170'),
         pricingSnapshot: null,
         clientRequestId: 'client-1',
@@ -54,7 +54,7 @@ describe('stale AI request recovery', () => {
     }
   });
 
-  it('claims stale requests, fails active video tasks, and releases the reservation once', async () => {
+  it('claims stale image requests and releases the reservation once', async () => {
     const { prisma, transaction } = makePrisma();
     const result = await recoverStaleAiRequests(
       prisma as never,
@@ -66,10 +66,10 @@ describe('stale AI request recovery', () => {
       where: expect.objectContaining({ id: 'request-1', status: { in: ['RESERVED', 'PROCESSING'] } }),
       data: expect.objectContaining({ status: 'FAILED' }),
     }));
-    expect(transaction.aiVideoTask.updateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { requestId: 'request-1', status: { notIn: ['SUCCEEDED', 'FAILED'] } },
-      data: expect.objectContaining({ status: 'FAILED', assetState: 'expired', videoAvailable: false }),
+    expect(prisma.aiRequest.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ capability: 'IMAGE' }),
     }));
+    expect(transaction.aiVideoTask.updateMany).not.toHaveBeenCalled();
     expect(transaction.wallet.update).toHaveBeenCalledWith({
       where: { userId: 'user-1' },
       data: {

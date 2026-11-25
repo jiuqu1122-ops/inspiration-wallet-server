@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { env } from '../../config/env.js';
 import { assertPublicProviderUrl } from '../providers/url.js';
 import { storageService } from '../storage/service.js';
+import { logVideoEvent } from './video-log.js';
 
 const VIDEO_RESULT_KEY_PATTERN = /^[a-f0-9]{64}\.(?:mp4|webm|mov|m4v|avi)$/;
 const MAX_VIDEO_RESULT_BYTES = 2 * 1024 * 1024 * 1024;
@@ -25,6 +26,17 @@ export function isStoredVideoResultUrl(value: string) {
 
 export function isVideoResultKey(value: string) {
   return VIDEO_RESULT_KEY_PATTERN.test(value);
+}
+
+const taskVideoDigest = (taskId: string) => createHash('sha256').update(`wallet-video-result:${taskId}`).digest('hex');
+
+export async function recoverStoredVideoTaskResult(taskId: string) {
+  const digest = taskVideoDigest(taskId);
+  for (const extension of ['mp4', 'webm', 'mov', 'm4v', 'avi']) {
+    const key = `${digest}.${extension}`;
+    if (await storageService.exists(`generated-videos/${key}`)) return videoResultUrl(key);
+  }
+  return null;
 }
 
 function videoTypeFromPrefix(prefix: Buffer) {
@@ -127,18 +139,17 @@ async function stagePublicVideo(source: string, requestHeaders?: HeadersInit) {
       await assertPublicProviderUrl(current.toString());
       const headers = new Headers(current.origin === authenticatedOrigin ? requestHeaders : undefined);
       headers.set('accept', 'video/mp4,video/webm,video/quicktime,video/*;q=0.9,*/*;q=0.1');
+      const started = Date.now();
       const response = await fetch(current, {
         method: 'GET',
         headers,
         redirect: 'manual',
         signal: controller.signal,
       });
-      console.info('[video_content_response]', {
-        contentUrl: current.toString(),
+      logVideoEvent('video_content_response', {
+        source: current.toString(),
         status: response.status,
-        contentType: response.headers.get('content-type') || null,
-        contentLength: response.headers.get('content-length') || null,
-        redirectCount,
+        durationMs: Date.now() - started,
       });
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
@@ -150,11 +161,10 @@ async function stagePublicVideo(source: string, requestHeaders?: HeadersInit) {
       const staged = await writeVideoResponseToFile(response, path);
       const fileSize = (await stat(path)).size;
       if (fileSize !== staged.size) throw new Error('generated video temporary file size mismatch');
-      console.info('[video_content_downloaded]', {
-        contentUrl: current.toString(),
+      logVideoEvent('video_content_downloaded', {
+        source: current.toString(),
         bytes: staged.size,
-        mime: staged.mime,
-        extension: staged.extension,
+        durationMs: Date.now() - started,
       });
       return {
         path,
@@ -196,7 +206,7 @@ async function stageInlineVideo(source: string) {
   }
 }
 
-async function performGeneratedVideoResultMirror(source: string, requestHeaders?: HeadersInit) {
+async function performGeneratedVideoResultMirror(source: string, requestHeaders?: HeadersInit, cacheScope?: string) {
   const trimmed = source.trim();
   if (isStoredVideoResultUrl(trimmed)) {
     const key = new URL(trimmed).pathname.split('/').filter(Boolean).pop();
@@ -210,7 +220,14 @@ async function performGeneratedVideoResultMirror(source: string, requestHeaders?
     ? await stageInlineVideo(trimmed)
     : await stagePublicVideo(trimmed, requestHeaders);
   try {
-    const key = `${randomBytes(32).toString('hex')}.${staged.extension}`;
+    const taskId = cacheScope?.startsWith('wallet-video:') ? cacheScope.slice('wallet-video:'.length) : undefined;
+    const digest = taskId ? taskVideoDigest(taskId)
+      : randomBytes(32).toString('hex');
+    const key = `${digest}.${staged.extension}`;
+    if (taskId && await storageService.exists(`generated-videos/${key}`)) {
+      return videoResultUrl(key);
+    }
+    const started = Date.now();
     const objectName = await storageService.uploadMedia({
       namespace: 'generated-videos',
       filename: key,
@@ -218,23 +235,15 @@ async function performGeneratedVideoResultMirror(source: string, requestHeaders?
       mime: staged.mime,
     });
     const exists = await storageService.exists(objectName);
-    console.info('[video_cos_upload]', {
-      storageProvider: storageService.providerName,
-      objectKey: objectName,
+    logVideoEvent('video_cos_upload', {
+      ...(taskId ? { taskId } : {}),
       bytes: staged.size,
-      mime: staged.mime,
-      exists,
+      durationMs: Date.now() - started,
     });
     if (!exists) {
       throw new Error('generated video mirror object is missing after upload');
     }
     const resultUrl = videoResultUrl(key);
-    console.info('[video_cos_result]', {
-      storageProvider: storageService.providerName,
-      objectKey: objectName,
-      resultUrl,
-      bytes: staged.size,
-    });
     storageService.getDownloadUrl(objectName);
     return resultUrl;
   } finally {
@@ -266,7 +275,7 @@ export async function mirrorGeneratedVideoResultToStorage(
   if (cached) completedVideoMirrors.delete(cacheKey);
   const pending = pendingVideoMirrors.get(cacheKey);
   if (pending) return pending;
-  const mirror = performGeneratedVideoResultMirror(trimmed, requestHeaders)
+  const mirror = performGeneratedVideoResultMirror(trimmed, requestHeaders, normalizedScope)
     .then((url) => {
       completedVideoMirrors.set(cacheKey, {
         url,

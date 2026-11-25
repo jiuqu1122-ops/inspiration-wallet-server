@@ -1,5 +1,6 @@
 import { decryptProviderSecrets } from '../../../lib/provider-secrets.js';
 import { assertPublicProviderUrl, providerEndpoint } from '../../providers/url.js';
+import { logVideoEvent } from '../video-log.js';
 import type {
   VideoAdapter,
   VideoAdapterContext,
@@ -29,6 +30,7 @@ export type GenericAsyncVideoConfig = {
   failedStatuses: string[];
   requiresVideoAvailable: boolean;
   idempotencyHeader: string;
+  submissionLookupEndpointTemplate?: string;
 };
 
 /** A single upstream HTTP exchange must never outlive the task that owns it. */
@@ -59,6 +61,7 @@ export function normalizeGenericAsyncVideoConfig(value: unknown): GenericAsyncVi
   const referenceImagesParameter = optionalParameter('referenceImagesParameter');
   const referenceVideosParameter = optionalParameter('referenceVideosParameter');
   const referenceAudiosParameter = optionalParameter('referenceAudiosParameter');
+  const submissionLookupEndpointTemplate = optionalParameter('submissionLookupEndpointTemplate');
   return {
     submitEndpoint: textValue(source.submitEndpoint, '/v1/videos'),
     statusEndpointTemplate: textValue(source.statusEndpointTemplate, '/v1/videos/{taskId}'),
@@ -82,6 +85,7 @@ export function normalizeGenericAsyncVideoConfig(value: unknown): GenericAsyncVi
     failedStatuses: listValue(source.failedStatuses, ['failed']),
     requiresVideoAvailable: source.requiresVideoAvailable !== false,
     idempotencyHeader: textValue(source.idempotencyHeader, 'Idempotency-Key'),
+    ...(submissionLookupEndpointTemplate ? { submissionLookupEndpointTemplate } : {}),
   };
 }
 
@@ -94,6 +98,11 @@ export function validateGenericAsyncVideoConfig(value: unknown) {
   if (!config.statusEndpointTemplate.includes('{taskId}')
     || !config.contentEndpointTemplate.includes('{taskId}')) {
     throw new Error('Video status and content endpoint templates must contain {taskId}');
+  }
+  if (config.submissionLookupEndpointTemplate
+    && (!/^\/(?!\/)/.test(config.submissionLookupEndpointTemplate)
+      || !config.submissionLookupEndpointTemplate.includes('{idempotencyKey}'))) {
+    throw new Error('Video submission lookup must be a relative path containing {idempotencyKey}');
   }
   if (config.processingStatuses.length === 0
     || config.completedStatuses.length === 0
@@ -153,13 +162,13 @@ async function jsonRequest(
   try {
     // Keep the same deadline for headers and body. A provider that sends headers
     // and then stalls must not leave an unbounded response.text() behind.
-    response = await fetch(requestUrl, { ...init, signal: controller.signal });
-    console.info('[video_upstream_http]', {
+    const started = Date.now();
+    response = await fetch(requestUrl, { ...init, redirect: 'error', signal: controller.signal });
+    logVideoEvent('video_upstream_http', {
       providerId: context.provider.id,
-      routeId: context.route.id,
-      method: init.method || 'GET',
-      url: requestUrl,
+      source: requestUrl,
       status: response.status,
+      durationMs: Date.now() - started,
     });
     const text = await response.text();
     let payload: unknown = null;
@@ -175,7 +184,7 @@ async function jsonRequest(
       // Only an explicit client/auth/validation rejection proves that no task was
       // accepted. Gateway errors, throttling and timeouts are intentionally
       // ambiguous and must not trigger another POST on a different route.
-      error.deliveryState = [400, 401, 403, 404, 405, 409, 415, 422].includes(response.status)
+      error.deliveryState = [400, 401, 402, 403, 404, 405, 415, 422].includes(response.status)
         ? 'not-accepted'
         : 'unknown';
       const retryAfter = response.headers.get('retry-after');
@@ -233,14 +242,6 @@ export const genericAsyncVideoAdapter: VideoAdapter = {
     if (request.inputImages.length > 0 && config.referenceImagesParameter) body[config.referenceImagesParameter] = request.inputImages;
     if (request.inputVideos.length > 0 && config.referenceVideosParameter) body[config.referenceVideosParameter] = request.inputVideos;
     if (request.inputAudios.length > 0 && config.referenceAudiosParameter) body[config.referenceAudiosParameter] = request.inputAudios;
-    const submitUrl = endpoint(context, config.submitEndpoint);
-    console.info('[video_upstream_submit]', {
-      providerId: context.provider.id,
-      routeId: context.route.id,
-      url: submitUrl,
-      model: context.route.upstreamModelId,
-      outputIndex: _outputIndex,
-    });
     const payload = await jsonRequest(context, config.submitEndpoint, {
       method: 'POST',
       headers: requestHeaders(context, { [config.idempotencyHeader]: idempotencyKey }),
@@ -248,13 +249,6 @@ export const genericAsyncVideoAdapter: VideoAdapter = {
     });
     const upstreamTaskId = scalarText(pathValue(payload, config.taskIdPath));
     if (!upstreamTaskId) throw new Error(`Video provider response is missing ${config.taskIdPath}`);
-    console.info('[video_upstream_task_created]', {
-      providerId: context.provider.id,
-      routeId: context.route.id,
-      url: submitUrl,
-      upstreamTaskId,
-      taskIdPath: config.taskIdPath,
-    });
     const pollAfter = Number(pathValue(payload, config.pollAfterMsPath));
     return {
       upstreamTaskId,
@@ -262,17 +256,21 @@ export const genericAsyncVideoAdapter: VideoAdapter = {
       ...(Number.isFinite(pollAfter) && pollAfter >= 0 ? { pollAfterMs: pollAfter } : {}),
     };
   },
+  canRecoverSubmission(context) {
+    return Boolean(normalizeGenericAsyncVideoConfig(context.route.adapterConfig).submissionLookupEndpointTemplate);
+  },
+  async recoverSubmission(context, idempotencyKey) {
+    const config = normalizeGenericAsyncVideoConfig(context.route.adapterConfig);
+    const template = config.submissionLookupEndpointTemplate;
+    if (!template) return null;
+    const path = template.replaceAll('{idempotencyKey}', encodeURIComponent(idempotencyKey));
+    const payload = await jsonRequest(context, path, { method: 'GET', headers: requestHeaders(context) });
+    const upstreamTaskId = scalarText(pathValue(payload, config.taskIdPath));
+    return upstreamTaskId ? { upstreamTaskId, upstreamPayload: null } : null;
+  },
   async poll(context, upstreamTaskId) {
     const config = normalizeGenericAsyncVideoConfig(context.route.adapterConfig);
     const statusPath = config.statusEndpointTemplate.replaceAll('{taskId}', encodeURIComponent(upstreamTaskId));
-    const statusUrl = endpoint(context, statusPath);
-    console.info('[video_upstream_status_url]', {
-      providerId: context.provider.id,
-      routeId: context.route.id,
-      upstreamTaskId,
-      statusUrl,
-      template: config.statusEndpointTemplate,
-    });
     let payload: unknown;
     try {
       payload = await jsonRequest(
@@ -307,16 +305,6 @@ export const genericAsyncVideoAdapter: VideoAdapter = {
       ...(assetState ? { assetState } : {}),
       ...(Number.isFinite(pollAfterValue) && pollAfterValue >= 0 ? { pollAfterMs: pollAfterValue } : {}),
     };
-    console.info('[video_upstream_status_result]', {
-      providerId: context.provider.id,
-      routeId: context.route.id,
-      upstreamTaskId,
-      statusUrl,
-      upstreamStatus: status || 'unknown',
-      videoAvailable: videoAvailable ?? null,
-      assetState: assetState ?? null,
-      pollAfterMs: Number.isFinite(pollAfterValue) && pollAfterValue >= 0 ? pollAfterValue : null,
-    });
     if (assetState === 'expired') return { state: 'failed', error: 'Video asset expired', ...common };
     if (config.failedStatuses.includes(status)) return { state: 'failed', error: `Video task failed: ${status}`, ...common };
     if (config.completedStatuses.includes(status)) {
@@ -329,13 +317,6 @@ export const genericAsyncVideoAdapter: VideoAdapter = {
   async fetchContent(context, upstreamTaskId) {
     const config = normalizeGenericAsyncVideoConfig(context.route.adapterConfig);
     const contentUrl = endpoint(context, config.contentEndpointTemplate, upstreamTaskId);
-    console.info('[video_upstream_content_url]', {
-      providerId: context.provider.id,
-      routeId: context.route.id,
-      upstreamTaskId,
-      contentUrl,
-      template: config.contentEndpointTemplate,
-    });
     return {
       source: contentUrl,
       requestHeaders: requestHeaders(context),

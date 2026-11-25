@@ -1,4 +1,5 @@
 import type { FastifyServerOptions } from 'fastify';
+import pino from 'pino';
 import { env } from './env.js';
 
 const sensitivePaths = [
@@ -30,3 +31,5 @@ export const loggerOptions: NonNullable<FastifyServerOptions['logger']> = {
     censor: '[REDACTED]',
   },
 };
+
+export const serviceLogger = pino(loggerOptions as pino.LoggerOptions);

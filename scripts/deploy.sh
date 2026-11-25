@@ -77,6 +77,11 @@ if [[ "$postgres_ready" != true ]]; then
   fail 'PostgreSQL did not become healthy within 60 seconds. Deployment stopped; no volume was removed.'
 fi
 
+if [[ "${QUIESCE_AI_BEFORE_MIGRATE:-0}" == 1 ]]; then
+  log 'Pausing the API and worker before a task-state migration...'
+  docker compose stop --timeout 120 api worker
+fi
+
 log 'Applying pending Prisma migrations exactly once...'
 if ! docker compose run --rm --no-deps api npm run prisma:migrate:deploy; then
   docker compose logs --tail=100 postgres >&2 || true

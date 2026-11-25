@@ -10,11 +10,11 @@ import { CloudAiError, listWalletAgentModels } from './service.js';
 import {
   executeWalletImageGeneration,
   executeWalletVideoGeneration,
-  executeWalletVideoStatus,
   getWalletImageGenerationByRequest,
   recoverWalletImageGeneration,
   listWalletImageModels,
 } from './image-service.js';
+import { getVideoRequestByClientId, getVideoTaskForUser } from './video-task-service.js';
 import { mkdir, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
@@ -36,6 +36,8 @@ import {
   ReferenceUploadError,
   getReferenceImageContent,
   issueReferenceUploadTicket,
+  issueVideoReferenceUploadTicket,
+  videoReferenceUploadInputSchema,
   recordLegacyReferenceUpload,
   referenceUploadInputSchema,
 } from './reference-upload-service.js';
@@ -738,6 +740,23 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
   });
 
   app.post(
+    '/videos/reference-upload-ticket',
+    {
+      preHandler: app.authenticateAccessToken,
+      config: { rateLimit: { max: 32, timeWindow: '1 minute' } },
+    },
+    async (request, reply) => {
+      const parsed = videoReferenceUploadInputSchema.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', message: '视频参考素材上传参数无效' });
+      try {
+        return await issueVideoReferenceUploadTicket(app.prisma, request.user.sub, parsed.data);
+      } catch (error) {
+        return knownError(reply, error);
+      }
+    },
+  );
+
+  app.post(
     '/videos',
     {
       preHandler: app.authenticateAccessToken,
@@ -755,6 +774,19 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
   );
 
   app.get(
+    '/videos/by-request/:clientRequestId',
+    { preHandler: app.authenticateAccessToken },
+    async (request, reply) => {
+      const { clientRequestId } = request.params as { clientRequestId: string };
+      const parsed = videoSchema.shape.clientRequestId.safeParse(clientRequestId);
+      if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', message: '视频请求 ID 无效' });
+      const result = await getVideoRequestByClientId(app.prisma, request.user.sub, parsed.data);
+      reply.header('cache-control', 'private, no-store');
+      return result ?? reply.code(404).send({ error: 'video_request_not_found', message: '没有找到该视频请求' });
+    },
+  );
+
+  app.get(
     '/videos/:taskId',
     { preHandler: app.authenticateAccessToken },
     async (request, reply) => {
@@ -763,31 +795,9 @@ export const aiRoutes: FastifyPluginAsync = async (app) => {
         taskId: (request.params as { taskId?: unknown }).taskId,
       });
       if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', message: '视频任务 ID 无效' });
-      try {
-        const result = await executeWalletVideoStatus(app.prisma, {
-          userId: request.user.sub,
-          ...parsed.data,
-        });
-        const response = result && typeof result === 'object' && !Array.isArray(result)
-          ? result as Record<string, unknown>
-          : {};
-        console.info('[video_client_query_final]', {
-          requestedTaskId: parsed.data.taskId,
-          clientRequestId: parsed.data.clientRequestId ?? null,
-          status: response.status ?? null,
-          task_id: response.task_id ?? null,
-          upstreamTaskId: response.upstreamTaskId ?? null,
-          upstreamTaskIds: Array.isArray(response.upstreamTaskIds) ? response.upstreamTaskIds : [],
-          responseFields: Object.keys(response),
-          video_url: response.video_url ?? null,
-          result_url: response.result_url ?? null,
-          cos_url: response.cos_url ?? null,
-          walletVideoResults: Array.isArray(response.walletVideoResults) ? response.walletVideoResults : [],
-        });
-        return result;
-      } catch (error) {
-        return knownError(reply, error);
-      }
+      const result = await getVideoTaskForUser(app.prisma, { userId: request.user.sub, ...parsed.data });
+      reply.header('cache-control', 'private, no-store');
+      return result ?? reply.code(404).send({ error: 'video_task_not_found', message: '没有找到该视频任务' });
     },
   );
 
