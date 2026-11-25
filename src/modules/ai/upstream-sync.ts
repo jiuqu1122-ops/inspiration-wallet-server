@@ -1,6 +1,8 @@
 import type { AiProviderChannel, Prisma, PrismaClient } from '@prisma/client';
 import { decryptProviderSecrets } from '../../lib/provider-secrets.js';
-import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
+import { metasoMiniMaxDispatcher } from '../providers/metaso-transport.js';
+import { assertPublicProviderUrl, isMetasoMiniMax, minimaxH3EndpointPath, providerEndpoint } from '../providers/url.js';
+import { buildFailureDiagnostic } from './failure-diagnostic.js';
 import {
   catalogAliasKey,
   explicitCanonicalModelKey,
@@ -19,6 +21,7 @@ export type NormalizedUpstreamModel = {
   duration: Prisma.InputJsonValue | null;
   cost: Prisma.InputJsonValue | null;
   metadata: Prisma.InputJsonValue;
+  configuredAdapterKey?: 'MINIMAX_NATIVE_VIDEO';
 };
 
 export interface UpstreamModelAdapter {
@@ -182,7 +185,7 @@ function normalizeModel(provider: AiProviderChannel, item: unknown): NormalizedU
   };
 }
 
-async function fetchProviderJson(provider: AiProviderChannel, path: string) {
+async function fetchProviderJson(provider: AiProviderChannel, path: string, dispatcher?: typeof metasoMiniMaxDispatcher) {
   await assertPublicProviderUrl(provider.baseUrl);
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
   const headers = new Headers({
@@ -190,7 +193,7 @@ async function fetchProviderJson(provider: AiProviderChannel, path: string) {
     authorization: `Bearer ${secrets.apiKey}`,
     'user-agent': 'Inspiration-Wallet-Server/1',
   });
-  if (provider.kind !== 'VOLCENGINE_ARK') headers.set('x-goog-api-key', secrets.apiKey);
+  if (provider.kind !== 'VOLCENGINE_ARK' && !dispatcher) headers.set('x-goog-api-key', secrets.apiKey);
   for (const [name, value] of Object.entries(secrets.headers)) headers.set(name, value);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 20_000);
@@ -199,8 +202,11 @@ async function fetchProviderJson(provider: AiProviderChannel, path: string) {
       headers,
       redirect: 'error',
       signal: controller.signal,
+      ...(dispatcher ? { dispatcher } : {}),
     });
-    if (!response.ok) throw new Error(`Upstream model sync failed with HTTP ${response.status}`);
+    if (!response.ok) {
+      throw Object.assign(new Error(`Upstream model sync failed with HTTP ${response.status}`), { status: response.status });
+    }
     return await response.json() as unknown;
   } finally {
     clearTimeout(timeout);
@@ -234,8 +240,31 @@ const openAiAdapter = new JsonModelAdapter('/v1/models');
 const geminiAdapter = new JsonModelAdapter('/v1beta/models');
 const arkAdapter = new JsonModelAdapter('/models');
 
+const metasoMiniMaxAdapter: UpstreamModelAdapter = {
+  async listModels(provider) {
+    const path = minimaxH3EndpointPath(provider.baseUrl, '/v2/credits/balance');
+    try {
+      const balance = objectValue(await fetchProviderJson(provider, path, metasoMiniMaxDispatcher));
+      if (!balance || balance.error || balance.type === 'error' || balance.success === false) {
+        throw new Error('MiniMax H3 account probe returned an invalid response');
+      }
+    } catch (error) {
+      const diagnostic = buildFailureDiagnostic(error, { stage: 'video_task' });
+      const reason = diagnostic.httpStatus ? `HTTP ${diagnostic.httpStatus}` : diagnostic.causeCode ?? diagnostic.message;
+      throw new Error(`MiniMax H3 渠道校验失败（${reason}）`);
+    }
+
+    // The account probe validates connectivity and credentials. The channel
+    // uses a fixed model ID and the probe supplies no model health or prices.
+    const model = normalizeModel(provider, { id: 'MiniMax-H3', type: 'video' })!;
+    return [{ ...model, configuredAdapterKey: 'MINIMAX_NATIVE_VIDEO',
+      metadata: { adapter: 'minimax-h3', catalogSource: 'configured', inferredModality: 'video' } }];
+  },
+};
+
 export function upstreamAdapterFor(provider: AiProviderChannel): UpstreamModelAdapter {
   if (provider.kind === 'VOLCENGINE_ARK') return arkAdapter;
+  if (provider.kind === 'MINIMAX' && isMetasoMiniMax(provider.baseUrl)) return metasoMiniMaxAdapter;
   return provider.kind === 'BIGMODEL' ? geminiAdapter : openAiAdapter;
 }
 
@@ -297,12 +326,15 @@ export async function syncUpstreamModels(prisma: PrismaClient, providerId: strin
   let statusChanges = 0;
   const changes: UpstreamSyncChange[] = [];
   for (const item of models) {
+    const configuredAdapterKey = item.configuredAdapterKey;
+    const upstreamAvailable = item.availability !== 'UNAVAILABLE';
+    const healthStatus = configuredAdapterKey ? 'UNKNOWN' : upstreamAvailable ? 'HEALTHY' : 'UNAVAILABLE';
     const existingRoute = await prisma.aiModelRoute.findFirst({
       where: { provider: provider.kind, channelId: provider.id, upstreamModelId: item.upstreamModelId },
     });
     if (existingRoute) {
-      if (existingRoute.upstreamAvailable !== (item.availability !== 'UNAVAILABLE')
-        || existingRoute.healthStatus !== (item.availability === 'UNAVAILABLE' ? 'UNAVAILABLE' : 'HEALTHY')) {
+      if (!configuredAdapterKey && (existingRoute.upstreamAvailable !== upstreamAvailable
+        || existingRoute.healthStatus !== healthStatus)) {
         statusChanges += 1;
         changes.push({
           kind: 'STATUS_CHANGED',
@@ -311,14 +343,17 @@ export async function syncUpstreamModels(prisma: PrismaClient, providerId: strin
           upstreamModelId: item.upstreamModelId,
           canonicalModelId: existingRoute.canonicalModelId,
           before: existingRoute.healthStatus,
-          after: item.availability === 'UNAVAILABLE' ? 'UNAVAILABLE' : 'HEALTHY',
+          after: healthStatus,
         });
       }
       await prisma.aiModelRoute.update({
         where: { id: existingRoute.id },
-        data: {
-          upstreamAvailable: item.availability !== 'UNAVAILABLE',
-          healthStatus: item.availability === 'UNAVAILABLE' ? 'UNAVAILABLE' : 'HEALTHY',
+        data: configuredAdapterKey ? {
+          lastSyncedAt: new Date(),
+          ...(existingRoute.adapterKey ? {} : { adapterKey: configuredAdapterKey }),
+        } : {
+          upstreamAvailable,
+          healthStatus,
           lastSyncedAt: new Date(),
           ...(item.capabilities && !preservesConfiguredRouteCapabilities(existingRoute.metadata)
             ? { capabilitiesOverride: item.capabilities }
@@ -326,7 +361,7 @@ export async function syncUpstreamModels(prisma: PrismaClient, providerId: strin
           metadata: refreshedRouteMetadata(existingRoute.metadata, item.metadata),
         },
       });
-      if (await updateMappedRouteCost(prisma, existingRoute, item.cost)) {
+      if (!configuredAdapterKey && await updateMappedRouteCost(prisma, existingRoute, item.cost)) {
         costChanges += 1;
         changes.push({
           kind: 'COST_CHANGED',
@@ -405,9 +440,10 @@ export async function syncUpstreamModels(prisma: PrismaClient, providerId: strin
           // A newly discovered route is never put into production automatically.
           enabled: false,
           priority: provider.priority,
-          healthStatus: item.availability === 'UNAVAILABLE' ? 'UNAVAILABLE' : 'HEALTHY',
-          upstreamAvailable: item.availability !== 'UNAVAILABLE',
+          healthStatus,
+          upstreamAvailable,
           lastSyncedAt: new Date(),
+          ...(configuredAdapterKey ? { adapterKey: configuredAdapterKey } : {}),
           ...(item.cost ? { costProfile: item.cost } : {}),
           ...(item.capabilities ? { capabilitiesOverride: item.capabilities } : {}),
           metadata: item.metadata,

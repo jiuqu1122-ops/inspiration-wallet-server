@@ -7,6 +7,11 @@ import {
   syncUpstreamModels,
   upstreamAdapterFor,
 } from '../src/modules/ai/upstream-sync.js';
+import { metasoMiniMaxDispatcher } from '../src/modules/providers/metaso-transport.js';
+
+vi.mock('node:dns/promises', () => ({
+  lookup: vi.fn(async () => [{ address: '1.1.1.1', family: 4 }]),
+}));
 
 const provider = (
   kind = 'USELG',
@@ -37,6 +42,63 @@ afterEach(() => {
 });
 
 describe('upstream model modality inference', () => {
+  it.each(['https://metaso.cn', 'https://metaso.cn/api/minimax'])(
+    'syncs the Metaso H3 model through the IPv4 account probe at %s', async baseUrl => {
+      const channel = { ...provider('MINIMAX', ['VIDEO_MINIMAX']), baseUrl };
+      const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => Response.json({ balance: 50 }));
+      vi.stubGlobal('fetch', fetchMock);
+      const createRoute = vi.fn(async () => ({ id: 'minimax-h3-route' }));
+      const prisma = {
+        aiProviderChannel: { findUnique: vi.fn(async () => channel) },
+        aiModel: { findUnique: vi.fn(async () => ({ id: 'minimax-h3-canonical' })) },
+        aiModelRoute: { findFirst: vi.fn(async () => null), create: createRoute },
+        aiUpstreamDiscovery: { findUnique: vi.fn(async () => null), upsert: vi.fn() },
+      } as unknown as PrismaClient;
+
+      await expect(syncUpstreamModels(prisma, channel.id)).resolves.toMatchObject({ discovered: 1, mapped: 1, costChanges: 0 });
+      expect(fetchMock).toHaveBeenCalledExactlyOnceWith('https://metaso.cn/api/minimax/v2/credits/balance',
+        expect.objectContaining({ dispatcher: metasoMiniMaxDispatcher, redirect: 'error' }));
+      const headers = new Headers(fetchMock.mock.calls[0]?.[1].headers);
+      expect(headers.get('authorization')).toBe('Bearer sk-test');
+      expect(headers.has('x-goog-api-key')).toBe(false);
+      expect(createRoute).toHaveBeenCalledWith({ data: expect.objectContaining({
+        canonicalModelId: 'minimax-h3-canonical', upstreamModelId: 'MiniMax-H3', enabled: false, healthStatus: 'UNKNOWN',
+        adapterKey: 'MINIMAX_NATIVE_VIDEO',
+        metadata: { adapter: 'minimax-h3', catalogSource: 'configured', inferredModality: 'video' },
+      }) });
+    },
+  );
+
+  it.each([null, 'LEGACY_VIDEO'])('refreshes a Metaso H3 route with adapter %s without overriding health or pricing', async adapterKey => {
+    const channel = { ...provider('MINIMAX', ['VIDEO_MINIMAX']), baseUrl: 'https://metaso.cn' };
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ balance: 50 })));
+    const update = vi.fn();
+    const prisma = {
+      aiProviderChannel: { findUnique: vi.fn(async () => channel) },
+      aiModelRoute: { findFirst: vi.fn(async () => ({
+        id: 'minimax-h3-route', canonicalModelId: 'minimax-h3-canonical', healthStatus: 'FAILED', costProfile: { credits: 2 }, adapterKey,
+      })), update },
+    } as unknown as PrismaClient;
+
+    await expect(syncUpstreamModels(prisma, channel.id)).resolves.toMatchObject({ mapped: 1, statusChanges: 0, costChanges: 0 });
+    expect(update).toHaveBeenCalledExactlyOnceWith({ where: { id: 'minimax-h3-route' }, data: {
+      lastSyncedAt: expect.any(Date), ...(adapterKey ? {} : { adapterKey: 'MINIMAX_NATIVE_VIDEO' }),
+    } });
+  });
+
+  it('rejects invalid Metaso credentials without changing the catalog or displaying the upstream response', async () => {
+    const channel = { ...provider('MINIMAX', ['VIDEO_MINIMAX']), baseUrl: 'https://metaso.cn' };
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ error: 'secret-bearing upstream response' }, { status: 401 })));
+    const findFirst = vi.fn();
+    const prisma = {
+      aiProviderChannel: { findUnique: vi.fn(async () => channel) },
+      aiModelRoute: { findFirst },
+    } as unknown as PrismaClient;
+
+    await expect(syncUpstreamModels(prisma, channel.id)).rejects.toThrow(/^MiniMax H3 渠道校验失败（HTTP 401）$/);
+    expect(findFirst).not.toHaveBeenCalled();
+  });
+
   it('discovers Ark model domains and an explicitly configured image endpoint', async () => {
     const channel = { ...provider('VOLCENGINE_ARK', ['IMAGE']), baseUrl: 'https://8.8.8.8/api/v3',
       defaultModel: 'ep-fixture' };
