@@ -176,7 +176,7 @@ export function sanitizeTaskError(error: unknown): PublicTaskError {
     PRICING_NOT_AVAILABLE: 'PRICING_NOT_AVAILABLE',
     USAGE_MODEL_NOT_AVAILABLE: 'USAGE_MODEL_NOT_AVAILABLE',
     provider_request_failed: 'UPSTREAM_UNAVAILABLE',
-    provider_stream_interrupted: 'UPSTREAM_UNAVAILABLE',
+    agent_upstream_result_unknown: 'UPSTREAM_RESULT_UNKNOWN',
     provider_invalid_response: 'UPSTREAM_INVALID_RESPONSE',
     insufficient_credits: 'INSUFFICIENT_CREDITS',
     TASK_TIMEOUT: 'TASK_TIMEOUT',

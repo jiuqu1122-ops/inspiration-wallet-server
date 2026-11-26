@@ -10,6 +10,7 @@ vi.mock('../src/modules/ai/catalog-seed.js', () => ({
 
 import { executeWalletImageGeneration } from '../src/modules/ai/image-service.js';
 import { executeWalletAgentChat } from '../src/modules/ai/service.js';
+import { sanitizeTaskError } from '../src/modules/ai/task-service.js';
 
 const encryptedSecrets = encryptProviderSecrets({ apiKey: 'sk-route-test', headers: {} });
 
@@ -83,7 +84,10 @@ afterEach(() => {
 });
 
 describe('managed canonical route identity', () => {
-  it('submits explicit Chat model A only to model A routes when its primary route fails', async () => {
+  const chatScenarios = [
+    'rejected', 'preconnect', 'truncated', 'stream-reset', 'transport-reset', 'gateway-timeout', 'fallback-truncated',
+  ] as const;
+  it.each(chatScenarios)('keeps explicit Chat model A on model A routes and handles %s correctly', async (scenario) => {
     const routeA1Provider = provider('chat-a-1', 'https://1.1.1.1', 'NEW_API', ['LLM']);
     const routeA2Provider = provider('chat-a-2', 'https://8.8.8.8', 'NEW_API', ['LLM']);
     const modelBProvider = provider('chat-b-1', 'https://9.9.9.9', 'NEW_API', ['LLM']);
@@ -165,11 +169,40 @@ describe('managed canonical route identity', () => {
       const url = String(source);
       const body = JSON.parse(String(init?.body)) as { model: string };
       submissions.push({ url, model: body.model });
-      if (url.startsWith(routeA1Provider.baseUrl)) {
+      const primary = url.startsWith(routeA1Provider.baseUrl);
+      if (primary && (scenario === 'rejected' || scenario === 'fallback-truncated')) {
         return new Response(JSON.stringify({ error: { message: 'primary route unavailable' } }), {
           status: 500,
           headers: { 'content-type': 'application/json' },
         });
+      }
+      if (primary && (scenario === 'preconnect' || scenario === 'transport-reset')) {
+        const code = scenario === 'preconnect' ? 'ECONNREFUSED' : 'UND_ERR_SOCKET';
+        throw new TypeError('fetch failed', { cause: Object.assign(new Error(code), { code }) });
+      }
+      if (primary && scenario === 'gateway-timeout') {
+        return new Response(new ReadableStream({
+          start(controller) { controller.error(new TypeError('terminated')); },
+        }), { status: 504 });
+      }
+      if ((primary && scenario === 'truncated') || (!primary && scenario === 'fallback-truncated')) {
+        return new Response('data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n', {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        });
+      }
+      if (primary && scenario === 'stream-reset') {
+        let started = false;
+        return new Response(new ReadableStream({
+          pull(controller) {
+            if (started) {
+              controller.error(new TypeError('terminated'));
+              return;
+            }
+            started = true;
+            controller.enqueue(new TextEncoder().encode('data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n'));
+          },
+        }), { headers: { 'content-type': 'text/event-stream' } });
       }
       return new Response(JSON.stringify({
         model: body.model,
@@ -178,26 +211,43 @@ describe('managed canonical route identity', () => {
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     }));
 
-    await expect(executeWalletAgentChat(prisma, {
+    const run = executeWalletAgentChat(prisma, {
       userId: 'user-1',
       clientRequestId: 'explicit-chat-a',
       model: 'chat-model-a',
       usageContext: 'chat',
       messages: [{ role: 'user', content: 'hello' }],
-    })).resolves.toMatchObject({ choices: expect.any(Array) });
+    });
+
+    const succeeds = scenario === 'rejected' || scenario === 'preconnect';
+    if (succeeds) {
+      await expect(run).resolves.toMatchObject({ choices: expect.any(Array) });
+    } else {
+      await expect(run).rejects.toMatchObject({ code: 'agent_upstream_result_unknown' });
+      const publicError = await run.catch(sanitizeTaskError);
+      expect(publicError).toEqual({
+        code: 'UPSTREAM_RESULT_UNKNOWN',
+        message: '渠道可能已受理本次请求，结果尚未确认。本次调用未结算积分。',
+      });
+    }
 
     expect(findLegacyProviders).not.toHaveBeenCalled();
-    expect(submissions).toEqual([
-      { url: 'https://1.1.1.1/v1/chat/completions', model: 'upstream-chat-a-primary' },
-      { url: 'https://8.8.8.8/v1/chat/completions', model: 'upstream-chat-a-fallback' },
-    ]);
-    expect(submissions.some(({ url }) => url.startsWith(modelBProvider.baseUrl))).toBe(false);
-    expect(getRequest()).toMatchObject({
+    const primarySubmission = { url: 'https://1.1.1.1/v1/chat/completions', model: 'upstream-chat-a-primary' };
+    const fallbackSubmission = { url: 'https://8.8.8.8/v1/chat/completions', model: 'upstream-chat-a-fallback' };
+    const expectedSubmissions = scenario === 'preconnect'
+      ? [primarySubmission, primarySubmission, fallbackSubmission]
+      : succeeds || scenario === 'fallback-truncated' ? [primarySubmission, fallbackSubmission] : [primarySubmission];
+    expect(submissions).toEqual(expectedSubmissions);
+    const chargeEntries = transaction.walletLedger.create.mock.calls.filter(([entry]) => (
+      (entry as { data: { type: string } }).data.type === 'CHARGE'
+    ));
+    expect(chargeEntries).toHaveLength(succeeds ? 1 : 0);
+    expect(getRequest()).toMatchObject(succeeds ? {
       canonicalModelId: 'model-a',
       logicalModel: 'chat-model-a',
       routeId: 'route-a-2',
       status: 'SUCCEEDED',
-    });
+    } : { status: 'FAILED', chargedCredits: creditDecimal(0) });
   });
 
   it('ignores a stale model B hint and submits Image model A only to model A routes', async () => {

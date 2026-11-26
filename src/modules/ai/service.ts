@@ -541,7 +541,7 @@ export class AgentCompletionSseParser {
     const hasFinishReason = Array.from(this.choices.values())
       .some(choice => choice.finishReason !== null && choice.finishReason !== undefined);
     if (!this.done && this.choices.size > 0 && !hasFinishReason) {
-      throw new CloudAiError('provider_stream_interrupted', 'Agent channel stream ended unexpectedly', 502);
+      throw new AgentUpstreamUnconfirmedError('Agent channel stream ended unexpectedly');
     }
     return buildAgentCompletionResult(this.metadata, this.choices, this.lastPayload);
   }
@@ -746,6 +746,23 @@ export class AgentUpstreamTimeoutError extends Error {
   }
 }
 
+class AgentUpstreamUnconfirmedError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = 'AgentUpstreamUnconfirmedError';
+  }
+}
+
+function isAgentUpstreamResultUnknown(error: unknown) {
+  return error instanceof AgentUpstreamUnconfirmedError
+    || error instanceof AgentUpstreamTimeoutError
+    || error instanceof AgentUpstreamHttpError && isAgentAmbiguousUpstreamStatus(error.status);
+}
+
+const AGENT_BEFORE_CONNECT_ERRORS = new Set([
+  'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_CONNECT_TIMEOUT',
+]);
+
 function agentProviderFailureDetail(error: unknown) {
   if (error instanceof AgentUpstreamHttpError) {
     if (isAgentAmbiguousUpstreamStatus(error.status)) {
@@ -770,7 +787,7 @@ function agentProviderFailureDetail(error: unknown) {
 }
 
 export function canFallbackToNextAgentProvider(error: unknown) {
-  if (error instanceof AgentUpstreamTimeoutError) return false;
+  if (isAgentUpstreamResultUnknown(error)) return false;
   if (error instanceof AgentUpstreamHttpError) {
     return isAgentProviderFallbackStatus(error.status);
   }
@@ -779,18 +796,16 @@ export function canFallbackToNextAgentProvider(error: unknown) {
       'provider_model_missing',
       'provider_request_failed',
       'provider_invalid_response',
-      'provider_stream_interrupted',
     ].includes(error.code);
   }
   return error instanceof Error;
 }
 
 export function canRetrySingleAgentProvider(error: unknown) {
-  if (error instanceof AgentUpstreamTimeoutError) return false;
+  if (isAgentUpstreamResultUnknown(error)) return false;
   if (error instanceof AgentUpstreamHttpError) {
     return isAgentProviderRetryStatus(error.status);
   }
-  if (error instanceof CloudAiError) return error.code === 'provider_stream_interrupted';
   return error instanceof Error && (
     error.name === 'AbortError'
     || error.name === 'TypeError'
@@ -799,7 +814,7 @@ export function canRetrySingleAgentProvider(error: unknown) {
 }
 
 export function canTryAlternativeAgentModel(error: unknown) {
-  if (error instanceof AgentUpstreamTimeoutError) return false;
+  if (isAgentUpstreamResultUnknown(error)) return false;
   if (error instanceof AgentUpstreamHttpError) {
     return error.status !== 401
       && error.status !== 403
@@ -810,7 +825,6 @@ export function canTryAlternativeAgentModel(error: unknown) {
       'provider_model_missing',
       'provider_request_failed',
       'provider_invalid_response',
-      'provider_stream_interrupted',
     ].includes(error.code);
   }
   return error instanceof Error;
@@ -946,7 +960,11 @@ async function requestStreamingCompletion(
         return await send(includeUsage);
       } catch (error) {
         if (didTimeout) throw timeoutError;
-        throw error instanceof Error ? error : new Error(String(error));
+        if (options?.signal?.aborted) throw error;
+        const transportError = objectValue(error);
+        const causeCode = objectValue(transportError?.cause)?.code ?? transportError?.code;
+        if (typeof causeCode === 'string' && AGENT_BEFORE_CONNECT_ERRORS.has(causeCode)) throw error;
+        throw new AgentUpstreamUnconfirmedError('Agent request outcome is unknown after transport failure', error);
       } finally {
         if (firstResponseTimeout !== undefined) clearTimeout(firstResponseTimeout);
         firstResponseTimeout = undefined;
@@ -971,7 +989,11 @@ async function requestStreamingCompletion(
     }, Math.min(10_000, env.AI_UPSTREAM_IDLE_TIMEOUT_MS));
     let text: string;
     try {
-      text = await response.text();
+      // A gateway timeout is ambiguous even if reading its error page fails.
+      text = await response.text().catch((error: unknown) => {
+        if (isAgentAmbiguousUpstreamStatus(response.status)) return '';
+        throw error;
+      });
     } finally {
       clearTimeout(errorBodyTimeout);
     }
@@ -990,7 +1012,7 @@ async function requestStreamingCompletion(
     );
   }
   if (!response.body) {
-    throw new CloudAiError('provider_invalid_response', 'Agent channel returned an empty body', 502);
+    throw new AgentUpstreamUnconfirmedError('Agent channel returned an empty body');
   }
 
   const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
@@ -1000,47 +1022,57 @@ async function requestStreamingCompletion(
   let firstChunkMs: number | undefined;
   let lastProgressAt = 0;
   let byteCount = 0;
-  while (true) {
-    const chunk = await readChunkWithIdleTimeout(reader, controller);
-    if (chunk.done) break;
-    if (!chunk.value?.byteLength) continue;
-    byteCount += chunk.value.byteLength;
-    const decoded = decoder.decode(chunk.value, { stream: true });
-    accumulator.push(decoded);
-    const now = Date.now();
-    if (firstChunkMs === undefined) {
-      firstChunkMs = now - startedAt;
-      await emitAgentProgress(options, {
-        stage: 'generating',
-        progress: 25,
-        provider: provider.name,
-        model,
-        attempt,
-        firstChunkMs,
-        upstreamStatus: response.status,
-      });
-      lastProgressAt = now;
-    } else if (now - lastProgressAt >= 5_000) {
-      await emitAgentProgress(options, {
-        stage: 'generating',
-        progress: Math.min(85, 25 + Math.floor((now - startedAt) / 5_000) * 3),
-        provider: provider.name,
-        model,
-        attempt,
-        durationMs: now - startedAt,
-        firstChunkMs,
-        upstreamStatus: response.status,
-      });
-      lastProgressAt = now;
+  let result: unknown;
+  try {
+    while (true) {
+      const chunk = await readChunkWithIdleTimeout(reader, controller);
+      if (chunk.done) break;
+      if (!chunk.value?.byteLength) continue;
+      byteCount += chunk.value.byteLength;
+      const decoded = decoder.decode(chunk.value, { stream: true });
+      accumulator.push(decoded);
+      const now = Date.now();
+      if (firstChunkMs === undefined) {
+        firstChunkMs = now - startedAt;
+        await emitAgentProgress(options, {
+          stage: 'generating',
+          progress: 25,
+          provider: provider.name,
+          model,
+          attempt,
+          firstChunkMs,
+          upstreamStatus: response.status,
+        });
+        lastProgressAt = now;
+      } else if (now - lastProgressAt >= 5_000) {
+        await emitAgentProgress(options, {
+          stage: 'generating',
+          progress: Math.min(85, 25 + Math.floor((now - startedAt) / 5_000) * 3),
+          provider: provider.name,
+          model,
+          attempt,
+          durationMs: now - startedAt,
+          firstChunkMs,
+          upstreamStatus: response.status,
+        });
+        lastProgressAt = now;
+      }
+      if (accumulator.isDone()) {
+        await drainAgentCompletionStreamAfterDone(reader);
+        break;
+      }
     }
-    if (accumulator.isDone()) {
-      await drainAgentCompletionStreamAfterDone(reader);
-      break;
-    }
+    accumulator.push(decoder.decode());
+    result = accumulator.finish();
+  } catch (error) {
+    controller.abort();
+    if (options?.signal?.aborted || isAgentUpstreamResultUnknown(error)) throw error;
+    // A successful HTTP response establishes that the request reached the
+    // gateway, even when the body fails to read or parse before content arrives.
+    throw new AgentUpstreamUnconfirmedError('Agent channel response could not be confirmed', error);
+  } finally {
+    reader.releaseLock();
   }
-  const tail = decoder.decode();
-  accumulator.push(tail);
-  const result = accumulator.finish();
   await emitAgentProgress(options, {
     stage: 'aggregating',
     progress: 90,
@@ -1626,6 +1658,7 @@ export async function executeWalletAgentChat(
             ? options.signal.reason
             : new Error('Task cancelled');
         }
+        if (isAgentUpstreamResultUnknown(error)) throw error;
         let finalError = error;
         const retriedModels: string[] = [];
         if (canTryAlternativeAgentModel(error) || canRetrySingleAgentProvider(error)) {
@@ -1670,6 +1703,7 @@ export async function executeWalletAgentChat(
                   ? options.signal.reason
                   : new Error('Task cancelled');
               }
+              if (isAgentUpstreamResultUnknown(retryError)) throw retryError;
               finalError = retryError;
               retriedModels.push(retryModel || failedModel || 'default');
               if (!canTryAlternativeAgentModel(retryError)
@@ -1735,6 +1769,10 @@ export async function executeWalletAgentChat(
   } catch (error) {
     await releaseCredits(prisma, input.userId, requestId,
       buildFailureDiagnostic(error, { stage: 'text_request' }));
+    if (isAgentUpstreamResultUnknown(error)) {
+      // Keep this out of the legacy desktop's automatic resubmission paths.
+      throw new CloudAiError('agent_upstream_result_unknown', '渠道可能已受理本次请求，结果尚未确认。本次调用未结算积分。', 502);
+    }
     throw error;
   }
 }
