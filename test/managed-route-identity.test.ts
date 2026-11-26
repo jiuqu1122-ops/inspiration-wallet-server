@@ -1,4 +1,5 @@
 import type { AiProviderChannel, PrismaClient } from '@prisma/client';
+import { Readable } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { encryptProviderSecrets } from '../src/lib/provider-secrets.js';
 import { storageService } from '../src/modules/storage/service.js';
@@ -84,6 +85,65 @@ afterEach(() => {
 });
 
 describe('managed canonical route identity', () => {
+  it.each([
+    ['gemini-4-neon-high', true],
+    ['gpt-5.6-sol', false],
+  ] as const)('uses the compatible image transport for Chat model %s', async (model, inline) => {
+    const channel = provider('vision-chat', 'https://1.1.1.1', 'NEW_API', ['LLM', 'VISION']);
+    const { transaction } = walletTransaction('vision-chat-request');
+    const filename = '12d2e7bb-6e3f-4ba0-bdb0-b82023a67e23.png';
+    const objectKey = `reference-images/${filename}`;
+    const base64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP1sAAAAASUVORK5CYII=';
+    const bytes = Buffer.from(base64, 'base64');
+    const headers = { 'content-type': 'image/png', 'content-length': String(bytes.length) };
+    vi.spyOn(storageService, 'headObject').mockResolvedValue({ objectKey, contentLength: bytes.length, contentType: 'image/png', headers, metadata: {} });
+    const readObject = vi.spyOn(storageService, 'getObjectStream').mockResolvedValue({
+      stream: Readable.from([bytes.subarray(0, 5), bytes.subarray(5)]), statusCode: 200, headers,
+    });
+    const prisma = {
+      aiPricingConfig: { findUnique: vi.fn(async () => null) },
+      aiProviderChannel: { findMany: vi.fn(async () => [channel]) },
+      referenceUpload: {
+        findFirst: vi.fn(async ({ where }: { where: { userId?: string; objectKey: string } }) => {
+          if (where.userId && where.userId !== 'user-1') return null;
+          return { id: 'reference-1', objectKey: where.objectKey, contentType: 'image/png', sizeBytes: bytes.length, status: 'UPLOADED' };
+        }),
+      },
+      $transaction: vi.fn(async (operation: (tx: typeof transaction) => unknown) => operation(transaction)),
+    } as unknown as PrismaClient;
+    const imageUrl = inline
+      ? `data:image/png;base64,${base64}`
+      : `https://api.example.test/v1/ai/reference-images/content/${filename}`;
+    const upstream = vi.fn(async (source: RequestInfo | URL, options?: RequestInit) => {
+      expect(String(source)).toBe('https://1.1.1.1/v1/chat/completions');
+      expect(JSON.parse(String(options?.body))).toMatchObject({
+        model,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Read the attached reference.' },
+            { type: 'image_url', image_url: { url: imageUrl, detail: 'high' } },
+          ],
+        }],
+      });
+      return Response.json({ model, choices: [{ message: { role: 'assistant', content: 'done' } }] });
+    });
+    vi.stubGlobal('fetch', upstream);
+
+    await expect(executeWalletAgentChat(prisma, {
+      userId: 'user-1', clientRequestId: 'vision-chat', model,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Read the attached reference.' },
+          { type: 'image_url', image_url: { url: objectKey, detail: 'high' } },
+        ],
+      }],
+    })).resolves.toMatchObject({ model });
+    expect(upstream).toHaveBeenCalledOnce();
+    expect(readObject).toHaveBeenCalledTimes(inline ? 1 : 0);
+  });
+
   const chatScenarios = [
     'rejected', 'preconnect', 'truncated', 'stream-reset', 'transport-reset', 'gateway-timeout', 'fallback-truncated',
   ] as const;

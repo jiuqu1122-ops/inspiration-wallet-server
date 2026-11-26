@@ -7,7 +7,7 @@ import { assertPublicProviderUrl, providerEndpoint } from '../providers/url.js';
 import { MIN_AI_IMAGE_TAGS, normalizeImageTagAnalysis } from './tag-analysis.js';
 import { extractChatTokenUsage } from './chat-pricing.js';
 import { creditDecimal } from '../wallets/credit-amount.js';
-import { proxyAgentChatReferenceImages } from './reference-upload-service.js';
+import { createAgentChatReferenceImageResolver, ReferenceUploadError } from './reference-upload-service.js';
 import { ensureAiCatalogSeeded } from './catalog-seed.js';
 import {
   assertCanonicalModelIdentity,
@@ -311,7 +311,10 @@ export function isAgentProviderRetryStatus(status: number) {
   return AGENT_PROVIDER_RETRY_STATUSES.has(status);
 }
 
-export function sanitizeAgentUpstreamDetail(value: string) {
+export function sanitizeAgentUpstreamDetail(value: string, redactInlineImages = false) {
+  if (redactInlineImages) {
+    value = value.replace(/data:image\/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=_-]+/gi, '[IMAGE DATA REDACTED]');
+  }
   return value
     .replace(/<[^>]*>/g, ' ')
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
@@ -330,7 +333,7 @@ function scalarString(value: unknown) {
   return '';
 }
 
-function upstreamErrorDetail(status: number, text: string) {
+function upstreamErrorDetail(status: number, text: string, redactInlineImages: boolean) {
   let message = '';
   let code = '';
   try {
@@ -347,7 +350,7 @@ function upstreamErrorDetail(status: number, text: string) {
   } catch {
     message = text;
   }
-  const safeMessage = sanitizeAgentUpstreamDetail(message);
+  const safeMessage = sanitizeAgentUpstreamDetail(message, redactInlineImages);
   const safeCode = code.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 100);
   return [
     `HTTP ${status}`,
@@ -915,6 +918,7 @@ async function requestStreamingCompletion(
   body: Record<string, unknown>,
   options: AgentExecutionOptions | undefined,
   attempt: number,
+  redactInlineImages = false,
 ) {
   const secrets = decryptProviderSecrets(provider.encryptedSecrets);
   const controller = linkedAbortController(options?.signal);
@@ -1008,7 +1012,7 @@ async function requestStreamingCompletion(
     });
     throw new AgentUpstreamHttpError(
       response.status,
-      upstreamErrorDetail(response.status, text),
+      upstreamErrorDetail(response.status, text, redactInlineImages),
     );
   }
   if (!response.body) {
@@ -1106,6 +1110,8 @@ async function requestAgentCompletionFromProvider(
   provider: AiProviderChannel,
   input: {
     messages: unknown[];
+    geminiMessages: () => Promise<unknown[]>;
+    canonicalModelKey: string;
     tools?: unknown[] | undefined;
     toolChoice?: unknown;
     model?: string | undefined;
@@ -1125,22 +1131,29 @@ async function requestAgentCompletionFromProvider(
     preferredModel,
     preferProviderDefault,
   );
+  const inlineImages = usesGeminiImageTransport(model) || usesGeminiImageTransport(input.canonicalModelKey);
+  const messages = inlineImages ? await input.geminiMessages() : input.messages;
   const { result } = await requestStreamingCompletion(
     provider,
     model,
-    buildAgentProviderRequestBody(input),
+    buildAgentProviderRequestBody({ ...input, messages }),
     options,
     attempt,
+    inlineImages,
   );
   const providerFailure = providerFailureMessage(result);
   if (providerFailure) {
     throw new CloudAiError(
       'provider_request_failed',
-      `Agent upstream failed: ${sanitizeAgentUpstreamDetail(providerFailure)}`,
+      `Agent upstream failed: ${sanitizeAgentUpstreamDetail(providerFailure, inlineImages)}`,
       502,
     );
   }
   return result;
+}
+
+function usesGeminiImageTransport(model: string) {
+  return /(?:^|[/:])gemini(?=[-_.]|$)/i.test(model.trim());
 }
 
 async function readProviderModels(
@@ -1574,10 +1587,14 @@ export async function executeWalletAgentChat(
     pricingSnapshot,
   });
   try {
+    const resolveReferenceImages = createAgentChatReferenceImageResolver(prisma, input.userId, input.messages);
+    let geminiMessages: Promise<unknown[]> | undefined;
     const providerInput = {
       ...input,
       usageContext,
-      messages: await proxyAgentChatReferenceImages(prisma, input.userId, input.messages),
+      canonicalModelKey,
+      messages: await resolveReferenceImages(),
+      geminiMessages: () => (geminiMessages ??= resolveReferenceImages('inline')),
     };
     const providersById = new Map(allProviders.map(provider => [provider.id, provider]));
     const prioritizedRoutes = resolved
@@ -1658,7 +1675,7 @@ export async function executeWalletAgentChat(
             ? options.signal.reason
             : new Error('Task cancelled');
         }
-        if (isAgentUpstreamResultUnknown(error)) throw error;
+        if (error instanceof ReferenceUploadError || isAgentUpstreamResultUnknown(error)) throw error;
         let finalError = error;
         const retriedModels: string[] = [];
         if (canTryAlternativeAgentModel(error) || canRetrySingleAgentProvider(error)) {
@@ -1703,7 +1720,7 @@ export async function executeWalletAgentChat(
                   ? options.signal.reason
                   : new Error('Task cancelled');
               }
-              if (isAgentUpstreamResultUnknown(retryError)) throw retryError;
+              if (retryError instanceof ReferenceUploadError || isAgentUpstreamResultUnknown(retryError)) throw retryError;
               finalError = retryError;
               retriedModels.push(retryModel || failedModel || 'default');
               if (!canTryAlternativeAgentModel(retryError)

@@ -274,26 +274,74 @@ function ownReferenceObjectKey(value: string) {
   return objectKey?.startsWith('reference-images/') ? objectKey : null;
 }
 
-/**
- * Converts private storage references in OpenAI-compatible multimodal messages
- * into short-lived API proxy URLs. The upstream model never needs direct COS
- * access, while unrelated public image URLs and data URLs remain untouched.
- */
-export async function proxyAgentChatReferenceImages(
+const MAX_AGENT_INLINE_REFERENCE_BYTES = 12 * 1024 * 1024;
+
+/** Reuse ownership validation across Chat route attempts and image transports. */
+export function createAgentChatReferenceImageResolver(
   prisma: PrismaClient,
   userId: string,
   messages: unknown[],
 ) {
-  const authorizationCache = new Map<string, Promise<string>>();
-  const authorize = (objectKey: string) => {
-    const cached = authorizationCache.get(objectKey);
-    if (cached) return cached;
-    const pending = authorizeReferenceObject(prisma, userId, objectKey);
-    authorizationCache.set(objectKey, pending);
+  const authorizations = new Map<string, Promise<string>>();
+  const authorize = (key: string) => {
+    let pending = authorizations.get(key);
+    if (!pending) {
+      pending = authorizeReferenceObject(prisma, userId, key);
+      authorizations.set(key, pending);
+    }
+    return pending;
+  };
+  return (transport: 'proxy' | 'inline' = 'proxy') =>
+    prepareAgentChatReferenceImages(prisma, messages, authorize, transport);
+}
+
+async function prepareAgentChatReferenceImages(
+  prisma: PrismaClient,
+  messages: unknown[],
+  authorize: (key: string) => Promise<string>,
+  transport: 'proxy' | 'inline' = 'proxy',
+) {
+  const resolved = new Map<string, Promise<{ url: string; size: number }>>();
+  let openedBytes = 0;
+  let includedBytes = 0;
+  const tooLarge = () => new ReferenceUploadError(
+    'Gemini 参考图总大小超过本轮限制，请减少图片数量或压缩后重试。',
+    'reference_image_too_large',
+    413,
+  );
+  const resolve = (objectKey: string) => {
+    let pending = resolved.get(objectKey);
+    if (!pending) {
+      pending = (async () => {
+        const authorized = await authorize(objectKey);
+        if (transport === 'proxy') return { url: referenceImageProxyUrl(authorized), size: 0 };
+        const filename = authorized.slice('reference-images/'.length);
+        const { response, contentType, contentLength } = await getReferenceImageContent(prisma, filename);
+        openedBytes += contentLength;
+        if (openedBytes > MAX_AGENT_INLINE_REFERENCE_BYTES) {
+          response.stream.destroy();
+          throw tooLarge();
+        }
+        const chunks: Buffer[] = [];
+        let size = 0;
+        for await (const chunk of response.stream as AsyncIterable<Uint8Array>) {
+          const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          size += bytes.length;
+          if (size > contentLength) throw new ReferenceUploadError('Reference image size changed', 'reference_image_invalid', 422);
+          chunks.push(bytes);
+        }
+        if (size !== contentLength) throw new ReferenceUploadError('Reference image download was incomplete', 'reference_image_invalid', 422);
+        return { url: `data:${contentType};base64,${Buffer.concat(chunks, size).toString('base64')}`, size };
+      })().catch(error => {
+        if (transport === 'proxy' || error instanceof ReferenceUploadError) throw error;
+        throw new ReferenceUploadError('无法从存储读取参考图，请重新添加图片。', 'reference_image_unavailable', 502);
+      });
+      resolved.set(objectKey, pending);
+    }
     return pending;
   };
 
-  return Promise.all(messages.map(async (message) => {
+  return Promise.all(messages.map(async message => {
     if (!message || typeof message !== 'object' || Array.isArray(message)) return message;
     const record = message as Record<string, unknown>;
     if (!Array.isArray(record.content)) return message;
@@ -309,13 +357,15 @@ export async function proxyAgentChatReferenceImages(
       if (typeof imageUrlRecord.url !== 'string') return part;
       const objectKey = ownReferenceObjectKey(imageUrlRecord.url);
       if (!objectKey) return part;
-      const authorizedKey = await authorize(objectKey);
+      const image = await resolve(objectKey);
+      includedBytes += image.size;
+      if (includedBytes > MAX_AGENT_INLINE_REFERENCE_BYTES) throw tooLarge();
       changed = true;
       return {
         ...contentPart,
         image_url: {
           ...imageUrlRecord,
-          url: referenceImageProxyUrl(authorizedKey),
+          url: image.url,
         },
       };
     }));

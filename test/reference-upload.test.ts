@@ -29,7 +29,7 @@ import {
   ReferenceUploadError,
   getReferenceImageContent,
   issueReferenceUploadTicket,
-  proxyAgentChatReferenceImages,
+  createAgentChatReferenceImageResolver,
   resolveReferenceImageSources,
   validateReferenceObjectKey,
 } from '../src/modules/ai/reference-upload-service.js';
@@ -242,11 +242,11 @@ describe('reference image direct upload ownership', () => {
       ],
     }];
 
-    await expect(proxyAgentChatReferenceImages(
+    await expect(createAgentChatReferenceImageResolver(
       prisma as never,
       'user-1',
       messages,
-    )).resolves.toEqual([{
+    )()).resolves.toEqual([{
       role: 'user',
       content: [
         { type: 'text', text: '分析图片' },
@@ -263,17 +263,37 @@ describe('reference image direct upload ownership', () => {
     expect(storageMocks.getDownloadUrl).not.toHaveBeenCalled();
   });
 
-  it('rejects a chat image key owned by another user before calling the provider', async () => {
+  it.each(['proxy', 'inline'] as const)('rejects an unowned chat image before preparing %s transport', async transport => {
     const prisma = fakePrisma();
     prisma.referenceUpload.findFirst.mockResolvedValueOnce(null);
-    await expect(proxyAgentChatReferenceImages(prisma as never, 'other-user', [{
+    await expect(createAgentChatReferenceImageResolver(prisma as never, 'other-user', [{
       role: 'user',
       content: [{
         type: 'image_url',
         image_url: { url: 'reference-images/12d2e7bb-6e3f-4ba0-bdb0-b82023a67e23.png' },
       }],
-    }])).rejects.toMatchObject({ code: 'invalid_reference_image' });
+    }])(transport)).rejects.toMatchObject({ code: 'invalid_reference_image' });
     expect(storageMocks.getDownloadUrl).not.toHaveBeenCalled();
+    expect(storageMocks.getObjectStream).not.toHaveBeenCalled();
+  });
+
+  it('reports an incomplete inline image instead of sending unreadable bytes', async () => {
+    const prisma = fakePrisma();
+    storageMocks.getObjectStream.mockResolvedValueOnce({
+      stream: Readable.from([Buffer.from('not')]),
+      statusCode: 200,
+      headers: { 'content-length': '4', 'content-type': 'image/png' },
+    });
+    await expect(createAgentChatReferenceImageResolver(prisma as never, 'user-1', [{
+      role: 'user',
+      content: [{
+        type: 'image_url',
+        image_url: { url: 'reference-images/12d2e7bb-6e3f-4ba0-bdb0-b82023a67e23.png' },
+      }],
+    }])('inline')).rejects.toMatchObject({
+      code: 'reference_image_invalid',
+      message: 'Reference image download was incomplete',
+    });
   });
 
   it('opens only an unexpired recorded reference object for proxy streaming', async () => {

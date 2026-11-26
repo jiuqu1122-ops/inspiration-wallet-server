@@ -207,6 +207,12 @@ describe('Agent provider fallback policy', () => {
     expect(detail).toContain('[REDACTED]');
   });
 
+  it('redacts an inline image echoed by the upstream channel', () => {
+    expect(sanitizeAgentUpstreamDetail('invalid image data:image/png;base64,c2VjcmV0LXJlZi1waWN0dXJl', true)).toBe(
+      'invalid image [IMAGE DATA REDACTED]',
+    );
+  });
+
   it('aggregates streamed text into a regular chat completion', () => {
     const result = parseAgentCompletionResponseText([
       'data: {"id":"chat-1","model":"gpt-test","choices":[{"index":0,"delta":{"role":"assistant","content":"hello "},"finish_reason":null}]}',
