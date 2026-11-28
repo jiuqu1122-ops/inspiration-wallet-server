@@ -2,7 +2,7 @@ import { AdminOperationType, Prisma, type PrismaClient } from '@prisma/client';
 import { AiModelAdminError, recordAdminOperation, type AdminMutationContext } from './model-admin.js';
 import { routeCanReceiveTraffic } from './model-catalog.js';
 
-export const AI_USAGE_MODEL_KEYS = ['IMAGE_ANALYSIS', 'CANVAS_TEXT'] as const;
+export const AI_USAGE_MODEL_KEYS = ['IMAGE_ANALYSIS', 'CANVAS_TEXT', 'WEB_SEARCH'] as const;
 export type AiUsageModelKey = typeof AI_USAGE_MODEL_KEYS[number];
 export const DEFAULT_USAGE_FIXED_CREDITS = '1.000000';
 
@@ -81,6 +81,9 @@ export async function resolveUsageModelBinding(prisma: PrismaClient, key: AiUsag
       `The ${key} usage model binding is missing, disabled, or unpublished`,
     );
   }
+  if (key === 'WEB_SEARCH' && binding.fixedCredits === null && model.billingType !== 'token') {
+    throw new UsageModelBindingError('USAGE_MODEL_NOT_AVAILABLE', 'The search model no longer supports token pricing');
+  }
   const enabledRoutes = operationalUsageRoutes(key, model);
   if (enabledRoutes.length === 0) {
     throw new UsageModelBindingError(
@@ -130,6 +133,7 @@ const usageBindingView = (key: AiUsageModelKey, binding: {
       && binding.canonicalModel.modality === 'chat'
       && binding.canonicalModel.enabled
       && binding.canonicalModel.status === 'PUBLISHED'
+      && (key !== 'WEB_SEARCH' || binding.fixedCredits !== null || binding.canonicalModel.billingType === 'token')
       && operationalRoutes.length > 0
     ),
     route: binding
@@ -162,13 +166,14 @@ export async function listAdminUsageModelBindings(prisma: PrismaClient) {
     analysisModels.add(model.id);
     return [];
   });
+  const textModels = eligibleModels
+    .filter(model => operationalUsageRoutes('CANVAS_TEXT', model).length > 0);
   return {
     items: AI_USAGE_MODEL_KEYS.map(key => usageBindingView(key, byKey.get(key) ?? null)),
     imageAnalysisExcluded,
     candidates: {
-      CANVAS_TEXT: eligibleModels
-        .filter(model => operationalUsageRoutes('CANVAS_TEXT', model).length > 0)
-        .map(identity),
+      CANVAS_TEXT: textModels.map(identity),
+      WEB_SEARCH: textModels.map(model => ({ ...identity(model), billingType: model.billingType })),
       IMAGE_ANALYSIS: models.filter(model => analysisModels.has(model.id)).map(identity),
     },
   };
@@ -177,7 +182,7 @@ export async function listAdminUsageModelBindings(prisma: PrismaClient) {
 export async function updateAdminUsageModelBinding(
   prisma: PrismaClient,
   key: AiUsageModelKey,
-  input: { canonicalModelId: string; fixedCredits: string },
+  input: { canonicalModelId: string; fixedCredits: string | null },
   context: AdminMutationContext,
 ) {
   return prisma.$transaction(async (transaction) => {
@@ -193,6 +198,9 @@ export async function updateAdminUsageModelBinding(
         'Usage bindings require an enabled, published canonical Chat model',
         400,
       );
+    }
+    if (fixedCredits === null && (key !== 'WEB_SEARCH' || model.billingType !== 'token')) {
+      throw new AiModelAdminError('INVALID_REQUEST', 'Token billing requires a token-priced Web Search model', 400);
     }
     const eligibleRoutes = operationalUsageRoutes(key, model);
     if (eligibleRoutes.length === 0) {
@@ -220,7 +228,7 @@ export async function updateAdminUsageModelBinding(
         beforeCanonicalModelId: before?.canonicalModelId ?? null,
         afterCanonicalModelId: canonicalModelId,
         beforeFixedCredits: before?.fixedCredits?.toFixed(6) ?? null,
-        afterFixedCredits: new Prisma.Decimal(fixedCredits).toFixed(6),
+        afterFixedCredits: fixedCredits === null ? null : new Prisma.Decimal(fixedCredits).toFixed(6),
       },
     );
     return usageBindingView(key, {
@@ -246,7 +254,7 @@ export async function ensureDefaultUsageModelBindings(transaction: Prisma.Transa
     const rank = (key: string) => key === 'gpt-5.6-sol' ? 0 : key === 'gpt-6-astra' ? 1 : 2;
     return rank(left.canonicalModelKey) - rank(right.canonicalModelKey);
   });
-  for (const key of AI_USAGE_MODEL_KEYS) {
+  for (const key of ['IMAGE_ANALYSIS', 'CANVAS_TEXT'] as const) {
     const existing = await transaction.aiUsageModelBinding.findUnique({ where: { key } });
     if (existing) {
       if (existing.fixedCredits === null) {

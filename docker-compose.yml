@@ -32,6 +32,7 @@ services:
       NODE_ENV: production
       HOST: 0.0.0.0
       PORT: 3000
+      SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-}
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?JWT_ACCESS_SECRET is required}
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required}
@@ -59,6 +60,21 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    networks:
+      - inspiration_backend
+    security_opt:
+      - no-new-privileges:true
+
+  searxng:
+    image: ${SEARXNG_IMAGE:-ghcr.io/searxng/searxng:latest}
+    profiles: ["search"]
+    restart: unless-stopped
+    environment:
+      SEARXNG_SETTINGS_PATH: /etc/drawer-search/settings.yml
+      GRANIAN_WORKERS: "1"
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-}
+    volumes:
+      - ./deploy/searxng/settings.yml:/etc/drawer-search/settings.yml:ro
     networks:
       - inspiration_backend
     security_opt:

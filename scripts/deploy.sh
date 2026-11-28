@@ -88,6 +88,28 @@ if ! docker compose run --rm --no-deps api npm run prisma:migrate:deploy; then
   fail 'Prisma migration failed. API and Caddy were not updated; database data and volumes were preserved.'
 fi
 
+if [[ "${ENABLE_WEB_SEARCH:-0}" == 1 ]]; then
+  search_url="$(docker compose config --environment | sed -n 's/^SEARXNG_BASE_URL=//p')"
+  if [[ -z "$search_url" ]]; then
+    search_url='http://searxng:8080'
+    export SEARXNG_BASE_URL="$search_url"
+    printf '\nSEARXNG_BASE_URL=%s\n' "$search_url" >> .env
+  fi
+  if [[ "${search_url%/}" == 'http://searxng:8080' ]]; then
+    if ! docker compose config --environment | awk '/^SEARXNG_SECRET=./ { available=1 } END { exit !available }'; then
+      command -v openssl >/dev/null 2>&1 || fail 'openssl is required to provision the SearXNG secret.'
+      search_secret="$(openssl rand -hex 32)" || fail 'SearXNG secret generation failed.'
+      printf '\nSEARXNG_SECRET=%s\n' "$search_secret" >> .env
+      export SEARXNG_SECRET="$search_secret"
+      unset search_secret
+    fi
+    log 'Starting the private SearXNG service...'
+    docker compose --profile search up -d searxng
+  else
+    log 'Using the configured external SearXNG service.'
+  fi
+fi
+
 log 'Starting or updating API, worker, and Caddy...'
 docker compose up -d api worker caddy
 

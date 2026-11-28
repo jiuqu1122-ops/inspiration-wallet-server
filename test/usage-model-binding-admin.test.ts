@@ -3,10 +3,14 @@ import { describe, expect, it, vi } from 'vitest';
 import { updateAdminUsageModelBinding } from '../src/modules/ai/usage-model-binding.js';
 
 describe('usage model binding administration', () => {
-  it('stores canonicalModelId and writes an admin audit record', async () => {
-    const upsert = vi.fn(async ({ create }: { create: { key: string; canonicalModelId: string; fixedCredits: string } }) => ({
+  it.each([
+    { key: 'CANVAS_TEXT', input: '1.5', expected: '1.500000' },
+    { key: 'WEB_SEARCH', input: '0', expected: '0.000000' },
+    { key: 'WEB_SEARCH', input: null, expected: null },
+  ] as const)('stores $key binding with $input credits and writes an admin audit record', async ({ key, input, expected }) => {
+    const upsert = vi.fn(async ({ create }: { create: { key: string; canonicalModelId: string; fixedCredits: string | null } }) => ({
       ...create,
-      fixedCredits: new Prisma.Decimal(create.fixedCredits),
+      fixedCredits: create.fixedCredits === null ? null : new Prisma.Decimal(create.fixedCredits),
       updatedAt: new Date('2026-09-14T00:00:00.000Z'),
     }));
     const createOperation = vi.fn(async () => ({}));
@@ -15,6 +19,7 @@ describe('usage model binding administration', () => {
       canonicalModelKey: 'chat-a',
       displayName: 'Chat A',
       modality: 'chat',
+      billingType: 'token',
       enabled: true,
       status: 'PUBLISHED',
       capabilities: {},
@@ -45,19 +50,19 @@ describe('usage model binding administration', () => {
 
     await expect(updateAdminUsageModelBinding(
       prisma,
-      'CANVAS_TEXT',
-      { canonicalModelId: 'canonical-chat-a', fixedCredits: '1.5' },
+      key,
+      { canonicalModelId: 'canonical-chat-a', fixedCredits: input },
       { actor: 'test-admin', requestId: 'request-1' },
     )).resolves.toMatchObject({
-      key: 'CANVAS_TEXT',
+      key,
       canonicalModelId: 'canonical-chat-a',
-      fixedCredits: '1.500000',
+      fixedCredits: expected,
       canonicalModelKey: 'chat-a',
       operational: true,
     });
     expect(upsert).toHaveBeenCalledWith(expect.objectContaining({
-      create: { key: 'CANVAS_TEXT', canonicalModelId: 'canonical-chat-a', fixedCredits: '1.5' },
-      update: { canonicalModelId: 'canonical-chat-a', fixedCredits: '1.5' },
+      create: { key, canonicalModelId: 'canonical-chat-a', fixedCredits: input },
+      update: { canonicalModelId: 'canonical-chat-a', fixedCredits: input },
     }));
     expect(createOperation).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ type: 'USAGE_MODEL_BINDING_UPDATED' }),

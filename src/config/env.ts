@@ -31,6 +31,16 @@ const envSchema = z
     HOST: z.string().min(1).default('0.0.0.0'),
     PORT: z.coerce.number().int().min(1).max(65535).default(3000),
     APP_BASE_URL: z.url(),
+    SEARXNG_BASE_URL: z.string().trim().refine((value) => {
+      if (!value) return true;
+      try {
+        const url = new URL(value);
+        return (url.protocol === 'http:' || url.protocol === 'https:')
+          && !url.username && !url.password && !url.search && !url.hash;
+      } catch {
+        return false;
+      }
+    }, 'must be an HTTP(S) service base URL without credentials or query').default(''),
     RECHARGE_PAGE_URL: z.url().default('https://www.unmind.art/recharge/'),
     RECHARGE_SESSION_TTL_MINUTES: z.coerce.number().int().min(5).max(10).default(10),
     DATABASE_URL: z.string().min(1),

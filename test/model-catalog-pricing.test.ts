@@ -351,6 +351,24 @@ describe('versioned server-side pricing', () => {
     expect(token.totalCredits).not.toBe('3.000000');
   });
 
+  it('charges search sorting by the bound model token rates or the configured fixed amount', () => {
+    const usage = { inputTokens: 500_000n, cachedInputTokens: 0n, cacheWriteTokens: 0n, outputTokens: 500_000n };
+    const token = snapshot('chat', astraPricing, { usageContext: 'web_search', fallbackCredits: '0' });
+    const chat = snapshot('chat', astraPricing, { usageContext: 'chat' });
+    expect(calculateSnapshotCharge(token, { usage })).toMatchObject({
+      billingType: 'token',
+      totalCredits: calculateSnapshotCharge(chat, { usage }).totalCredits,
+    });
+    expect(calculateSnapshotCharge(token).totalCredits).toBe('0.000000');
+    expect(estimateSnapshotCredits(token)).toBe('0.000001');
+    const fixed = snapshot('chat', astraPricing, { usageContext: 'web_search', fixedUsageCredits: '0' });
+    expect(calculateSnapshotCharge(fixed, { usage })).toMatchObject({
+      billingType: 'request_fixed',
+      totalCredits: '0.000000',
+    });
+    expect(estimateSnapshotCredits(fixed)).toBe('0.000000');
+  });
+
   it('does not reserve the fixed fallback for post-billed token chat', () => {
     const token = snapshot('chat', astraPricing, {
       usageContext: 'chat',

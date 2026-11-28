@@ -135,7 +135,7 @@ function membershipCategory(
   modelKey: string,
   request: Record<string, unknown>,
 ): MembershipDiscountCategory {
-  if (context === 'canvas_text_agent' || context === 'workflow' || context === 'inspiration_analysis') return 'other';
+  if (context === 'canvas_text_agent' || context === 'workflow' || context === 'inspiration_analysis' || context === 'web_search') return 'other';
   if (modality === 'chat' && (!context || context === 'chat')) return 'chat';
   if (modality === 'video') return 'video';
   const resolution = scalarText(request.resolution).toLowerCase();
@@ -731,7 +731,7 @@ function chatCharge(snapshot: PricingSnapshot, usage?: ChatTokenUsage | null): C
       outputTokens: usage.outputTokens.toString(),
     };
   })() : null;
-  if (isFixedCanvasLlmUsageContext(usageContext)) {
+  if (usesFixedLlmPrice(snapshot.request)) {
     const total = creditMicros(snapshot.request.fixedUsageCredits ?? snapshot.request.fallbackCredits ?? '0');
     return {
       schemaVersion: 1,
@@ -825,9 +825,15 @@ export function calculateSnapshotCharge(
   return videoCharge(snapshot, options.generatedCount);
 }
 
+function usesFixedLlmPrice(request: PricingSnapshot['request']) {
+  const context = scalarText(request.usageContext);
+  return context === 'web_search'
+    ? request.fixedUsageCredits !== undefined
+    : isFixedCanvasLlmUsageContext(context);
+}
+
 export function estimateSnapshotCredits(snapshot: PricingSnapshot) {
-  if (snapshot.modality === 'chat'
-    && isFixedCanvasLlmUsageContext(scalarText(snapshot.request.usageContext))) {
+  if (snapshot.modality === 'chat' && usesFixedLlmPrice(snapshot.request)) {
     // Canvas/workflow LLM nodes are sold at a fixed per-run price regardless
     // of whether the bound upstream model itself is token- or request-billed.
     // Reserve that fixed amount before contacting the provider so changing the

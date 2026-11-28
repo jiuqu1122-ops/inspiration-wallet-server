@@ -220,6 +220,7 @@ export function resolveConfiguredAgentModel(
 export function usageModelBindingKeyForAgentContext(
   usageContext: string | undefined,
 ): AiUsageModelKey | null {
+  if (usageContext === 'web_search') return 'WEB_SEARCH';
   return usageContext === 'canvas_text_agent'
     || usageContext === 'prompt_optimization'
     || usageContext === 'workflow'
@@ -390,6 +391,7 @@ export type AgentExecutionProgress = {
 
 export type AgentExecutionOptions = {
   signal?: AbortSignal;
+  searchRanking?: { validateResult: (result: unknown) => void };
   onProgress?: (progress: AgentExecutionProgress) => void | Promise<void>;
 };
 
@@ -1494,13 +1496,19 @@ export async function executeWalletAgentChat(
   },
   options?: AgentExecutionOptions,
 ) {
-  const usageContext = resolveAgentUsageContext(input.usageContext, input.clientRequestId);
-  const isFixedCanvasLlm = isFixedCanvasLlmUsageContext(usageContext);
+  const usageContext = options?.searchRanking
+    ? 'web_search'
+    : resolveAgentUsageContext(input.usageContext, input.clientRequestId);
   await ensureAiCatalogSeeded(prisma);
   const usageBindingKey = usageModelBindingKeyForAgentContext(usageContext);
-  const configuredFallbackCredits = usageBindingKey
-    ? await getUsageFixedCredits(prisma, usageBindingKey, '1.000000')
-    : REQUEST_CREDITS;
+  const searchBinding = options?.searchRanking
+    ? await resolveUsageModelBinding(prisma, 'WEB_SEARCH')
+    : null;
+  const isTokenSearch = searchBinding?.binding.fixedCredits === null;
+  const isFixedLlm = isFixedCanvasLlmUsageContext(usageContext) || (searchBinding !== null && !isTokenSearch);
+  const configuredFallbackCredits = searchBinding
+    ? searchBinding.binding.fixedCredits?.toFixed(6) ?? '0'
+    : usageBindingKey ? await getUsageFixedCredits(prisma, usageBindingKey, '1.000000') : REQUEST_CREDITS;
   const fallbackCredits = await resolveMembershipContextCredits(
     prisma,
     input.userId,
@@ -1513,7 +1521,9 @@ export async function executeWalletAgentChat(
     | Awaited<ReturnType<typeof resolveAutomaticChatModel>>
     | Awaited<ReturnType<typeof resolveUsageModelBinding>> = null;
   if (catalogDelegateAvailable(prisma)) {
-    if (usageBindingKey) {
+    if (searchBinding) {
+      resolved = searchBinding;
+    } else if (usageBindingKey) {
       resolved = await resolveUsageModelBinding(prisma, usageBindingKey);
     } else if (automaticModelSelection) {
       resolved = await resolveAutomaticChatModel(prisma);
@@ -1570,10 +1580,13 @@ export async function executeWalletAgentChat(
   const pricingSnapshot = canonicalModel
     ? await capturePricingSnapshot(prisma, canonicalModel, route?.id ?? null, {
       fallbackCredits: fallbackCredits.toString(),
-      ...(isFixedCanvasLlm ? { fixedUsageCredits: fallbackCredits.toString() } : {}),
+      ...(isFixedLlm ? { fixedUsageCredits: fallbackCredits.toString() } : {}),
       usageContext,
     }, input.userId)
     : undefined;
+  if (isTokenSearch && pricingSnapshot?.pricing.billingType !== 'token') {
+    throw new ModelCatalogError('PRICING_NOT_AVAILABLE', 'The search model requires a published token price', 503);
+  }
   const credits = pricingSnapshot ? estimateSnapshotCredits(pricingSnapshot) : fallbackCredits;
   const requestId = await reserveCredits(prisma, {
     userId: input.userId,
@@ -1581,8 +1594,9 @@ export async function executeWalletAgentChat(
     credits,
     capability: 'LLM',
     logicalModel: canonicalModelKey,
-    description: isFixedCanvasLlm
-      ? '文字分析节点按次结算预留'
+    description: options?.searchRanking
+      ? '联网搜索排序预扣'
+      : isFixedLlm ? '文字分析节点按次结算预留'
       : 'Agent 请求预扣',
     pricingSnapshot,
   });
@@ -1751,6 +1765,7 @@ export async function executeWalletAgentChat(
     if (result === undefined) {
       throw new CloudAiError('provider_request_failed', '全部 Agent 渠道请求失败', 502);
     }
+    options?.searchRanking?.validateResult(result);
     const billingSnapshot = pricingSnapshot
       ? { ...pricingSnapshot, routeId: successfulRouteId }
       : undefined;
@@ -1770,8 +1785,9 @@ export async function executeWalletAgentChat(
         details: { fallbackReason: 'catalog_unavailable' },
       };
     const usage = billing.details.usage as Record<string, string> | null | undefined;
-    const description = isFixedCanvasLlm
-      ? `文字分析节点按次结算 · ${billing.model}`
+    const description = options?.searchRanking
+      ? `联网搜索排序${isTokenSearch ? ' Token' : '按次'}结算 · ${billing.model}`
+      : isFixedLlm ? `文字分析节点按次结算 · ${billing.model}`
       : usage
       ? `Chat Token 结算 · ${billing.model} · 输入 ${usage.normalInputTokens} · 缓存读 ${usage.cachedInputTokens} · 缓存写 ${usage.cacheWriteTokens} · 输出 ${usage.outputTokens}`
       : `Chat 请求结算 · ${billing.model}`;

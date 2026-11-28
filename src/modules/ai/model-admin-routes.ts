@@ -186,7 +186,7 @@ const usageBindingParamsSchema = z.object({ key: z.enum(AI_USAGE_MODEL_KEYS) }).
 const fixedCreditsSchema = z.string().regex(/^(?:0|[1-9]\d{0,11})(?:\.\d{1,6})?$/);
 const updateUsageBindingSchema = z.object({
   canonicalModelId: idSchema,
-  fixedCredits: fixedCreditsSchema,
+  fixedCredits: fixedCreditsSchema.nullable(),
 }).strict();
 
 function invalid(reply: FastifyReply, message: string) {

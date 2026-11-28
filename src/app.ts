@@ -10,6 +10,7 @@ import { accountRoutes } from './modules/users/routes.js';
 import { walletRoutes } from './modules/wallets/routes.js';
 import { adminRoutes } from './modules/admin/routes.js';
 import { aiRoutes } from './modules/ai/routes.js';
+import { webSearchRoutes } from './modules/ai/web-search.js';
 import { inspirationSpaceRoutes } from './modules/inspiration-space/routes.js';
 import { mobileRoutes } from './modules/mobile/routes.js';
 import { membershipRoutes, referralAliasRoutes } from './modules/membership/routes.js';
@@ -105,6 +106,7 @@ export async function buildApp() {
       await v1.register(accountRoutes);
       await v1.register(walletRoutes, { prefix: '/wallet' });
       await v1.register(aiRoutes, { prefix: '/ai' });
+      await v1.register(webSearchRoutes, { prefix: '/web' });
       await v1.register(inspirationSpaceRoutes, { prefix: '/inspiration-space' });
       await v1.register(mobileRoutes, { prefix: '/mobile' });
       await v1.register(membershipRoutes, { prefix: '/membership' });

@@ -345,3 +345,17 @@ curl --fail --show-error \
 也可以直接运行 `./scripts/deploy.sh`。脚本在健康检查后会额外请求 `PROMPT`
 分类接口；若迁移未生效，部署会明确失败并输出 API 日志。该迁移只增加枚举值，
 不会删除或改写已有灵感空间数据。
+
+## 可选的联网搜索服务
+
+钱包 API 在 `SEARXNG_BASE_URL` 有值时启用 `POST /v1/web/search`。可指向已有的私有
+SearXNG 实例，实例须启用 JSON 输出。也可使用本仓库的 Compose `search` 配置，将
+`SEARXNG_BASE_URL` 设为 `http://searxng:8080`，给 `SEARXNG_SECRET` 设置独立随机值，
+启动 `docker compose --profile search up -d searxng` 后重新创建 API 容器以读取环境变量。SearXNG 仅在
+Docker 网络内提供服务。也可以在标准部署时设置 `ENABLE_WEB_SEARCH=1`。部署脚本会仅在
+现有值为空时追加内网地址与随机密钥并启动该服务。已有外部实例地址会继续使用。
+
+管理后台的「AI Model Center → 任务模型 → 联网搜索」可选用已有的 Chat 模型并设置每次
+排序的固定积分（新配置默认 0），或按该模型发布的 Token 售价结算。模型不可用时服务返回 SearXNG 自带顺序。桌面端检测到钱包
+搜索接口不可用或无候选后会调用原有搜索。技能目录接口使用 Vercel Labs CLI 现有的公开
+检索入口，查询无需管理员或 GitHub 凭据，并通过钱包用户登录验证。
